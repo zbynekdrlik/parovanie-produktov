@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 import logging
+from collections.abc import Callable
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -12,7 +13,7 @@ from parovanie.suppliers import wetland, betalov
 
 log = logging.getLogger("parovanie.client")
 
-PARSERS: dict[str, callable] = {
+PARSERS: dict[str, Callable[[str, str], list[Candidate]]] = {
     "WETLAND": wetland.parse_search,
     "BETALOV": betalov.parse_search,
 }
@@ -73,7 +74,7 @@ class SearchClient:
 
     def __init__(
         self,
-        fetch: callable = _DEFAULT_FETCH,
+        fetch: Callable[[str], str] = _DEFAULT_FETCH,
         cache: dict | None = None,
         throttle: float = config.THROTTLE_SECONDS,
     ) -> None:
