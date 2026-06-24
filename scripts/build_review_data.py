@@ -50,13 +50,16 @@ def resolve_url(name: str):
     return None
 
 imgcols = ["defaultImage"] + [f"image{i}" for i in range(2, 16)] + ["image"]
-code2img, code2pair = {}, {}
+code2img, code2pair, code2cur = {}, {}, {}
 with open(SRC, encoding="cp1250", errors="replace") as f:
     for row in csv.DictReader(f, delimiter=";"):
         c = (row.get("code") or "").strip()
         if not c:
             continue
         code2pair[c] = (row.get("pairCode") or "").strip()
+        code2cur[c] = ((row.get("productVisibility") or "").strip(),
+                       (row.get("availabilityInStock") or "").strip(),
+                       (row.get("availabilityOutOfStock") or "").strip())
         imgs = []
         for col in imgcols:
             v = (row.get(col) or "").strip()
@@ -81,12 +84,16 @@ for i, r in enumerate(recs):
     ci = v["chosen_i"] if v else -1
     cands = r["candidates"]
     matched = isinstance(ci, int) and 0 <= ci < len(cands)
+    _vis, _ais, _aos = code2cur.get(vcodes[0], ("?", "", "")) if vcodes else ("?", "", "")
+    _a = _ais or _aos
+    _off = (_vis != "visible") or ("Vypredan" in _a) or ("skon" in _a.lower())
     out.append({
         "idx": i, "key": r["pair_key"], "supplier": r["supplier"], "name": r["name"],
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",
         "variant_codes": vcodes,
         "our_images": our_imgs[:6],
         "our_url": resolve_url(r["name"]),
+        "current": {"off": _off, "vis": _vis, "avail": _a},
         "ai_status": "matched" if matched else "unmatched",
         "ai_chosen_url": cands[ci]["url"] if matched else "",
         "ai_reason": v["reason"] if v else "",

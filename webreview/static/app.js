@@ -42,6 +42,7 @@ function matchesFilter(p) {
     case 'unmatched': return p.ai_status === 'unmatched';
     case 'good': return s === 'good' || s === 'manual';
     case 'bad': return s === 'bad' || s === 'unavailable';
+    case 'off_now': return p.current && p.current.off;
     default: return true;
   }
 }
@@ -99,6 +100,11 @@ function renderCard(p) {
   oa.textContent = p.our_url ? '↗ otvoriť náš produkt na forestshop.sk' : '↗ nájsť náš produkt na forestshop.sk';
   left.appendChild(oa);
   left.appendChild(el('div', 'meta', `${p.supplier} · pairCode ${p.pairCode || '—'} · ${p.variant_codes.length} variant(ov)`));
+  if (p.current) {
+    const cb = el('span', 'curbadge ' + (p.current.off ? 'off' : 'on'),
+      p.current.off ? '⚫ teraz vypnutý u nás' : '🟢 teraz zapnutý u nás');
+    left.appendChild(cb);
+  }
   const oimgs = el('div', 'imgs');
   if (p.our_images.length) { for (const u of p.our_images) { const im = el('img'); im.src = u; im.loading = 'lazy'; oimgs.appendChild(im); } }
   else oimgs.innerHTML = '<span class="noimg">bez obrázkov</span>';
@@ -136,7 +142,7 @@ function renderCard(p) {
 
 const FILTERS = [
   ['unreviewed', 'Nezrevidované'], ['matched', 'Napárované (AI)'], ['unmatched', 'Nenapárované'],
-  ['good', '✓ Dobré/Vybrané'], ['bad', '✗ Zlé/Nedostupné'], ['all', 'Všetky'],
+  ['off_now', '⚫ Teraz vypnuté'], ['good', '✓ Dobré/Vybrané'], ['bad', '✗ Zlé/Nedostupné'], ['all', 'Všetky'],
 ];
 
 function renderFilters() {
