@@ -21,6 +21,10 @@ main { max-width: 1200px; margin: 14px auto; padding: 0 12px; display: flex; fle
 .card.unavailable { border-color: #9ca3af; }
 .panel { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e5e7eb; }
 .noimg { font-size: 12px; color: #9ca3af; }
+.curbadge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
+  border-radius: 10px; margin: 2px 0 6px; }
+.curbadge.off { background: #fee2e2; color: #991b1b; }
+.curbadge.on { background: #d1fae5; color: #065f46; }
 .btn.warn { background: #fca5a5; color: #7f1d1d; }
 .side { padding: 12px; }
 .side.left { border-right: 1px solid #eef0f3; }
