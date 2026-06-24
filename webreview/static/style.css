@@ -18,6 +18,10 @@ main { max-width: 1200px; margin: 14px auto; padding: 0 12px; display: flex; fle
 .card.good { border-color: #34d399; }
 .card.bad { border-color: #f87171; }
 .card.manual { border-color: #60a5fa; }
+.card.unavailable { border-color: #9ca3af; }
+.panel { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e5e7eb; }
+.noimg { font-size: 12px; color: #9ca3af; }
+.btn.warn { background: #fca5a5; color: #7f1d1d; }
 .side { padding: 12px; }
 .side.left { border-right: 1px solid #eef0f3; }
 .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; margin-bottom: 4px; }
@@ -54,5 +58,6 @@ a.supurl:hover { text-decoration: underline; }
 .badge.good { background: #d1fae5; color: #065f46; }
 .badge.bad { background: #fee2e2; color: #991b1b; }
 .badge.manual { background: #dbeafe; color: #1e40af; }
+.badge.unavailable { background: #e5e7eb; color: #374151; }
 .empty { text-align: center; color: #6b7280; padding: 40px; }
 @media (max-width: 760px) { .card { grid-template-columns: 1fr; } .side.left { border-right: 0; border-bottom: 1px solid #eef0f3; } }

@@ -82,7 +82,7 @@ for i, r in enumerate(recs):
     cands = r["candidates"]
     matched = isinstance(ci, int) and 0 <= ci < len(cands)
     out.append({
-        "idx": i, "supplier": r["supplier"], "name": r["name"],
+        "idx": i, "key": r["pair_key"], "supplier": r["supplier"], "name": r["name"],
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",
         "variant_codes": vcodes,
         "our_images": our_imgs[:6],

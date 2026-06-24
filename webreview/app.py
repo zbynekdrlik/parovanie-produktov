@@ -79,6 +79,13 @@ def _extract_images(html: str, base: str) -> list[str]:
     return imgs[:1]
 
 
+@app.after_request
+def _no_cache(resp):
+    # tool is actively developed + the index/decisions must always be fresh
+    resp.headers["Cache-Control"] = "no-cache, must-revalidate, max-age=0"
+    return resp
+
+
 @app.route("/")
 def index():
     return send_from_directory("templates", "index.html")
@@ -117,12 +124,28 @@ def api_images():
 @app.route("/api/decision", methods=["POST"])
 def api_decision():
     body = request.get_json(force=True)
-    idx = str(body.get("idx"))
+    key = str(body.get("key"))
     with _lock:
         d = _load_decisions()
-        d[idx] = {"status": body.get("status"), "url": body.get("url", "")}
+        d[key] = {"status": body.get("status"), "url": body.get("url", "")}
         _save_decisions(d)
     return jsonify({"ok": True})
+
+
+@app.route("/api/export")
+def api_export():
+    """All decisions joined to products — for building the corrected import +
+    the unavailable list. Stable key = supplier|pairCode."""
+    dec = _load_decisions()
+    rows = []
+    for p in PRODUCTS:
+        d = dec.get(p.get("key"))
+        if not d:
+            continue
+        rows.append({"key": p.get("key"), "supplier": p["supplier"], "name": p["name"],
+                     "variant_codes": p["variant_codes"], "status": d.get("status"),
+                     "url": d.get("url", "")})
+    return jsonify({"decisions": rows})
 
 
 @app.route("/static/<path:p>")
