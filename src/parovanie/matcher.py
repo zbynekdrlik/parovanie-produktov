@@ -71,8 +71,9 @@ GENERIC = {
 
 
 def query_variants(p: Product) -> list[str]:
-    """Several query forms to widen recall: external code, full name, name with
-    leading generic words stripped, and trailing 'model' token groups."""
+    """Several query forms to maximize recall: external code, full name, name with
+    leading generic words stripped, and both prefix and suffix token-groups of the
+    full and stripped names. The AI verifier dedups and picks among the union."""
     qs: list[str] = []
     if p.external_code:
         qs.append(p.external_code)
@@ -80,17 +81,17 @@ def query_variants(p: Product) -> list[str]:
     if name:
         qs.append(name)
         toks = name.split()
-        # strip leading generic words (keep at least 1 token)
         i = 0
         while i < len(toks) - 1 and toks[i].lower().strip("-,.") in GENERIC:
             i += 1
+        stripped = toks[i:] if i > 0 else toks
         if i > 0:
-            qs.append(" ".join(toks[i:]))
-        # trailing model-ish tokens (model name usually trails)
-        if len(toks) >= 3:
-            qs.append(" ".join(toks[-3:]))
-        if len(toks) >= 2:
-            qs.append(" ".join(toks[-2:]))
+            qs.append(" ".join(stripped))
+        for base in (toks, stripped):
+            for n in (3, 2):
+                if len(base) > n:
+                    qs.append(" ".join(base[:n]))   # prefix
+                    qs.append(" ".join(base[-n:]))  # suffix
     out: list[str] = []
     seen: set[str] = set()
     for q in qs:

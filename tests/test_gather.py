@@ -13,19 +13,22 @@ class FakeClient:
 
 
 def test_query_variants_strips_leading_generic():
-    # clean_name strips the leading numeric token "04 " → "Nohavice HART FAIRFAX FZ"
-    # query_variants should also strip the leading generic word "Nohavice"
-    p = Product("BETALOV", "k", None, "04 Nohavice HART FAIRFAX FZ", [])
+    # For "Nohavice HART RANDO XHP": should produce full name, stripped form,
+    # and both prefix + suffix groups (from full and stripped names).
+    p = Product("BETALOV", "k", None, "Nohavice HART RANDO XHP", [])
     variants = query_variants(p)
-    # The full cleaned name is expected
-    assert "Nohavice HART FAIRFAX FZ" in variants
-    # A variant WITHOUT the leading generic "Nohavice" must exist
-    stripped = [v for v in variants if not v.lower().startswith("nohavice")]
-    assert any("HART FAIRFAX FZ" in v for v in stripped), (
-        f"Expected a variant without leading 'Nohavice', got: {variants}"
-    )
-    # Trailing groups should also be present
-    assert any("FAIRFAX FZ" in v for v in variants)
+
+    # Full cleaned name must be present
+    assert "Nohavice HART RANDO XHP" in variants, f"Full name missing: {variants}"
+
+    # Stripped form (leading "Nohavice" removed) must be present
+    assert "HART RANDO XHP" in variants, f"Stripped form missing: {variants}"
+
+    # Prefix form "Nohavice HART RANDO" (first 3 of full name) must be present
+    assert "Nohavice HART RANDO" in variants, f"Prefix form missing: {variants}"
+
+    # No duplicates
+    assert len(variants) == len(set(variants)), f"Duplicates found: {variants}"
 
 
 def test_query_variants_code_first():
