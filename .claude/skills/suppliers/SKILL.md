@@ -32,7 +32,9 @@ Výsledok Betalov+Wetland: 784/969 napárovaných, 185 prísne zamietnutých.
 ## Gotchas
 
 - **Forestshop URL produktu sa NEDÁ z exportu** (CSV/XML nemajú čisté URL pole; `seoTitle` prázdne). Rieš cez **sitemap.xml**: `_slug(name)` → exact ∪ suffix (`-slug`) ∪ token-subset (všetky slová názvu ⊆ tokeny slugu) = presné, existujúce URL (688/969). Zvyšok → funkčný search `…/vyhladavanie/?string=<name>` (**`?q=` presmeruje na homepage, nepouživaj**).
+- **`productVisibility: detailOnly`** = produkt dostupný LEN cez priamy odkaz (nie v sitemap/vyhľadávaní). Mnohé naše drop-ship produkty sú také → sitemap (3378) < katalóg (4513). URL sa nedá z poľa; `resolve_urls.py` overí slug-kandidátov cez HTTP 200 (názov-slug, bez generického slova, `polovnicke-/polovnicka-` prefix). Tak vznikne 791/969 priamych URL; zvyšok fallback `?string=`.
 - **Obrázky z produktovej stránky: ver LEN `og:image`** — gallery selektory ťahajú aj „súvisiace/odporúčané" produkty (zlé obrázky). og:image je spoľahlivo hlavný produkt.
+- **Durabilita rozhodnutí (webreview):** decisions kľúčuj **stabilným `supplier|pairCode`** (NIE array idx — prestavba dát by rozhodila), ukladaj na disk `data/out/decisions.json` (gitignored, prežije reštart/deploy), atomicky (tmp+rename). Assety verzuj `?v=N` nech reload ukáže novú UI.
 - **Kódovanie cp1250** (Windows-1250) vstup aj výstup, `;`, CRLF — Shoptet import to čaká.
 - `externalCode` = supplier kód, ale huntingshop ho často NEindexuje (napr. OB570 → 0 výsledkov) → query-rebrík/varianty nutné, nielen kód.
 - `pair_key` musí byť scope-nutý dodávateľom (`sup|key`) — inak kolízia v checkpointe pri rovnakom pairCode u dvoch dodávateľov.
