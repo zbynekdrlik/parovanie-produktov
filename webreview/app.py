@@ -62,17 +62,21 @@ def _extract_images(html: str, base: str) -> list[str]:
         if u not in imgs:
             imgs.append(u)
 
+    # og:image is reliably THE product's main image on both supplier platforms.
+    # Gallery selectors leak related/carousel products (user-confirmed), so we
+    # trust ONLY og:image, with a single product-detail image as fallback.
     og = soup.find("meta", attrs={"property": "og:image"})
     if og:
         add(og.get("content"))
-    # product-detail-scoped galleries only (avoids related/carousel leakage)
-    for sel in [".p-detail img", ".product-detail img", "#product .images img",
-                ".product-images img", ".images-container img",
-                ".product-gallery img", "[itemprop='image']"]:
-        for im in soup.select(sel):
-            add(im.get("src") or im.get("data-src") or im.get("data-zoom-image")
-                or im.get("data-image"))
-    return imgs[:5]
+    if not imgs:
+        for sel in [".p-detail img", ".product-detail img", ".product-images img",
+                    "[itemprop='image']"]:
+            el = soup.select_one(sel)
+            if el:
+                add(el.get("src") or el.get("data-src") or el.get("data-zoom-image"))
+                if imgs:
+                    break
+    return imgs[:1]
 
 
 @app.route("/")
