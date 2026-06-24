@@ -5,6 +5,7 @@ Nástroj: páruje forestshop (Shoptet) produkty na produktové stránky dodávat
 ## Playbook router
 Load the matching skill BEFORE working on that area (don't re-derive):
 - dodávatelia / recon webu / pridanie dodávateľa / parsovanie výsledkov → load `.claude/skills/suppliers`
+- deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`
 
 ## Always
 - Kódovanie I/O = **cp1250**, `;`, CRLF (Shoptet import).
