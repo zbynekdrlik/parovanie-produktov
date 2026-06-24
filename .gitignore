@@ -1,0 +1,9 @@
+data/
+*.csv
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+.playwright/
+*.log
