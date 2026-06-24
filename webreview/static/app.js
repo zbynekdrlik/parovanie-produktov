@@ -66,8 +66,12 @@ function renderCard(p) {
   left.appendChild(el('div', 'label', 'Náš produkt'));
   left.appendChild(el('div', 'pname', escapeHtml(p.name)));
   const oa = el('a', 'supurl');
-  oa.href = 'https://www.forestshop.sk/vyhladavanie/?q=' + encodeURIComponent(p.name);
-  oa.target = '_blank'; oa.rel = 'noopener'; oa.textContent = '↗ otvoriť náš produkt na forestshop.sk';
+  oa.href = p.our_url
+    || ('https://www.forestshop.sk/vyhladavanie/?string=' + encodeURIComponent(p.name));
+  oa.target = '_blank'; oa.rel = 'noopener';
+  oa.textContent = p.our_url
+    ? '↗ otvoriť náš produkt na forestshop.sk'
+    : '↗ nájsť náš produkt na forestshop.sk';
   left.appendChild(oa);
   left.appendChild(el('div', 'meta', `${p.supplier} · pairCode ${p.pairCode || '—'} · ${p.variant_codes.length} variant(ov)`));
   const oimgs = el('div', 'imgs');

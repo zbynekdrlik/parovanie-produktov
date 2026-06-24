@@ -6,10 +6,48 @@ Writes: data/out/review_data.json  (consumed by webreview/app.py)
 """
 import csv
 import json
+import re
+import unicodedata
+
+import requests
 
 csv.field_size_limit(10**9)
 SRC = "data/products.csv"
 OUT = "data/out"
+BASE = "https://www.forestshop.sk/"
+
+
+def _slug(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
+
+
+# Build a resolver of forestshop product URLs from the public sitemap.
+# Real product URLs sometimes carry a category prefix (e.g. "polovnicke-..."),
+# so we match name-slug exactly, as a suffix, or by full token-subset; the rest
+# fall back (in the UI) to the working ?string= search.
+_sm = requests.get(BASE + "sitemap.xml", timeout=30,
+                   headers={"User-Agent": "Mozilla/5.0"}).text
+_locs = re.findall(r"<loc>https://www\.forestshop\.sk/([^<]+?)/?</loc>", _sm)
+_slugset = set(_locs)
+_slug_tokens = {s: set(s.split("-")) for s in _locs}
+
+
+def resolve_url(name: str):
+    sn = _slug(name)
+    if not sn:
+        return None
+    if sn in _slugset:
+        return BASE + sn + "/"
+    suf = [s for s in _slugset if s.endswith("-" + sn)]
+    if suf:
+        return BASE + min(suf, key=len) + "/"
+    nt = {t for t in sn.split("-") if t and not t.isdigit()}
+    cands = [s for s, toks in _slug_tokens.items() if nt and nt <= toks]
+    if cands:
+        return BASE + min(cands, key=lambda s: len(_slug_tokens[s])) + "/"
+    return None
 
 imgcols = ["defaultImage"] + [f"image{i}" for i in range(2, 16)] + ["image"]
 code2img, code2pair = {}, {}
@@ -48,6 +86,7 @@ for i, r in enumerate(recs):
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",
         "variant_codes": vcodes,
         "our_images": our_imgs[:6],
+        "our_url": resolve_url(r["name"]),
         "ai_status": "matched" if matched else "unmatched",
         "ai_chosen_url": cands[ci]["url"] if matched else "",
         "ai_reason": v["reason"] if v else "",
