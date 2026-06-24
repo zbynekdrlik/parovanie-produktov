@@ -20,3 +20,24 @@ def test_run_writes_three_outputs(tmp_path):
     assert os.path.exists(out / "unmatched.csv")
     assert len(matches) == 2
     assert all(m.chosen is not None for m in matches)
+
+
+def test_resume_skips_already_matched(tmp_path):
+    out = tmp_path / "out"
+    ck = tmp_path / "ck.json"
+
+    class CountingClient:
+        def __init__(self): self.calls = 0
+        def search(self, supplier, query):
+            self.calls += 1
+            from parovanie.models import Candidate
+            return [Candidate("X", f"https://x/{supplier.lower()}")]
+
+    c1 = CountingClient()
+    run(FIX, str(out), {"BETALOV", "WETLAND"}, client=c1, checkpoint=str(ck))
+    assert c1.calls > 0
+    # second run with same checkpoint: every product already done -> zero searches
+    c2 = CountingClient()
+    matches = run(FIX, str(out), {"BETALOV", "WETLAND"}, client=c2, checkpoint=str(ck))
+    assert c2.calls == 0
+    assert all(m.chosen is not None for m in matches)

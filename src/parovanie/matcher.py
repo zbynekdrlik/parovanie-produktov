@@ -31,20 +31,25 @@ def query_ladder(p: Product) -> list[str]:
     return out
 
 
+def match_one(product: Product, client) -> Match:
+    ladder = query_ladder(product)
+    candidates: list = []
+    used_query = ladder[0] if ladder else ""
+    for q in ladder:
+        used_query = q
+        candidates = client.search(product.supplier, q)
+        if candidates:
+            break
+    best, conf = pick_best(product, candidates)
+    return Match(product=product, query=used_query, chosen=best,
+                 confidence=conf, candidate_count=len(candidates))
+
+
 def match_products(products: list[Product], client) -> list[Match]:
     matches: list[Match] = []
     for i, p in enumerate(products, 1):
-        ladder = query_ladder(p)
-        candidates: list = []
-        used_query = ladder[0] if ladder else ""
-        for q in ladder:
-            used_query = q
-            candidates = client.search(p.supplier, q)
-            if candidates:
-                break
-        best, conf = pick_best(p, candidates)
+        m = match_one(p, client)
         log.info("[%d/%d] %s %r -> %s (%s)", i, len(products), p.supplier,
-                 used_query, best.url if best else "NO MATCH", conf)
-        matches.append(Match(product=p, query=used_query, chosen=best,
-                             confidence=conf, candidate_count=len(candidates)))
+                 m.query, m.chosen.url if m.chosen else "NO MATCH", m.confidence)
+        matches.append(m)
     return matches
