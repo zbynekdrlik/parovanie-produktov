@@ -3,3 +3,4 @@ beautifulsoup4>=4.12
 lxml>=5.0
 rapidfuzz>=3.6
 pytest>=8.0
+flask>=3.0

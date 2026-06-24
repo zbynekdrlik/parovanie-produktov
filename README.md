@@ -53,6 +53,21 @@ PYTHONPATH=src .venv/bin/python scripts/smoke.py 10
 
 Vypíše napárovanie pre prvých 10 produktov každého dodávateľa proti živým webom.
 
+## Web na ručnú kontrolu (webreview)
+
+Vizuálne porovnanie náš-produkt ↔ dodávateľ s fajka/krížik (a ručným výberom URL
+pri nenapárovaných). Rozhodnutia sa ukladajú do `data/out/decisions.json`.
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/build_review_data.py   # postaví review_data.json
+pip install flask   # ak nie je
+PYTHONPATH=src .venv/bin/python webreview/app.py               # počúva na 0.0.0.0:8801
+```
+
+Otvor `http://<LAN-IP>:8801/`. Vľavo náš produkt (názov + obrázky), vpravo dodávateľ
+(názov, klikateľná URL, obrázky). Napárované → ✓ Dobré / ✗ Zlé; nenapárované → výber
+z kandidátov alebo vlastná URL. `decisions.json` potom drží `{idx: {status, url}}`.
+
 ## Architektúra
 
 | Modul | Zodpovednosť |
