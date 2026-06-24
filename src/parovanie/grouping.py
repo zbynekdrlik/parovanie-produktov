@@ -21,7 +21,7 @@ def group_products(rows: list[dict]) -> list[Product]:
         key = (sup, "pc:" + pair) if pair else (sup, "nm:" + _name_key(name))
         g = groups.get(key)
         if g is None:
-            g = {"supplier": sup, "pair_key": pair or _name_key(name),
+            g = {"supplier": sup, "pair_key": f"{sup}|{pair or _name_key(name)}",
                  "external_code": ext or None, "name": name, "variant_codes": []}
             groups[key] = g
             order.append(key)
