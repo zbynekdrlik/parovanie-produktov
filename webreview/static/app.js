@@ -65,6 +65,10 @@ function renderCard(p) {
   const left = el('div', 'side left');
   left.appendChild(el('div', 'label', 'Náš produkt'));
   left.appendChild(el('div', 'pname', escapeHtml(p.name)));
+  const oa = el('a', 'supurl');
+  oa.href = 'https://www.forestshop.sk/vyhladavanie/?q=' + encodeURIComponent(p.name);
+  oa.target = '_blank'; oa.rel = 'noopener'; oa.textContent = '↗ otvoriť náš produkt na forestshop.sk';
+  left.appendChild(oa);
   left.appendChild(el('div', 'meta', `${p.supplier} · pairCode ${p.pairCode || '—'} · ${p.variant_codes.length} variant(ov)`));
   const oimgs = el('div', 'imgs');
   if (p.our_images.length) { for (const u of p.our_images) { const im = el('img'); im.src = u; im.loading = 'lazy'; oimgs.appendChild(im); } }
@@ -137,12 +141,13 @@ function renderFilters() {
   const f = document.getElementById('filters'); f.innerHTML = '';
   for (const [key, lbl] of FILTERS) {
     const b = el('button', FILTER === key ? 'active' : '', lbl);
-    b.onclick = () => { FILTER = key; render(); };
+    b.onclick = () => { FILTER = key; localStorage.setItem('filter', key); window.scrollTo(0, 0); render(); };
     f.appendChild(b);
   }
 }
 
 function render() {
+  const keepY = window.scrollY;  // preserve scroll across re-render (e.g. after a decision)
   renderFilters();
   const reviewed = Object.keys(DECISIONS).length;
   document.getElementById('progressText').textContent = `${reviewed} / ${PRODUCTS.length} skontrolovaných`;
@@ -151,12 +156,26 @@ function render() {
   const shown = PRODUCTS.filter(matchesFilter);
   document.getElementById('empty').hidden = shown.length > 0;
   for (const p of shown) list.appendChild(renderCard(p));
+  window.scrollTo(0, keepY);
 }
+
+let _scrollTimer;
+window.addEventListener('scroll', () => {
+  clearTimeout(_scrollTimer);
+  _scrollTimer = setTimeout(() => localStorage.setItem('scrollY', String(window.scrollY)), 150);
+});
 
 async function init() {
   const r = await fetch('/api/products');
   const j = await r.json();
-  PRODUCTS = j.products; DECISIONS = j.decisions || {};
+  PRODUCTS = j.products;
+  DECISIONS = j.decisions || {};
+  // matched first, unmatched at the end (stable by idx within each group)
+  PRODUCTS.sort((a, b) =>
+    ((a.ai_status === 'unmatched') ? 1 : 0) - ((b.ai_status === 'unmatched') ? 1 : 0) || a.idx - b.idx);
+  FILTER = localStorage.getItem('filter') || 'unreviewed';
   render();
+  const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
+  if (y) window.scrollTo(0, y);
 }
 init();
