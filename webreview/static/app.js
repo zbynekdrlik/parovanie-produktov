@@ -1,28 +1,43 @@
 let PRODUCTS = [];
-let DECISIONS = {};      // key -> {status, url}
+let DECISIONS = {};         // key -> {status, url}
 let FILTER = 'unreviewed';
+const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
 
 const imgObserver = new IntersectionObserver((entries) => {
   for (const e of entries) {
-    if (e.isIntersecting) { loadSupplierImages(e.target); imgObserver.unobserve(e.target); }
+    if (e.isIntersecting) { loadInfo(e.target); imgObserver.unobserve(e.target); }
   }
 }, { rootMargin: '300px' });
 
-async function loadSupplierImages(box) {
+async function loadInfo(box) {
   const url = box.dataset.url;
   if (!url) { box.classList.remove('loading'); return; }
   try {
-    const r = await fetch('/api/images?url=' + encodeURIComponent(url));
-    const j = await r.json();
+    const j = await (await fetch('/api/images?url=' + encodeURIComponent(url))).json();
     box.classList.remove('loading');
     box.innerHTML = '';
-    if (!j.images.length) { box.innerHTML = '<span class="noimg">bez obrázkov</span>'; return; }
-    for (const u of j.images) { const im = document.createElement('img'); im.src = u; im.loading = 'lazy'; box.appendChild(im); }
+    if (!j.images || !j.images.length) { box.innerHTML = '<span class="noimg">bez obrázkov</span>'; }
+    else for (const u of j.images) { const im = document.createElement('img'); im.src = u; im.loading = 'lazy'; box.appendChild(im); }
+    // fill an associated title node (for manually entered links)
+    if (box.dataset.titleId && j.title) {
+      const t = document.getElementById(box.dataset.titleId);
+      if (t) t.textContent = j.title;
+    }
   } catch (_) { box.classList.remove('loading'); }
 }
 
+let _tid = 0;
+function gallery(url, titleNode) {
+  const b = el('div', 'imgs loading'); b.dataset.url = url;
+  if (titleNode) { const id = 'ti' + (++_tid); titleNode.id = id; b.dataset.titleId = id; }
+  imgObserver.observe(b); return b;
+}
+function smallThumb(url) { const b = el('div', 'thumb loading'); b.dataset.url = url; imgObserver.observe(b); return b; }
+
 async function saveDecision(p, status, url) {
-  DECISIONS[p.key] = { status, url: url || '' };
+  if (status === 'undo') delete DECISIONS[p.key];
+  else DECISIONS[p.key] = { status, url: url || '' };
+  expanded.delete(p.key);   // collapse panel; card now lands in its list
   render();
   await fetch('/api/decision', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -40,25 +55,32 @@ function matchesFilter(p) {
     case 'unreviewed': return s === null;
     case 'matched': return p.ai_status === 'matched';
     case 'unmatched': return p.ai_status === 'unmatched';
-    case 'good': return s === 'good' || s === 'manual';
-    case 'bad': return s === 'bad' || s === 'unavailable';
     case 'off_now': return p.current && p.current.off;
+    case 'good': return s === 'good' || s === 'manual';
+    case 'unavailable': return s === 'unavailable';
     default: return true;
   }
 }
 
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
 function escapeHtml(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
-
-function smallThumb(url) { const b = el('div', 'thumb loading'); b.dataset.url = url; imgObserver.observe(b); return b; }
-function gallery(url) { const b = el('div', 'imgs loading'); b.dataset.url = url; imgObserver.observe(b); return b; }
-
 function badge(s) {
-  const t = { good: '✓ Dobré', manual: '✓ Ručne vybrané', unavailable: '⛔ Nedostupné', bad: '✗ Zlé — doriešiť' }[s];
+  const t = { good: '✓ Dobré', manual: '✓ Vybraný link', unavailable: '⛔ Nedostupné' }[s];
   return t ? el('span', 'badge ' + s, t) : null;
 }
 
-// Resolution panel: pick a candidate, enter own URL, or mark unavailable.
+// supplier block: title (lazy for manual links), url link, image gallery
+function supplierBlock(container, p, url, showReason) {
+  const cand = p.candidates.find(c => c.url === url);
+  const title = el('div', 'pname', cand ? escapeHtml(cand.name || '(produkt)') : 'načítavam názov…');
+  container.appendChild(title);
+  const a = el('a', 'supurl'); a.href = url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = url;
+  container.appendChild(a);
+  if (showReason && p.ai_reason && p.ai_status === 'matched') container.appendChild(el('div', 'reason', '🤖 ' + escapeHtml(p.ai_reason)));
+  container.appendChild(gallery(url, cand ? null : title));   // lazy title only when unknown
+}
+
+// candidates + manual URL + Nedostupné. Saving here moves the card to its list.
 function resolutionPanel(p) {
   const wrap = el('div', 'panel');
   const cur = decUrl(p), s = statusOf(p);
@@ -88,7 +110,8 @@ function resolutionPanel(p) {
 
 function renderCard(p) {
   const s = statusOf(p);
-  const card = el('div', 'card' + (s ? ' ' + s : ''));
+  const exp = expanded.has(p.key);
+  const card = el('div', 'card' + (s ? ' ' + s : '') + (p.current && p.current.off ? ' curoff' : ''));
 
   // LEFT — our product
   const left = el('div', 'side left');
@@ -100,40 +123,41 @@ function renderCard(p) {
   oa.textContent = p.our_url ? '↗ otvoriť náš produkt na forestshop.sk' : '↗ nájsť náš produkt na forestshop.sk';
   left.appendChild(oa);
   left.appendChild(el('div', 'meta', `${p.supplier} · pairCode ${p.pairCode || '—'} · ${p.variant_codes.length} variant(ov)`));
-  if (p.current) {
-    const cb = el('span', 'curbadge ' + (p.current.off ? 'off' : 'on'),
-      p.current.off ? '⚫ teraz vypnutý u nás' : '🟢 teraz zapnutý u nás');
-    left.appendChild(cb);
-  }
+  if (p.current) left.appendChild(el('span', 'curbadge ' + (p.current.off ? 'off' : 'on'),
+    p.current.off ? '⚫ teraz vypnutý u nás' : '🟢 teraz zapnutý u nás'));
   const oimgs = el('div', 'imgs');
-  if (p.our_images.length) { for (const u of p.our_images) { const im = el('img'); im.src = u; im.loading = 'lazy'; oimgs.appendChild(im); } }
+  if (p.our_images.length) for (const u of p.our_images) { const im = el('img'); im.src = u; im.loading = 'lazy'; oimgs.appendChild(im); }
   else oimgs.innerHTML = '<span class="noimg">bez obrázkov</span>';
   left.appendChild(oimgs);
   card.appendChild(left);
 
-  // RIGHT — supplier
+  // RIGHT — supplier / decision
   const right = el('div', 'side right');
   right.appendChild(el('div', 'label', 'Dodávateľ'));
-  const b = badge(s); if (b) right.appendChild(b);
+  const bg = badge(s); if (bg) right.appendChild(bg);
 
-  if (p.ai_status === 'matched') {
-    const chosen = p.candidates.find(c => c.url === p.ai_chosen_url) || { name: '', url: p.ai_chosen_url };
-    right.appendChild(el('div', 'pname', escapeHtml(chosen.name || '(produkt)')));
-    const a = el('a', 'supurl'); a.href = p.ai_chosen_url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = p.ai_chosen_url;
-    right.appendChild(a);
-    if (p.ai_reason) right.appendChild(el('div', 'reason', '🤖 ' + escapeHtml(p.ai_reason)));
-    right.appendChild(gallery(p.ai_chosen_url));
+  if (s === 'unavailable') {
+    right.appendChild(el('div', 'reason', 'Označené ako nedostupné → pri importe sa nastaví Vypredané (stock 0).'));
+    const back = el('button', 'btn ghost sm', '↩ Vrátiť');
+    back.onclick = () => saveDecision(p, 'undo');
+    right.appendChild(back);
+  } else if (s === 'good' || s === 'manual') {
+    supplierBlock(right, p, s === 'good' ? p.ai_chosen_url : decUrl(p), s === 'good');
     const act = el('div', 'actions');
-    const g = el('button', 'btn good' + (s === 'good' ? ' active' : ''), '✓ Dobré');
+    const change = el('button', 'btn ghost sm', '✗ Zmeniť / iný link');
+    change.onclick = () => { expanded.add(p.key); render(); };
+    act.appendChild(change); right.appendChild(act);
+    if (exp) right.appendChild(resolutionPanel(p));
+  } else if (p.ai_status === 'matched' && !exp) {
+    supplierBlock(right, p, p.ai_chosen_url, true);
+    const act = el('div', 'actions');
+    const g = el('button', 'btn good', '✓ Dobré');
     g.onclick = () => saveDecision(p, 'good', p.ai_chosen_url);
-    const bad = el('button', 'btn bad' + (s === 'bad' ? ' active' : ''), '✗ Zlé');
-    bad.onclick = () => saveDecision(p, 'bad', '');
-    act.appendChild(g); act.appendChild(bad);
-    right.appendChild(act);
-    // when marked wrong / being corrected, reveal the resolution panel
-    if (s === 'bad' || s === 'manual' || s === 'unavailable') right.appendChild(resolutionPanel(p));
+    const bad = el('button', 'btn bad', '✗ Zlé');
+    bad.onclick = () => { expanded.add(p.key); render(); };   // only reveals options, does NOT move card
+    act.appendChild(g); act.appendChild(bad); right.appendChild(act);
   } else {
-    if (p.ai_reason) right.appendChild(el('div', 'reason', '🤖 AI nenašla istú zhodu: ' + escapeHtml(p.ai_reason)));
+    if (p.ai_status === 'unmatched' && p.ai_reason) right.appendChild(el('div', 'reason', '🤖 AI nenašla istú zhodu: ' + escapeHtml(p.ai_reason)));
     right.appendChild(resolutionPanel(p));
   }
   card.appendChild(right);
@@ -142,7 +166,7 @@ function renderCard(p) {
 
 const FILTERS = [
   ['unreviewed', 'Nezrevidované'], ['matched', 'Napárované (AI)'], ['unmatched', 'Nenapárované'],
-  ['off_now', '⚫ Teraz vypnuté'], ['good', '✓ Dobré/Vybrané'], ['bad', '✗ Zlé/Nedostupné'], ['all', 'Všetky'],
+  ['off_now', '⚫ Teraz vypnuté'], ['good', '✓ Dobré/Vybrané'], ['unavailable', '⛔ Vypnuté'], ['all', 'Všetky'],
 ];
 
 function renderFilters() {
@@ -174,8 +198,7 @@ window.addEventListener('scroll', () => {
 });
 
 async function init() {
-  const r = await fetch('/api/products');
-  const j = await r.json();
+  const j = await (await fetch('/api/products')).json();
   PRODUCTS = j.products;
   DECISIONS = j.decisions || {};
   PRODUCTS.sort((a, b) =>

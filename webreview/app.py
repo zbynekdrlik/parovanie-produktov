@@ -103,31 +103,46 @@ def api_products():
 
 @app.route("/api/images")
 def api_images():
+    """Title + images for any supplier URL (so a manually entered link pulls its
+    data). Cached on disk."""
     url = request.args.get("url", "").strip()
     if not url.startswith("http"):
-        return jsonify({"images": []})
+        return jsonify({"title": "", "images": []})
     key = hashlib.sha1(url.encode()).hexdigest()
     cache = os.path.join(IMGCACHE, key + ".json")
     if os.path.exists(cache):
         with open(cache, encoding="utf-8") as f:
-            return jsonify({"images": json.load(f)})
+            data = json.load(f)
+        if isinstance(data, list):              # legacy cache format
+            data = {"title": "", "images": data}
+        return jsonify(data)
     try:
         r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
-        imgs = _extract_images(r.text, url) if r.ok else []
+        if r.ok:
+            from parovanie.verify import extract_page
+            title = extract_page(r.text).get("title", "")
+            imgs = _extract_images(r.text, url)
+        else:
+            title, imgs = "", []
     except Exception:
-        imgs = []
+        title, imgs = "", []
+    data = {"title": title, "images": imgs}
     with open(cache, "w", encoding="utf-8") as f:
-        json.dump(imgs, f)
-    return jsonify({"images": imgs})
+        json.dump(data, f)
+    return jsonify(data)
 
 
 @app.route("/api/decision", methods=["POST"])
 def api_decision():
     body = request.get_json(force=True)
     key = str(body.get("key"))
+    status = body.get("status")
     with _lock:
         d = _load_decisions()
-        d[key] = {"status": body.get("status"), "url": body.get("url", "")}
+        if status in (None, "", "undo"):          # undo / un-decide
+            d.pop(key, None)
+        else:
+            d[key] = {"status": status, "url": body.get("url", "")}
         _save_decisions(d)
     return jsonify({"ok": True})
 

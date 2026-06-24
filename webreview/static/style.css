@@ -65,3 +65,4 @@ a.supurl:hover { text-decoration: underline; }
 .badge.unavailable { background: #e5e7eb; color: #374151; }
 .empty { text-align: center; color: #6b7280; padding: 40px; }
 @media (max-width: 760px) { .card { grid-template-columns: 1fr; } .side.left { border-right: 0; border-bottom: 1px solid #eef0f3; } }
+.card.curoff { box-shadow: 0 1px 4px rgba(0,0,0,.08), inset 4px 0 0 #fbbf24; }
