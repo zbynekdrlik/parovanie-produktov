@@ -31,6 +31,8 @@ Výsledok Betalov+Wetland: 784/969 napárovaných, 185 prísne zamietnutých.
 
 ## Gotchas
 
+- **Forestshop URL produktu sa NEDÁ z exportu** (CSV/XML nemajú čisté URL pole; `seoTitle` prázdne). Rieš cez **sitemap.xml**: `_slug(name)` → exact ∪ suffix (`-slug`) ∪ token-subset (všetky slová názvu ⊆ tokeny slugu) = presné, existujúce URL (688/969). Zvyšok → funkčný search `…/vyhladavanie/?string=<name>` (**`?q=` presmeruje na homepage, nepouživaj**).
+- **Obrázky z produktovej stránky: ver LEN `og:image`** — gallery selektory ťahajú aj „súvisiace/odporúčané" produkty (zlé obrázky). og:image je spoľahlivo hlavný produkt.
 - **Kódovanie cp1250** (Windows-1250) vstup aj výstup, `;`, CRLF — Shoptet import to čaká.
 - `externalCode` = supplier kód, ale huntingshop ho často NEindexuje (napr. OB570 → 0 výsledkov) → query-rebrík/varianty nutné, nielen kód.
 - `pair_key` musí byť scope-nutý dodávateľom (`sup|key`) — inak kolízia v checkpointe pri rovnakom pairCode u dvoch dodávateľov.
