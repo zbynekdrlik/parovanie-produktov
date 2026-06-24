@@ -68,6 +68,21 @@ Otvor `http://<LAN-IP>:8801/`. Vľavo náš produkt (názov + obrázky), vpravo 
 (názov, klikateľná URL, obrázky). Napárované → ✓ Dobré / ✗ Zlé; nenapárované → výber
 z kandidátov alebo vlastná URL. `decisions.json` potom drží `{idx: {status, url}}`.
 
+## Verejné nasadenie (Cloudflare Tunnel)
+
+Web je verejne na **https://parovanie-forestshop.newlevel.media** cez `cloudflared`
+tunel (žiadny otvorený port navonok). Dve `systemd --user` služby (Restart=always, linger):
+
+- `parovanie-web.service` — Flask na :8801
+- `parovanie-tunnel.service` — cloudflared (tunel token v `data/.cf_env`, gitignored)
+
+```bash
+systemctl --user restart parovanie-web parovanie-tunnel   # reštart
+journalctl --user -u parovanie-web -f                      # logy
+```
+
+Cloudflare tunel/DNS spravované cez API; lokálne tokeny v `data/.cf_*` (gitignored, NIE v gite).
+
 ## Architektúra
 
 | Modul | Zodpovednosť |
