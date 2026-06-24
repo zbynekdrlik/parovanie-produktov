@@ -78,7 +78,7 @@ function resolutionPanel(p) {
   const save = el('button', 'btn good sm', 'Uložiť URL');
   save.onclick = () => { const v = inp.value.trim(); if (v.startsWith('http')) saveDecision(p, 'manual', v); };
   mr.appendChild(inp); mr.appendChild(save); wrap.appendChild(mr);
-  const un = el('button', 'btn warn sm' + (s === 'unavailable' ? ' active' : ''), '⛔ Nedostupné (vyradiť u nás)');
+  const un = el('button', 'btn warn sm' + (s === 'unavailable' ? ' active' : ''), '⛔ Nedostupné → Vypredané');
   un.style.marginTop = '6px';
   un.onclick = () => saveDecision(p, 'unavailable', '');
   wrap.appendChild(un);
