@@ -82,9 +82,10 @@ PYTHONPATH=src .venv/bin/python scripts/shoptet_import.py               # ostrý
 
 Poistky (v poradí): pred-letová kontrola CSV (kódovanie, `code`+`pairCode`, rozpis
 riadkov) → potvrdenie (`--yes` preskočí) → **záloha exportu** do `data/backups/`
-(bez zálohy sa neimportuje) → login → nastaví UTF-8 / „nahradiť prázdne" VYPNUTÉ /
-párovať podľa Kódu → **read-back kontrola** tých parametrov → spustí → prečíta
-skutočný výsledok z Logu. Viac v `.claude/skills/shoptet`.
+(bez zálohy sa neimportuje) → login → nahranie + **read-back kontrola bezpečných
+parametrov** (režim „Nemeniť produkty mimo súboru", nie „Zmazať"; „Zmeniť URL podľa
+názvu" VYPNUTÉ) → spustí → prečíta skutočný výsledok z Logu. Shoptet kódovanie
+auto-detekuje (náš BOM = UTF-8) a páruje podľa `code`. Viac v `.claude/skills/shoptet`.
 
 ## Verejné nasadenie (Cloudflare Tunnel)
 

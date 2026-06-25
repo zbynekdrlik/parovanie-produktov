@@ -77,11 +77,12 @@ zlyhá nahlas, ak súbor chýba alebo nemá všetky tri kľúče.
    Pri `--dry-run` sa preskakuje.
 4. **Login:** headless Chromium (Playwright), prihlásenie údajmi zo súboru.
    Overí, že je naozaj prihlásený (inak stop).
-5. **Nahranie + nastavenie:** Produkty → Import → nahrá CSV → nastaví **kódovanie
-   UTF-8**, **„nahradiť prázdne hodnoty" = VYPNUTÉ**, **párovať podľa Kódu**.
-6. **Kontrola parametrov (read-back):** PREČÍTA skutočný stav formulára a overí,
-   že kódovanie = UTF-8, „nahradiť prázdne" = VYPNUTÉ, párovanie = Kód. Ak
-   čokoľvek nesedí → **stop, NEspustí import** a povie, ktorý parameter je zlý.
+5. **Nahranie + nastavenie:** `/admin/import-produktov/` → nahrá CSV (cez
+   file-chooser). Reálny Shoptet formulár NEMÁ voľby kódovania/„prázdne"/párovania
+   — kódovanie auto-detekuje (náš BOM = UTF-8), páruje podľa `code` automaticky.
+6. **Kontrola parametrov (read-back):** nastaví a OVERÍ jediné rizikové voľby na
+   formulári — režim **„Nemeniť produkty a varianty mimo súboru"** (NIKDY „Zmazať")
+   + **„Zmeniť URL podľa názvu" = VYPNUTÉ**. Nesedí → **stop, NEspustí import**.
 7. **Spustenie + výsledok:** spustí import, prečíta záložku **Log** → naparsuje a
    vypíše skutočný výsledok (Spracované / Upravené / Zlyhania variantov). Uloží
    screenshot + textový log do `data/out/shoptet_import_<čas>.{png,log}` na audit.
@@ -100,8 +101,8 @@ zlyhá nahlas, ak súbor chýba alebo nemá všetky tri kľúče.
 - Žiadny zápis do eshopu pred kontrolou CSV a potvrdením.
 - **Záloha exportu pred KAŽDÝM ostrým importom** — bez úspešnej zálohy sa
   neimportuje (dá sa vrátiť späť re-importom zálohy).
-- **Kontrola importačných parametrov tesne pred spustením** (read-back UTF-8 /
-  „nahradiť prázdne" VYPNUTÉ / párovať podľa Kódu) — nesedí → import sa nespustí.
+- **Kontrola parametrov tesne pred spustením** (read-back režim „Nemeniť mimo
+  súboru" — nie „Zmazať" — a „Zmeniť URL podľa názvu" VYPNUTÉ) — nesedí → nespustí.
 - `--dry-run` overí celý reťazec okrem zálohy a ostrého zápisu.
 - Po importe sa číta **skutočný** výsledok — nie „tváril sa OK".
 - Heslo nikdy do gitu; zálohy do `data/backups/`, logy/screenshoty do `data/out/`
