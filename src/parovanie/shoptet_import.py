@@ -39,15 +39,15 @@ def load_credentials(path):
     return dict(creds)   # all parsed keys (incl. optional SHOPTET_EXPORT_URL for backup)
 
 
-EXPECTED_HEADER = ["code", "pairCode", "textProperty10", "textProperty11",
-                   "productVisibility", "stock", "availabilityInStock",
-                   "availabilityOutOfStock"]
+EXPECTED_HEADER = ["code", "pairCode", "internalNote", "productVisibility",
+                   "stock", "availabilityInStock", "availabilityOutOfStock"]
 
 
 def classify_row(row):
     """Classify one generated import row by its column values (mirrors
-    import_builder.import_rows)."""
-    if (row.get("textProperty10") or "").strip():
+    import_builder link_rows / state_rows). A link carries the reorder URL in the
+    private `internalNote` field."""
+    if (row.get("internalNote") or "").strip():
         return "link"
     vis = (row.get("productVisibility") or "").strip().lower()
     avail = ((row.get("availabilityInStock") or "")

@@ -16,7 +16,7 @@ def test_import_has_one_row_per_variant(tmp_path):
     write_import(_matches(), str(path))
     with open(path, encoding="cp1250", newline="") as f:
         rows = list(csv.reader(f, delimiter=";"))
-    assert rows[0] == ["code", "textProperty10"]
+    assert rows[0] == ["code", "internalNote"]
     body = rows[1:]
     assert ["60177/46", "https://h/hart-ob570"] in body
     assert ["60177/48", "https://h/hart-ob570"] in body

@@ -52,19 +52,19 @@ def _csv(tmp_path, rows):
 
 
 def test_classify_row_types():
-    assert classify_row({"textProperty10": "https://h/x", "productVisibility": ""}) == "link"
-    assert classify_row({"textProperty10": "", "productVisibility": "detailOnly"}) == "discontinued"
-    assert classify_row({"textProperty10": "", "productVisibility": "visible",
+    assert classify_row({"internalNote": "https://h/x", "productVisibility": ""}) == "link"
+    assert classify_row({"internalNote": "", "productVisibility": "detailOnly"}) == "discontinued"
+    assert classify_row({"internalNote": "", "productVisibility": "visible",
                          "availabilityInStock": "Vypredané"}) == "unavailable"
-    assert classify_row({"textProperty10": "", "productVisibility": ""}) == "other"
+    assert classify_row({"internalNote": "", "productVisibility": ""}) == "other"
 
 
 def test_preflight_counts_breakdown(tmp_path):
     path = _csv(tmp_path, [
-        ["A/1", "100", "https://h/x", "human matched", "", "", "", ""],     # link
-        ["B", "200", "", "", "visible", "0", "Vypredané", "Vypredané"],     # unavailable
-        ["C", "300", "", "", "detailOnly", "0", "Predaj výrobku skončil",
-         "Predaj výrobku skončil"],                                         # discontinued
+        ["A/1", "100", "https://h/x", "", "", "", ""],                  # link (internalNote)
+        ["B", "200", "", "visible", "0", "Vypredané", "Vypredané"],     # unavailable
+        ["C", "300", "", "detailOnly", "0", "Predaj výrobku skončil",
+         "Predaj výrobku skončil"],                                     # discontinued
     ])
     plan = preflight_csv(path)
     assert plan["total"] == 3
