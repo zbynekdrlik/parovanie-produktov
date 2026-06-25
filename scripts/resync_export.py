@@ -27,7 +27,8 @@ def is_off(vis: str, avail: str) -> bool:
 
 
 # index current export by (supplier, name)
-idx = defaultdict(lambda: {"codes": [], "images": [], "vis": "", "ais": "", "aos": ""})
+idx = defaultdict(lambda: {"codes": [], "images": [], "vis": "", "ais": "", "aos": "",
+                           "price": "", "std": "", "stock": ""})
 with open(SRC, encoding="cp1250", errors="replace") as f:
     for row in csv.DictReader(f, delimiter=";"):
         sup = (row.get("supplier") or "").strip().upper()
@@ -47,6 +48,10 @@ with open(SRC, encoding="cp1250", errors="replace") as f:
             g["vis"] = (row.get("productVisibility") or "").strip()
             g["ais"] = (row.get("availabilityInStock") or "").strip()
             g["aos"] = (row.get("availabilityOutOfStock") or "").strip()
+        if not g["price"]:
+            g["price"] = (row.get("price") or "").strip()
+            g["std"] = (row.get("standardPrice") or "").strip()
+            g["stock"] = (row.get("stock") or "").strip()
 
 rd = json.load(open(f"{OUT}/review_data.json", encoding="utf-8"))
 synced = stale = 0
@@ -56,7 +61,8 @@ for p in rd:
         p["variant_codes"] = g["codes"]
         p["our_images"] = g["images"][:6]
         a = g["ais"] or g["aos"]
-        p["current"] = {"off": is_off(g["vis"], a), "vis": g["vis"], "avail": a}
+        p["current"] = {"off": is_off(g["vis"], a), "vis": g["vis"], "avail": a,
+                        "price": g["price"], "std": g["std"], "stock": g["stock"]}
         synced += 1
     else:
         # not found by name in current export (renamed/removed) — flag, keep old

@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import hashlib
 import threading
 from urllib.parse import urljoin
@@ -102,6 +103,22 @@ def _no_cache(resp):
     return resp
 
 
+_AVAIL_WORDS = ("Skladom", "Na sklade", "Vypredané", "Momentálne nedostupné",
+                "Na objednávku", "Posledný kus", "Predaj výrobku skončil", "Na dotaz")
+
+
+def _supplier_meta(html: str):
+    """Best-effort price + availability from a supplier product page."""
+    price = ""
+    m = re.search(r'(?:product:price:amount|og:price:amount)"\s+content="([0-9]+(?:[.,][0-9]+)?)"', html)
+    if not m:
+        m = re.search(r'"price"\s*:\s*"?([0-9]+(?:[.,][0-9]+)?)', html)
+    if m:
+        price = m.group(1).replace(".", ",")   # match our EUR formatting (5,41)
+    avail = next((w for w in _AVAIL_WORDS if w in html), "")
+    return price, avail
+
+
 @app.route("/")
 def index():
     return send_from_directory("templates", "index.html")
@@ -131,6 +148,8 @@ def api_images():
             data = json.load(f)
         if isinstance(data, list):              # legacy cache format
             data = {"title": "", "images": data}
+        data.setdefault("price", "")
+        data.setdefault("availability", "")
         return jsonify(data)
     try:
         r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
@@ -138,11 +157,12 @@ def api_images():
             from parovanie.verify import extract_page
             title = extract_page(r.text).get("title", "")
             imgs = _extract_images(r.text, url)
+            price, avail = _supplier_meta(r.text)
         else:
-            title, imgs = "", []
+            title, imgs, price, avail = "", [], "", ""
     except Exception:
-        title, imgs = "", []
-    data = {"title": title, "images": imgs}
+        title, imgs, price, avail = "", [], "", ""
+    data = {"title": title, "images": imgs, "price": price, "availability": avail}
     with open(cache, "w", encoding="utf-8") as f:
         json.dump(data, f)
     return jsonify(data)
