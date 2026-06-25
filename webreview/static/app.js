@@ -69,7 +69,7 @@ function matchesFilter(p) {
     case 'unmatched': return p.ai_status === 'unmatched';
     case 'off_now': return p.current && p.current.off;
     case 'good': return s === 'good' || s === 'manual';
-    case 'unavailable': return s === 'unavailable';
+    case 'unavailable': return s === 'unavailable' || s === 'discontinued';
     default: return true;
   }
 }
@@ -77,7 +77,8 @@ function matchesFilter(p) {
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
 function escapeHtml(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function badge(s) {
-  const t = { good: '✓ Dobré', manual: '✓ Vybraný link', unavailable: '⛔ Nedostupné' }[s];
+  const t = { good: '✓ Dobré', manual: '✓ Vybraný link',
+    unavailable: '📦 Nie je skladom', discontinued: '🚫 Nebude sa predávať' }[s];
   return t ? el('span', 'badge ' + s, t) : null;
 }
 
@@ -118,10 +119,15 @@ function resolutionPanel(p) {
   const save = el('button', 'btn good sm', 'Uložiť URL');
   save.onclick = () => { const v = inp.value.trim(); if (v.startsWith('http')) saveDecision(p, 'manual', v); };
   mr.appendChild(inp); mr.appendChild(save); wrap.appendChild(mr);
-  const un = el('button', 'btn warn sm' + (s === 'unavailable' ? ' active' : ''), '⛔ Nedostupné → Vypredané');
-  un.style.marginTop = '6px';
-  un.onclick = () => saveDecision(p, 'unavailable', '');
-  wrap.appendChild(un);
+  const states = el('div', 'staterow');
+  const b2 = el('button', 'btn warn sm' + (s === 'unavailable' ? ' active' : ''), '📦 Nie je skladom');
+  b2.title = 'visible + Vypredané, stock 0 — dočasne, ostáva na re-kontrolu';
+  b2.onclick = () => saveDecision(p, 'unavailable', '');
+  const b3 = el('button', 'btn ghost sm' + (s === 'discontinued' ? ' active' : ''), '🚫 Už sa nebude predávať');
+  b3.title = 'detailOnly + Predaj výrobku skončil — link ostane pre Google';
+  b3.onclick = () => saveDecision(p, 'discontinued', '');
+  states.appendChild(b2); states.appendChild(b3);
+  wrap.appendChild(states);
   return wrap;
 }
 
@@ -161,8 +167,10 @@ function renderCard(p) {
   right.appendChild(el('div', 'label', 'Dodávateľ'));
   const bg = badge(s); if (bg) right.appendChild(bg);
 
-  if (s === 'unavailable') {
-    right.appendChild(el('div', 'reason', 'Označené ako nedostupné → pri importe sa nastaví Vypredané (stock 0).'));
+  if (s === 'unavailable' || s === 'discontinued') {
+    right.appendChild(el('div', 'reason', s === 'unavailable'
+      ? '📦 Nie je skladom → import: visible + Vypredané (stock 0). Ostáva na re-kontrolu.'
+      : '🚫 Už sa nebude predávať → import: detailOnly + Predaj výrobku skončil (link ostane pre Google).'));
     const back = el('button', 'btn ghost sm', '↩ Vrátiť');
     back.onclick = () => saveDecision(p, 'undo');
     right.appendChild(back);

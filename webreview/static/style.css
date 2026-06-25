@@ -72,3 +72,6 @@ a.supurl:hover { text-decoration: underline; }
 .downloads a:hover { background: #1d4ed8; }
 .priceline { font-size: 12px; font-weight: 600; color: #1f2937; margin: 3px 0 4px; }
 .supmeta { font-size: 12px; font-weight: 600; color: #1f2937; margin: 2px 0; }
+.card.discontinued { border-color: #9ca3af; }
+.badge.discontinued { background: #f3f4f6; color: #4b5563; }
+.staterow { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
