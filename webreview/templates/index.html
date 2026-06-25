@@ -4,16 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrola párovania — Forestshop</title>
-  <link rel="stylesheet" href="/static/style.css?v=6">
+  <link rel="stylesheet" href="/static/style.css?v=7">
 </head>
 <body>
   <header>
     <div class="title">Kontrola párovania produktov</div>
     <div class="progress"><span id="progressText">…</span><div class="bar"><div id="progressBar"></div></div></div>
     <div class="filters" id="filters"></div>
+    <div class="downloads">
+      <a id="dlLinks" href="/api/import/links" download>⬇ Stiahnuť import odkazov</a>
+      <a id="dlUnavail" href="/api/import/unavailable" download>⬇ Stiahnuť import vypredané</a>
+    </div>
   </header>
   <main id="list"></main>
   <div id="empty" class="empty" hidden>Žiadne produkty v tomto filtri.</div>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>
