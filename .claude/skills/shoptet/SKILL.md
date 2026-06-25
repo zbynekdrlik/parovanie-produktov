@@ -65,3 +65,18 @@ Preto sa import **rozdelí podľa polí** — každý súbor/riadok nesie LEN st
 - **Spustenie:** tlačidlo `data-testid="buttonImport"` → presmeruje na `/admin/import-produktov/log/`.
 - **Výsledok (Log):** SK „Spracované: N. Upravené: K. Zlyhanie variantov: M.", auto-import býva CZ „Zpracováno/Upraveno". Parser berie len najnovší riadok a „Zlyhanie: N" uprednostní pred prózou „skončil s chybou".
 - **Export na zálohu:** hash je **per-pattern aj per-formát**. Plný export = šablóna **„vsetko" (patternId 14), formát CSV** — URL+hash vyčítaj na `/admin/export-produktov/` (vyber šablónu + formát → „Verejný odkaz"). Ten ide do `SHOPTET_EXPORT_URL`.
+
+## n8n denný export → Data Table (pre sklad/ceny/objednávky)
+
+Workflow **„Forestshop products export"** (`pi2vURB2wwGwTBPG`, n8n.newlevel.media) beží **denne o 00:00** a upsertne produkty do Data Table **„ForestShop"** (`OR5AnysuvKFXY8j6`, projekt `KWh7xR1bd5EyraM5`). Z neho idú ďalšie automatizácie (porovnanie skladu, cien, doobjednávanie).
+
+- **Dve vetvy:** XLS `patternId=11` (má `code`,`pairCode`,`guid`,`internalNote`,ceny,sklad…) + marketingový XML `patternId=-23` (**59 MB!**, len kvôli `ORIG_URL`→`url` a `id`→`editUrl`; join na `guid`). Hashe v URL sú **partner creds — placeholder `<HASH>`, NIE do gitu**.
+- **Filter (DOHODNUTÉ):** `internalNote` **začína `http`** → píše len **spárované** (variant má reorder link). `internalNote` je **zmiešané pole**: ~2388 variantov (489 produktov) má plnú URL (náš link), ~4444 má len starý textový zdroj (`tthunt.sk`,`betalov.sk`,`Trigona`…) — tie **nie sú linka**, filter ich odreže.
+- **Význam polí v tabuľke:** `internalNote` = **reorder link** (URL na produkt u dodávateľa, z neho objednávajú automatizácie). `url` = vlastná stránka produktu na forestshop.sk (z XML `ORIG_URL`) — NEzamieňať. Upsert match = `code` (len technický kľúč).
+- **Pasce n8n (overené naživo):**
+  - `update_workflow` uloží len **DRAFT** (`versionId` ≠ `activeVersionId`) → **MUSÍŠ `publish_workflow`**, inak schedule ide po starom.
+  - Beh cez MCP: **`executionMode:"manual"` reálne spustí** pipeline (aj na schedule-trigger workflowe); **`"production"` je na schedule-trigger no-op** (nezapíše). Manuálne behy sa **neukladajú** (`saveManualExecutions=false`) → over cez čítací workflow nad tabuľkou, nie cez `get_execution`.
+  - `saveDataError=none` → zlyhania nikde nevidno; odporúčanie: zapnúť „Save failed executions" v nastavení workflowu (workflow-level, cez MCP sa nedá — len UI).
+  - Beh je **ťažký**: 59 MB XML, **~3,5 min**, počas neho n8n padá na **502/520** (preťaženie). Poistka = `retryOnFail` na HTTP uzloch. Zľahčenie = doplniť `url` do XLS exportu a zrušiť XML (zatiaľ NErobené — user zvolil len poistky).
+  - dataTable `deleteRows` má `dryRun` (vracia **2× riadky** — before+after stav); upsert **neprunuje** → nespárované staré riadky čisti `deleteRows` kde `internalNote isEmpty` (jednorazovo).
+  - Read tabuľky: nový workflow v **tom istom projekte** (`KWh7xR1bd5EyraM5`), inak Data Table nevidí. Žiadny MCP „read rows" tool — čítaj cez `dataTable get returnAll`.
