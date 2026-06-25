@@ -188,13 +188,11 @@ function render() {
   const shown = PRODUCTS.filter(matchesFilter);
   document.getElementById('empty').hidden = shown.length > 0;
   for (const p of shown) list.appendChild(renderCard(p));
-  const dl = document.getElementById('dlLinks'), du = document.getElementById('dlUnavail');
+  const dl = document.getElementById('dlImport');
   if (dl) {
-    const vals = Object.values(DECISIONS);
-    const g = vals.filter(d => (d.status === 'good' || d.status === 'manual') && d.url).length;
-    const u = vals.filter(d => d.status === 'unavailable').length;
-    dl.textContent = `⬇ Import odkazov (${g})`;
-    du.textContent = `⬇ Import vypredané (${u})`;
+    const n = Object.values(DECISIONS).filter(d =>
+      ((d.status === 'good' || d.status === 'manual') && d.url) || d.status === 'unavailable').length;
+    dl.textContent = `⬇ Stiahnuť import (${n})`;
   }
   window.scrollTo(0, keepY);
 }

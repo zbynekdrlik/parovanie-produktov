@@ -31,6 +31,20 @@ _lock = threading.Lock()
 with open(DATA, encoding="utf-8") as f:
     PRODUCTS = json.load(f)
 
+# current stock + availability per variant code (to preserve them in the combined
+# import for link-products, so empty cells never clear a value)
+SRC = os.path.join(ROOT, "data", "products.csv")
+CODE2STOCK = {}
+if os.path.exists(SRC):
+    csv.field_size_limit(10**9)
+    with open(SRC, encoding="cp1250", errors="replace") as _f:
+        for _row in csv.DictReader(_f, delimiter=";"):
+            _c = (_row.get("code") or "").strip()
+            if _c:
+                CODE2STOCK[_c] = ((_row.get("stock") or "").strip(),
+                                  (_row.get("availabilityInStock") or "").strip(),
+                                  (_row.get("availabilityOutOfStock") or "").strip())
+
 
 def _load_decisions() -> dict:
     if os.path.exists(DECISIONS):
@@ -159,32 +173,36 @@ def _csv_response(header, rows, filename):
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
-@app.route("/api/import/links")
-def import_links():
-    """Shoptet import: code;textProperty10(url);textProperty11(human matched) for
-    every variant of every good/manual product. One row per variant."""
+IMPORT_HEADER = ["code", "textProperty10", "textProperty11",
+                 "stock", "availabilityInStock", "availabilityOutOfStock"]
+
+
+def _import_rows():
+    """One combined import for every decided product, one row per variant:
+      - link (good/manual): textProperty10=url, textProperty11='human matched',
+        stock/availability preserved (current values → no change).
+      - unavailable: textProperty10='' (clear link until one is found),
+        textProperty11='', stock=0, availability='Vypredané' (sold-out, stays
+        in the app pool to re-check later — NOT marked human matched)."""
     dec = _load_decisions()
     rows = []
     for p in PRODUCTS:
         d = dec.get(p.get("key"))
-        if d and d.get("status") in ("good", "manual") and d.get("url"):
-            for c in p["variant_codes"]:
-                rows.append([c, d["url"], "human matched"])
-    return _csv_response(["code", "textProperty10", "textProperty11"], rows, "import_links.csv")
+        if not d:
+            continue
+        status, url = d.get("status"), d.get("url", "")
+        for c in p["variant_codes"]:
+            if status in ("good", "manual") and url:
+                st, ais, aos = CODE2STOCK.get(c, ("", "", ""))
+                rows.append([c, url, "human matched", st, ais, aos])
+            elif status == "unavailable":
+                rows.append([c, "", "", "0", "Vypredané", "Vypredané"])
+    return rows
 
 
-@app.route("/api/import/unavailable")
-def import_unavailable():
-    """Shoptet import: sold-out (visible stays, stock 0, both availability = Vypredané)."""
-    dec = _load_decisions()
-    rows = []
-    for p in PRODUCTS:
-        d = dec.get(p.get("key"))
-        if d and d.get("status") == "unavailable":
-            for c in p["variant_codes"]:
-                rows.append([c, "0", "Vypredané", "Vypredané"])
-    return _csv_response(["code", "stock", "availabilityInStock", "availabilityOutOfStock"],
-                         rows, "import_unavailable.csv")
+@app.route("/api/import")
+def api_import():
+    return _csv_response(IMPORT_HEADER, _import_rows(), "import_forestshop.csv")
 
 
 @app.route("/api/export")
