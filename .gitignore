@@ -11,3 +11,7 @@ node_modules/
 review-*.jpeg
 *.jpeg
 *.png
+.coverage
+htmlcov/
+.pytest_cache/
+.ruff_cache/
