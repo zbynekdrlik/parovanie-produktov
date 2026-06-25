@@ -1,0 +1,4 @@
+# Local-only deps for scripts/shoptet_import.py (the Shoptet admin auto-import).
+# NOT installed in CI (the browser automation is not run in CI). Install with:
+#   .venv/bin/pip install -r requirements-import.txt && .venv/bin/playwright install chromium
+playwright>=1.45
