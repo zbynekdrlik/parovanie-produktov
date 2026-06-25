@@ -5,6 +5,7 @@ ukladajú do data/out/decisions.json.
 Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:8799)
 """
 from __future__ import annotations
+import csv
 import json
 import os
 import hashlib
@@ -13,7 +14,8 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, request, send_from_directory
+import io
+from flask import Flask, jsonify, request, send_from_directory, Response
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "data", "out")
@@ -145,6 +147,44 @@ def api_decision():
             d[key] = {"status": status, "url": body.get("url", "")}
         _save_decisions(d)
     return jsonify({"ok": True})
+
+
+def _csv_response(header, rows, filename):
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    w.writerow(header)
+    w.writerows(rows)
+    data = buf.getvalue().encode("cp1250", errors="replace")
+    return Response(data, content_type="text/csv; charset=windows-1250",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.route("/api/import/links")
+def import_links():
+    """Shoptet import: code;textProperty10(url);textProperty11(human matched) for
+    every variant of every good/manual product. One row per variant."""
+    dec = _load_decisions()
+    rows = []
+    for p in PRODUCTS:
+        d = dec.get(p.get("key"))
+        if d and d.get("status") in ("good", "manual") and d.get("url"):
+            for c in p["variant_codes"]:
+                rows.append([c, d["url"], "human matched"])
+    return _csv_response(["code", "textProperty10", "textProperty11"], rows, "import_links.csv")
+
+
+@app.route("/api/import/unavailable")
+def import_unavailable():
+    """Shoptet import: sold-out (visible stays, stock 0, both availability = Vypredané)."""
+    dec = _load_decisions()
+    rows = []
+    for p in PRODUCTS:
+        d = dec.get(p.get("key"))
+        if d and d.get("status") == "unavailable":
+            for c in p["variant_codes"]:
+                rows.append([c, "0", "Vypredané", "Vypredané"])
+    return _csv_response(["code", "stock", "availabilityInStock", "availabilityOutOfStock"],
+                         rows, "import_unavailable.csv")
 
 
 @app.route("/api/export")

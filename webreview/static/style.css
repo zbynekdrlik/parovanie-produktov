@@ -66,3 +66,7 @@ a.supurl:hover { text-decoration: underline; }
 .empty { text-align: center; color: #6b7280; padding: 40px; }
 @media (max-width: 760px) { .card { grid-template-columns: 1fr; } .side.left { border-right: 0; border-bottom: 1px solid #eef0f3; } }
 .card.curoff { box-shadow: 0 1px 4px rgba(0,0,0,.08), inset 4px 0 0 #fbbf24; }
+.downloads { display: flex; gap: 8px; margin-top: 8px; }
+.downloads a { background: #2563eb; color: #fff; text-decoration: none; font-size: 13px;
+  font-weight: 600; padding: 6px 12px; border-radius: 7px; }
+.downloads a:hover { background: #1d4ed8; }

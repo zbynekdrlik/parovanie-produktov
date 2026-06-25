@@ -188,6 +188,14 @@ function render() {
   const shown = PRODUCTS.filter(matchesFilter);
   document.getElementById('empty').hidden = shown.length > 0;
   for (const p of shown) list.appendChild(renderCard(p));
+  const dl = document.getElementById('dlLinks'), du = document.getElementById('dlUnavail');
+  if (dl) {
+    const vals = Object.values(DECISIONS);
+    const g = vals.filter(d => (d.status === 'good' || d.status === 'manual') && d.url).length;
+    const u = vals.filter(d => d.status === 'unavailable').length;
+    dl.textContent = `⬇ Import odkazov (${g})`;
+    du.textContent = `⬇ Import vypredané (${u})`;
+  }
   window.scrollTo(0, keepY);
 }
 
