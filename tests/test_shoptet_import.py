@@ -93,6 +93,14 @@ def test_preflight_missing_file(tmp_path):
         preflight_csv(str(tmp_path / "nope.csv"))
 
 
+def test_preflight_rejects_non_utf8(tmp_path):
+    # cp1250 'č' (0xE8) as a lone byte is invalid UTF-8 -> must fail loud, not import
+    p = tmp_path / "cp1250.csv"
+    p.write_bytes(b"code;pairCode\r\nX;\xe8\r\n")
+    with pytest.raises(ShoptetError, match="UTF-8"):
+        preflight_csv(str(p))
+
+
 def test_parse_import_log_known_phrasing():
     txt = "Spracované 3776, Upravené 784, Zlyhanie variantov 1"
     r = parse_import_log(txt)
