@@ -117,3 +117,17 @@ def test_parse_import_log_missing_numbers():
     r = parse_import_log("import prebehol")
     assert r["processed"] is None and r["updated"] is None and r["failed"] is None
     assert r["raw"] == "import prebehol"
+
+
+def test_parse_import_log_real_failed_line_not_fooled_by_chybou():
+    # real Shoptet phrasing: 'chybou' is prose (no count) — 'failed' must read 'Zlyhanie … N'
+    txt = "Import skončil s chybou. Spracované: 50. Zlyhanie variantov: 3."
+    r = parse_import_log(txt)
+    assert r["processed"] == 50
+    assert r["failed"] == 3        # NOT 50 (must not grab the processed number after 'chybou')
+    assert r["updated"] is None
+
+
+def test_parse_import_log_czech_success_line():
+    r = parse_import_log("Import doběhl úspěšně. Zpracováno: 9. Upraveno: 4.")
+    assert r["processed"] == 9 and r["updated"] == 4 and r["failed"] is None

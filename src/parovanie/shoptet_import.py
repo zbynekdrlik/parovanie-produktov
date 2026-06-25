@@ -85,20 +85,31 @@ def preflight_csv(path):
     return {"path": path, "total": total, "columns": columns, **counts}
 
 
-_LOG_PATTERNS = {
-    "processed": r"spracovan\w*",
-    "updated": r"uprav\w*",
-    "failed": r"(?:zlyhan\w*|chyb\w*)",
-}
+def _num_after(low, *patterns):
+    """First integer that follows any of the given keyword patterns (tried in
+    order). Returns None if none match."""
+    for kw in patterns:
+        m = re.search(kw, low)
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def parse_import_log(text):
     """Extract processed/updated/failed counts from the Shoptet import result
-    text. Robust to ':'/word variants; returns None for any count not found."""
+    line (e.g. 'Spracované: 1. Zlyhanie variantov: 1.' or the Czech
+    'Zpracováno: 1. Upraveno: 1.'). Returns None for any count not found.
+
+    'failed' prefers the explicit 'Zlyhanie …: N' count over the generic
+    'skončil s chybou' prose (which carries no count) — otherwise the prose
+    'chybou' would wrongly grab the processed number that follows it."""
     text = text or ""
-    out = {"raw": text}
     low = text.lower()
-    for key, kw in _LOG_PATTERNS.items():
-        m = re.search(kw + r"[^0-9]{0,40}?(\d+)", low)
-        out[key] = int(m.group(1)) if m else None
-    return out
+    return {
+        "raw": text,
+        "processed": _num_after(low, r"z?pracov\w*[^0-9]{0,40}?(\d+)"),
+        "updated": _num_after(low, r"uprav\w*[^0-9]{0,40}?(\d+)"),
+        # explicit 'zlyhanie … N' first; only then a tight 'chyby: N' (no prose gap)
+        "failed": _num_after(low, r"zlyhan\w*[^0-9]{0,40}?(\d+)", r"chýb\w*\s*:?\s*(\d+)",
+                             r"chyb\w*\s*:\s*(\d+)"),
+    }

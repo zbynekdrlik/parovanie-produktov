@@ -16,6 +16,7 @@ Lokálny setup (raz):
   .venv/bin/pip install -r requirements-import.txt && .venv/bin/playwright install chromium
 """
 import argparse
+import re
 import sys
 import time
 from pathlib import Path
@@ -164,49 +165,68 @@ def _login(page, creds):
     print(f"[login] OK → {page.url}")
 
 
+IMPORT_PATH = "import-produktov/"
+# Bezpečný režim: produkty/varianty MIMO súboru NEMENIŤ (nikdy "Zmazať").
+_SAFE_RADIO = "Nemeniť produkty a varianty, ktoré nie sú obsiahnuté v importovanom súbore."
+_URL_BY_NAME = "Zmeňte adresu URL produktu podľa názvu produktu."
+
+
 def _goto_import(page, creds):
-    """Otvor Produkty → Import. Presná cesta/selektory sa potvrdia v živom behu
-    s prihlásením; fail-loud ak sa import formulár (file input) nenájde."""
+    """Otvor Produkty → Import (/admin/import-produktov/). Fail-loud, ak formulár
+    (skrytý file input) chýba."""
     base = creds["SHOPTET_ADMIN_URL"].rstrip("/")
-    page.goto(base + "/produkty-import/", wait_until="domcontentloaded")
+    page.goto(f"{base}/{IMPORT_PATH}", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
-    if page.locator('input[type="file"]').count() == 0:
-        raise ShoptetError("nenašiel som import formulár (file input) na "
-                           f"{page.url} — over cestu na Produkty → Import")
+    if page.locator('input[type="file"][name="file"]').count() == 0:
+        raise ShoptetError(f"nenašiel som import formulár (file input) na {page.url}")
     print(f"[import] na stránke importu → {page.url}")
 
 
-# Požadované hodnoty importačných parametrov (DOHODNUTÉ pravidlá, viď skill shoptet).
-_WANT = {"encoding": "utf-8", "replace_empty": False, "pair_by": "code"}
+def _ensure_safe_settings(page):
+    """Nastav a OVER (read-back) bezpečné parametre. Shoptet auto-detekuje kódovanie
+    (náš BOM = UTF-8) a páruje podľa 'code' — na formulári to voľby nemajú. Jediné
+    rizikové voľby sú: režim mimo-súboru (musí byť 'Nemeniť', NIKDY 'Zmazať') a
+    'Zmeniť URL podľa názvu' (musí byť VYPNUTÉ). Nesedí → ShoptetError, neimportuje."""
+    safe = page.get_by_role("radio", name=_SAFE_RADIO)
+    if safe.count() == 0:
+        raise ShoptetError("nenašiel som voľbu režimu importu (radio 'Nemeniť …')")
+    safe.check()
+    url_by_name = page.get_by_role("checkbox", name=_URL_BY_NAME)
+    if url_by_name.count() and url_by_name.is_checked():
+        url_by_name.uncheck()
+    if not safe.is_checked():
+        raise ShoptetError("bezpečný režim 'Nemeniť produkty mimo súboru' sa nepodarilo zvoliť")
+    if url_by_name.count() and url_by_name.is_checked():
+        raise ShoptetError("'Zmeniť URL podľa názvu' ostáva zapnuté — neimportujem")
+    print("[import] parametre OK: režim=Nemeniť-mimo-súboru, URL-podľa-názvu=VYPNUTÉ, "
+          "kódovanie=auto(BOM→UTF-8), párovanie=code")
 
 
-def _set_import_options(page):
-    """Nastav kódovanie UTF-8, „nahradiť prázdne" VYPNUTÉ, párovať podľa Kódu.
-    Presné selektory sa dolaďujú v živom behu s prihlásením (fail-loud, ak chýbajú)."""
-    raise ShoptetError("_set_import_options: import formulár sa dolaďuje v živom "
-                       "behu s prihlásením (selektory ešte neoverené)")
-
-
-def _read_back_options(page):
-    """Prečítaj SKUTOČNÝ stav formulára: {'encoding','replace_empty','pair_by'}.
-    Dolaďuje sa naživo (fail-loud)."""
-    raise ShoptetError("_read_back_options: dolaďuje sa v živom behu s prihlásením")
+def _read_result(page):
+    """Z Logu vytiahni text NAJNOVŠIEHO riadku s výsledkom (Spracované/Upravené/
+    Zlyhanie) — len ten riadok, aby parser nechytil staršie behy."""
+    return page.evaluate(
+        "() => { for (const r of document.querySelectorAll('tr')) {"
+        " const t = r.innerText || '';"
+        " if (/spracov|zpracov|upraven|zlyhan/i.test(t)) return t.replace(/\\s+/g,' ').trim(); }"
+        " return (document.body.innerText || '').slice(0, 600); }"
+    )
 
 
 def _do_import(page, csv_path):
-    """Nahraj CSV, nastav parametre, OVER ich (read-back), spusti, vráť text výsledku."""
+    """Nahraj CSV (cez file-chooser — Shoptet widget inak súbor nezaregistruje),
+    over bezpečné parametre, spusti import (Importovať → Log), vráť text výsledku."""
     print(f"[import] nahrávam súbor {csv_path}")
-    page.locator('input[type="file"]').first.set_input_files(csv_path)
-    _set_import_options(page)
-    got = _read_back_options(page)
-    bad = [k for k, want in _WANT.items() if got.get(k) != want]
-    if bad:
-        raise ShoptetError(f"zlé importačné parametre (neimportujem): {bad}; "
-                           f"chcené={_WANT}, prečítané={got}")
-    print(f"[import] parametre OK {got} — spúšťam import")
-    page.get_by_role("button", name="Importovať").click()
+    with page.expect_file_chooser() as fc:
+        page.locator('button:has-text("Vyberte súbor")').first.click()
+    fc.value.set_files(csv_path)
+    page.wait_for_timeout(800)   # widget zaregistruje súbor (názov sa zobrazí na tlačidle)
+    _ensure_safe_settings(page)
+    print("[import] spúšťam import …")
+    page.get_by_test_id("buttonImport").click()
+    page.wait_for_url(re.compile(r"import-produktov/log"), timeout=120000)
     page.wait_for_load_state("networkidle")
-    return page.inner_text("body")
+    return _read_result(page)
 
 
 if __name__ == "__main__":
