@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 
 from parovanie import import_builder
 import io
+import zipfile
 from flask import Flask, jsonify, request, send_from_directory, Response
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -206,8 +207,26 @@ def _csv_response(header, rows, filename):
 
 @app.route("/api/import")
 def api_import():
-    rows = import_builder.import_rows(PRODUCTS, _load_decisions(), CODE2PAIR)
-    return _csv_response(import_builder.HEADER, rows, "import_forestshop.csv")
+    # TWO files (Shoptet wipes empty cells, so columns are split — see import_builder):
+    #   import_links.csv  = code;pairCode;internalNote (reorder URL in the private field)
+    #   import_states.csv = code;pairCode;productVisibility;stock;availability (Vypredané / Predaj skončil)
+    dec = _load_decisions()
+    files = [
+        ("import_links.csv", import_builder.LINK_HEADER,
+         import_builder.link_rows(PRODUCTS, dec, CODE2PAIR)),
+        ("import_states.csv", import_builder.STATE_HEADER,
+         import_builder.state_rows(PRODUCTS, dec, CODE2PAIR)),
+    ]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, header, rows in files:
+            s = io.StringIO()
+            w = csv.writer(s, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+            w.writerow(header)
+            w.writerows(rows)
+            z.writestr(name, s.getvalue().encode("utf-8-sig"))
+    return Response(buf.getvalue(), content_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="import_forestshop.zip"'})
 
 
 @app.route("/api/export")

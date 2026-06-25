@@ -11,7 +11,7 @@ def _writer(f):
 def write_import(matches: list[Match], path: str) -> None:
     with open(path, "w", encoding="cp1250", errors="replace", newline="") as f:
         w = _writer(f)
-        w.writerow(["code", "textProperty10"])
+        w.writerow(["code", "internalNote"])  # reorder URL → private field (not public textProperty)
         for m in matches:
             if m.chosen is None:
                 continue

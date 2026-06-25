@@ -4,7 +4,7 @@ Reads:
   data/out/candidates.json   (969 product records, index = position)
   data/out/ai_verdicts.json  (list of {idx, chosen_i, reason})
 Writes:
-  data/out/import_betalov_wetland.csv  (code;textProperty10, one row per variant of matched products)
+  data/out/import_betalov_wetland.csv  (code;pairCode;internalNote, one row per variant of matched products)
   data/out/match_report.csv            (per product, with AI verdict)
   data/out/unmatched.csv               (products the AI rejected / no candidate)
 """
@@ -21,7 +21,8 @@ recs = json.load(open(f"{OUT}/candidates.json", encoding="utf-8"))
 verds = {v["idx"]: v for v in json.load(open(f"{OUT}/ai_verdicts.json", encoding="utf-8"))}
 
 # code -> raw pairCode from the source export, so the import is the minimal safe
-# set (code;pairCode;textProperty10) and never overwrites other product fields.
+# set (code;pairCode;internalNote — reorder URL in the private field) and never
+# overwrites other product fields.
 code2pair = {}
 with open(SOURCE, encoding="cp1250", errors="replace", newline="") as _f:
     for _row in csv.DictReader(_f, delimiter=";"):
@@ -59,11 +60,11 @@ for i, r in enumerate(recs):
         "attempts": "1",
     })
 
-# Minimal import: code;pairCode;textProperty10 (one row per matched variant).
+# Minimal import: code;pairCode;internalNote (one row per matched variant).
 with open(f"{OUT}/import_betalov_wetland.csv", "w", encoding="cp1250",
           errors="replace", newline="") as f:
     w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
-    w.writerow(["code", "pairCode", "textProperty10"])
+    w.writerow(["code", "pairCode", "internalNote"])
     for m in matches:
         if not m.chosen:
             continue
