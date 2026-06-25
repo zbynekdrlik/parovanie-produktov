@@ -12,7 +12,7 @@ Load BEFORE vystavovaním lokálneho webu na verejnú doménu (newlevel.media).
 
 ## Postup (API-only, bez interaktívneho login)
 
-Cloudflare account `8f3efbc0edbe05bd6fdcab10cd63876a`, zóna `newlevel.media`. Meta-token
+Cloudflare account `<ACCOUNT_ID>`, zóna `newlevel.media`. Meta-token
 (account-owned, „API Tokens" management) → vytvor scoped token, ním sprav zvyšok.
 
 1. **Scoped token** (POST `/accounts/{acct}/tokens` meta-tokenom). Permission groups:

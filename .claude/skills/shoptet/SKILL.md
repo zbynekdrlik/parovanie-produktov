@@ -16,21 +16,29 @@ Toto sú dohodnuté pravidlá — nepýtaj sa ich nanovo.
 - Oddeľovač `;`, CRLF.
 - **VŽDY stĺpce `code` AJ `pairCode`** — Shoptet ich oba potrebuje na import variantových produktov. Párovanie podľa `code`.
 - **„Nahradiť prázdne hodnoty" = VYPNUTÉ** (prázdna bunka = nechať tak). Tak jeden súbor zvládne aj linky aj vypredané bez vymazania nechcených polí.
-- Stĺpce: `code;pairCode;textProperty10;textProperty11;stock;availabilityInStock;availabilityOutOfStock`.
+- Stĺpce: `code;pairCode;textProperty10;textProperty11;productVisibility;stock;availabilityInStock;availabilityOutOfStock`.
+
+## TRI STAVY produktu (overené z dát eshopu — DOHODNUTÉ)
+
+| Stav | productVisibility | stock | availability | textProperty10 |
+|---|---|---|---|---|
+| **1. Skladom** | `visible` | >0 | `Skladom`/prázdne | (link ak je) |
+| **2. Nie je skladom** (dočasne) | `visible` | 0 | `Vypredané` | prázdny (čaká na link) |
+| **3. Už sa nebude predávať** (link pre Google) | `detailOnly` | 0 | `Predaj výrobku skončil` | prázdny |
+
+`detailOnly` = LEN cez priamy odkaz (nie v kategóriách/vyhľadávaní) → stránka ostáva pre Google, ale produkt nie je v ponuke (stav 3, ~4 600 v katalógu). „Vypredané"=dočasne; „Predaj výrobku skončil"=už nikdy.
 
 ## Význam polí + konvencie (DOHODNUTÉ)
 
 - **`textProperty10`** = odkaz na produkt u dodávateľa. Slúži **automatizácii na doobjednávanie** (hitne link).
 - **`textProperty11` = `human matched`** = ručne overené. Druhá automatizácia podľa neho (a podľa linku) **zapne produkt (visible)**; budúce párovanie tieto **preskočí**.
-- **Napárovaný produkt (link):** `textProperty10`=URL, `textProperty11`=`human matched`, a **stock/availability nechaj PRÁZDNE** (viditeľnosť/dostupnosť rieši ich automatizácia — NEprepisuj starý stav typu „Predaj výrobku skončil").
-- **Nedostupný (sold-out):** `textProperty10`=prázdne (kým sa nenájde link), `textProperty11`=prázdne, `stock=0`, `availabilityInStock`=`availabilityOutOfStock`=**`Vypredané`**. NEoznačuj `human matched` → ostáva v poole na re-kontrolu, či nepribudol link.
+- **Napárovaný (link):** `textProperty10`=URL, `textProperty11`=`human matched`; `productVisibility`/`stock`/`availability` **PRÁZDNE** (automatizácia ich nastaví z linku → stav 1). NEprepisuj starý stav.
+- **Nie je skladom (stav 2):** prázdny link a marker, `productVisibility=visible`, `stock=0`, availability `Vypredané`. Ostáva v poole na re-kontrolu.
+- **Už sa nebude predávať (stav 3):** prázdny link a marker, `productVisibility=detailOnly`, `stock=0`, availability `Predaj výrobku skončil`. Stránka ostane pre Google.
 
 ## productVisibility hodnoty
 
-`visible`, `detailOnly` (len cez priamy odkaz — drop-ship, **predajný**), `hidden`, `blocked`, `cashDeskOnly`, `blockUnregistered`.
-
-- **„vypnutý/nedostupný" = NEpredajný** = `hidden`/`blocked` ALEBO dostupnosť `Vypredané`/`Predaj výrobku skončil`/`Momentálne nedostupné`.
-- **`detailOnly` NIE je vypnutý** (je predajný cez link). Nepočítaj ho ako off.
+`visible`, `detailOnly` (predajný cez priamy odkaz; so „Predaj skončil" = stav 3), `hidden`, `blocked`, `cashDeskOnly`, `blockUnregistered`. `detailOnly` samo o sebe NIE je „vypnutý".
 
 ## Generovanie importu
 
