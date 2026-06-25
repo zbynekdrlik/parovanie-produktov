@@ -16,14 +16,17 @@ OUT = "data/out"
 IMGCOLS = ["defaultImage"] + [f"image{i}" for i in range(2, 16)] + ["image"]
 
 
-def is_off(vis: str, avail: str) -> bool:
-    """Off = NOT sellable. detailOnly (drop-ship, sellable via link) is NOT off;
-    only hidden/blocked or an explicit sold-out / discontinued availability is."""
+def state_of(vis: str, avail: str) -> int:
+    """The three eshop states (see .claude/skills/shoptet):
+      1 = Skladom (predajný), 2 = Nie je skladom (Vypredané/nedostupné),
+      3 = Už sa nebude predávať (Predaj výrobku skončil / hidden / blocked)."""
     v = vis.lower()
     a = avail.lower()
-    if v in ("hidden", "blocked", "cashdeskonly", "blockunregistered"):
-        return True
-    return any(x in a for x in ("vypredan", "skon", "nedostupn", "není skladem", "neni skladem"))
+    if "skon" in a or v in ("hidden", "blocked", "cashdeskonly", "blockunregistered"):
+        return 3
+    if any(x in a for x in ("vypredan", "nedostupn", "není skladem", "neni skladem")):
+        return 2
+    return 1
 
 
 # index current export by (supplier, name)
@@ -61,7 +64,8 @@ for p in rd:
         p["variant_codes"] = g["codes"]
         p["our_images"] = g["images"][:6]
         a = g["ais"] or g["aos"]
-        p["current"] = {"off": is_off(g["vis"], a), "vis": g["vis"], "avail": a,
+        st = state_of(g["vis"], a)
+        p["current"] = {"state": st, "off": st != 1, "vis": g["vis"], "avail": a,
                         "price": g["price"], "std": g["std"], "stock": g["stock"]}
         synced += 1
     else:
