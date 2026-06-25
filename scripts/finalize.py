@@ -11,7 +11,7 @@ Writes:
 import csv
 import json
 from parovanie.models import Product, Candidate, Match
-from parovanie.writer import write_unmatched, REPORT_COLS
+from parovanie.writer import write_unmatched
 from parovanie.report_io import write_report_rows
 
 csv.field_size_limit(10**9)
