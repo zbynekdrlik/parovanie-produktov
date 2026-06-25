@@ -18,21 +18,33 @@ async function loadInfo(box) {
     box.innerHTML = '';
     if (!j.images || !j.images.length) { box.innerHTML = '<span class="noimg">bez obrázkov</span>'; }
     else for (const u of j.images) { const im = document.createElement('img'); im.src = u; im.loading = 'lazy'; box.appendChild(im); }
-    // fill an associated title node (for manually entered links)
     if (box.dataset.titleId && j.title) {
-      const t = document.getElementById(box.dataset.titleId);
-      if (t) t.textContent = j.title;
+      const t = document.getElementById(box.dataset.titleId); if (t) t.textContent = j.title;
+    }
+    if (box.dataset.metaId) {
+      const mEl = document.getElementById(box.dataset.metaId);
+      if (mEl) {
+        const parts = [];
+        if (j.price) parts.push('💶 ' + j.price + ' €');
+        if (j.availability) parts.push(j.availability);
+        mEl.textContent = parts.join(' · ');
+      }
     }
   } catch (_) { box.classList.remove('loading'); }
 }
 
 let _tid = 0;
-function gallery(url, titleNode) {
+function gallery(url, titleNode, metaNode) {
   const b = el('div', 'imgs loading'); b.dataset.url = url;
   if (titleNode) { const id = 'ti' + (++_tid); titleNode.id = id; b.dataset.titleId = id; }
+  if (metaNode) { const id = 'me' + (++_tid); metaNode.id = id; b.dataset.metaId = id; }
   imgObserver.observe(b); return b;
 }
-function smallThumb(url) { const b = el('div', 'thumb loading'); b.dataset.url = url; imgObserver.observe(b); return b; }
+function smallThumb(url, metaNode) {
+  const b = el('div', 'thumb loading'); b.dataset.url = url;
+  if (metaNode) { const id = 'me' + (++_tid); metaNode.id = id; b.dataset.metaId = id; }
+  imgObserver.observe(b); return b;
+}
 
 async function saveDecision(p, status, url) {
   if (status === 'undo') delete DECISIONS[p.key];
@@ -76,8 +88,10 @@ function supplierBlock(container, p, url, showReason) {
   container.appendChild(title);
   const a = el('a', 'supurl'); a.href = url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = url;
   container.appendChild(a);
+  const meta = el('div', 'supmeta', 'cena/sklad…');
+  container.appendChild(meta);
   if (showReason && p.ai_reason && p.ai_status === 'matched') container.appendChild(el('div', 'reason', '🤖 ' + escapeHtml(p.ai_reason)));
-  container.appendChild(gallery(url, cand ? null : title));   // lazy title only when unknown
+  container.appendChild(gallery(url, cand ? null : title, meta));   // lazy title/price/avail
 }
 
 // candidates + manual URL + Nedostupné. Saving here moves the card to its list.
@@ -86,11 +100,14 @@ function resolutionPanel(p) {
   const cur = decUrl(p), s = statusOf(p);
   p.candidates.forEach((c) => {
     const row = el('div', 'cand');
-    row.appendChild(smallThumb(c.url));
     const m = el('div', 'c-main');
     m.appendChild(el('div', 'c-name', escapeHtml(c.name || '(produkt)')));
     const a = el('a', 'supurl'); a.href = c.url; a.target = '_blank'; a.rel = 'noopener'; a.textContent = c.url;
-    m.appendChild(a); row.appendChild(m);
+    m.appendChild(a);
+    const meta = el('div', 'supmeta', '');
+    m.appendChild(meta);
+    row.appendChild(smallThumb(c.url, meta));
+    row.appendChild(m);
     const pick = el('button', 'btn good sm' + (s === 'manual' && cur === c.url ? ' active' : ''), 'Vybrať');
     pick.onclick = () => saveDecision(p, 'manual', c.url);
     row.appendChild(pick); wrap.appendChild(row);
@@ -125,6 +142,14 @@ function renderCard(p) {
   left.appendChild(el('div', 'meta', `${p.supplier} · pairCode ${p.pairCode || '—'} · ${p.variant_codes.length} variant(ov)`));
   if (p.current) left.appendChild(el('span', 'curbadge ' + (p.current.off ? 'off' : 'on'),
     p.current.off ? '⚫ teraz vypnutý u nás' : '🟢 teraz zapnutý u nás'));
+  if (p.current && (p.current.price || p.current.stock !== '')) {
+    const cp = p.current, parts = [];
+    if (cp.price) parts.push('💶 ' + cp.price + ' €');
+    if (cp.std && cp.std !== cp.price) parts.push('pôv. ' + cp.std + ' €');
+    if (cp.stock !== undefined && cp.stock !== '') parts.push('sklad: ' + cp.stock);
+    if (cp.avail) parts.push(cp.avail);
+    if (parts.length) left.appendChild(el('div', 'priceline', parts.join(' · ')));
+  }
   const oimgs = el('div', 'imgs');
   if (p.our_images.length) for (const u of p.our_images) { const im = el('img'); im.src = u; im.loading = 'lazy'; oimgs.appendChild(im); }
   else oimgs.innerHTML = '<span class="noimg">bez obrázkov</span>';
