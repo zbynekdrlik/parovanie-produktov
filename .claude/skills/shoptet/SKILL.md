@@ -43,3 +43,21 @@ Toto sú dohodnuté pravidlá — nepýtaj sa ich nanovo.
 ## Generovanie importu
 
 `scripts/build_decisions_import.py` (alebo web `/api/import` tlačidlo „⬇ Stiahnuť import") → z rozhodnutí (`decisions.json`) cez `src/parovanie/import_builder.py`. Logika je v `import_builder.import_rows` (otestované).
+
+## Auto-import do adminu (script)
+
+`scripts/shoptet_import.py` — prihlási sa do Shoptet adminu a nahrá import CSV namiesto ručného klikania. Čistá logika (načítanie údajov, pred-letová kontrola CSV, parser výsledku) je v `src/parovanie/shoptet_import.py` (unit testy, bez prehliadača); browser riadi tenká Playwright obálka v scripte.
+
+- **Secret:** `data/.shoptet_admin` (chmod 600, `data/` je gitignored — NIE v gite). Kľúče: `SHOPTET_ADMIN_URL`, `SHOPTET_USER`, `SHOPTET_PASS`, `SHOPTET_EXPORT_URL` (pattern-14 export s hash, na zálohu). Hodnoty NIKDY do gitu/skillu.
+- **Beh:** `PYTHONPATH=src .venv/bin/python scripts/shoptet_import.py [--file CSV] [--dry-run] [--yes] [--headful]`. Default súbor `data/out/import_forestshop.csv`. Playwright: `pip install -r requirements-import.txt && playwright install chromium` (NIE v CI).
+- **Poistky (poradie):** pred-letová kontrola CSV (UTF-8, `code`+`pairCode`, rozpis link/nie-skladom/nebude-predávať) → potvrdenie (`--yes` preskočí) → **záloha exportu** do `data/backups/export_<ts>.csv` (bez úspešnej zálohy sa NEimportuje) → login → upload + **nastaví a read-back overí bezpečné parametre** (viď nižšie) → spustí → prečíta skutočný výsledok z **Logu**. Audit (screenshot + log) do `data/out/shoptet_import_<ts>.*`.
+
+### Reálny Shoptet import formulár (overené naživo)
+
+- **URL:** `/admin/import-produktov/` (POZOR: NIE `produkty-import`). Login: placeholder `E-mail` / `Vaše heslo`, tlačidlo `Prihlásenie`.
+- **Formulár NEMÁ voľby kódovania / „nahradiť prázdne" / párovania.** Shoptet **auto-detekuje kódovanie** (náš `utf-8-sig` BOM → UTF-8) a **páruje podľa `code`** automaticky (stĺpec v hlavičke). Stĺpec uvedený v súbore s prázdnou bunkou → Shoptet ho nechá tak (preto link riadky nechávajú vis/stock/avail prázdne).
+- **Jediné rizikové voľby na formulári** (script ich nastaví + read-back overí): radio **„Nemeniť produkty a varianty, ktoré nie sú obsiahnuté v importovanom súbore"** (bezpečný default — NIKDY „Zmazať…") + checkbox **„Zmeňte adresu URL produktu podľa názvu produktu" = VYPNUTÉ**.
+- **Súbor sa MUSÍ nahrať cez file-chooser** (`expect_file_chooser` + klik „Vyberte súbor") — nastavenie skrytého `input[name=file]` Shoptet widget nezaregistruje (zostane „Povinné pole").
+- **Spustenie:** tlačidlo `data-testid="buttonImport"` → presmeruje na `/admin/import-produktov/log/`.
+- **Výsledok (Log):** SK „Spracované: N. Upravené: K. Zlyhanie variantov: M.", auto-import býva CZ „Zpracováno/Upraveno". Parser berie len najnovší riadok a „Zlyhanie: N" uprednostní pred prózou „skončil s chybou".
+- **Export na zálohu:** hash je **per-pattern aj per-formát**. Plný export = šablóna **„vsetko" (patternId 14), formát CSV** — URL+hash vyčítaj na `/admin/export-produktov/` (vyber šablónu + formát → „Verejný odkaz"). Ten ide do `SHOPTET_EXPORT_URL`.
