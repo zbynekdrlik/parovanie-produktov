@@ -38,3 +38,47 @@ def load_credentials(path):
     if missing:
         raise ShoptetError(f"V {path} chýbajú kľúče: {', '.join(missing)}.")
     return dict(creds)   # all parsed keys (incl. optional SHOPTET_EXPORT_URL for backup)
+
+
+EXPECTED_HEADER = ["code", "pairCode", "textProperty10", "textProperty11",
+                   "productVisibility", "stock", "availabilityInStock",
+                   "availabilityOutOfStock"]
+
+
+def classify_row(row):
+    """Classify one generated import row by its column values (mirrors
+    import_builder.import_rows)."""
+    if (row.get("textProperty10") or "").strip():
+        return "link"
+    vis = (row.get("productVisibility") or "").strip().lower()
+    avail = ((row.get("availabilityInStock") or "")
+             + " " + (row.get("availabilityOutOfStock") or "")).lower()
+    if vis == "detailonly":
+        return "discontinued"
+    if vis == "visible" and "vypredan" in avail:
+        return "unavailable"
+    return "other"
+
+
+def preflight_csv(path):
+    """Read the generated import CSV (utf-8-sig, ';'), verify it is well-formed,
+    and return a plan with per-type counts. Raises ShoptetError on any problem so
+    nothing gets uploaded blindly."""
+    if not os.path.exists(path):
+        raise ShoptetError(f"Import súbor chýba: {path}")
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f, delimiter=";")
+            columns = reader.fieldnames or []
+            counts = {"link": 0, "unavailable": 0, "discontinued": 0, "other": 0}
+            total = 0
+            for row in reader:
+                total += 1
+                counts[classify_row(row)] += 1
+    except UnicodeError as e:
+        raise ShoptetError(f"Import súbor sa nedá prečítať ako UTF-8: {path} ({e})")
+    if "code" not in columns or "pairCode" not in columns:
+        raise ShoptetError(f"Import súbor nemá stĺpce code+pairCode (má: {columns}).")
+    if total == 0:
+        raise ShoptetError(f"Import súbor nemá žiadne riadky: {path}")
+    return {"path": path, "total": total, "columns": columns, **counts}
