@@ -43,3 +43,12 @@ Toto sú dohodnuté pravidlá — nepýtaj sa ich nanovo.
 ## Generovanie importu
 
 `scripts/build_decisions_import.py` (alebo web `/api/import` tlačidlo „⬇ Stiahnuť import") → z rozhodnutí (`decisions.json`) cez `src/parovanie/import_builder.py`. Logika je v `import_builder.import_rows` (otestované).
+
+## Auto-import do adminu (script)
+
+`scripts/shoptet_import.py` — prihlási sa do Shoptet adminu a nahrá import CSV namiesto ručného klikania. Čistá logika (načítanie údajov, pred-letová kontrola CSV, parser výsledku) je v `src/parovanie/shoptet_import.py` (unit testy, bez prehliadača); browser riadi tenká Playwright obálka v scripte.
+
+- **Secret:** `data/.shoptet_admin` (chmod 600, `data/` je gitignored — NIE v gite). Kľúče: `SHOPTET_ADMIN_URL`, `SHOPTET_USER`, `SHOPTET_PASS`, `SHOPTET_EXPORT_URL` (pattern-14 export s hash, na zálohu). Hodnoty NIKDY do gitu/skillu.
+- **Beh:** `PYTHONPATH=src .venv/bin/python scripts/shoptet_import.py [--file CSV] [--dry-run] [--yes] [--headful]`. Default súbor `data/out/import_forestshop.csv`. Playwright: `pip install -r requirements-import.txt && playwright install chromium` (NIE v CI).
+- **Poistky (poradie):** pred-letová kontrola CSV (UTF-8, `code`+`pairCode`, rozpis link/nie-skladom/nebude-predávať) → potvrdenie (`--yes` preskočí) → **záloha exportu** do `data/backups/export_<ts>.csv` (bez úspešnej zálohy sa NEimportuje) → login → nastaví **UTF-8 / „nahradiť prázdne" VYPNUTÉ / párovať podľa Kódu** → **read-back** týchto parametrov (nesedí → NEimportuje) → spustí → prečíta skutočný výsledok z **Logu** (Spracované/Upravené/Zlyhania). Audit (screenshot + log) do `data/out/shoptet_import_<ts>.*`.
+- **Login selektory:** placeholder `E-mail` / `Vaše heslo`, tlačidlo `Prihlásenie` (overené). Import formulár (`/admin/produkty-import/`, voľby kódovania/prázdnych/párovania) sa dolaďuje v živom behu s prihlásením.

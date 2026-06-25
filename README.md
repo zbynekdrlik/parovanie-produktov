@@ -68,6 +68,24 @@ Otvor `http://<LAN-IP>:8801/`. Vľavo náš produkt (názov + obrázky), vpravo 
 (názov, klikateľná URL, obrázky). Napárované → ✓ Dobré / ✗ Zlé; nenapárované → výber
 z kandidátov alebo vlastná URL. `decisions.json` potom drží `{idx: {status, url}}`.
 
+## Auto-import do eshopu (opatrný script)
+
+Namiesto ručného importu v admine: `scripts/shoptet_import.py` sa prihlási do
+Shoptet adminu a nahrá import CSV — s poistkami. Prihlásenie + export URL sú v
+`data/.shoptet_admin` (chmod 600, mimo gitu).
+
+```bash
+.venv/bin/pip install -r requirements-import.txt && .venv/bin/playwright install chromium  # raz
+PYTHONPATH=src .venv/bin/python scripts/shoptet_import.py --dry-run     # len overí, NIČ nenahrá
+PYTHONPATH=src .venv/bin/python scripts/shoptet_import.py               # ostrý import (pýta potvrdenie)
+```
+
+Poistky (v poradí): pred-letová kontrola CSV (kódovanie, `code`+`pairCode`, rozpis
+riadkov) → potvrdenie (`--yes` preskočí) → **záloha exportu** do `data/backups/`
+(bez zálohy sa neimportuje) → login → nastaví UTF-8 / „nahradiť prázdne" VYPNUTÉ /
+párovať podľa Kódu → **read-back kontrola** tých parametrov → spustí → prečíta
+skutočný výsledok z Logu. Viac v `.claude/skills/shoptet`.
+
 ## Verejné nasadenie (Cloudflare Tunnel)
 
 Web je verejne na **https://parovanie-forestshop.newlevel.media** cez `cloudflared`
