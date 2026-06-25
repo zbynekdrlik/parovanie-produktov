@@ -15,6 +15,8 @@ from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+
+from parovanie import import_builder
 import io
 from flask import Flask, jsonify, request, send_from_directory, Response
 
@@ -32,19 +34,16 @@ _lock = threading.Lock()
 with open(DATA, encoding="utf-8") as f:
     PRODUCTS = json.load(f)
 
-# current stock + availability per variant code (to preserve them in the combined
-# import for link-products, so empty cells never clear a value)
+# code -> pairCode (Shoptet import needs BOTH code and pairCode present)
 SRC = os.path.join(ROOT, "data", "products.csv")
-CODE2STOCK = {}
+CODE2PAIR = {}
 if os.path.exists(SRC):
     csv.field_size_limit(10**9)
     with open(SRC, encoding="cp1250", errors="replace") as _f:
         for _row in csv.DictReader(_f, delimiter=";"):
             _c = (_row.get("code") or "").strip()
             if _c:
-                CODE2STOCK[_c] = ((_row.get("stock") or "").strip(),
-                                  (_row.get("availabilityInStock") or "").strip(),
-                                  (_row.get("availabilityOutOfStock") or "").strip())
+                CODE2PAIR[_c] = (_row.get("pairCode") or "").strip()
 
 
 def _load_decisions() -> dict:
@@ -198,41 +197,17 @@ def _csv_response(header, rows, filename):
     w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
     w.writerow(header)
     w.writerows(rows)
-    data = buf.getvalue().encode("cp1250", errors="replace")
-    return Response(data, content_type="text/csv; charset=windows-1250",
+    # UTF-8 with BOM — universal, avoids the cp1250 'č'→'è' mojibake. Import into
+    # Shoptet as UTF-8.
+    data = buf.getvalue().encode("utf-8-sig")
+    return Response(data, content_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
-
-
-IMPORT_HEADER = ["code", "textProperty10", "textProperty11",
-                 "stock", "availabilityInStock", "availabilityOutOfStock"]
-
-
-def _import_rows():
-    """One combined import for every decided product, one row per variant:
-      - link (good/manual): textProperty10=url, textProperty11='human matched',
-        stock/availability preserved (current values → no change).
-      - unavailable: textProperty10='' (clear link until one is found),
-        textProperty11='', stock=0, availability='Vypredané' (sold-out, stays
-        in the app pool to re-check later — NOT marked human matched)."""
-    dec = _load_decisions()
-    rows = []
-    for p in PRODUCTS:
-        d = dec.get(p.get("key"))
-        if not d:
-            continue
-        status, url = d.get("status"), d.get("url", "")
-        for c in p["variant_codes"]:
-            if status in ("good", "manual") and url:
-                st, ais, aos = CODE2STOCK.get(c, ("", "", ""))
-                rows.append([c, url, "human matched", st, ais, aos])
-            elif status == "unavailable":
-                rows.append([c, "", "", "0", "Vypredané", "Vypredané"])
-    return rows
 
 
 @app.route("/api/import")
 def api_import():
-    return _csv_response(IMPORT_HEADER, _import_rows(), "import_forestshop.csv")
+    rows = import_builder.import_rows(PRODUCTS, _load_decisions(), CODE2PAIR)
+    return _csv_response(import_builder.HEADER, rows, "import_forestshop.csv")
 
 
 @app.route("/api/export")
