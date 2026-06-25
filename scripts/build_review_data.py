@@ -86,7 +86,12 @@ for i, r in enumerate(recs):
     matched = isinstance(ci, int) and 0 <= ci < len(cands)
     _vis, _ais, _aos = code2cur.get(vcodes[0], ("?", "", "")) if vcodes else ("?", "", "")
     _a = _ais or _aos
-    _off = (_vis != "visible") or ("Vypredan" in _a) or ("skon" in _a.lower())
+    # off = NOT sellable: hidden/blocked OR sold-out/discontinued availability.
+    # detailOnly (drop-ship, sellable via link) is NOT off. Run resync_export.py
+    # afterwards to refresh codes/images/status against the live catalog.
+    _vl, _al = _vis.lower(), _a.lower()
+    _off = (_vl in ("hidden", "blocked", "cashdeskonly", "blockunregistered")
+            or any(x in _al for x in ("vypredan", "skon", "nedostupn", "není skladem")))
     out.append({
         "idx": i, "key": r["pair_key"], "supplier": r["supplier"], "name": r["name"],
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",

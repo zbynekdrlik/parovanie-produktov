@@ -21,7 +21,9 @@ def _w(path, header):
     return f, w
 
 
-lf, lw = _w(f"{OUT}/import_links.csv", ["code", "textProperty10"])
+# textProperty11 = "human matched" marks the product as human-verified, so the
+# reorder automation works with it and future pairing skips it.
+lf, lw = _w(f"{OUT}/import_links.csv", ["code", "textProperty10", "textProperty11"])
 uf, uw = _w(f"{OUT}/import_unavailable.csv",
             ["code", "stock", "availabilityInStock", "availabilityOutOfStock"])
 n_links = n_unavail = 0
@@ -32,7 +34,7 @@ for key, d in dec.items():
     status, url = d.get("status"), d.get("url", "")
     if status in ("good", "manual") and url:
         for c in p["variant_codes"]:
-            lw.writerow([c, url])
+            lw.writerow([c, url, "human matched"])
         n_links += 1
     elif status == "unavailable":
         for c in p["variant_codes"]:
