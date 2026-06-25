@@ -54,7 +54,9 @@ def _backup_export(creds):
         r = requests.get(url, timeout=120)
         r.raise_for_status()
     except requests.RequestException as e:
-        raise ShoptetError(f"stiahnutie zálohy exportu zlyhalo: {e}")
+        # NEvkladaj `e` do hlášky — obsahuje URL s tajným hashom; len typ chyby
+        raise ShoptetError(f"stiahnutie zálohy exportu zlyhalo: {type(e).__name__} "
+                           "(URL skrytá — over SHOPTET_EXPORT_URL)")
     if not r.content:
         raise ShoptetError("export zálohy je prázdny — neimportujem")
     dest.write_bytes(r.content)
@@ -144,6 +146,10 @@ def _run_browser(args, creds, plan):
     (AUDIT_DIR / f"shoptet_import_{ts}.log").write_text(result_text, encoding="utf-8")
     print(f"\nVÝSLEDOK: spracované={log['processed']} upravené={log['updated']} "
           f"zlyhania={log['failed']}")
+    if log["processed"] is None:
+        # výsledok sa nedal prečítať (zmena Logu / nenačítaná stránka) — NEhlás úspech
+        print("POZOR: výsledok importu sa nepodarilo prečítať — over Log ručne.", file=sys.stderr)
+        return 2
     if log["failed"]:
         print("POZOR: Shoptet hlási zlyhania — skontroluj log.", file=sys.stderr)
         return 2
@@ -192,7 +198,10 @@ def _ensure_safe_settings(page):
         raise ShoptetError("nenašiel som voľbu režimu importu (radio 'Nemeniť …')")
     safe.check()
     url_by_name = page.get_by_role("checkbox", name=_URL_BY_NAME)
-    if url_by_name.count() and url_by_name.is_checked():
+    if url_by_name.count() == 0:
+        # checkbox chýba na formulári → funkcia je vypnutá; nič netreba meniť
+        print("[import] checkbox 'Zmeniť URL podľa názvu' nenájdený — predpokladám VYPNUTÉ")
+    elif url_by_name.is_checked():
         url_by_name.uncheck()
     if not safe.is_checked():
         raise ShoptetError("bezpečný režim 'Nemeniť produkty mimo súboru' sa nepodarilo zvoliť")
@@ -204,7 +213,10 @@ def _ensure_safe_settings(page):
 
 def _read_result(page):
     """Z Logu vytiahni text NAJNOVŠIEHO riadku s výsledkom (Spracované/Upravené/
-    Zlyhanie) — len ten riadok, aby parser nechytil staršie behy."""
+    Zlyhanie) — len ten riadok, aby parser nechytil staršie behy. Shoptet renderuje
+    Log NAJNOVŠÍM HORE (overené naživo), takže PRVÝ zhodný riadok = tento beh.
+    Ak sa nenájde nič, vráti orezaný text stránky → parser dá processed=None →
+    script to vyhodnotí ako nečitateľný výsledok (exit 2), nie ako úspech."""
     return page.evaluate(
         "() => { for (const r of document.querySelectorAll('tr')) {"
         " const t = r.innerText || '';"

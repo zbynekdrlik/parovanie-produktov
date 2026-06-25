@@ -8,8 +8,6 @@ import csv
 import os
 import re
 
-csv.field_size_limit(10**9)
-
 REQUIRED_KEYS = ("SHOPTET_ADMIN_URL", "SHOPTET_USER", "SHOPTET_PASS")
 
 
@@ -109,7 +107,7 @@ def parse_import_log(text):
         "raw": text,
         "processed": _num_after(low, r"z?pracov\w*[^0-9]{0,40}?(\d+)"),
         "updated": _num_after(low, r"uprav\w*[^0-9]{0,40}?(\d+)"),
-        # explicit 'zlyhanie … N' first; only then a tight 'chyby: N' (no prose gap)
-        "failed": _num_after(low, r"zlyhan\w*[^0-9]{0,40}?(\d+)", r"chýb\w*\s*:?\s*(\d+)",
-                             r"chyb\w*\s*:\s*(\d+)"),
+        # explicit 'zlyhanie … N' first; only then a tight 'chyb(y)/chýb: N' (colon
+        # required, so the prose 'skončil s chybou …' can't bridge to a later number)
+        "failed": _num_after(low, r"zlyhan\w*[^0-9]{0,40}?(\d+)", r"ch[ýy]b\w*\s*:\s*(\d+)"),
     }

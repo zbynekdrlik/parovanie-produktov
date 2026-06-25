@@ -114,6 +114,9 @@ def test_parse_import_log_colon_and_newlines():
 
 
 def test_parse_import_log_missing_numbers():
+    # unrecognised text → all None. The browser shell (scripts/shoptet_import.py)
+    # treats processed=None as an UNREADABLE result and exits 2 (never silent success).
+    # That caller branch is browser-only and is verified live, not in CI.
     r = parse_import_log("import prebehol")
     assert r["processed"] is None and r["updated"] is None and r["failed"] is None
     assert r["raw"] == "import prebehol"
