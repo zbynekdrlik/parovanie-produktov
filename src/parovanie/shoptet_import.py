@@ -6,6 +6,7 @@ driving lives in scripts/shoptet_import.py. See docs spec
 """
 import csv
 import os
+import re
 
 csv.field_size_limit(10**9)
 
@@ -82,3 +83,22 @@ def preflight_csv(path):
     if total == 0:
         raise ShoptetError(f"Import súbor nemá žiadne riadky: {path}")
     return {"path": path, "total": total, "columns": columns, **counts}
+
+
+_LOG_PATTERNS = {
+    "processed": r"spracovan\w*",
+    "updated": r"uprav\w*",
+    "failed": r"(?:zlyhan\w*|chyb\w*)",
+}
+
+
+def parse_import_log(text):
+    """Extract processed/updated/failed counts from the Shoptet import result
+    text. Robust to ':'/word variants; returns None for any count not found."""
+    text = text or ""
+    out = {"raw": text}
+    low = text.lower()
+    for key, kw in _LOG_PATTERNS.items():
+        m = re.search(kw + r"[^0-9]{0,40}?(\d+)", low)
+        out[key] = int(m.group(1)) if m else None
+    return out

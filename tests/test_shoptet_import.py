@@ -1,6 +1,16 @@
 # tests/test_shoptet_import.py
+import csv
+
 import pytest
-from parovanie.shoptet_import import load_credentials, ShoptetError
+
+from parovanie.shoptet_import import (
+    EXPECTED_HEADER,
+    ShoptetError,
+    classify_row,
+    load_credentials,
+    parse_import_log,
+    preflight_csv,
+)
 
 
 def _write(tmp_path, text):
@@ -30,11 +40,6 @@ def test_load_credentials_missing_key(tmp_path):
     path = _write(tmp_path, "SHOPTET_ADMIN_URL=https://x/\nSHOPTET_USER=a\n")
     with pytest.raises(ShoptetError, match="SHOPTET_PASS"):
         load_credentials(path)
-
-
-# append to tests/test_shoptet_import.py
-import csv
-from parovanie.shoptet_import import classify_row, preflight_csv, EXPECTED_HEADER
 
 
 def _csv(tmp_path, rows):
@@ -86,3 +91,21 @@ def test_preflight_rejects_empty(tmp_path):
 def test_preflight_missing_file(tmp_path):
     with pytest.raises(ShoptetError, match="chýba"):
         preflight_csv(str(tmp_path / "nope.csv"))
+
+
+def test_parse_import_log_known_phrasing():
+    txt = "Spracované 3776, Upravené 784, Zlyhanie variantov 1"
+    r = parse_import_log(txt)
+    assert r["processed"] == 3776 and r["updated"] == 784 and r["failed"] == 1
+
+
+def test_parse_import_log_colon_and_newlines():
+    txt = "Spracované záznamy: 12\nUpravené produkty: 5\nChyby: 0\n"
+    r = parse_import_log(txt)
+    assert r["processed"] == 12 and r["updated"] == 5 and r["failed"] == 0
+
+
+def test_parse_import_log_missing_numbers():
+    r = parse_import_log("import prebehol")
+    assert r["processed"] is None and r["updated"] is None and r["failed"] is None
+    assert r["raw"] == "import prebehol"
