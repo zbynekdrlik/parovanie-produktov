@@ -61,6 +61,16 @@ def _save_decisions(d: dict) -> None:
     os.replace(tmp, DECISIONS)
 
 
+# at startup, prune orphan decisions whose key matches no product (e.g. a stale
+# 'None'/'bad' from before stable keys) so the progress count == the import count
+_VALID_KEYS = {p.get("key") for p in PRODUCTS}
+with _lock:
+    _d0 = _load_decisions()
+    _d1 = {k: v for k, v in _d0.items() if k in _VALID_KEYS}
+    if len(_d1) != len(_d0):
+        _save_decisions(_d1)
+
+
 _IMG_NOISE = ("logo", "/producer/", ".svg", "/svg/", "placeholder", "no-image",
               "banner", "/img/m/")  # m/ = presta related-product thumbs
 
