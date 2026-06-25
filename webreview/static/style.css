@@ -75,3 +75,6 @@ a.supurl:hover { text-decoration: underline; }
 .card.discontinued { border-color: #9ca3af; }
 .badge.discontinued { background: #f3f4f6; color: #4b5563; }
 .staterow { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.curbadge.st1 { background: #d1fae5; color: #065f46; }
+.curbadge.st2 { background: #fef3c7; color: #92400e; }
+.curbadge.st3 { background: #f3f4f6; color: #4b5563; }

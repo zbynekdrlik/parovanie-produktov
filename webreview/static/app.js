@@ -67,7 +67,9 @@ function matchesFilter(p) {
     case 'unreviewed': return s === null;
     case 'matched': return p.ai_status === 'matched';
     case 'unmatched': return p.ai_status === 'unmatched';
-    case 'off_now': return p.current && p.current.off;
+    case 'st1': return p.current && p.current.state === 1;
+    case 'st2': return p.current && p.current.state === 2;
+    case 'st3': return p.current && p.current.state === 3;
     case 'good': return s === 'good' || s === 'manual';
     case 'unavailable': return s === 'unavailable' || s === 'discontinued';
     default: return true;
@@ -146,8 +148,11 @@ function renderCard(p) {
   oa.textContent = p.our_url ? '↗ otvoriť náš produkt na forestshop.sk' : '↗ nájsť náš produkt na forestshop.sk';
   left.appendChild(oa);
   left.appendChild(el('div', 'meta', `${p.supplier} · pairCode ${p.pairCode || '—'} · ${p.variant_codes.length} variant(ov)`));
-  if (p.current) left.appendChild(el('span', 'curbadge ' + (p.current.off ? 'off' : 'on'),
-    p.current.off ? '⚫ teraz vypnutý u nás' : '🟢 teraz zapnutý u nás'));
+  if (p.current && p.current.state) {
+    const lbl = { 1: '🟢 Skladom', 2: '📦 Nie je skladom', 3: '🚫 Už sa nebude predávať' }[p.current.state];
+    const cls = { 1: 'st1', 2: 'st2', 3: 'st3' }[p.current.state];
+    left.appendChild(el('span', 'curbadge ' + cls, 'teraz u nás: ' + lbl));
+  }
   if (p.current && (p.current.price || p.current.stock !== '')) {
     const cp = p.current, parts = [];
     if (cp.price) parts.push('💶 ' + cp.price + ' €');
@@ -199,7 +204,8 @@ function renderCard(p) {
 
 const FILTERS = [
   ['unreviewed', 'Nezrevidované'], ['matched', 'Napárované (AI)'], ['unmatched', 'Nenapárované'],
-  ['off_now', '⚫ Teraz vypnuté'], ['good', '✓ Dobré/Vybrané'], ['unavailable', '⛔ Vypnuté'], ['all', 'Všetky'],
+  ['st1', '🟢 Skladom'], ['st2', '📦 Nie skladom'], ['st3', '🚫 Nepredáva sa'],
+  ['good', '✓ Dobré/Vybrané'], ['unavailable', '⛔ Vyriešené-vypnuté'], ['all', 'Všetky'],
 ];
 
 function renderFilters() {

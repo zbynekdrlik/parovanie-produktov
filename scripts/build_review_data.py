@@ -90,15 +90,22 @@ for i, r in enumerate(recs):
     # detailOnly (drop-ship, sellable via link) is NOT off. Run resync_export.py
     # afterwards to refresh codes/images/status against the live catalog.
     _vl, _al = _vis.lower(), _a.lower()
-    _off = (_vl in ("hidden", "blocked", "cashdeskonly", "blockunregistered")
-            or any(x in _al for x in ("vypredan", "skon", "nedostupn", "není skladem")))
+    # 3 states: 1 Skladom, 2 Nie je skladom (vypredané), 3 Už sa nebude predávať
+    # (Predaj skončil/hidden/blocked). resync_export.py refreshes this from the live catalog.
+    if "skon" in _al or _vl in ("hidden", "blocked", "cashdeskonly", "blockunregistered"):
+        _state = 3
+    elif any(x in _al for x in ("vypredan", "nedostupn", "není skladem")):
+        _state = 2
+    else:
+        _state = 1
+    _off = _state != 1
     out.append({
         "idx": i, "key": r["pair_key"], "supplier": r["supplier"], "name": r["name"],
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",
         "variant_codes": vcodes,
         "our_images": our_imgs[:6],
         "our_url": resolve_url(r["name"]),
-        "current": {"off": _off, "vis": _vis, "avail": _a},
+        "current": {"state": _state, "off": _off, "vis": _vis, "avail": _a},
         "ai_status": "matched" if matched else "unmatched",
         "ai_chosen_url": cands[ci]["url"] if matched else "",
         "ai_reason": v["reason"] if v else "",
