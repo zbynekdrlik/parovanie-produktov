@@ -174,6 +174,49 @@ def test_pairings_uploads_link_csv_and_marks_uploaded(monkeypatch, tmp_path):
     assert r2.get_json()["count"] == 0
 
 
+def test_pairings_rejects_wrong_token(monkeypatch, tmp_path):
+    _arm_pairings(monkeypatch, tmp_path, {})
+    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": "Bearer nope"})
+    assert r.status_code == 401
+
+
+def test_pairings_failed_import_does_not_mark_uploaded(monkeypatch, tmp_path):
+    # A FAILED import (rc != 0) must NOT record the pairing as uploaded — else it's
+    # silently lost and never retried.
+    dec = {"k1": {"status": "good", "url": "https://supplier/z"}}
+    tok = _arm_pairings(monkeypatch, tmp_path, dec)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (2, "POZOR: zlyhania", "boom"))
+    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 502 and r.get_json()["ok"] is False
+    # not marked → a later (succeeding) call still sees it as new
+    calls = {"n": 0}
+
+    def ok_run(p, dry_run=False, timeout=300):
+        calls["n"] += 1
+        return 0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""
+
+    monkeypatch.setattr(webapp, "run_import", ok_run)
+    r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    assert r2.get_json()["count"] == 1 and calls["n"] == 1
+
+
+def test_pairings_whitespace_url_does_not_re_upload_forever(monkeypatch, tmp_path):
+    # A decision URL with surrounding whitespace must be normalized so it's marked
+    # uploaded and not re-selected every night.
+    dec = {"k1": {"status": "good", "url": "https://supplier/w  "}}
+    tok = _arm_pairings(monkeypatch, tmp_path, dec)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (0, "spracované=2", ""))
+    assert _client().post("/api/n8n/upload-pairings",
+                          headers={"Authorization": f"Bearer {tok}"}).get_json()["count"] == 1
+    # second run: must be 0 (marked despite the trailing spaces)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-uploaded!")))
+    assert _client().post("/api/n8n/upload-pairings",
+                          headers={"Authorization": f"Bearer {tok}"}).get_json()["count"] == 0
+
+
 def test_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
     dec = {"k1": {"status": "manual", "url": "https://supplier/y"}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec)

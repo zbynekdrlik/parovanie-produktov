@@ -220,7 +220,7 @@ def api_decision():
         if status in (None, "", "undo"):          # undo / un-decide
             d.pop(key, None)
         else:
-            d[key] = {"status": status, "url": body.get("url", "")}
+            d[key] = {"status": status, "url": body.get("url", "").strip()}
         _save_decisions(d)
     log.info("decision key=%s status=%s url=%s", key, status, body.get("url", ""))
     return jsonify({"ok": True})
@@ -472,6 +472,17 @@ def n8n_upload_pairings():
         return jsonify({"ok": True, "count": 0, "products": products,
                         "message": "no import rows"}), 200
 
+    # surface a real data inconsistency: the same variant code paired to two different
+    # supplier URLs (a code can hold only one link, so first-wins drops the rest)
+    code_urls = {}
+    for k in new_keys:
+        for c in by_key.get(k, {}).get("variant_codes", []):
+            code_urls.setdefault(c, set()).add((dec[k].get("url") or "").strip())
+    conflicts = [c for c, u in code_urls.items() if len(u) > 1]
+    if conflicts:
+        log.warning("n8n pairings: %d codes paired to conflicting URLs (first wins): %s",
+                    len(conflicts), conflicts[:10])
+
     os.makedirs(OUT, exist_ok=True)
     out_fd, out_path = tempfile.mkstemp(prefix="import_links_", suffix=".csv", dir=OUT)
     with os.fdopen(out_fd, "w", encoding="utf-8-sig", newline="") as f:
@@ -488,18 +499,21 @@ def n8n_upload_pairings():
     try:
         # pairing CSVs can be large (an initial bulk of thousands of rows) → more time
         rc, out, err = run_import(out_path, dry_run=dry, timeout=900)
+        parsed = parse_import_log(out)
+        ok = rc == 0
+        if ok and not dry:                   # record only after a real success (inside the lock)
+            for k in new_keys:               # mark with the SAME normalization as the selection
+                uploaded[k] = (dec[k].get("url") or "").strip()
+            _save_uploaded(uploaded)
     except subprocess.TimeoutExpired:
         log.error("n8n pairings: subprocess timeout — killed import group")
+        _safe_unlink(out_path)
         return jsonify({"ok": False, "error": "import timeout"}), 504
     finally:
         _import_lock.release()
 
-    parsed = parse_import_log(out)
-    ok = rc == 0
-    if ok and not dry:                       # record only after a real success
-        for k in new_keys:
-            uploaded[k] = dec[k].get("url", "")
-        _save_uploaded(uploaded)
+    if ok:
+        _safe_unlink(out_path)               # success → drop the temp CSV (the catalog backup is the audit record)
     result = {"ok": ok, "exit_code": rc, "count": len(new_keys), "rows": len(rows),
               "dry_run": dry, "processed": parsed.get("processed"),
               "updated": parsed.get("updated"), "failed": parsed.get("failed"),

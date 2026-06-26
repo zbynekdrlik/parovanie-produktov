@@ -84,12 +84,13 @@ def link_rows(products, decisions, code2pair):
         d = decisions.get(p.get("key"))
         if not d:
             continue
-        if d.get("status") in ("good", "manual") and d.get("url"):
+        if d.get("status") in ("good", "manual") and (d.get("url") or "").strip():
+            url = d["url"].strip()
             for c in p["variant_codes"]:
                 if c in seen:
                     continue
                 seen.add(c)
-                rows.append([c, code2pair.get(c, ""), d["url"]])
+                rows.append([c, code2pair.get(c, ""), url])
     return rows
 
 
