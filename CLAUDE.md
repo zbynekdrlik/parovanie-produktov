@@ -9,6 +9,9 @@ Load the matching skill BEFORE working on that area (don't re-derive):
 - deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`
 
 ## Always
-- Kódovanie I/O = **cp1250**, `;`, CRLF (Shoptet import).
-- Testy bez živej siete (uložené HTML fixtúry): `.venv/bin/pytest`. Beh: `PYTHONPATH=src`.
+- Kódovanie I/O = **cp1250** na ČÍTANIE exportu; **import CSV = UTF-8 s BOM** (`utf-8-sig`), `;`, CRLF (cp1250 import → mojibake `č`→`è`).
+- Testy bez živej siete (uložené HTML fixtúry): `.venv/bin/pytest`. Beh: `PYTHONPATH=src`. Hlavný beh ide `--ignore=tests/e2e`.
 - Dáta (`data/`) a `.venv/` sú gitignored; veľký export sa necommituje.
+- **Verzia**: `src/parovanie/__init__.py` `__version__` — bumpni na `dev` PRED prácou (CI job `version-check` vyžaduje dev > main). Zobrazuje sa na webe cez `/api/version` (footer); po deployi over na živom DOM.
+- **Zdieľané helpery — NEkopíruj logiku**: `csv_loader.load_code2pair`, `writer.shoptet_writer` (kánonický CSV dialekt), `export_helpers` (`slug`/`state_of`/`IMGCOLS`/`row_images`). 3-stavová klasifikácia produktu žije v `export_helpers.state_of` (raz, otestované).
+- **E2E webu**: `tests/e2e` (pytest-playwright) bootuje `webreview/app.py` proti fixture cez env `WEBREVIEW_OUT`/`WEBREVIEW_PRODUCTS`/`WEBREVIEW_PORT`; samostatný CI job `e2e`. App toleruje chýbajúci `review_data.json` (0 produktov).
