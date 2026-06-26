@@ -6,6 +6,7 @@ import re
 from bs4 import BeautifulSoup
 
 from parovanie.models import Product
+from parovanie.normalize import code_present
 
 _WS = re.compile(r"\s+")
 
@@ -112,10 +113,9 @@ def code_verdict(product: Product, page: dict) -> tuple[str, str]:
     if not product.external_code:
         return "UNSURE", "no external code to verify against"
 
-    code = product.external_code.lower()
-    hay = " ".join(filter(None, [page.get("title"), page.get("code")])).lower()
+    hay = " ".join(filter(None, [page.get("title"), page.get("code")]))
 
-    if code in hay:
+    if code_present(product.external_code, hay):
         return "OK", f"code {product.external_code} present on page"
     return "UNSURE", f"code {product.external_code} not found on page"
 

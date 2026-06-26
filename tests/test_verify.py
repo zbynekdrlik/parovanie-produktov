@@ -36,6 +36,22 @@ def test_code_verdict_unsure_when_absent():
     assert verdict == "UNSURE"
 
 
+def test_code_verdict_unsure_on_substring_of_longer_number():
+    # Regression: code '376' must NOT verify-OK against a page titled '...3760'
+    # (a raw `code in hay` substring test wrongly rubber-stamped it).
+    page = {"title": "Lampáš model 3760", "code": None, "price": None}
+    p = Product("BETALOV", "k", "376", "Lampáš", ["c"])
+    verdict, _ = code_verdict(p, page)
+    assert verdict == "UNSURE", "code '376' wrongly matched '3760'"
+
+
+def test_code_verdict_ok_on_delimited_short_code():
+    page = {"title": "Lampáš model 376 LED", "code": "376", "price": None}
+    p = Product("BETALOV", "k", "376", "Lampáš", ["c"])
+    verdict, _ = code_verdict(p, page)
+    assert verdict == "OK"
+
+
 def test_merge_verdict_fills_columns():
     rows = [{"supplier": "BETALOV", "name": "X", "verdict": "", "verdict_reason": "",
              "attempts": ""}]

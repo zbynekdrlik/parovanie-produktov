@@ -29,3 +29,20 @@ def test_name_match_ranks_closest_first():
 def test_empty_candidates_returns_none():
     best, conf = pick_best(_p("X"), [])
     assert best is None and conf == "none"
+
+
+def test_short_numeric_code_not_substring_matched():
+    # Regression: external_code '110' must NOT match candidate '...model 1100'
+    # (a raw `code in hay` substring test wrongly boosted it to 'high').
+    p = _p("Nôž lovecký Helle 110", "110")
+    cands = [Candidate("Nôž Helle model 1100", "https://h/noz-helle-1100")]
+    best, conf = pick_best(p, cands)
+    assert conf != "high", f"code '110' wrongly high-matched '1100' (conf={conf})"
+
+
+def test_delimited_short_code_still_high():
+    # A short code that appears as a whole token SHOULD still boost to 'high'.
+    p = _p("Nôž 110", "110")
+    cands = [Candidate("Nôž lovecký model 110 oceľ", "https://h/noz-110")]
+    best, conf = pick_best(p, cands)
+    assert conf == "high"
