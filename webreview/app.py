@@ -6,13 +6,17 @@ Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:879
 """
 from __future__ import annotations
 import csv
+import hmac
 import io
 import json
 import logging
 import os
 import re
 import hashlib
+import subprocess
+import sys
 import threading
+import time
 import zipfile
 from urllib.parse import urljoin
 
@@ -21,6 +25,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, send_from_directory, Response
 
 from parovanie import __version__, import_builder
+from parovanie.shoptet_import import parse_import_log
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data dir is env-overridable so tests/E2E can boot the app against a fixture.
@@ -33,6 +38,9 @@ os.makedirs(IMGCACHE, exist_ok=True)
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 app = Flask(__name__, static_folder="static", template_folder="templates")
 _lock = threading.Lock()
+_import_lock = threading.Lock()   # one Shoptet import at a time (browser automation)
+CRED_PATH = os.environ.get("SHOPTET_CRED") or os.path.join(ROOT, "data", ".shoptet_admin")
+IMPORT_SCRIPT = os.path.join(ROOT, "scripts", "shoptet_import.py")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -271,6 +279,92 @@ def api_export():
 @app.route("/static/<path:p>")
 def static_files(p):
     return send_from_directory("static", p)
+
+
+# --------------------------------------------------------------------------- #
+# n8n → Shoptet auto-import (vypredané → skladom)
+# --------------------------------------------------------------------------- #
+def _import_token():
+    """Bearer token for the import endpoint, from the gitignored creds file
+    (key N8N_IMPORT_TOKEN). None if not configured → endpoint refuses all calls."""
+    try:
+        with open(CRED_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("N8N_IMPORT_TOKEN=") and "=" in line:
+                    v = line.split("=", 1)[1].strip().strip("'\"")
+                    return v or None
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def run_import(csv_path, dry_run=False):
+    """Run the existing careful import script as a subprocess (it does the catalog
+    backup + safe-mode + result read-back). Returns (returncode, stdout, stderr).
+    Separated out so tests can stub it without launching a browser."""
+    cmd = [sys.executable, IMPORT_SCRIPT, "--file", csv_path, "--yes"]
+    if dry_run:
+        cmd.append("--dry-run")
+    env = {**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")}
+    p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True,
+                       timeout=300, check=False)
+    return p.returncode, p.stdout, p.stderr
+
+
+@app.route("/api/n8n/shoptet-import", methods=["POST"])
+def n8n_shoptet_import():
+    """n8n posts a restock CSV (multipart 'file', or raw body); we whitelist it to
+    the safe restock columns and run the careful Shoptet import. Bearer-authّd.
+    Pass dry_run=1 (form/query) to reach the import form without changing anything."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    if not token or not hmac.compare_digest(auth, f"Bearer {token}"):
+        log.warning("n8n import: unauthorized call from %s", request.remote_addr)
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    f = request.files.get("file")
+    raw = f.read() if f else request.get_data()
+    if not raw:
+        log.warning("n8n import: empty body")
+        return jsonify({"ok": False, "error": "empty body"}), 400
+
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    raw_path = os.path.join(OUT, f"n8n_restock_{ts}_raw.csv")
+    out_path = os.path.join(OUT, f"n8n_restock_{ts}.csv")
+    with open(raw_path, "wb") as w:
+        w.write(raw)
+    try:
+        rows = import_builder.sanitize_csv(raw_path, out_path)
+    except ValueError as e:
+        log.warning("n8n import: bad CSV: %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 400
+    if rows == 0:
+        log.info("n8n import: 0 restock rows — nothing to import")
+        return jsonify({"ok": True, "rows": 0, "message": "no restock rows"}), 200
+
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    if not _import_lock.acquire(blocking=False):
+        log.warning("n8n import: another import already running")
+        return jsonify({"ok": False, "error": "import already running"}), 409
+    log.info("n8n import: %d rows, dry_run=%s, file=%s", rows, dry, out_path)
+    try:
+        rc, out, err = run_import(out_path, dry_run=dry)
+    except subprocess.TimeoutExpired:
+        log.error("n8n import: subprocess timeout")
+        return jsonify({"ok": False, "error": "import timeout"}), 504
+    finally:
+        _import_lock.release()
+
+    parsed = parse_import_log(out)
+    result = {"ok": rc == 0, "exit_code": rc, "rows": rows, "dry_run": dry,
+              "processed": parsed.get("processed"), "updated": parsed.get("updated"),
+              "failed": parsed.get("failed"), "stdout_tail": (out or "")[-800:]}
+    log.info("n8n import: rc=%s processed=%s updated=%s failed=%s",
+             rc, parsed.get("processed"), parsed.get("updated"), parsed.get("failed"))
+    if rc != 0:
+        log.error("n8n import FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
+    return jsonify(result), (200 if rc == 0 else 502)
 
 
 if __name__ == "__main__":
