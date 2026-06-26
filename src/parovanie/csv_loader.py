@@ -14,3 +14,15 @@ def load_rows(path: str, suppliers: set[str]) -> list[dict]:
             if sup in want:
                 out.append(row)
     return out
+
+
+def load_code2pair(path: str) -> dict[str, str]:
+    """Map variant `code` -> `pairCode` from a Shoptet export (cp1250, ';').
+    Shoptet imports need BOTH columns; this is the one shared reader for it."""
+    out: dict[str, str] = {}
+    with open(path, encoding="cp1250", errors="replace", newline="") as f:
+        for row in csv.DictReader(f, delimiter=";"):
+            code = (row.get("code") or "").strip()
+            if code:
+                out[code] = (row.get("pairCode") or "").strip()
+    return out

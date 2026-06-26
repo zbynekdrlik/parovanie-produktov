@@ -8,15 +8,21 @@ def _writer(f):
                       lineterminator="\r\n")
 
 
-def write_import(matches: list[Match], path: str) -> None:
-    with open(path, "w", encoding="cp1250", errors="replace", newline="") as f:
+def write_import(matches: list[Match], path: str,
+                 code2pair: dict[str, str] | None = None) -> None:
+    """Shoptet link import: code;pairCode;internalNote, UTF-8 with BOM (the
+    documented contract — Shoptet needs both code AND pairCode, and cp1250 causes
+    'č'→'è' mojibake). One row per matched variant; reorder URL in the private
+    internalNote field."""
+    code2pair = code2pair or {}
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = _writer(f)
-        w.writerow(["code", "internalNote"])  # reorder URL → private field (not public textProperty)
+        w.writerow(["code", "pairCode", "internalNote"])
         for m in matches:
             if m.chosen is None:
                 continue
             for code in m.product.variant_codes:
-                w.writerow([code, m.chosen.url])
+                w.writerow([code, code2pair.get(code, ""), m.chosen.url])
 
 
 REPORT_COLS = ["supplier", "external_code", "name", "query", "chosen_url",

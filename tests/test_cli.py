@@ -1,6 +1,6 @@
 import os
 from parovanie.models import Candidate
-from parovanie.cli import run
+from parovanie.cli import run, run_gather
 
 FIX = "tests/fixtures/sample_products.csv"
 
@@ -59,3 +59,23 @@ def test_run_continues_when_one_product_fails(tmp_path):
     assert any(m.chosen is None and m.confidence == "none" for m in matches)
     assert any(m.chosen is not None for m in matches)
     assert os.path.exists(out / "import_betalov_wetland.csv")
+
+
+def test_run_gather_resume_skips_already_gathered(tmp_path):
+    out = tmp_path / "out"
+    ck = tmp_path / "gck.json"
+
+    class CountingClient:
+        def __init__(self): self.calls = 0
+        def search(self, supplier, query):
+            self.calls += 1
+            return [Candidate("X", f"https://x/{supplier.lower()}")]
+
+    c1 = CountingClient()
+    run_gather(FIX, str(out), {"BETALOV", "WETLAND"}, client=c1, checkpoint=str(ck))
+    assert c1.calls > 0
+    assert os.path.exists(out / "candidates.json")
+    # second run with same checkpoint: every product already gathered -> zero searches
+    c2 = CountingClient()
+    run_gather(FIX, str(out), {"BETALOV", "WETLAND"}, client=c2, checkpoint=str(ck))
+    assert c2.calls == 0
