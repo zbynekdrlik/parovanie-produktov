@@ -22,8 +22,37 @@ LINK_HEADER = ["code", "pairCode", "internalNote"]
 STATE_HEADER = ["code", "pairCode", "productVisibility", "stock",
                 "availabilityInStock", "availabilityOutOfStock"]
 
+# Restock import (vypredané → skladom): the ONLY columns a restock CSV may set.
+# An upstream feed (n8n) carries extra info columns (name, prices, supplier, …);
+# Shoptet imports every recognised header, so we must keep ONLY these — otherwise
+# the feed could silently overwrite prices/names on the live eshop.
+RESTOCK_COLS = ["code", "pairCode", "productVisibility", "availabilityInStock", "stock"]
+
 _VYPREDANE = "Vypredané"
 _SKONCIL = "Predaj výrobku skončil"
+
+
+def sanitize_csv(in_path, out_path, cols=RESTOCK_COLS):
+    """Read an arbitrary ';'-CSV (utf-8 or utf-8-sig) and rewrite it keeping ONLY
+    `cols`, in the canonical Shoptet import dialect (utf-8-sig BOM, ';', CRLF).
+    Every other column is dropped, so an upstream feed can never overwrite a field
+    it didn't intend to (prices, names, …). Rows with an empty `code` are skipped.
+    Returns the kept-row count. Raises ValueError if the input lacks code+pairCode."""
+    import csv as _csv
+
+    from parovanie.writer import shoptet_writer
+    with open(in_path, encoding="utf-8-sig", newline="") as f:
+        reader = _csv.DictReader(f, delimiter=";")
+        fields = reader.fieldnames or []
+        if "code" not in fields or "pairCode" not in fields:
+            raise ValueError(f"vstupné CSV nemá code+pairCode (má: {fields})")
+        rows = [[(row.get(c) or "").strip() for c in cols]
+                for row in reader if (row.get("code") or "").strip()]
+    with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
+        w = shoptet_writer(f)
+        w.writerow(cols)
+        w.writerows(rows)
+    return len(rows)
 
 
 def link_rows(products, decisions, code2pair):

@@ -6,13 +6,19 @@ Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:879
 """
 from __future__ import annotations
 import csv
+import hmac
 import io
 import json
 import logging
 import os
 import re
 import hashlib
+import signal
+import subprocess
+import sys
+import tempfile
 import threading
+import time
 import zipfile
 from urllib.parse import urljoin
 
@@ -21,6 +27,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, send_from_directory, Response
 
 from parovanie import __version__, import_builder
+from parovanie.shoptet_import import parse_import_log
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data dir is env-overridable so tests/E2E can boot the app against a fixture.
@@ -33,6 +40,9 @@ os.makedirs(IMGCACHE, exist_ok=True)
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 app = Flask(__name__, static_folder="static", template_folder="templates")
 _lock = threading.Lock()
+_import_lock = threading.Lock()   # one Shoptet import at a time (browser automation)
+CRED_PATH = os.environ.get("SHOPTET_CRED") or os.path.join(ROOT, "data", ".shoptet_admin")
+IMPORT_SCRIPT = os.path.join(ROOT, "scripts", "shoptet_import.py")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -271,6 +281,137 @@ def api_export():
 @app.route("/static/<path:p>")
 def static_files(p):
     return send_from_directory("static", p)
+
+
+# --------------------------------------------------------------------------- #
+# n8n → Shoptet auto-import (vypredané → skladom)
+# --------------------------------------------------------------------------- #
+def _import_token():
+    """Bearer token for the import endpoint, from the gitignored creds file
+    (key N8N_IMPORT_TOKEN). None if not configured → endpoint refuses all calls."""
+    try:
+        with open(CRED_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("N8N_IMPORT_TOKEN=") and "=" in line:
+                    v = line.split("=", 1)[1].strip().strip("'\"")
+                    return v or None
+    except FileNotFoundError:
+        return None
+    return None
+
+
+MAX_IMPORT_BYTES = 5 * 1024 * 1024   # restock CSVs are a few kB; cap the in-memory read
+
+
+def _safe_unlink(*paths):
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _client_ip():
+    """Real caller IP behind the Cloudflare tunnel (so the unauthorized-attempt
+    log is useful, not just the tunnel/local address)."""
+    return (request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.remote_addr)
+
+
+def run_import(csv_path, dry_run=False):
+    """Run the existing careful import script as a subprocess (catalog backup +
+    safe-mode + result read-back). Returns (returncode, stdout, stderr). Started in
+    its own session so a timeout kills the WHOLE group (the Playwright/Chromium it
+    spawns too), never an orphaned browser mid-import. Stubbable in tests."""
+    cmd = [sys.executable, IMPORT_SCRIPT, "--file", csv_path, "--yes"]
+    if dry_run:
+        cmd.append("--dry-run")
+    env = {**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")}
+    p = subprocess.Popen(cmd, cwd=ROOT, env=env, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        p.communicate()
+        raise
+    return p.returncode, out, err
+
+
+@app.route("/api/n8n/shoptet-import", methods=["POST"])
+def n8n_shoptet_import():
+    """n8n posts a restock CSV (multipart 'file', or raw body); we whitelist it to
+    the safe restock columns and run the careful Shoptet import. Bearer-auth'd.
+    Pass dry_run=1 (form/query) to reach the import form without changing anything."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {token}".encode() if token else b""
+    # compare bytes — a non-ASCII Authorization header must 401, not raise (latin-1
+    # is how WSGI decodes the header; compare_digest rejects non-ASCII str args)
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n import: unauthorized call from %s", _client_ip())
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    f = request.files.get("file")
+    raw = f.read() if f else request.get_data()
+    if not raw:
+        log.warning("n8n import: empty body")
+        return jsonify({"ok": False, "error": "empty body"}), 400
+    if len(raw) > MAX_IMPORT_BYTES:
+        log.warning("n8n import: payload too large (%d B)", len(raw))
+        return jsonify({"ok": False, "error": "payload too large"}), 413
+
+    os.makedirs(OUT, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    # unique names (mkstemp) so two same-second calls never clobber each other's
+    # file while a subprocess is reading it
+    raw_fd, raw_path = tempfile.mkstemp(prefix=f"n8n_restock_{ts}_", suffix="_raw.csv", dir=OUT)
+    out_fd, out_path = tempfile.mkstemp(prefix=f"n8n_restock_{ts}_", suffix=".csv", dir=OUT)
+    os.close(out_fd)
+    with os.fdopen(raw_fd, "wb") as w:
+        w.write(raw)
+    try:
+        rows = import_builder.sanitize_csv(raw_path, out_path)
+    except (ValueError, UnicodeDecodeError) as e:
+        log.warning("n8n import: bad CSV: %s", e)
+        _safe_unlink(raw_path, out_path)
+        return jsonify({"ok": False, "error": str(e)}), 400
+    finally:
+        _safe_unlink(raw_path)   # sanitized file is the audit record; raw is transient
+    if rows == 0:
+        log.info("n8n import: 0 restock rows — nothing to import")
+        _safe_unlink(out_path)
+        return jsonify({"ok": True, "rows": 0, "message": "no restock rows"}), 200
+
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    if not _import_lock.acquire(blocking=False):
+        log.warning("n8n import: another import already running")
+        _safe_unlink(out_path)
+        return jsonify({"ok": False, "error": "import already running"}), 409
+    log.info("n8n import: %d rows, dry_run=%s, file=%s", rows, dry, out_path)
+    try:
+        rc, out, err = run_import(out_path, dry_run=dry)
+    except subprocess.TimeoutExpired:
+        log.error("n8n import: subprocess timeout — killed import group")
+        return jsonify({"ok": False, "error": "import timeout"}), 504
+    finally:
+        _import_lock.release()
+
+    parsed = parse_import_log(out)
+    result = {"ok": rc == 0, "exit_code": rc, "rows": rows, "dry_run": dry,
+              "processed": parsed.get("processed"), "updated": parsed.get("updated"),
+              "failed": parsed.get("failed"), "stdout_tail": (out or "")[-800:]}
+    log.info("n8n import: rc=%s processed=%s updated=%s failed=%s",
+             rc, parsed.get("processed"), parsed.get("updated"), parsed.get("failed"))
+    if rc != 0:
+        log.error("n8n import FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
+    return jsonify(result), (200 if rc == 0 else 502)
 
 
 if __name__ == "__main__":

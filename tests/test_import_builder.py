@@ -1,9 +1,77 @@
+import csv
+
+import pytest
+
 from parovanie.import_builder import (
     LINK_HEADER,
+    RESTOCK_COLS,
     STATE_HEADER,
     link_rows,
+    sanitize_csv,
     state_rows,
 )
+
+
+def _write(path, header, rows, delim=";", bom=False):
+    enc = "utf-8-sig" if bom else "utf-8"
+    with open(path, "w", encoding=enc, newline="") as f:
+        w = csv.writer(f, delimiter=delim)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def test_sanitize_drops_unsafe_columns_keeps_restock(tmp_path):
+    # An n8n feed with price/name columns must NEVER reach Shoptet — only the
+    # restock columns survive, so the live eshop's prices/names are not overwritten.
+    src = tmp_path / "feed.csv"
+    out = tmp_path / "import.csv"
+    header = ["code", "pairCode", "name", "purchasePrice", "ourPrice",
+              "productVisibility", "availabilityInStock", "stock", "competition_price"]
+    _write(src, header, [["15233/M", "1564", "Vesta", "999", "67.80",
+                          "visible", "Skladom", "5", "111"]])
+    n = sanitize_csv(str(src), str(out))
+    assert n == 1
+    with open(out, encoding="utf-8-sig", newline="") as f:
+        rd = csv.DictReader(f, delimiter=";")
+        assert rd.fieldnames == RESTOCK_COLS
+        row = next(rd)
+    assert row == {"code": "15233/M", "pairCode": "1564",
+                   "productVisibility": "visible", "availabilityInStock": "Skladom",
+                   "stock": "5"}
+    # the dangerous columns are gone
+    text = out.read_text(encoding="utf-8-sig")
+    for bad in ("999", "67.80", "Vesta", "purchasePrice", "ourPrice", "competition_price"):
+        assert bad not in text
+
+
+def test_sanitize_writes_bom_utf8(tmp_path):
+    src = tmp_path / "feed.csv"
+    out = tmp_path / "import.csv"
+    _write(src, ["code", "pairCode"], [["A/1", "10"]])
+    sanitize_csv(str(src), str(out))
+    assert out.read_bytes().startswith(b"\xef\xbb\xbf")  # UTF-8 BOM (Shoptet import)
+
+
+def test_sanitize_skips_empty_code_rows(tmp_path):
+    src = tmp_path / "feed.csv"
+    out = tmp_path / "import.csv"
+    _write(src, ["code", "pairCode", "stock"], [["A/1", "10", "5"], ["", "10", "5"]])
+    assert sanitize_csv(str(src), str(out)) == 1
+
+
+def test_sanitize_reads_bom_input(tmp_path):
+    src = tmp_path / "feed.csv"
+    out = tmp_path / "import.csv"
+    _write(src, ["code", "pairCode", "stock"], [["A/1", "10", "5"]], bom=True)
+    assert sanitize_csv(str(src), str(out)) == 1
+
+
+def test_sanitize_rejects_csv_without_code_paircode(tmp_path):
+    src = tmp_path / "feed.csv"
+    out = tmp_path / "import.csv"
+    _write(src, ["name", "stock"], [["Vesta", "5"]])
+    with pytest.raises(ValueError):
+        sanitize_csv(str(src), str(out))
 
 
 def test_headers_disjoint_no_empty_wipe():

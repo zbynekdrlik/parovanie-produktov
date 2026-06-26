@@ -80,3 +80,14 @@ Workflow **„Forestshop products export"** (`pi2vURB2wwGwTBPG`, n8n.newlevel.me
   - Beh je **ťažký**: 59 MB XML, **~3,5 min**, počas neho n8n padá na **502/520** (preťaženie). Poistka = `retryOnFail` na HTTP uzloch. Zľahčenie = doplniť `url` do XLS exportu a zrušiť XML (zatiaľ NErobené — user zvolil len poistky).
   - dataTable `deleteRows` má `dryRun` (vracia **2× riadky** — before+after stav); upsert **neprunuje** → nespárované staré riadky čisti `deleteRows` kde `internalNote isEmpty` (jednorazovo).
   - Read tabuľky: nový workflow v **tom istom projekte** (`KWh7xR1bd5EyraM5`), inak Data Table nevidí. Žiadny MCP „read rows" tool — čítaj cez `dataTable get returnAll`.
+
+## n8n → spustenie importu (HTTP endpoint na dev1)
+
+n8n (cloud) spustí Shoptet import cez **HTTP endpoint na dev1**: `POST https://parovanie-forestshop.newlevel.media/api/n8n/shoptet-import` (route vo webreview Flask appke `webreview/app.py`, za existujúcim `parovanie-tunnel`). n8n je v cloude, creds+prehliadač sú na dev1 → cloud volá verejnú adresu tunela.
+
+- **Auth:** `Authorization: Bearer <token>`, constant-time (`hmac.compare_digest`). Token v `data/.shoptet_admin` kľúč **`N8N_IMPORT_TOKEN`** (gitignored, chmod 600). Bez tokenu endpoint odmietne všetko (401).
+- **Telo:** CSV (multipart `file` alebo raw body). Endpoint **whitelistne stĺpce** na `import_builder.RESTOCK_COLS` = `code, pairCode, productVisibility, availabilityInStock, stock` — **nikdy ceny/názvy** (n8n feed nesie navyše `name`,`purchasePrice`,`ourPrice`… → Shoptet by ich inak prepísal). Potom spustí `scripts/shoptet_import.py --file … --yes` (záloha katalógu + bezpečný režim + read-back).
+- **`?dry_run=1`** → script ide `--dry-run` (login + dôjde na import, NIČ nenahrá) — takto over chain bez zmeny eshopu.
+- **Odpoveď JSON:** `{ok, exit_code, rows, processed, updated, failed, dry_run, stdout_tail}`. 401 bez tokenu, 400 zlé CSV, 409 keď už beží import (lock), 504 timeout, 502 keď import zlyhal.
+- **n8n workflow „Forestshop — Vypredané → Skladom v2"** (`KN1BE18HLdM8mfTc`): `Denne 06:00 → Naše produkty + Dodávateľský sklad → Vyhodnoť kandidátov → CSV príloha → [Discord notif] + [HTTP „Importuj do Shoptetu"]`. HTTP uzol = `httpRequest` v4.4, `contentType: binaryData`, `inputDataFieldName: data`, `options.timeout: 200000`, `neverError: true`. **PUBLISHED + active** (denne ~06:00, plne automaticky).
+- **Pasca:** n8n credential cez MCP **NEvieš vytvoriť** (žiadny tool) → token je natvrdo v header parametri uzla (`HARDCODED_CREDENTIALS` warning). Pre privátny n8n OK; presun do httpHeaderAuth credentialu sa dá len cez UI.
