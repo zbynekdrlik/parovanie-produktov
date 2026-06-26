@@ -10,6 +10,7 @@ from parovanie.shoptet_import import (
     load_credentials,
     parse_import_log,
     preflight_csv,
+    result_exit_code,
 )
 
 
@@ -17,6 +18,21 @@ def _write(tmp_path, text):
     p = tmp_path / ".shoptet_admin"
     p.write_text(text, encoding="utf-8")
     return str(p)
+
+
+def test_result_exit_code_unreadable_is_nonzero():
+    # processed=None (Log unreadable) → never report success
+    assert result_exit_code({"processed": None, "updated": None, "failed": None}) == 2
+    assert result_exit_code(None) == 2
+
+
+def test_result_exit_code_failures_is_nonzero():
+    assert result_exit_code({"processed": 100, "updated": 50, "failed": 3}) == 2
+
+
+def test_result_exit_code_clean_is_zero():
+    assert result_exit_code({"processed": 100, "updated": 50, "failed": None}) == 0
+    assert result_exit_code({"processed": 100, "updated": 50, "failed": 0}) == 0
 
 
 def test_load_credentials_ok(tmp_path):

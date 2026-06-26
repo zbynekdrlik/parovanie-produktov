@@ -41,3 +41,21 @@ def test_resume_skips_already_matched(tmp_path):
     matches = run(FIX, str(out), {"BETALOV", "WETLAND"}, client=c2, checkpoint=str(ck))
     assert c2.calls == 0
     assert all(m.chosen is not None for m in matches)
+
+
+def test_run_continues_when_one_product_fails(tmp_path):
+    # Regression: a persistent fetch failure on one product must NOT abort the
+    # whole batch — it degrades to an unmatched Match and the rest still run.
+    out = tmp_path / "out"
+
+    class FlakyClient:
+        def search(self, supplier, query):
+            if supplier == "BETALOV":
+                raise RuntimeError("supplier down")
+            return [Candidate("Strike Deerhunter 3989", "https://w/strike-3989")]
+
+    matches = run(FIX, str(out), {"BETALOV", "WETLAND"}, client=FlakyClient())
+    assert len(matches) == 2
+    assert any(m.chosen is None and m.confidence == "none" for m in matches)
+    assert any(m.chosen is not None for m in matches)
+    assert os.path.exists(out / "import_betalov_wetland.csv")
