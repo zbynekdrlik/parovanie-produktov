@@ -111,3 +111,14 @@ def parse_import_log(text):
         # required, so the prose 'skončil s chybou …' can't bridge to a later number)
         "failed": _num_after(low, r"zlyhan\w*[^0-9]{0,40}?(\d+)", r"ch[ýy]b\w*\s*:\s*(\d+)"),
     }
+
+
+def result_exit_code(parsed) -> int:
+    """Process exit code for a parsed import result — never report a failed or
+    unreadable import as success. processed=None (Log unreadable) → 2; any reported
+    failures → 2; only a clean processed-count with no failures → 0."""
+    if not parsed or parsed.get("processed") is None:
+        return 2
+    if parsed.get("failed"):
+        return 2
+    return 0

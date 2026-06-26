@@ -61,7 +61,13 @@ def run(input_csv: str, out_dir: str, suppliers: set[str], client=None,
         if p.pair_key in done:
             matches.append(_ckpt_to_match(p, done[p.pair_key]))
             continue
-        m = match_one(p, client)
+        try:
+            m = match_one(p, client)
+        except Exception as e:  # noqa: BLE001 — degrade per-item, never abort the batch
+            log.warning("match failed for %s %r: %r — recording as unmatched",
+                        p.supplier, p.name[:40], e)
+            m = Match(product=p, query="", chosen=None, confidence="none",
+                      candidate_count=0)
         matches.append(m)
         if checkpoint:
             done[p.pair_key] = _match_to_ckpt(m)
@@ -88,7 +94,12 @@ def run_gather(input_csv, out_dir, suppliers, client=None, checkpoint=None, k=8)
         if p.pair_key in done:
             records.append(done[p.pair_key])
             continue
-        queries, cands = gather_candidates(p, client, k=k)
+        try:
+            queries, cands = gather_candidates(p, client, k=k)
+        except Exception as e:  # noqa: BLE001 — degrade per-item, never abort the batch
+            log.warning("gather failed for %s %r: %r — recording empty candidates",
+                        p.supplier, p.name[:40], e)
+            queries, cands = [], []
         rec = candidates_io.record(p, queries, cands)
         records.append(rec)
         log.info("[%d/%d] %s %r -> %d candidates", i, len(products), p.supplier,

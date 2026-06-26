@@ -1,15 +1,14 @@
 from __future__ import annotations
 from rapidfuzz import fuzz
 from parovanie.models import Product, Candidate
-from parovanie.normalize import clean_name
+from parovanie.normalize import clean_name, code_present
 
 
 def _code_hit(product: Product, c: Candidate) -> bool:
     if not product.external_code:
         return False
-    code = product.external_code.lower()
-    hay = " ".join(filter(None, [c.name, c.url, c.code or ""])).lower()
-    return code in hay
+    hay = " ".join(filter(None, [c.name, c.url, c.code or ""]))
+    return code_present(product.external_code, hay)
 
 
 def _name_score(product: Product, c: Candidate) -> float:

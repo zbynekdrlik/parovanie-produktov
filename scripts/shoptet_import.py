@@ -29,6 +29,7 @@ from parovanie.shoptet_import import (  # noqa: E402
     load_credentials,
     parse_import_log,
     preflight_csv,
+    result_exit_code,
 )
 
 CRED_PATH = "data/.shoptet_admin"
@@ -146,14 +147,15 @@ def _run_browser(args, creds, plan):
     (AUDIT_DIR / f"shoptet_import_{ts}.log").write_text(result_text, encoding="utf-8")
     print(f"\nVÝSLEDOK: spracované={log['processed']} upravené={log['updated']} "
           f"zlyhania={log['failed']}")
-    if log["processed"] is None:
-        # výsledok sa nedal prečítať (zmena Logu / nenačítaná stránka) — NEhlás úspech
-        print("POZOR: výsledok importu sa nepodarilo prečítať — over Log ručne.", file=sys.stderr)
-        return 2
-    if log["failed"]:
-        print("POZOR: Shoptet hlási zlyhania — skontroluj log.", file=sys.stderr)
-        return 2
-    return 0
+    rc = result_exit_code(log)
+    if rc != 0:
+        if log["processed"] is None:
+            # výsledok sa nedal prečítať (zmena Logu / nenačítaná stránka) — NEhlás úspech
+            print("POZOR: výsledok importu sa nepodarilo prečítať — over Log ručne.",
+                  file=sys.stderr)
+        else:
+            print("POZOR: Shoptet hlási zlyhania — skontroluj log.", file=sys.stderr)
+    return rc
 
 
 def _login(page, creds):
