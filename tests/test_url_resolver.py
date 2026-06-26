@@ -103,3 +103,38 @@ def test_no_candidate_returns_none():
     url, strength, _ = resolve("Úplne iný produkt XYZ", [], *build_index(SITEMAP))
     assert url is None
     assert strength == 0
+
+
+def test_image_supported_tie_does_not_guess():
+    """Two image-supported candidates with EQUAL extra-token counts → the
+    fewest-extra tiebreak must refuse to guess (return None), not pick one."""
+    sitemap = [
+        "vesta-deerhunter-moor-padded-red",
+        "vesta-deerhunter-moor-padded-blue",
+    ]
+    # image tokens {vesta,deerhunter,moor,padded} are a subset of BOTH; each slug
+    # adds exactly one extra token (red / blue) → symmetric tie.
+    url, strength, _ = resolve(
+        "Vesta Deerhunter Moor Padded",
+        [CDN + "100_vesta-deerhunter-moor-padded.jpg"],
+        *build_index(sitemap))
+    assert url is None
+    assert strength == 0
+
+
+def test_dedup_tie_among_different_products_drops_all():
+    """When the strongest match to one URL is a tie between DIFFERENT products,
+    neither gets the link (don't hand a wrong link to either)."""
+    sitemap = ["polovnicke-rukavice-deerhunter-muflon-pro-light-gloves"]
+    products = [  # both single-superset (strength 1), different names → tie → drop both
+        {"name": "Deerhunter Muflon Light rukavice", "our_images": []},
+        {"name": "Rukavice Deerhunter Muflon Gloves", "our_images": []},
+    ]
+    urls = assign_urls(products, sitemap)
+    assert urls[0] is None
+    assert urls[1] is None
+
+
+def test_none_images_does_not_crash():
+    url, _, _ = resolve("Poľovnícka vesta Deerhunter Moor Padded 367", None, *build_index(SITEMAP))
+    assert url is None

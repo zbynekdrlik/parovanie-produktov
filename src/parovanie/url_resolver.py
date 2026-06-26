@@ -25,7 +25,7 @@ from parovanie.export_helpers import slug
 
 BASE = "https://www.forestshop.sk/"
 
-_IMG_EXT = re.compile(r"\.(jpe?g|png|webp|gif)$", re.IGNORECASE)
+_IMG_EXT = re.compile(r"\.(jpe?g|png|webp|gif|avif|svg|bmp|tiff?)$", re.IGNORECASE)
 _IMG_CODE_PREFIX = re.compile(r"^\d+(?:-\d+)?_")  # Shoptet "15233_" / "15233-1_" prefix
 
 # Resolution strength (higher = more trustworthy), used by the dedup pass.
@@ -44,7 +44,7 @@ def image_slug(url: str) -> str:
     """Descriptive slug from a Shoptet image URL: drop directory, query, file
     extension, and the leading numeric code prefix, then slugify the rest.
     `…/orig/15233_deerhunter-moor-padded-waistcoat-vesta.jpg?x` → that slug."""
-    base = url.rsplit("/", 1)[-1].split("?")[0]
+    base = url.split("?", 1)[0].rsplit("/", 1)[-1]  # drop query first (it may hold '/')
     base = _IMG_EXT.sub("", base)
     base = _IMG_CODE_PREFIX.sub("", base)
     return slug(base)
@@ -78,7 +78,7 @@ def resolve(name, image_urls, slugset, slug_tokens):
 
     # Ambiguous on name alone — disambiguate with the image filename(s). Test each
     # image independently so a stray brand-logo image can't disqualify the real one.
-    img_token_sets = [t for t in (_tokens(image_slug(u)) for u in image_urls[:4]) if t]
+    img_token_sets = [t for t in (_tokens(image_slug(u)) for u in (image_urls or [])[:4]) if t]
     if not img_token_sets:
         return None, _NONE, sn
 
