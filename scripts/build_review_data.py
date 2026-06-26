@@ -7,20 +7,15 @@ Writes: data/out/review_data.json  (consumed by webreview/app.py)
 import csv
 import json
 import re
-import unicodedata
 
 import requests
+
+from parovanie.export_helpers import row_images, slug, state_of
 
 csv.field_size_limit(10**9)
 SRC = "data/products.csv"
 OUT = "data/out"
 BASE = "https://www.forestshop.sk/"
-
-
-def _slug(s: str) -> str:
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
 # Build a resolver of forestshop product URLs from the public sitemap.
@@ -39,7 +34,7 @@ _slug_tokens = {s: set(s.split("-")) for s in _locs}
 
 
 def resolve_url(name: str):
-    sn = _slug(name)
+    sn = slug(name)
     if not sn:
         return None
     if sn in _slugset:
@@ -53,7 +48,6 @@ def resolve_url(name: str):
         return BASE + min(cands, key=lambda s: len(_slug_tokens[s])) + "/"
     return None
 
-imgcols = ["defaultImage"] + [f"image{i}" for i in range(2, 16)] + ["image"]
 code2img, code2pair, code2cur = {}, {}, {}
 with open(SRC, encoding="cp1250", errors="replace") as f:
     for row in csv.DictReader(f, delimiter=";"):
@@ -64,12 +58,7 @@ with open(SRC, encoding="cp1250", errors="replace") as f:
         code2cur[c] = ((row.get("productVisibility") or "").strip(),
                        (row.get("availabilityInStock") or "").strip(),
                        (row.get("availabilityOutOfStock") or "").strip())
-        imgs = []
-        for col in imgcols:
-            v = (row.get(col) or "").strip()
-            if v.startswith("http") and v not in imgs:
-                imgs.append(v)
-        code2img[c] = imgs
+        code2img[c] = row_images(row)
 
 recs = json.load(open(f"{OUT}/candidates.json", encoding="utf-8"))
 verds = {v["idx"]: v for v in json.load(open(f"{OUT}/ai_verdicts.json", encoding="utf-8"))}
@@ -90,18 +79,10 @@ for i, r in enumerate(recs):
     matched = isinstance(ci, int) and 0 <= ci < len(cands)
     _vis, _ais, _aos = code2cur.get(vcodes[0], ("?", "", "")) if vcodes else ("?", "", "")
     _a = _ais or _aos
-    # off = NOT sellable: hidden/blocked OR sold-out/discontinued availability.
-    # detailOnly (drop-ship, sellable via link) is NOT off. Run resync_export.py
-    # afterwards to refresh codes/images/status against the live catalog.
-    _vl, _al = _vis.lower(), _a.lower()
-    # 3 states: 1 Skladom, 2 Nie je skladom (vypredané), 3 Už sa nebude predávať
-    # (Predaj skončil/hidden/blocked). resync_export.py refreshes this from the live catalog.
-    if "skon" in _al or _vl in ("hidden", "blocked", "cashdeskonly", "blockunregistered"):
-        _state = 3
-    elif any(x in _al for x in ("vypredan", "nedostupn", "není skladem")):
-        _state = 2
-    else:
-        _state = 1
+    # 3 states (1 Skladom / 2 Nie je skladom / 3 Už sa nebude predávať); detailOnly
+    # (drop-ship, sellable via link) is NOT off. resync_export.py later refreshes
+    # this from the live catalog.
+    _state = state_of(_vis, _a)
     _off = _state != 1
     out.append({
         "idx": i, "key": r["pair_key"], "supplier": r["supplier"], "name": r["name"],
