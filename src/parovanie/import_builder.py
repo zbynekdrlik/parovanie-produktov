@@ -75,14 +75,20 @@ def new_pairing_keys(decisions, uploaded):
 def link_rows(products, decisions, code2pair):
     """Reorder-link rows → `internalNote` = URL, one per variant, for good/manual
     decisions with a URL. Only code;pairCode;internalNote (no state columns → the
-    eshop's stock/visibility is left untouched)."""
+    eshop's stock/visibility is left untouched). Each `code` appears ONCE — Shoptet
+    aborts the whole import on a duplicate code, and the catalog has duplicate
+    products that share variant codes (first pairing wins)."""
     rows = []
+    seen = set()
     for p in products:
         d = decisions.get(p.get("key"))
         if not d:
             continue
         if d.get("status") in ("good", "manual") and d.get("url"):
             for c in p["variant_codes"]:
+                if c in seen:
+                    continue
+                seen.add(c)
                 rows.append([c, code2pair.get(c, ""), d["url"]])
     return rows
 
@@ -91,17 +97,23 @@ def state_rows(products, decisions, code2pair):
     """Stock-state rows → visibility/availability, one per variant:
       - unavailable (state 2): visible, stock 0, 'Vypredané'.
       - discontinued (state 3): detailOnly, stock 0, 'Predaj výrobku skončil'.
-    Only code;pairCode;state columns (no internalNote → existing links untouched)."""
+    Only code;pairCode;state columns (no internalNote → existing links untouched).
+    Each `code` appears ONCE (duplicate-product catalog) — Shoptet rejects dupes."""
     rows = []
+    seen = set()
     for p in products:
         d = decisions.get(p.get("key"))
         if not d:
             continue
         st = d.get("status")
         for c in p["variant_codes"]:
+            if c in seen:
+                continue
             pc = code2pair.get(c, "")
             if st == "unavailable":
+                seen.add(c)
                 rows.append([c, pc, "visible", "0", _VYPREDANE, _VYPREDANE])
             elif st == "discontinued":
+                seen.add(c)
                 rows.append([c, pc, "detailOnly", "0", _SKONCIL, _SKONCIL])
     return rows
