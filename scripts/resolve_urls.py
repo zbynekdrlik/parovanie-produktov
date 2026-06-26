@@ -3,11 +3,11 @@ try slug-candidates, keep the one that returns HTTP 200 on its own slug.
 Incremental save to data/out/review_data.json. Run in background."""
 import json
 import logging
-import re
 import time
-import unicodedata
 
 import requests
+
+from parovanie.export_helpers import slug
 
 log = logging.getLogger("resolve_urls")
 
@@ -19,15 +19,8 @@ GEN = {"nohavice", "bunda", "mikina", "vesta", "komplet", "set", "ponozky", "cia
        "vreckovy", "flisova", "funkcne", "zatvaraci", "suprava"}
 
 
-def slug(s):
-    s = re.sub(r"^\d+\s+", "", s)
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(c for c in s if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
-
-
 def candidates(name):
-    base = slug(name)
+    base = slug(name, strip_leading_number=True)
     out = [base]
     toks = base.split("-")
     i = 0

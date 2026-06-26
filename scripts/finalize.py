@@ -11,7 +11,8 @@ Writes:
 import csv
 import json
 from parovanie.models import Product, Candidate, Match
-from parovanie.writer import write_unmatched
+from parovanie.csv_loader import load_code2pair
+from parovanie.writer import write_unmatched, shoptet_writer
 from parovanie.report_io import write_report_rows
 
 csv.field_size_limit(10**9)
@@ -20,15 +21,9 @@ SOURCE = "data/products.csv"
 recs = json.load(open(f"{OUT}/candidates.json", encoding="utf-8"))
 verds = {v["idx"]: v for v in json.load(open(f"{OUT}/ai_verdicts.json", encoding="utf-8"))}
 
-# code -> raw pairCode from the source export, so the import is the minimal safe
-# set (code;pairCode;internalNote — reorder URL in the private field) and never
-# overwrites other product fields.
-code2pair = {}
-with open(SOURCE, encoding="cp1250", errors="replace", newline="") as _f:
-    for _row in csv.DictReader(_f, delimiter=";"):
-        _c = (_row.get("code") or "").strip()
-        if _c:
-            code2pair[_c] = (_row.get("pairCode") or "").strip()
+# code -> pairCode from the source export, so the import is the minimal safe set
+# (code;pairCode;internalNote — reorder URL in the private field).
+code2pair = load_code2pair(SOURCE)
 
 matches, report_rows = [], []
 n_ok = 0
@@ -65,7 +60,7 @@ for i, r in enumerate(recs):
 # errors= handler: an un-encodable char aborts loudly instead of shipping '?'.
 with open(f"{OUT}/import_betalov_wetland.csv", "w", encoding="utf-8-sig",
           newline="") as f:
-    w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    w = shoptet_writer(f)
     w.writerow(["code", "pairCode", "internalNote"])
     for m in matches:
         if not m.chosen:

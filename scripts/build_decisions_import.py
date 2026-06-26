@@ -13,12 +13,14 @@ See .claude/skills/shoptet for the full rules.
 import csv
 import json
 
+from parovanie.csv_loader import load_code2pair
 from parovanie.import_builder import (
     LINK_HEADER,
     STATE_HEADER,
     link_rows,
     state_rows,
 )
+from parovanie.writer import shoptet_writer
 
 csv.field_size_limit(10**9)
 OUT = "data/out"
@@ -26,17 +28,12 @@ SRC = "data/products.csv"
 
 products = json.load(open(f"{OUT}/review_data.json", encoding="utf-8"))
 dec = json.load(open(f"{OUT}/decisions.json", encoding="utf-8"))
-code2pair = {}
-with open(SRC, encoding="cp1250", errors="replace") as f:
-    for row in csv.DictReader(f, delimiter=";"):
-        c = (row.get("code") or "").strip()
-        if c:
-            code2pair[c] = (row.get("pairCode") or "").strip()
+code2pair = load_code2pair(SRC)
 
 
 def _write(name, header, rows):
     with open(f"{OUT}/{name}", "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+        w = shoptet_writer(f)
         w.writerow(header)
         w.writerows(rows)
     print(f"{name}: {len(rows)} variant rows")

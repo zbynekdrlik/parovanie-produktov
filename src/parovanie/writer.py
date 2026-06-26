@@ -3,7 +3,9 @@ import csv
 from parovanie.models import Match
 
 
-def _writer(f):
+def shoptet_writer(f):
+    """The canonical Shoptet CSV dialect (';' delimiter, minimal quoting, CRLF).
+    One home so the invariant can't drift across the import producers."""
     return csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL,
                       lineterminator="\r\n")
 
@@ -16,7 +18,7 @@ def write_import(matches: list[Match], path: str,
     internalNote field."""
     code2pair = code2pair or {}
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = _writer(f)
+        w = shoptet_writer(f)
         w.writerow(["code", "pairCode", "internalNote"])
         for m in matches:
             if m.chosen is None:
@@ -32,7 +34,7 @@ REPORT_COLS = ["supplier", "external_code", "name", "query", "chosen_url",
 
 def write_report(matches: list[Match], path: str) -> None:
     with open(path, "w", encoding="cp1250", errors="replace", newline="") as f:
-        w = _writer(f)
+        w = shoptet_writer(f)
         w.writerow(REPORT_COLS)
         for m in matches:
             w.writerow([
@@ -45,7 +47,7 @@ def write_report(matches: list[Match], path: str) -> None:
 
 def write_unmatched(matches: list[Match], path: str) -> None:
     with open(path, "w", encoding="cp1250", errors="replace", newline="") as f:
-        w = _writer(f)
+        w = shoptet_writer(f)
         w.writerow(["supplier", "external_code", "name", "query", "candidate_count"])
         for m in matches:
             if m.chosen is None:

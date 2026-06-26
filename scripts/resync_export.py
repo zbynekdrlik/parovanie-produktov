@@ -10,23 +10,11 @@ import csv
 import json
 from collections import defaultdict
 
+from parovanie.export_helpers import row_images, state_of
+
 csv.field_size_limit(10**9)
 SRC = "data/products.csv"
 OUT = "data/out"
-IMGCOLS = ["defaultImage"] + [f"image{i}" for i in range(2, 16)] + ["image"]
-
-
-def state_of(vis: str, avail: str) -> int:
-    """The three eshop states (see .claude/skills/shoptet):
-      1 = Skladom (predajný), 2 = Nie je skladom (Vypredané/nedostupné),
-      3 = Už sa nebude predávať (Predaj výrobku skončil / hidden / blocked)."""
-    v = vis.lower()
-    a = avail.lower()
-    if "skon" in a or v in ("hidden", "blocked", "cashdeskonly", "blockunregistered"):
-        return 3
-    if any(x in a for x in ("vypredan", "nedostupn", "není skladem", "neni skladem")):
-        return 2
-    return 1
 
 
 # index current export by (supplier, name)
@@ -43,10 +31,7 @@ with open(SRC, encoding="cp1250", errors="replace") as f:
         if code:
             g["codes"].append(code)
         if not g["images"]:
-            for col in IMGCOLS:
-                v = (row.get(col) or "").strip()
-                if v.startswith("http") and v not in g["images"]:
-                    g["images"].append(v)
+            g["images"] = row_images(row)
         if not g["vis"]:
             g["vis"] = (row.get("productVisibility") or "").strip()
             g["ais"] = (row.get("availabilityInStock") or "").strip()
