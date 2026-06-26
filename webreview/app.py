@@ -23,7 +23,8 @@ from flask import Flask, jsonify, request, send_from_directory, Response
 from parovanie import __version__, import_builder
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "data", "out")
+# Data dir is env-overridable so tests/E2E can boot the app against a fixture.
+OUT = os.environ.get("WEBREVIEW_OUT") or os.path.join(ROOT, "data", "out")
 DATA = os.path.join(OUT, "review_data.json")
 DECISIONS = os.path.join(OUT, "decisions.json")
 IMGCACHE = os.path.join(OUT, "imgcache")
@@ -47,7 +48,7 @@ except FileNotFoundError:
     log.warning("review data missing: %s — starting with 0 products", DATA)
 
 # code -> pairCode (Shoptet import needs BOTH code and pairCode present)
-SRC = os.path.join(ROOT, "data", "products.csv")
+SRC = os.environ.get("WEBREVIEW_PRODUCTS") or os.path.join(ROOT, "data", "products.csv")
 CODE2PAIR = {}
 if os.path.exists(SRC):
     csv.field_size_limit(10**9)
@@ -273,4 +274,5 @@ def static_files(p):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8801, threaded=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("WEBREVIEW_PORT", "8801")),
+            threaded=True)

@@ -1,0 +1,3 @@
+# Browser E2E (separate CI job) — not needed for the fast unit/lint job.
+pytest>=8.0
+pytest-playwright>=0.5

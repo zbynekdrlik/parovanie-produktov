@@ -23,7 +23,21 @@ jobs:
       - name: Lint (ruff)
         run: ruff check src tests scripts webreview
       - name: Tests + coverage
-        run: pytest --cov=parovanie --cov-report=term-missing --cov-fail-under=80 -q
+        run: pytest --ignore=tests/e2e --cov=parovanie --cov-report=term-missing --cov-fail-under=80 -q
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps + browser
+        run: |
+          pip install -r requirements.txt -r requirements-e2e.txt
+          python -m playwright install --with-deps chromium
+      - name: E2E review UI (Playwright, real browser)
+        run: pytest tests/e2e -q
 
   version-check:
     # dev / PRs must carry a version strictly greater than main (skip on main itself)
