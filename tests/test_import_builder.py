@@ -7,9 +7,29 @@ from parovanie.import_builder import (
     RESTOCK_COLS,
     STATE_HEADER,
     link_rows,
+    new_pairing_keys,
     sanitize_csv,
     state_rows,
 )
+
+
+def test_new_pairing_keys_only_new_good_manual_with_url():
+    dec = {
+        "new_good": {"status": "good", "url": "https://s/a"},
+        "new_manual": {"status": "manual", "url": "https://s/b"},
+        "no_url": {"status": "good", "url": ""},
+        "bad": {"status": "bad", "url": "https://s/c"},
+        "already": {"status": "good", "url": "https://s/d"},
+    }
+    uploaded = {"already": "https://s/d"}
+    keys = set(new_pairing_keys(dec, uploaded))
+    assert keys == {"new_good", "new_manual"}
+
+
+def test_new_pairing_keys_detects_changed_url():
+    dec = {"k": {"status": "manual", "url": "https://s/NEW"}}
+    assert new_pairing_keys(dec, {"k": "https://s/OLD"}) == ["k"]
+    assert new_pairing_keys(dec, {"k": "https://s/NEW"}) == []
 
 
 def _write(path, header, rows, delim=";", bom=False):
@@ -81,6 +101,22 @@ def test_headers_disjoint_no_empty_wipe():
     assert "internalNote" not in STATE_HEADER
     assert STATE_HEADER[:2] == ["code", "pairCode"]
     assert "productVisibility" in STATE_HEADER and "availabilityInStock" in STATE_HEADER
+
+
+def test_link_rows_dedupes_codes_shoptet_requires_unique():
+    # Catalog has duplicate products that SHARE variant codes (e.g. lady-jacket /
+    # jacket-2). If both are paired, link_rows must NOT emit the same code twice —
+    # Shoptet aborts the whole import with 'Data in column "code" are not unique'.
+    products = [
+        {"key": "k1", "variant_codes": ["15218/40", "15221/40"]},
+        {"key": "k2", "variant_codes": ["15218/40", "15221/40"]},  # same codes (dupe product)
+    ]
+    dec = {"k1": {"status": "good", "url": "https://s/x"},
+           "k2": {"status": "manual", "url": "https://s/x"}}
+    rows = link_rows(products, dec, {})
+    codes = [r[0] for r in rows]
+    assert len(codes) == len(set(codes)), f"duplicate codes emitted: {codes}"
+    assert sorted(codes) == ["15218/40", "15221/40"]
 
 
 def test_link_rows_put_url_in_internalnote():

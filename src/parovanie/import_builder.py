@@ -55,6 +55,23 @@ def sanitize_csv(in_path, out_path, cols=RESTOCK_COLS):
     return len(rows)
 
 
+def new_pairing_keys(decisions, uploaded):
+    """Decision keys ready for the nightly pairing upload: good/manual decisions
+    that carry a URL and were NOT yet uploaded (new key) or whose URL changed since
+    the last upload. `uploaded` is the persisted {key: url} of past uploads. Keeps
+    the upload incremental — only genuinely new/changed pairings go to the eshop."""
+    out = []
+    for k, d in decisions.items():
+        if d.get("status") not in ("good", "manual"):
+            continue
+        url = (d.get("url") or "").strip()
+        if not url:
+            continue
+        if uploaded.get(k) != url:
+            out.append(k)
+    return out
+
+
 def link_rows(products, decisions, code2pair):
     """Reorder-link rows → `internalNote` = URL, one per variant, for good/manual
     decisions with a URL. Only code;pairCode;internalNote (no state columns → the

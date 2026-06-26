@@ -320,11 +320,13 @@ def _client_ip():
             or request.remote_addr)
 
 
-def run_import(csv_path, dry_run=False):
+def run_import(csv_path, dry_run=False, timeout=300):
     """Run the existing careful import script as a subprocess (catalog backup +
     safe-mode + result read-back). Returns (returncode, stdout, stderr). Started in
     its own session so a timeout kills the WHOLE group (the Playwright/Chromium it
-    spawns too), never an orphaned browser mid-import. Stubbable in tests."""
+    spawns too), never an orphaned browser mid-import. `timeout` scales with the CSV
+    size — a few thousand pairing rows legitimately take longer than a small restock.
+    Stubbable in tests."""
     cmd = [sys.executable, IMPORT_SCRIPT, "--file", csv_path, "--yes"]
     if dry_run:
         cmd.append("--dry-run")
@@ -333,7 +335,7 @@ def run_import(csv_path, dry_run=False):
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True)
     try:
-        out, err = p.communicate(timeout=300)
+        out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
@@ -412,6 +414,100 @@ def n8n_shoptet_import():
     if rc != 0:
         log.error("n8n import FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
     return jsonify(result), (200 if rc == 0 else 502)
+
+
+# --------------------------------------------------------------------------- #
+# n8n → nightly upload of worker pairings (reorder links → eshop internalNote)
+# --------------------------------------------------------------------------- #
+PAIRINGS_STATE = os.path.join(OUT, "uploaded_pairings.json")
+
+
+def _load_uploaded():
+    """{key: url} of pairings already uploaded — so the nightly job only sends new
+    or changed ones. Missing/corrupt → empty (treat everything as new)."""
+    try:
+        with open(PAIRINGS_STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_uploaded(d):
+    tmp = PAIRINGS_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, PAIRINGS_STATE)
+
+
+@app.route("/api/n8n/upload-pairings", methods=["POST"])
+def n8n_upload_pairings():
+    """Upload the workers' NEW pairings (reorder links) to the eshop. Reads the
+    local review decisions, builds the link import (code;pairCode;internalNote) for
+    only the pairings not yet uploaded, runs the careful import, and records what
+    went up. Bearer-auth'd; dry_run=1 reaches the import without changing anything.
+    Visibility/stock are NOT touched here — the morning restock job turns a product
+    on once the supplier has it in stock."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {token}".encode() if token else b""
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n pairings: unauthorized call from %s", _client_ip())
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    dec = _load_decisions()
+    uploaded = _load_uploaded()
+    new_keys = import_builder.new_pairing_keys(dec, uploaded)
+    by_key = {p.get("key"): p for p in PRODUCTS}
+    products = [{"name": by_key.get(k, {}).get("name", ""),
+                 "our_url": by_key.get(k, {}).get("our_url", ""),
+                 "supplier_url": dec[k].get("url", "")} for k in new_keys]
+    if not new_keys:
+        log.info("n8n pairings: 0 new pairings")
+        return jsonify({"ok": True, "count": 0, "products": []}), 200
+
+    rows = import_builder.link_rows(PRODUCTS, {k: dec[k] for k in new_keys}, CODE2PAIR)
+    if not rows:
+        log.warning("n8n pairings: %d new keys but 0 import rows (codes missing)", len(new_keys))
+        return jsonify({"ok": True, "count": 0, "products": products,
+                        "message": "no import rows"}), 200
+
+    os.makedirs(OUT, exist_ok=True)
+    out_fd, out_path = tempfile.mkstemp(prefix="import_links_", suffix=".csv", dir=OUT)
+    with os.fdopen(out_fd, "w", encoding="utf-8-sig", newline="") as f:
+        from parovanie.writer import shoptet_writer
+        w = shoptet_writer(f)
+        w.writerow(import_builder.LINK_HEADER)
+        w.writerows(rows)
+
+    if not _import_lock.acquire(blocking=False):
+        log.warning("n8n pairings: another import already running")
+        _safe_unlink(out_path)
+        return jsonify({"ok": False, "error": "import already running"}), 409
+    log.info("n8n pairings: %d products, %d rows, dry_run=%s", len(new_keys), len(rows), dry)
+    try:
+        # pairing CSVs can be large (an initial bulk of thousands of rows) → more time
+        rc, out, err = run_import(out_path, dry_run=dry, timeout=900)
+    except subprocess.TimeoutExpired:
+        log.error("n8n pairings: subprocess timeout — killed import group")
+        return jsonify({"ok": False, "error": "import timeout"}), 504
+    finally:
+        _import_lock.release()
+
+    parsed = parse_import_log(out)
+    ok = rc == 0
+    if ok and not dry:                       # record only after a real success
+        for k in new_keys:
+            uploaded[k] = dec[k].get("url", "")
+        _save_uploaded(uploaded)
+    result = {"ok": ok, "exit_code": rc, "count": len(new_keys), "rows": len(rows),
+              "dry_run": dry, "processed": parsed.get("processed"),
+              "updated": parsed.get("updated"), "failed": parsed.get("failed"),
+              "products": products, "stdout_tail": (out or "")[-800:]}
+    log.info("n8n pairings: rc=%s processed=%s products=%d", rc, parsed.get("processed"), len(new_keys))
+    if not ok:
+        log.error("n8n pairings FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
+    return jsonify(result), (200 if ok else 502)
 
 
 if __name__ == "__main__":
