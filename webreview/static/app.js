@@ -242,7 +242,16 @@ window.addEventListener('scroll', () => {
   _scrollTimer = setTimeout(() => localStorage.setItem('scrollY', String(window.scrollY)), 150);
 });
 
+async function loadVersion() {
+  try {
+    const v = await (await fetch('/api/version')).text();
+    const el = document.getElementById('version');
+    if (el) el.textContent = v.trim();
+  } catch (_) { /* version label is non-critical */ }
+}
+
 async function init() {
+  loadVersion();
   const j = await (await fetch('/api/products')).json();
   PRODUCTS = j.products;
   DECISIONS = j.decisions || {};

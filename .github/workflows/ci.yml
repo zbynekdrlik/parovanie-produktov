@@ -21,6 +21,25 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
       - name: Lint (ruff)
-        run: ruff check src tests scripts
+        run: ruff check src tests scripts webreview
       - name: Tests + coverage
         run: pytest --cov=parovanie --cov-report=term-missing --cov-fail-under=80 -q
+
+  version-check:
+    # dev / PRs must carry a version strictly greater than main (skip on main itself)
+    if: github.ref_name != 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dev version must be greater than main
+        run: |
+          dev_v=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/parovanie/__init__.py)
+          git fetch origin main --quiet
+          main_v=$(git show origin/main:src/parovanie/__init__.py 2>/dev/null \
+                   | grep -oP '__version__\s*=\s*"\K[^"]+' || echo "0.0.0")
+          echo "dev=$dev_v main=$main_v"
+          if [ "$dev_v" = "$main_v" ] || \
+             [ "$(printf '%s\n%s\n' "$main_v" "$dev_v" | sort -V | tail -1)" != "$dev_v" ]; then
+            echo "::error::dev version ($dev_v) must be strictly greater than main ($main_v) — bump src/parovanie/__init__.py"
+            exit 1
+          fi

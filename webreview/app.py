@@ -6,20 +6,21 @@ Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:879
 """
 from __future__ import annotations
 import csv
+import io
 import json
+import logging
 import os
 import re
 import hashlib
 import threading
+import zipfile
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-
-from parovanie import import_builder
-import io
-import zipfile
 from flask import Flask, jsonify, request, send_from_directory, Response
+
+from parovanie import __version__, import_builder
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "data", "out")
@@ -32,8 +33,18 @@ UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.3
 app = Flask(__name__, static_folder="static", template_folder="templates")
 _lock = threading.Lock()
 
-with open(DATA, encoding="utf-8") as f:
-    PRODUCTS = json.load(f)
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("webreview")
+log.info("starting webreview v%s", __version__)
+
+try:
+    with open(DATA, encoding="utf-8") as f:
+        PRODUCTS = json.load(f)
+    log.info("loaded %d products from %s", len(PRODUCTS), DATA)
+except FileNotFoundError:
+    PRODUCTS = []
+    log.warning("review data missing: %s — starting with 0 products", DATA)
 
 # code -> pairCode (Shoptet import needs BOTH code and pairCode present)
 SRC = os.path.join(ROOT, "data", "products.csv")
@@ -68,6 +79,7 @@ with _lock:
     _d0 = _load_decisions()
     _d1 = {k: v for k, v in _d0.items() if k in _VALID_KEYS}
     if len(_d1) != len(_d0):
+        log.info("pruned %d orphan decisions at startup", len(_d0) - len(_d1))
         _save_decisions(_d1)
 
 
@@ -139,6 +151,13 @@ def favicon():
     return ("", 204)
 
 
+@app.route("/api/version")
+def api_version():
+    """Deployed version (single source: parovanie.__version__) — shown in the
+    footer for post-deploy verification."""
+    return Response(f"v{__version__}", content_type="text/plain; charset=utf-8")
+
+
 @app.route("/api/products")
 def api_products():
     return jsonify({"products": PRODUCTS, "decisions": _load_decisions()})
@@ -169,8 +188,10 @@ def api_images():
             imgs = _extract_images(r.text, url)
             price, avail = _supplier_meta(r.text)
         else:
+            log.warning("image fetch non-OK url=%s status=%s", url, r.status_code)
             title, imgs, price, avail = "", [], "", ""
-    except Exception:
+    except Exception as e:  # noqa: BLE001 — best-effort scrape; log cause and degrade
+        log.warning("image fetch failed url=%s: %r", url, e)
         title, imgs, price, avail = "", [], "", ""
     data = {"title": title, "images": imgs, "price": price, "availability": avail}
     with open(cache, "w", encoding="utf-8") as f:
@@ -190,6 +211,7 @@ def api_decision():
         else:
             d[key] = {"status": status, "url": body.get("url", "")}
         _save_decisions(d)
+    log.info("decision key=%s status=%s url=%s", key, status, body.get("url", ""))
     return jsonify({"ok": True})
 
 
