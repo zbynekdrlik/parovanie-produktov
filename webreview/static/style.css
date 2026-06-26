@@ -11,6 +11,9 @@ header { position: sticky; top: 0; z-index: 10; background: #1f2937; color: #fff
 .filters button { background: #374151; color: #cbd5e1; border: 0; padding: 5px 11px;
   border-radius: 6px; cursor: pointer; font-size: 13px; }
 .filters button.active { background: #34d399; color: #06281d; font-weight: 700; }
+.appfoot { position: fixed; bottom: 6px; right: 10px; z-index: 50; font-size: 11px;
+  color: #6b7280; background: rgba(255,255,255,.85); padding: 1px 7px;
+  border-radius: 4px; pointer-events: none; }
 
 main { max-width: 1200px; margin: 14px auto; padding: 0 12px; display: flex; flex-direction: column; gap: 12px; }
 .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
