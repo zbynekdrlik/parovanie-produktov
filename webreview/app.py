@@ -13,8 +13,10 @@ import logging
 import os
 import re
 import hashlib
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -299,28 +301,61 @@ def _import_token():
     return None
 
 
+MAX_IMPORT_BYTES = 5 * 1024 * 1024   # restock CSVs are a few kB; cap the in-memory read
+
+
+def _safe_unlink(*paths):
+    for p in paths:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _client_ip():
+    """Real caller IP behind the Cloudflare tunnel (so the unauthorized-attempt
+    log is useful, not just the tunnel/local address)."""
+    return (request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.remote_addr)
+
+
 def run_import(csv_path, dry_run=False):
-    """Run the existing careful import script as a subprocess (it does the catalog
-    backup + safe-mode + result read-back). Returns (returncode, stdout, stderr).
-    Separated out so tests can stub it without launching a browser."""
+    """Run the existing careful import script as a subprocess (catalog backup +
+    safe-mode + result read-back). Returns (returncode, stdout, stderr). Started in
+    its own session so a timeout kills the WHOLE group (the Playwright/Chromium it
+    spawns too), never an orphaned browser mid-import. Stubbable in tests."""
     cmd = [sys.executable, IMPORT_SCRIPT, "--file", csv_path, "--yes"]
     if dry_run:
         cmd.append("--dry-run")
     env = {**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")}
-    p = subprocess.run(cmd, cwd=ROOT, env=env, capture_output=True, text=True,
-                       timeout=300, check=False)
-    return p.returncode, p.stdout, p.stderr
+    p = subprocess.Popen(cmd, cwd=ROOT, env=env, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        p.communicate()
+        raise
+    return p.returncode, out, err
 
 
 @app.route("/api/n8n/shoptet-import", methods=["POST"])
 def n8n_shoptet_import():
     """n8n posts a restock CSV (multipart 'file', or raw body); we whitelist it to
-    the safe restock columns and run the careful Shoptet import. Bearer-authّd.
+    the safe restock columns and run the careful Shoptet import. Bearer-auth'd.
     Pass dry_run=1 (form/query) to reach the import form without changing anything."""
     token = _import_token()
     auth = request.headers.get("Authorization", "")
-    if not token or not hmac.compare_digest(auth, f"Bearer {token}"):
-        log.warning("n8n import: unauthorized call from %s", request.remote_addr)
+    expected = f"Bearer {token}".encode() if token else b""
+    # compare bytes — a non-ASCII Authorization header must 401, not raise (latin-1
+    # is how WSGI decodes the header; compare_digest rejects non-ASCII str args)
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n import: unauthorized call from %s", _client_ip())
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     f = request.files.get("file")
@@ -328,30 +363,42 @@ def n8n_shoptet_import():
     if not raw:
         log.warning("n8n import: empty body")
         return jsonify({"ok": False, "error": "empty body"}), 400
+    if len(raw) > MAX_IMPORT_BYTES:
+        log.warning("n8n import: payload too large (%d B)", len(raw))
+        return jsonify({"ok": False, "error": "payload too large"}), 413
 
+    os.makedirs(OUT, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    raw_path = os.path.join(OUT, f"n8n_restock_{ts}_raw.csv")
-    out_path = os.path.join(OUT, f"n8n_restock_{ts}.csv")
-    with open(raw_path, "wb") as w:
+    # unique names (mkstemp) so two same-second calls never clobber each other's
+    # file while a subprocess is reading it
+    raw_fd, raw_path = tempfile.mkstemp(prefix=f"n8n_restock_{ts}_", suffix="_raw.csv", dir=OUT)
+    out_fd, out_path = tempfile.mkstemp(prefix=f"n8n_restock_{ts}_", suffix=".csv", dir=OUT)
+    os.close(out_fd)
+    with os.fdopen(raw_fd, "wb") as w:
         w.write(raw)
     try:
         rows = import_builder.sanitize_csv(raw_path, out_path)
-    except ValueError as e:
+    except (ValueError, UnicodeDecodeError) as e:
         log.warning("n8n import: bad CSV: %s", e)
+        _safe_unlink(raw_path, out_path)
         return jsonify({"ok": False, "error": str(e)}), 400
+    finally:
+        _safe_unlink(raw_path)   # sanitized file is the audit record; raw is transient
     if rows == 0:
         log.info("n8n import: 0 restock rows — nothing to import")
+        _safe_unlink(out_path)
         return jsonify({"ok": True, "rows": 0, "message": "no restock rows"}), 200
 
     dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n import: another import already running")
+        _safe_unlink(out_path)
         return jsonify({"ok": False, "error": "import already running"}), 409
     log.info("n8n import: %d rows, dry_run=%s, file=%s", rows, dry, out_path)
     try:
         rc, out, err = run_import(out_path, dry_run=dry)
     except subprocess.TimeoutExpired:
-        log.error("n8n import: subprocess timeout")
+        log.error("n8n import: subprocess timeout — killed import group")
         return jsonify({"ok": False, "error": "import timeout"}), 504
     finally:
         _import_lock.release()

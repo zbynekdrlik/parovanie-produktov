@@ -3,6 +3,7 @@
 The app tolerates missing data files at import (loads 0 products), so these run
 in CI without the gitignored data/ tree.
 """
+import io
 import os
 import sys
 
@@ -127,3 +128,39 @@ def test_import_dry_run_passthrough(monkeypatch, tmp_path):
     r = _client().post("/api/n8n/shoptet-import?dry_run=1", data=_FEED,
                        headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 200 and seen["dry_run"] is True
+
+
+def test_import_fail_closed_without_creds(monkeypatch, tmp_path):
+    # No creds file → token None → even a Bearer call is rejected (never open).
+    monkeypatch.setattr(webapp, "CRED_PATH", str(tmp_path / "missing"))
+    r = _client().post("/api/n8n/shoptet-import", data=_FEED,
+                       headers={"Authorization": "Bearer anything"})
+    assert r.status_code == 401
+
+
+def test_import_non_ascii_auth_header_is_401_not_500(monkeypatch, tmp_path):
+    _arm_token(monkeypatch, tmp_path)
+    r = _client().post("/api/n8n/shoptet-import", data=_FEED,
+                       headers={"Authorization": "Bearer ÿþ"})
+    assert r.status_code == 401
+
+
+def test_import_releases_lock_after_run(monkeypatch, tmp_path):
+    tok = _arm_token(monkeypatch, tmp_path)
+    monkeypatch.setattr(webapp, "run_import", lambda *a, **k: (0, "spracované=1", ""))
+    _client().post("/api/n8n/shoptet-import", data=_FEED,
+                   headers={"Authorization": f"Bearer {tok}"})
+    # lock must be free again (a leaked lock would wedge every future import)
+    assert webapp._import_lock.acquire(blocking=False)
+    webapp._import_lock.release()
+
+
+def test_import_multipart_file_path(monkeypatch, tmp_path):
+    tok = _arm_token(monkeypatch, tmp_path)
+    monkeypatch.setattr(webapp, "run_import", lambda *a, **k: (0, "spracované=1", ""))
+    r = _client().post(
+        "/api/n8n/shoptet-import",
+        data={"file": (io.BytesIO(_FEED), "restock.csv")},
+        content_type="multipart/form-data",
+        headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200 and r.get_json()["rows"] == 1
