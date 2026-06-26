@@ -10,7 +10,8 @@ import re
 
 import requests
 
-from parovanie.export_helpers import row_images, slug, state_of
+from parovanie.export_helpers import row_images, state_of
+from parovanie.url_resolver import assign_urls
 
 csv.field_size_limit(10**9)
 SRC = "data/products.csv"
@@ -18,35 +19,15 @@ OUT = "data/out"
 BASE = "https://www.forestshop.sk/"
 
 
-# Build a resolver of forestshop product URLs from the public sitemap.
-# Real product URLs sometimes carry a category prefix (e.g. "polovnicke-..."),
-# so we match name-slug exactly, as a suffix, or by full token-subset; the rest
-# fall back (in the UI) to the working ?string= search.
+# Forestshop product URLs come from the public sitemap (the export has none).
+# Matching is name + image-filename based — see parovanie.url_resolver. Products
+# with no confident match fall back (in the UI) to the working ?string= search.
 _smr = requests.get(BASE + "sitemap.xml", timeout=30,
                     headers={"User-Agent": "Mozilla/5.0"})
 _smr.raise_for_status()   # fail loud on 4xx/5xx instead of writing all-null output
-_sm = _smr.text
-_locs = re.findall(r"<loc>https://www\.forestshop\.sk/([^<]+?)/?</loc>", _sm)
+_locs = re.findall(r"<loc>https://www\.forestshop\.sk/([^<]+?)/?</loc>", _smr.text)
 if not _locs:
     raise SystemExit("sitemap prázdny/nečitateľný — odmietam zapísať all-null review_data.json")
-_slugset = set(_locs)
-_slug_tokens = {s: set(s.split("-")) for s in _locs}
-
-
-def resolve_url(name: str):
-    sn = slug(name)
-    if not sn:
-        return None
-    if sn in _slugset:
-        return BASE + sn + "/"
-    suf = [s for s in _slugset if s.endswith("-" + sn)]
-    if suf:
-        return BASE + min(suf, key=len) + "/"
-    nt = {t for t in sn.split("-") if t and not t.isdigit()}
-    cands = [s for s, toks in _slug_tokens.items() if nt and nt <= toks]
-    if cands:
-        return BASE + min(cands, key=lambda s: len(_slug_tokens[s])) + "/"
-    return None
 
 code2img, code2pair, code2cur = {}, {}, {}
 with open(SRC, encoding="cp1250", errors="replace") as f:
@@ -89,12 +70,17 @@ for i, r in enumerate(recs):
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",
         "variant_codes": vcodes,
         "our_images": our_imgs[:6],
-        "our_url": resolve_url(r["name"]),
+        "our_url": None,  # filled below by the image-aware, dedup-safe resolver
         "current": {"state": _state, "off": _off, "vis": _vis, "avail": _a},
         "ai_status": "matched" if matched else "unmatched",
         "ai_chosen_url": cands[ci]["url"] if matched else "",
         "ai_reason": v["reason"] if v else "",
         "candidates": cands,
     })
+
+urls = assign_urls(out, _locs)
+for i, rec in enumerate(out):
+    rec["our_url"] = urls[i]
+linked = sum(1 for u in urls.values() if u)
 json.dump(out, open(f"{OUT}/review_data.json", "w", encoding="utf-8"), ensure_ascii=False)
-print(f"review_data.json: {len(out)} products")
+print(f"review_data.json: {len(out)} products, {linked} with a forestshop URL")
