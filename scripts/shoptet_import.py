@@ -33,7 +33,7 @@ from parovanie.shoptet_import import (  # noqa: E402
 )
 
 CRED_PATH = "data/.shoptet_admin"
-DEFAULT_CSV = "data/out/import_forestshop.csv"
+DEFAULT_CSV = "data/out/import_links.csv"
 AUDIT_DIR = Path("data/out")
 BACKUP_DIR = Path("data/backups")
 

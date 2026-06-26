@@ -61,8 +61,10 @@ for i, r in enumerate(recs):
     })
 
 # Minimal import: code;pairCode;internalNote (one row per matched variant).
-with open(f"{OUT}/import_betalov_wetland.csv", "w", encoding="cp1250",
-          errors="replace", newline="") as f:
+# UTF-8 with BOM (documented import contract; avoids cp1250 mojibake). No
+# errors= handler: an un-encodable char aborts loudly instead of shipping '?'.
+with open(f"{OUT}/import_betalov_wetland.csv", "w", encoding="utf-8-sig",
+          newline="") as f:
     w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
     w.writerow(["code", "pairCode", "internalNote"])
     for m in matches:

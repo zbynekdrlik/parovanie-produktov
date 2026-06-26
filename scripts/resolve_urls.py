@@ -2,11 +2,14 @@
 try slug-candidates, keep the one that returns HTTP 200 on its own slug.
 Incremental save to data/out/review_data.json. Run in background."""
 import json
+import logging
 import re
 import time
 import unicodedata
 
 import requests
+
+log = logging.getLogger("resolve_urls")
 
 BASE = "https://www.forestshop.sk/"
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Chrome/120 Safari/537.36"}
@@ -59,8 +62,8 @@ def main():
                     p["our_url"] = r.url
                     hit += 1
                     break
-            except Exception:
-                pass
+            except requests.RequestException as e:
+                log.debug("probe failed url=%s: %r", url, e)
             time.sleep(0.12)
         if n % 25 == 0:
             json.dump(rd, open("data/out/review_data.json", "w", encoding="utf-8"),

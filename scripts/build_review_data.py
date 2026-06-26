@@ -27,9 +27,13 @@ def _slug(s: str) -> str:
 # Real product URLs sometimes carry a category prefix (e.g. "polovnicke-..."),
 # so we match name-slug exactly, as a suffix, or by full token-subset; the rest
 # fall back (in the UI) to the working ?string= search.
-_sm = requests.get(BASE + "sitemap.xml", timeout=30,
-                   headers={"User-Agent": "Mozilla/5.0"}).text
+_smr = requests.get(BASE + "sitemap.xml", timeout=30,
+                    headers={"User-Agent": "Mozilla/5.0"})
+_smr.raise_for_status()   # fail loud on 4xx/5xx instead of writing all-null output
+_sm = _smr.text
 _locs = re.findall(r"<loc>https://www\.forestshop\.sk/([^<]+?)/?</loc>", _sm)
+if not _locs:
+    raise SystemExit("sitemap prázdny/nečitateľný — odmietam zapísať all-null review_data.json")
 _slugset = set(_locs)
 _slug_tokens = {s: set(s.split("-")) for s in _locs}
 

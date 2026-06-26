@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from parovanie.models import Candidate, Match
-from parovanie.csv_loader import load_rows
+from parovanie.csv_loader import load_rows, load_code2pair
 from parovanie.grouping import group_products
 from parovanie.matcher import match_one, gather_candidates
 from parovanie.client import SearchClient
@@ -73,7 +73,8 @@ def run(input_csv: str, out_dir: str, suppliers: set[str], client=None,
             done[p.pair_key] = _match_to_ckpt(m)
             with open(checkpoint, "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=2)
-    write_import(matches, os.path.join(out_dir, "import_betalov_wetland.csv"))
+    write_import(matches, os.path.join(out_dir, "import_betalov_wetland.csv"),
+                 load_code2pair(input_csv))
     write_report(matches, os.path.join(out_dir, "match_report.csv"))
     write_unmatched(matches, os.path.join(out_dir, "unmatched.csv"))
     return matches

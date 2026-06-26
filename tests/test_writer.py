@@ -13,13 +13,13 @@ def _matches():
 
 def test_import_has_one_row_per_variant(tmp_path):
     path = tmp_path / "imp.csv"
-    write_import(_matches(), str(path))
-    with open(path, encoding="cp1250", newline="") as f:
+    write_import(_matches(), str(path), {"60177/46": "K1", "60177/48": "K1"})
+    with open(path, encoding="utf-8-sig", newline="") as f:
         rows = list(csv.reader(f, delimiter=";"))
-    assert rows[0] == ["code", "internalNote"]
+    assert rows[0] == ["code", "pairCode", "internalNote"]
     body = rows[1:]
-    assert ["60177/46", "https://h/hart-ob570"] in body
-    assert ["60177/48", "https://h/hart-ob570"] in body
+    assert ["60177/46", "K1", "https://h/hart-ob570"] in body
+    assert ["60177/48", "K1", "https://h/hart-ob570"] in body
     assert len(body) == 2  # unmatched p2 produced no rows
 
 
