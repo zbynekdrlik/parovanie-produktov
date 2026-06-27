@@ -83,6 +83,24 @@ def _save_decisions(d: dict) -> None:
     os.replace(tmp, DECISIONS)
 
 
+# Per-line "objednané" state for the Na-objednanie tab (key = '<orderCode>|<itemCode>').
+ORDERED = os.path.join(OUT, "ordered_items.json")
+
+
+def _load_ordered() -> dict:
+    if os.path.exists(ORDERED):
+        with open(ORDERED, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_ordered(d: dict) -> None:
+    tmp = ORDERED + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ORDERED)
+
+
 # at startup, prune orphan decisions whose key matches no product (e.g. a stale
 # 'None'/'bad' from before stable keys) so the progress count == the import count
 _VALID_KEYS = {p.get("key") for p in PRODUCTS}
@@ -150,6 +168,84 @@ def _supplier_meta(html: str):
         price = m.group(1).replace(".", ",")   # match our EUR formatting (5,41)
     avail = next((w for w in _AVAIL_WORDS if w in html), "")
     return price, avail
+
+
+# --------------------------------------------------------------------------- #
+# Na objednanie: forestshop "Vybavuje sa" orders → supplier reorder links
+# --------------------------------------------------------------------------- #
+ORDERS_CACHE = os.path.join(OUT, "orders_cache.csv")
+ORDERS_MAXAGE = 300   # s — refresh the cached orders export at most every 5 min
+
+
+def _cred(key: str):
+    """Read a single KEY=value from the gitignored creds file (data/.shoptet_admin).
+    None if missing — callers degrade/refuse rather than crash."""
+    try:
+        with open(CRED_PATH, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(key + "=") and "=" in line:
+                    return line.split("=", 1)[1].strip().strip("'\"") or None
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def build_to_order_rows(orders_csv, products, decisions, code2pair):
+    """Forestshop orders.csv (cp1250 bytes or str) → to-order rows.
+
+    Keeps statusName=='Vybavuje sa', drops SHIPPING*/BILLING* pseudo-items, and joins
+    each item code to its supplier reorder URL via the canonical
+    import_builder.link_rows() (code -> internalNote). One row per order line; row
+    key = '<orderCode>|<itemCode>'. Pure (no network) -> unit-testable."""
+    text = (orders_csv.decode("cp1250", errors="replace")
+            if isinstance(orders_csv, bytes) else orders_csv)
+    code2url = {r[0]: r[2] for r in import_builder.link_rows(products, decisions, code2pair)}
+    rows = []
+    for r in csv.DictReader(io.StringIO(text), delimiter=";"):
+        if (r.get("statusName") or "").strip() != "Vybavuje sa":
+            continue
+        code = (r.get("itemCode") or "").strip()
+        if not code or re.match(r"^(SHIPPING|BILLING)", code, re.I):
+            continue
+        order = (r.get("code") or "").strip()
+        rows.append({
+            "key": f"{order}|{code}",
+            "orderCode": order,
+            "itemCode": code,
+            "size": (r.get("itemVariantName") or "").strip(),
+            "qty": (r.get("itemAmount") or "").strip(),
+            "supplier": (r.get("itemSupplier") or "").strip(),
+            "name": (r.get("itemName") or "").strip(),
+            "supplierUrl": code2url.get(code, ""),
+        })
+    return rows
+
+
+def _fetch_orders_csv() -> bytes:
+    base = _cred("SHOPTET_ORDERS_URL")
+    if not base:
+        raise RuntimeError(f"SHOPTET_ORDERS_URL chýba v {CRED_PATH}")
+    today = time.strftime("%Y-%m-%d")
+    frm = time.strftime("%Y-%m-%d", time.localtime(time.time() - 90 * 86400))
+    sep = "&" if "?" in base else "?"
+    r = requests.get(f"{base}{sep}dateFrom={frm}&dateUntil={today}",
+                     headers={"User-Agent": UA}, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+
+def _orders_csv_cached() -> bytes:
+    if (os.path.exists(ORDERS_CACHE)
+            and time.time() - os.path.getmtime(ORDERS_CACHE) < ORDERS_MAXAGE):
+        with open(ORDERS_CACHE, "rb") as f:
+            return f.read()
+    data = _fetch_orders_csv()
+    tmp = ORDERS_CACHE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, ORDERS_CACHE)
+    return data
 
 
 @app.route("/")
@@ -278,6 +374,43 @@ def api_export():
     return jsonify({"decisions": rows})
 
 
+@app.route("/api/ordered", methods=["GET", "POST"])
+def api_ordered():
+    """Per-line 'objednané' state (key='<orderCode>|<itemCode>'), persisted like
+    decisions. GET -> the map; POST {key, ordered} toggles a single line."""
+    if request.method == "GET":
+        return jsonify({"ordered": _load_ordered()})
+    body = request.get_json(force=True)
+    key = str(body.get("key"))
+    ordered = bool(body.get("ordered"))
+    with _lock:
+        d = _load_ordered()
+        if ordered:
+            d[key] = True
+        else:
+            d.pop(key, None)
+        _save_ordered(d)
+    log.info("ordered key=%s ordered=%s", key, ordered)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/orders")
+def api_orders():
+    """To-order list: forestshop 'Vybavuje sa' items joined to supplier reorder
+    links, with the per-line 'ordered' state merged in. Degrades to [] on fetch
+    error so the tab still renders."""
+    try:
+        csv_bytes = _orders_csv_cached()
+    except Exception as e:  # noqa: BLE001 — degrade to empty list, log the cause
+        log.warning("orders fetch failed: %r", e)
+        return jsonify({"orders": [], "error": str(e)})
+    rows = build_to_order_rows(csv_bytes, PRODUCTS, _load_decisions(), CODE2PAIR)
+    ordered = _load_ordered()
+    for r in rows:
+        r["ordered"] = bool(ordered.get(r["key"]))
+    return jsonify({"orders": rows})
+
+
 @app.route("/static/<path:p>")
 def static_files(p):
     return send_from_directory("static", p)
@@ -289,16 +422,7 @@ def static_files(p):
 def _import_token():
     """Bearer token for the import endpoint, from the gitignored creds file
     (key N8N_IMPORT_TOKEN). None if not configured → endpoint refuses all calls."""
-    try:
-        with open(CRED_PATH, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("N8N_IMPORT_TOKEN=") and "=" in line:
-                    v = line.split("=", 1)[1].strip().strip("'\"")
-                    return v or None
-    except FileNotFoundError:
-        return None
-    return None
+    return _cred("N8N_IMPORT_TOKEN")
 
 
 MAX_IMPORT_BYTES = 5 * 1024 * 1024   # restock CSVs are a few kB; cap the in-memory read

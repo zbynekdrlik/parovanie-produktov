@@ -1,6 +1,10 @@
 let PRODUCTS = [];
 let DECISIONS = {};         // key -> {status, url}
 let FILTER = 'unreviewed';
+let ORDERS = [];            // [{key, orderCode, itemCode, size, qty, supplier, name, supplierUrl, ordered}]
+let ORDERED = {};           // key -> true (ordered/objednané)
+let ORDER_SUPPLIER = 'all';
+let ACTIVE_TAB = localStorage.getItem('tab') || 'review';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
 
 const imgObserver = new IntersectionObserver((entries) => {
@@ -217,7 +221,87 @@ function renderFilters() {
   }
 }
 
+// ---- Na objednanie (to-order) tab ---------------------------------------- //
+const TABS = [['review', '🔍 Kontrola párovania'], ['toorder', '📋 Na objednanie']];
+
+function renderTabs() {
+  const t = document.getElementById('tabs'); if (!t) return;
+  t.innerHTML = '';
+  for (const [key, lbl] of TABS) {
+    const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''), lbl);
+    bt.onclick = () => switchTab(key);
+    t.appendChild(bt);
+  }
+}
+
+async function switchTab(tab) {
+  ACTIVE_TAB = tab; localStorage.setItem('tab', tab); window.scrollTo(0, 0);
+  if (tab === 'toorder' && !ORDERS.length) await loadOrders();
+  render();
+}
+
+async function loadOrders() {
+  try {
+    ORDERS = (await (await fetch('/api/orders')).json()).orders || [];
+    ORDERED = (await (await fetch('/api/ordered')).json()).ordered || {};
+  } catch (_) { ORDERS = []; ORDERED = {}; }
+}
+
+async function saveOrdered(key, ordered) {
+  if (ordered) ORDERED[key] = true; else delete ORDERED[key];
+  await fetch('/api/ordered', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, ordered })
+  });
+}
+
+function renderOrderRow(o) {
+  const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : ''));
+  row.dataset.key = o.key; row.dataset.code = o.itemCode;
+  const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!ORDERED[o.key];
+  cb.onchange = () => { saveOrdered(o.key, cb.checked); row.classList.toggle('done', cb.checked); };
+  row.appendChild(cb);
+  if (o.supplierUrl) {
+    const a = el('a', 'to-link'); a.href = o.supplierUrl; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = '🔗 ' + (o.itemCode || 'link');
+    row.appendChild(a);
+  } else {
+    row.appendChild(el('span', 'to-nolink', escapeHtml(o.itemCode) + ' · nenapárované'));
+  }
+  row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
+  row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
+  row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));
+  return row;
+}
+
+function renderToOrder() {
+  const cnt = {};
+  for (const o of ORDERS) { const s = o.supplier || '—'; cnt[s] = (cnt[s] || 0) + 1; }
+  const fbar = document.getElementById('filters'); fbar.innerHTML = '';
+  const mk = (key, lbl) => {
+    const b = el('button', ORDER_SUPPLIER === key ? 'active' : '', lbl);
+    b.onclick = () => { ORDER_SUPPLIER = key; localStorage.setItem('orderSupplier', key); window.scrollTo(0, 0); render(); };
+    return b;
+  };
+  fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`));
+  for (const s of Object.keys(cnt).sort()) fbar.appendChild(mk(s, `${s} (${cnt[s]})`));
+  const list = document.getElementById('list'); list.innerHTML = '';
+  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || (o.supplier || '—') === ORDER_SUPPLIER);
+  document.getElementById('empty').hidden = shown.length > 0;
+  const groups = {};
+  for (const o of shown) { const s = o.supplier || '—'; (groups[s] = groups[s] || []).push(o); }
+  for (const sup of Object.keys(groups).sort()) {
+    list.appendChild(el('div', 'toorder-supplier', `${sup} — ${groups[sup].length} položiek`));
+    for (const o of groups[sup]) list.appendChild(renderOrderRow(o));
+  }
+}
+
 function render() {
+  renderTabs();
+  const toorder = ACTIVE_TAB === 'toorder';
+  const prog = document.querySelector('.progress'); if (prog) prog.style.display = toorder ? 'none' : '';
+  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = toorder ? 'none' : '';
+  if (toorder) { renderToOrder(); return; }
   const keepY = window.scrollY;
   renderFilters();
   const reviewed = Object.keys(DECISIONS).length;
@@ -258,6 +342,8 @@ async function init() {
   PRODUCTS.sort((a, b) =>
     ((a.ai_status === 'unmatched') ? 1 : 0) - ((b.ai_status === 'unmatched') ? 1 : 0) || a.idx - b.idx);
   FILTER = localStorage.getItem('filter') || 'unreviewed';
+  ORDER_SUPPLIER = localStorage.getItem('orderSupplier') || 'all';
+  if (ACTIVE_TAB === 'toorder') await loadOrders();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
   if (y) window.scrollTo(0, y);

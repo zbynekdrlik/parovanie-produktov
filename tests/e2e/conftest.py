@@ -59,6 +59,11 @@ def live_server(tmp_path_factory):
     base = f"http://127.0.0.1:{port}"
     (out / "review_data.json").write_text(
         json.dumps(_fixture_products(base), ensure_ascii=False), encoding="utf-8")
+    # Fresh orders cache so /api/orders serves it (no live forestshop fetch in CI).
+    (out / "orders_cache.csv").write_text(
+        "code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "O1;Vybavuje sa;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n",
+        encoding="cp1250")
     env = {
         **os.environ,
         "WEBREVIEW_OUT": str(out),
