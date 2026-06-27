@@ -20,6 +20,11 @@ SUPPLIERS: dict[str, SupplierConfig] = {
         base_url="https://www.wetland.sk",
         search_url_template="https://www.wetland.sk/vyhladavanie?controller=search&s={q}",
     ),
+    "ODIMON": SupplierConfig(
+        name="ODIMON",
+        base_url="https://www.odimon.sk",
+        search_url_template="https://www.odimon.sk/vysledky-vyhladavania?term={q}",
+    ),
 }
 
 USER_AGENT = (

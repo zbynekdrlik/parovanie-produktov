@@ -9,13 +9,14 @@ import requests
 
 from parovanie import config
 from parovanie.models import Candidate
-from parovanie.suppliers import wetland, betalov
+from parovanie.suppliers import wetland, betalov, odimon
 
 log = logging.getLogger("parovanie.client")
 
 PARSERS: dict[str, Callable[[str, str], list[Candidate]]] = {
     "WETLAND": wetland.parse_search,
     "BETALOV": betalov.parse_search,
+    "ODIMON": odimon.parse_search,
 }
 
 
