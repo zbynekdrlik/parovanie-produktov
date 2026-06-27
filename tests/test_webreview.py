@@ -42,6 +42,53 @@ def test_export_route_shape():
     assert "decisions" in r.get_json()
 
 
+# --- Na objednanie (to-order tab) ------------------------------------------- #
+def test_build_to_order_rows_filters_and_joins():
+    orders = (
+        "code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20261045;Vybavuje sa;Polokošeľa HART;1;61247/L;Veľkosť: L;BETALOV\r\n"
+        "20261099;Vybavená;Iné;1;99999/M;Veľkosť: M;ORBIS\r\n"
+        "20261045;Vybavuje sa;Kuriér;1;SHIPPING11;;\r\n"
+    )
+    products = [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa HART",
+                 "variant_codes": ["61247/L"], "pairCode": "231"}]
+    decisions = {"BETALOV|231": {"status": "good", "url": "https://www.huntingshop.eu/x"}}
+    rows = webapp.build_to_order_rows(orders, products, decisions, {"61247/L": "231"})
+    assert len(rows) == 1                      # Vybavená + SHIPPING dropped
+    r = rows[0]
+    assert r["itemCode"] == "61247/L" and r["qty"] == "1" and r["supplier"] == "BETALOV"
+    assert r["size"] == "Veľkosť: L"
+    assert r["key"] == "20261045|61247/L"
+    assert r["supplierUrl"] == "https://www.huntingshop.eu/x"
+
+
+def test_ordered_endpoint_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "ordered.json"))
+    c = _client()
+    r = c.post("/api/ordered", json={"key": "20261045|61247/L", "ordered": True})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert c.get("/api/ordered").get_json()["ordered"]["20261045|61247/L"] is True
+    c.post("/api/ordered", json={"key": "20261045|61247/L", "ordered": False})
+    assert "20261045|61247/L" not in c.get("/api/ordered").get_json()["ordered"]
+
+
+def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS",
+        [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
+          "variant_codes": ["61247/L"], "pairCode": "231"}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "_load_decisions",
+        lambda: {"BETALOV|231": {"status": "good", "url": "https://www.huntingshop.eu/x"}})
+    j = _client().get("/api/orders").get_json()
+    assert len(j["orders"]) == 1
+    assert j["orders"][0]["supplierUrl"] == "https://www.huntingshop.eu/x"
+    assert j["orders"][0]["ordered"] is False
+
+
 def test_supplier_meta_parses_price_and_availability():
     html = '<meta property="product:price:amount" content="12.50"> Skladom dnes'
     price, avail = webapp._supplier_meta(html)

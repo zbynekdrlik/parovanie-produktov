@@ -81,3 +81,27 @@ a.supurl:hover { text-decoration: underline; }
 .curbadge.st1 { background: #d1fae5; color: #065f46; }
 .curbadge.st2 { background: #fef3c7; color: #92400e; }
 .curbadge.st3 { background: #f3f4f6; color: #4b5563; }
+
+/* Na objednanie (to-order) tab */
+.tabs { display: flex; gap: 6px; margin: 6px 0; }
+.tabs .tab { background: #1f2937; color: #cbd5e1; border: 0; padding: 7px 14px;
+  border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
+.tabs .tab.active { background: #34d399; color: #06281d; }
+.toorder-supplier { font-weight: 700; color: #1f2937; margin: 14px 0 6px; padding: 4px 0;
+  border-bottom: 2px solid #e5e7eb; font-size: 15px; }
+.toorder-row { display: flex; gap: 12px; align-items: center; padding: 8px 10px;
+  background: #fff; border: 1px solid #e5e7eb; border-radius: 7px; margin-bottom: 6px; }
+.toorder-row.done { opacity: .5; background: #f0fdf4; }
+.toorder-row input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; flex: 0 0 auto; }
+.toorder-row .to-link { color: #2563eb; text-decoration: none; font-weight: 600; font-size: 13px;
+  flex: 0 0 auto; min-width: 110px; }
+.toorder-row .to-link:hover { text-decoration: underline; }
+.toorder-row .to-nolink { color: #9ca3af; font-size: 12px; min-width: 110px; flex: 0 0 auto; }
+.toorder-row .to-size { font-weight: 600; font-size: 13px; min-width: 90px; }
+.toorder-row .to-qty { font-weight: 700; color: #065f46; font-size: 13px; min-width: 52px; }
+.toorder-row .to-name { color: #4b5563; font-size: 13px; flex: 1; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 760px) {
+  .toorder-row { flex-wrap: wrap; gap: 6px 10px; }
+  .toorder-row .to-name { flex-basis: 100%; white-space: normal; }
+}
