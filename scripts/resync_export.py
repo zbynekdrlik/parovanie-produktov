@@ -10,11 +10,15 @@ import csv
 import json
 from collections import defaultdict
 
+from parovanie.config import SUPPLIERS
 from parovanie.export_helpers import row_images, state_of
 
 csv.field_size_limit(10**9)
 SRC = "data/products.csv"
 OUT = "data/out"
+# which suppliers the review app covers — derived from the configured set, so
+# adding a supplier to config.SUPPLIERS automatically includes it here.
+_SUPPLIERS = set(SUPPLIERS)
 
 
 # index current export by (supplier, name)
@@ -25,7 +29,7 @@ with open(SRC, encoding="cp1250", errors="replace") as f:
         sup = (row.get("supplier") or "").strip().upper()
         name = (row.get("name") or "").strip()
         code = (row.get("code") or "").strip()
-        if not name or sup not in ("BETALOV", "WETLAND"):
+        if not name or sup not in _SUPPLIERS:
             continue
         g = idx[(sup, name)]
         if code:

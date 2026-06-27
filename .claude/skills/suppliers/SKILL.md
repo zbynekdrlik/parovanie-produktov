@@ -8,6 +8,7 @@ Load BEFORE pridávaním nového dodávateľa do párovača alebo ladením parso
 |---|---|---|---|---|---|
 | BETALOV | huntingshop.eu | Nette | `/hladanie?search=<q>` | kontajner `#snippet--productList`, odkazy `.product-col a.mh-100` (thumb) / `.product-title a` (názov) | **AJAX-lazy: prázdne bez PHPSESSID** — klient musí `requests.Session` + warmup GET na homepage |
 | WETLAND | wetland.sk | PrestaShop | `/vyhladavanie?controller=search&s=<q>` | `div.product-miniature__title a.link` | produkt-URL má `#/variant` fragment → striptnúť `urldefrag` |
+| ODIMON | odimon.sk | BUXUS | `/vysledky-vyhladavania?term=<q>` | scope `.product-list__results`, karta = `a.product-card` (celý link), názov z `img[alt]/[title]` | statické HTML, cookie-gated (warmup GET homepage). Kód-search funguje (AH5→Alpenheat AH5 hore). 76 % má externalCode |
 
 `/export/*` feedy nie sú verejné (huntingshop 302, wetland 404) → scrapujeme hľadanie.
 
