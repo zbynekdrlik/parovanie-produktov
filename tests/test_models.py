@@ -20,6 +20,10 @@ def test_match_optional_chosen():
 
 
 def test_suppliers_configured():
-    assert set(config.SUPPLIERS) == {"BETALOV", "WETLAND"}
+    assert {"BETALOV", "WETLAND", "ODIMON"} <= set(config.SUPPLIERS)
     assert config.SUPPLIERS["WETLAND"].base_url.startswith("https://www.wetland.sk")
     assert config.SUPPLIERS["BETALOV"].base_url.startswith("https://www.huntingshop.eu")
+    assert config.SUPPLIERS["ODIMON"].base_url.startswith("https://www.odimon.sk")
+    # every configured supplier has a registered parser
+    from parovanie.client import PARSERS
+    assert set(config.SUPPLIERS) <= set(PARSERS)
