@@ -35,6 +35,13 @@ SUPPLIERS: dict[str, SupplierConfig] = {
             "/searchtype/all/searchsubmit/1/action/search/cid/0.xhtml"
         ),
     ),
+    "GRUBE": SupplierConfig(
+        name="GRUBE",
+        base_url="https://www.grube.sk",
+        # Shopware: results render only in a real browser (bot-gated) → gathered via a
+        # headless-Playwright fetcher (scripts/gather_grube.py), not the requests client.
+        search_url_template="https://www.grube.sk/search/?q={q}",
+    ),
 }
 
 USER_AGENT = (
