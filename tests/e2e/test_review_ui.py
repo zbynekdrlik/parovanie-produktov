@@ -45,6 +45,10 @@ def test_toorder_tab_lists_items_and_checkbox_persists(page, live_server):
     page.wait_for_selector(".toorder-row")
     assert page.locator(".toorder-row").count() >= 1
 
+    # The order number renders as a clickable admin link (opens that exact order).
+    order_link = page.locator(".toorder-row .to-order").first
+    assert "objednavky-detail/?code=O1" in order_link.get_attribute("href")
+
     # Tick 'objednané'; wait for the persist POST, then confirm it survives a reload.
     cb = page.locator(".toorder-row input[type='checkbox']").first
     with page.expect_response(

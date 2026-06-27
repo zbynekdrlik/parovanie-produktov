@@ -259,6 +259,7 @@ function renderOrderRow(o) {
   const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : ''));
   row.dataset.key = o.key; row.dataset.code = o.itemCode;
   const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!ORDERED[o.key];
+  cb.title = 'Označiť ako objednané';
   cb.onchange = () => { saveOrdered(o.key, cb.checked); row.classList.toggle('done', cb.checked); };
   row.appendChild(cb);
   if (o.supplierUrl) {
@@ -271,6 +272,14 @@ function renderOrderRow(o) {
   row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
   row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
   row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));
+  if (o.orderCode) {
+    const oa = el('a', 'to-order');
+    oa.href = 'https://www.forestshop.sk/admin/objednavky-detail/?code=' + encodeURIComponent(o.orderCode);
+    oa.target = '_blank'; oa.rel = 'noopener';
+    oa.textContent = '📋 obj. ' + o.orderCode;
+    oa.title = 'Otvoriť objednávku ' + o.orderCode + ' v admine';
+    row.appendChild(oa);
+  }
   return row;
 }
 
