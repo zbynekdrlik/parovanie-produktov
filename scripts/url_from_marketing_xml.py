@@ -57,6 +57,26 @@ def _local(tag):
     return tag.rsplit("}", 1)[-1]  # strip namespace
 
 
+def _own_codes(el):
+    """The product's OWN codes only: the SHOPITEM's direct-child <CODE> plus each
+    <VARIANT>'s direct-child <CODE>. Must NOT descend into <RELATED_PRODUCTS> (cross-sell
+    references to OTHER products) or <FLAGS> — that pollution mapped an unrelated
+    product's code to this product's URL (manager's AH5→Nitecore-P30 bug)."""
+    codes = []
+    for c in el:                       # direct children of SHOPITEM
+        t = _local(c.tag)
+        if t == "CODE" and (c.text or "").strip():
+            codes.append(c.text.strip())
+        elif t == "VARIANTS":
+            for v in c:
+                if _local(v.tag) != "VARIANT":
+                    continue
+                for vc in v:           # direct children of VARIANT
+                    if _local(vc.tag) == "CODE" and (vc.text or "").strip():
+                        codes.append(vc.text.strip())
+    return codes
+
+
 def build_code2url(path):
     """Stream the marketing XML → {code: ORIG_URL} for every product + variant code.
     lxml recover=True tolerates the malformed tokens the strict parser chokes on."""
@@ -66,15 +86,11 @@ def build_code2url(path):
         if _local(el.tag) != "SHOPITEM":
             continue
         orig = ""
-        codes = []
-        for c in el.iter():
-            t = _local(c.tag)
-            if t == "ORIG_URL" and (c.text or "").strip():
+        for c in el:                   # ORIG_URL is a direct child
+            if _local(c.tag) == "ORIG_URL" and (c.text or "").strip():
                 orig = c.text.strip()
-            elif t == "CODE" and (c.text or "").strip():
-                codes.append(c.text.strip())
         if orig:
-            for code in codes:
+            for code in _own_codes(el):
                 code2url.setdefault(code, orig)
         el.clear()
     return code2url
