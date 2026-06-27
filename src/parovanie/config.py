@@ -25,6 +25,16 @@ SUPPLIERS: dict[str, SupplierConfig] = {
         base_url="https://www.odimon.sk",
         search_url_template="https://www.odimon.sk/vysledky-vyhladavania?term={q}",
     ),
+    "TRIGONA": SupplierConfig(
+        name="TRIGONA",
+        base_url="https://www.trigona.sk",
+        # Unisite path-based search (the index.php?page= form silently redirects to a
+        # generic listing; the real, filtering URL is the SEO path the autosuggest links to).
+        search_url_template=(
+            "https://www.trigona.sk/eshop/searchstring/{q}"
+            "/searchtype/all/searchsubmit/1/action/search/cid/0.xhtml"
+        ),
+    ),
 }
 
 USER_AGENT = (
