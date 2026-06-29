@@ -127,3 +127,40 @@ def test_toorder_oldest_first_ordering(page, live_server):
     assert dt.strip().endswith("24.04.2026"), dt
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_toorder_waiting_marker_toggles_and_persists(page, live_server):
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    page.goto(live_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    # The 2/M BETALOV line: a '⏳ Počkať' chip marks an active order we can't stock yet.
+    row = page.locator(".toorder-row[data-code='2/M']")
+    wbtn = row.locator(".to-wait")
+    assert "Počkať" in wbtn.inner_text()
+    assert "waiting" not in (row.get_attribute("class") or "")
+
+    # Click it → the row lights up amber (.waiting) and the chip flips to '⏳ Čaká sa'.
+    with page.expect_response(
+            lambda r: "/api/waiting" in r.url and r.request.method == "POST"):
+        wbtn.click()
+    assert "Čaká sa" in row.locator(".to-wait").inner_text()
+    assert "waiting" in (row.get_attribute("class") or "")
+
+    # Survives reload (persisted server-side in waiting_items.json).
+    page.reload()
+    page.wait_for_selector(".toorder-row[data-code='2/M']")
+    row = page.locator(".toorder-row[data-code='2/M']")
+    assert "waiting" in (row.get_attribute("class") or "")
+    assert "Čaká sa" in row.locator(".to-wait").inner_text()
+
+    # Toggle off again — clears the mark and leaves the shared fixture state clean.
+    with page.expect_response(
+            lambda r: "/api/waiting" in r.url and r.request.method == "POST"):
+        row.locator(".to-wait").click()
+    assert "waiting" not in (row.get_attribute("class") or "")
+
+    assert console == [], f"console not clean: {console}"

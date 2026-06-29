@@ -3,6 +3,7 @@ let DECISIONS = {};         // key -> {status, url}
 let FILTER = 'unreviewed';
 let ORDERS = [];            // [{key, orderCode, itemCode, size, qty, supplier, name, supplierUrl, ordered}]
 let ORDERED = {};           // key -> true (ordered/objednané)
+let WAITING = {};           // key -> true (čaká sa — deferred active line)
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'review';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
@@ -245,7 +246,8 @@ async function loadOrders() {
   try {
     ORDERS = (await (await fetch('/api/orders')).json()).orders || [];
     ORDERED = (await (await fetch('/api/ordered')).json()).ordered || {};
-  } catch (_) { ORDERS = []; ORDERED = {}; }
+    WAITING = (await (await fetch('/api/waiting')).json()).waiting || {};
+  } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; }
 }
 
 async function saveOrdered(key, ordered) {
@@ -253,6 +255,14 @@ async function saveOrdered(key, ordered) {
   await fetch('/api/ordered', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key, ordered })
+  });
+}
+
+async function saveWaiting(key, waiting) {
+  if (waiting) WAITING[key] = true; else delete WAITING[key];
+  await fetch('/api/waiting', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, waiting })
   });
 }
 
@@ -288,7 +298,7 @@ function pairEditor(o, row, focus) {
 }
 
 function renderOrderRow(o) {
-  const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : ''));
+  const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : '') + (WAITING[o.key] ? ' waiting' : ''));
   row.dataset.key = o.key; row.dataset.code = o.itemCode;
   const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!ORDERED[o.key];
   cb.title = 'Označiť ako objednané';
@@ -329,6 +339,19 @@ function renderOrderRow(o) {
     oa.title = 'Otvoriť objednávku ' + o.orderCode + ' v admine';
     row.appendChild(oa);
   }
+  // 'čaká sa' — aktívna objednávka, ktorú zatiaľ neobjednávame/naskladňujeme
+  const w = el('button', 'to-wait' + (WAITING[o.key] ? ' on' : ''));
+  w.textContent = WAITING[o.key] ? '⏳ Čaká sa' : '⏳ Počkať';
+  w.title = 'Aktívna objednávka, ktorá sa zatiaľ nenaskladňuje — čaká sa na dodávateľa, '
+    + 'zbierame viac položiek, alebo dohoda so zákazníkom (napr. september)';
+  w.onclick = () => {
+    const on = !WAITING[o.key];
+    saveWaiting(o.key, on);
+    w.textContent = on ? '⏳ Čaká sa' : '⏳ Počkať';
+    w.classList.toggle('on', on);
+    row.classList.toggle('waiting', on);
+  };
+  row.appendChild(w);
   return row;
 }
 

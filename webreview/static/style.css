@@ -92,6 +92,11 @@ a.supurl:hover { text-decoration: underline; }
 .toorder-row { display: flex; gap: 12px; align-items: center; padding: 8px 10px;
   background: #fff; border: 1px solid #e5e7eb; border-radius: 7px; margin-bottom: 6px; }
 .toorder-row.done { opacity: .5; background: #f0fdf4; }
+.toorder-row.waiting { background: #fffbeb; box-shadow: inset 4px 0 0 #f59e0b; }  /* čaká sa — amber, viditeľné */
+.toorder-row .to-wait { flex: 0 0 auto; background: #e5e7eb; color: #6b7280; border: 0; border-radius: 6px;
+  padding: 4px 9px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.toorder-row .to-wait:hover { background: #d1d5db; }
+.toorder-row .to-wait.on { background: #f59e0b; color: #422006; }
 .toorder-row input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; flex: 0 0 auto; }
 .toorder-row .to-link { color: #2563eb; text-decoration: none; font-weight: 600; font-size: 13px;
   flex: 0 0 auto; min-width: 110px; }

@@ -89,12 +89,15 @@ def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
           "variant_codes": ["61247/L"], "pairCode": "231"}])
     monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
     monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
     monkeypatch.setattr(webapp, "_load_decisions",
         lambda: {"BETALOV|231": {"status": "good", "url": "https://www.huntingshop.eu/x"}})
     j = _client().get("/api/orders").get_json()
     assert len(j["orders"]) == 1
     assert j["orders"][0]["supplierUrl"] == "https://www.huntingshop.eu/x"
     assert j["orders"][0]["ordered"] is False
+    assert j["orders"][0]["waiting"] is False
 
 
 def test_order_pair_endpoint_persists(monkeypatch, tmp_path):
