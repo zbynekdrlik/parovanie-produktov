@@ -42,6 +42,14 @@ SUPPLIERS: dict[str, SupplierConfig] = {
         # headless-Playwright fetcher (scripts/gather_grube.py), not the requests client.
         search_url_template="https://www.grube.sk/search/?q={q}",
     ),
+    "LUKO": SupplierConfig(
+        name="LUKO",
+        base_url="https://www.luko.cz",
+        # Shoptet (manufacturer's own eshop). Forestshop carries LUKO's 6-digit code
+        # in the product NAME → query by that exact code; deterministic match, no AI
+        # (scripts/gather_luko.py). Static SSR results, cookie-gated (session warm-up).
+        search_url_template="https://www.luko.cz/vyhledavani/?string={q}",
+    ),
 }
 
 USER_AGENT = (
