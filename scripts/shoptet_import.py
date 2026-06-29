@@ -84,6 +84,8 @@ def _print_plan(plan):
     print(f"  • napárované (link):        {plan['link']}")
     print(f"  • nie je skladom:           {plan['unavailable']}")
     print(f"  • už sa nebude predávať:    {plan['discontinued']}")
+    if plan.get("externalcode"):
+        print(f"  • grube kód (externalCode): {plan['externalcode']}")
     if plan["other"]:
         print(f"  • iné/neznáme:              {plan['other']}")
 
