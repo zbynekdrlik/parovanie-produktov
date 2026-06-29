@@ -9,6 +9,7 @@ Load the matching skill BEFORE working on that area (don't re-derive):
 - deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`
 - webreview web (review tab / Na objednanie / per-riadkové stavy / api endpointy / úložiská párov) → load `.claude/skills/webreview`
 - import párov z Discord vlákna cez n8n (forwardnuté notifikácie → páry) → load `.claude/skills/discord-import`
+- GRUBE per-veľkosť kódy / grube.de itemId extrakcia / externalCode zápis → load `.claude/skills/grube`
 
 ## Always
 - Kódovanie I/O = **cp1250** na ČÍTANIE exportu; **import CSV = UTF-8 s BOM** (`utf-8-sig`), `;`, CRLF (cp1250 import → mojibake `č`→`è`).
