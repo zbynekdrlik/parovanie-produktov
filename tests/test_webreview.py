@@ -320,6 +320,33 @@ def test_pairings_uploads_link_csv_and_marks_uploaded(monkeypatch, tmp_path):
     assert r2.get_json()["count"] == 0
 
 
+def test_pairings_response_carries_summary_counts(monkeypatch, tmp_path):
+    # The n8n notifier needs totals to post ONE summary Discord message instead of
+    # one-per-product: new (count), total uploaded, remaining, total products, review link.
+    dec = {"k1": {"status": "good", "url": "https://supplier/x"}}
+    tok = _arm_pairings(monkeypatch, tmp_path, dec)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""))
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j["count"] == 1                       # newly uploaded this run
+    assert j["total_products"] == 1              # PRODUCTS in the review set
+    assert j["total_uploaded"] == 1              # uploaded total now includes this run
+    assert j["remaining"] == 0                   # nothing left without a pairing
+    assert j["review_url"].startswith("https://")
+
+
+def test_pairings_zero_new_still_reports_totals(monkeypatch, tmp_path):
+    # no new pairings → no Discord per-product spam, but the summary still carries totals
+    tok = _arm_pairings(monkeypatch, tmp_path, {})
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j["count"] == 0
+    assert j["total_products"] == 1 and j["total_uploaded"] == 0 and j["remaining"] == 1
+
+
 def test_pairings_rejects_wrong_token(monkeypatch, tmp_path):
     _arm_pairings(monkeypatch, tmp_path, {})
     r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": "Bearer nope"})

@@ -682,6 +682,21 @@ def _save_uploaded(d):
     os.replace(tmp, PAIRINGS_STATE)
 
 
+# Public URL of the review web — handed to the n8n notifier so the single summary
+# Discord message can link straight to the pairing app.
+PUBLIC_URL = os.environ.get("WEBREVIEW_PUBLIC_URL", "https://parovanie-forestshop.newlevel.media")
+
+
+def _pairing_summary(uploaded):
+    """Totals for the n8n summary notification: how many pairings are uploaded to the
+    eshop in total, how many of our products still have none, and the review link.
+    ``uploaded`` is the post-run map so ``total_uploaded`` already includes this run."""
+    total = len(PRODUCTS)
+    up = len(uploaded)
+    return {"total_products": total, "total_uploaded": up,
+            "remaining": max(0, total - up), "review_url": PUBLIC_URL}
+
+
 @app.route("/api/n8n/upload-pairings", methods=["POST"])
 def n8n_upload_pairings():
     """Upload the workers' NEW pairings (reorder links) to the eshop. Reads the
@@ -707,13 +722,14 @@ def n8n_upload_pairings():
                  "supplier_url": dec[k].get("url", "")} for k in new_keys]
     if not new_keys:
         log.info("n8n pairings: 0 new pairings")
-        return jsonify({"ok": True, "count": 0, "products": []}), 200
+        return jsonify({"ok": True, "count": 0, "products": [],
+                        **_pairing_summary(uploaded)}), 200
 
     rows = import_builder.link_rows(PRODUCTS, {k: dec[k] for k in new_keys}, CODE2PAIR)
     if not rows:
         log.warning("n8n pairings: %d new keys but 0 import rows (codes missing)", len(new_keys))
         return jsonify({"ok": True, "count": 0, "products": products,
-                        "message": "no import rows"}), 200
+                        "message": "no import rows", **_pairing_summary(uploaded)}), 200
 
     # surface a real data inconsistency: the same variant code paired to two different
     # supplier URLs (a code can hold only one link, so first-wins drops the rest)
@@ -760,7 +776,8 @@ def n8n_upload_pairings():
     result = {"ok": ok, "exit_code": rc, "count": len(new_keys), "rows": len(rows),
               "dry_run": dry, "processed": parsed.get("processed"),
               "updated": parsed.get("updated"), "failed": parsed.get("failed"),
-              "products": products, "stdout_tail": (out or "")[-800:]}
+              "products": products, "stdout_tail": (out or "")[-800:],
+              **_pairing_summary(uploaded)}
     log.info("n8n pairings: rc=%s processed=%s products=%d", rc, parsed.get("processed"), len(new_keys))
     if not ok:
         log.error("n8n pairings FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
