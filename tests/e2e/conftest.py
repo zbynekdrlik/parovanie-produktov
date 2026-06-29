@@ -60,12 +60,16 @@ def live_server(tmp_path_factory):
     (out / "review_data.json").write_text(
         json.dumps(_fixture_products(base), ensure_ascii=False), encoding="utf-8")
     # Fresh orders cache so /api/orders serves it (no live forestshop fetch in CI).
-    # O1 maps to the fixture product (1/M); O2's code (77/X) is NOT in the review
-    # set → always unpaired, so the inline-pairing field is exercisable.
+    # Order codes are chronological (lower = older). 1/M maps to the fixture product
+    # (pairable); 2/M and 77/X are NOT in the review set → unpaired (inline-pairing
+    # field). Crafted so the OLDEST-first sort is observable: ORBIS holds the single
+    # oldest order (20260700) so its group sorts ABOVE BETALOV (oldest 20260750),
+    # beating the old alphabetical order; within BETALOV 2/M (20260750) precedes 1/M.
     (out / "orders_cache.csv").write_text(
         "code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "O1;Vybavuje sa;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
-        "O2;Vybavuje sa;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n",
+        "20260900;Vybavuje sa;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
+        "20260750;Vybavuje sa;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
+        "20260700;Vybavuje sa;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n",
         encoding="cp1250")
     env = {
         **os.environ,

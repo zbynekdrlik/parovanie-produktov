@@ -40,17 +40,18 @@ def test_toorder_tab_lists_items_and_checkbox_persists(page, live_server):
     page.goto(live_server)
     page.wait_for_selector('[data-testid="version"]')
 
-    # Switch to the 'Na objednanie' tab — the order row from the fixture renders.
+    # Switch to the 'Na objednanie' tab — the order rows from the fixture render.
     page.get_by_role("button", name="Na objednanie").click()
     page.wait_for_selector(".toorder-row")
     assert page.locator(".toorder-row").count() >= 1
 
-    # The order number renders as a clickable admin link (opens that exact order).
-    order_link = page.locator(".toorder-row .to-order").first
-    assert "objednavky-detail/?code=O1" in order_link.get_attribute("href")
+    # The BETALOV line (1/M) renders its order number as a clickable admin link
+    # (target by code — robust to the oldest-first group ordering).
+    beta = page.locator(".toorder-row[data-code='1/M']")
+    assert "objednavky-detail/?code=20260900" in beta.locator(".to-order").first.get_attribute("href")
 
-    # Tick 'objednané'; wait for the persist POST, then confirm it survives a reload.
-    cb = page.locator(".toorder-row input[type='checkbox']").first
+    # Tick 'objednané' on it; wait for the persist POST, then confirm it survives reload.
+    cb = beta.locator("input[type='checkbox']").first
     with page.expect_response(
             lambda r: "/api/ordered" in r.url and r.request.method == "POST"):
         cb.check()
@@ -58,7 +59,7 @@ def test_toorder_tab_lists_items_and_checkbox_persists(page, live_server):
 
     page.reload()                                   # tab restored from localStorage
     page.wait_for_selector(".toorder-row")
-    assert page.locator(".toorder-row input[type='checkbox']").first.is_checked()
+    assert page.locator(".toorder-row[data-code='1/M'] input[type='checkbox']").first.is_checked()
 
     assert console == [], f"console not clean: {console}"
 
@@ -92,5 +93,27 @@ def test_toorder_deeplink_and_inline_pairing(page, live_server):
     page.wait_for_selector(".toorder-row[data-code='77/X'] a.to-link")
     assert (page.locator(".toorder-row[data-code='77/X'] a.to-link").first
             .get_attribute("href") == "https://supplier.test/rukavice")
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_toorder_oldest_first_ordering(page, live_server):
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    page.goto(live_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-supplier")
+
+    # The oldest pending order is most urgent → its supplier group sorts to the top.
+    # ORBIS holds order 20260700 (oldest); BETALOV's oldest is 20260750 → ORBIS first,
+    # beating the old alphabetical order (BETALOV would have been first).
+    headers = page.locator(".toorder-supplier").all_inner_texts()
+    assert headers[0].startswith("ORBIS"), headers
+    assert any(h.startswith("BETALOV") for h in headers), headers
+
+    # Within BETALOV the older order (2/M = 20260750) precedes the newer (1/M = 20260900).
+    codes = page.locator(".toorder-row").evaluate_all("els => els.map(e => e.dataset.code)")
+    assert codes.index("2/M") < codes.index("1/M"), codes
 
     assert console == [], f"console not clean: {console}"
