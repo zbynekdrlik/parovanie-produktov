@@ -344,6 +344,18 @@ def api_decision():
     return jsonify({"ok": True})
 
 
+# CSV/spreadsheet formula-injection guard. A cell beginning with one of these is a
+# live formula when the file is opened in Excel/LibreOffice. Real forestshop codes,
+# pairCodes and http(s) URLs never start with these, so legit cells are untouched
+# (Shoptet matching unaffected); a malicious cell is prefixed with ' → inert text.
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    s = str(value)
+    return "'" + s if s[:1] in _FORMULA_LEAD else s
+
+
 def _csv_response(header, rows, filename):
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
@@ -379,7 +391,7 @@ def api_import():
             s = io.StringIO()
             w = csv.writer(s, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
             w.writerow(header)
-            w.writerows(rows)
+            w.writerows([_csv_safe(c) for c in row] for row in rows)   # formula-injection guard
             z.writestr(name, s.getvalue().encode("utf-8-sig"))
     return Response(buf.getvalue(), content_type="application/zip",
                     headers={"Content-Disposition": 'attachment; filename="import_forestshop.zip"'})
@@ -433,8 +445,14 @@ def api_order_pair():
     url = str(body.get("url") or "").strip()
     if not code:
         return jsonify({"ok": False, "error": "missing code"}), 400
-    if url and not url.startswith("http"):
-        return jsonify({"ok": False, "error": "url must start with http"}), 400
+    # forestshop codes always start alphanumeric — a leading formula char (=,+,-,@,…)
+    # is either malformed or a CSV-injection attempt; reject it at the source.
+    if code[:1] in _FORMULA_LEAD:
+        return jsonify({"ok": False, "error": "invalid code"}), 400
+    # authoritative URL guard (matches the client) — only real http(s) links reach
+    # the import's internalNote; blocks javascript:/data: and malformed 'httpfoo'.
+    if url and not re.match(r"^https?://", url):
+        return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
     with _lock:
         d = _load_order_pairings()
         if url:

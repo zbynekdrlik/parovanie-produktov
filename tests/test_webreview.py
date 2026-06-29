@@ -101,16 +101,47 @@ def test_order_pair_endpoint_persists(monkeypatch, tmp_path):
 
 
 def test_order_pair_rejects_non_http_url(monkeypatch, tmp_path):
+    # server guard must match the client (^https?://) — block javascript:/data: AND
+    # malformed 'httpfoo'/'http' that the lax startswith("http") used to let through.
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
-    r = _client().post("/api/order-pair", json={"code": "X", "url": "javascript:alert(1)"})
-    assert r.status_code == 400
-    assert "60028/XL" not in webapp._load_order_pairings()
+    for bad in ("javascript:alert(1)", "data:text/html,x", "httpfoo://x", "http", "ftp://x"):
+        r = _client().post("/api/order-pair", json={"code": "X", "url": bad})
+        assert r.status_code == 400, f"should reject {bad!r}"
+    assert webapp._load_order_pairings() == {}
+
+
+def test_order_pair_rejects_formula_code(monkeypatch, tmp_path):
+    # a code beginning with a spreadsheet formula trigger is a CSV-injection attempt
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    for bad in ('=HYPERLINK("http://evil","x")', "+1", "-cmd", "@SUM"):
+        r = _client().post("/api/order-pair", json={"code": bad, "url": "https://supplier/x"})
+        assert r.status_code == 400, f"should reject code {bad!r}"
+    assert webapp._load_order_pairings() == {}
+    # a real code with an interior dash / space is still accepted
+    assert _client().post("/api/order-pair",
+                          json={"code": "61449 JELEN", "url": "https://supplier/x"}).status_code == 200
 
 
 def test_order_pair_requires_code(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
     r = _client().post("/api/order-pair", json={"code": "", "url": "https://x"})
     assert r.status_code == 400
+
+
+def test_import_zip_formula_escapes_codes(monkeypatch, tmp_path):
+    # defense-in-depth: even a formula-leading code already sitting in the store
+    # (bypassing the endpoint guard) is neutralized with a leading ' in the export.
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {})
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    webapp._save_order_pairings({'=HYPERLINK("http://evil","x")': "https://supplier/x"})
+    r = _client().get("/api/import")
+    import zipfile
+    raw = zipfile.ZipFile(io.BytesIO(r.data)).read("import_links.csv").decode("utf-8-sig")
+    rows = list(_csv.reader(io.StringIO(raw), delimiter=";"))
+    # CSV-parsed back: the code cell is neutralized with a leading ' (text, not formula)
+    assert rows[1][0].startswith("'=HYPERLINK")
 
 
 def test_orders_exposes_inline_pair_url(monkeypatch, tmp_path):
