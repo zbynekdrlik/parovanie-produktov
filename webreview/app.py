@@ -690,9 +690,12 @@ PUBLIC_URL = os.environ.get("WEBREVIEW_PUBLIC_URL", "https://parovanie-forestsho
 def _pairing_summary(uploaded):
     """Totals for the n8n summary notification: how many pairings are uploaded to the
     eshop in total, how many of our products still have none, and the review link.
-    ``uploaded`` is the post-run map so ``total_uploaded`` already includes this run."""
-    total = len(PRODUCTS)
-    up = len(uploaded)
+    ``uploaded`` is the post-run map so ``total_uploaded`` already includes this run.
+    Only keys still present in the current review set count, so a product removed
+    since its upload can't push the ratio past total (e.g. avoid "Spolu 105 / 100")."""
+    valid = {p.get("key") for p in PRODUCTS}
+    total = len(valid)
+    up = sum(1 for k in uploaded if k in valid)
     return {"total_products": total, "total_uploaded": up,
             "remaining": max(0, total - up), "review_url": PUBLIC_URL}
 
@@ -728,8 +731,11 @@ def n8n_upload_pairings():
     rows = import_builder.link_rows(PRODUCTS, {k: dec[k] for k in new_keys}, CODE2PAIR)
     if not rows:
         log.warning("n8n pairings: %d new keys but 0 import rows (codes missing)", len(new_keys))
+        # paired but un-uploadable (variant codes missing) — surface so the notifier
+        # warns instead of staying silent (count:0 alone would send nothing)
         return jsonify({"ok": True, "count": 0, "products": products,
-                        "message": "no import rows", **_pairing_summary(uploaded)}), 200
+                        "message": "no import rows", "blocked": len(new_keys),
+                        **_pairing_summary(uploaded)}), 200
 
     # surface a real data inconsistency: the same variant code paired to two different
     # supplier URLs (a code can hold only one link, so first-wins drops the rest)

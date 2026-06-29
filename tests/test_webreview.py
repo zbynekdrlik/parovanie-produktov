@@ -347,6 +347,37 @@ def test_pairings_zero_new_still_reports_totals(monkeypatch, tmp_path):
     assert j["total_products"] == 1 and j["total_uploaded"] == 0 and j["remaining"] == 1
 
 
+def test_pairings_summary_excludes_stale_uploaded_keys(monkeypatch, tmp_path):
+    # a key uploaded for a product that has since left the review set must NOT count —
+    # otherwise the ratio can read "Spolu 2 / 1" and remaining looks wrong.
+    tok = _arm_pairings(monkeypatch, tmp_path, {})              # no new decisions
+    (tmp_path / "uploaded.json").write_text('{"GONE|1": "https://x"}', encoding="utf-8")
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j["count"] == 0
+    assert j["total_products"] == 1 and j["total_uploaded"] == 0 and j["remaining"] == 1
+
+
+def test_pairings_blocked_when_codes_missing(monkeypatch, tmp_path):
+    # a paired product with no variant codes yields 0 import rows — the response flags
+    # `blocked` so the notifier warns instead of staying silent.
+    cred = tmp_path / ".shoptet_admin"
+    cred.write_text("N8N_IMPORT_TOKEN=secret-tok\n", encoding="utf-8")
+    monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded.json"))
+    monkeypatch.setattr(webapp, "PRODUCTS",
+                        [{"key": "k1", "name": "X", "our_url": "u", "variant_codes": []}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {})               # no codes → 0 import rows
+    monkeypatch.setattr(webapp, "_load_decisions",
+                        lambda: {"k1": {"status": "good", "url": "https://supplier/x"}})
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": "Bearer secret-tok"}).get_json()
+    assert j["count"] == 0 and j["blocked"] == 1 and j["total_products"] == 1
+
+
 def test_pairings_rejects_wrong_token(monkeypatch, tmp_path):
     _arm_pairings(monkeypatch, tmp_path, {})
     r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": "Bearer nope"})
