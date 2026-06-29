@@ -49,7 +49,7 @@ _TITLE_SELECTORS = (
 )
 
 
-def _clean(html: str, base_url: str, href: str | None, seen: set[str]) -> str | None:
+def _clean(base_url: str, href: str | None, seen: set[str]) -> str | None:
     """Normalize a raw href → in-host, fragment-free, not-yet-seen absolute URL, else None."""
     href = (href or "").strip()
     if not href:
@@ -74,7 +74,7 @@ def _parse_single(soup: BeautifulSoup, base_url: str) -> list[Candidate]:
     if not href:
         ogu = soup.select_one('meta[property="og:url"]')
         href = ogu.get("content") if ogu else None
-    url = _clean("", base_url, href, set())
+    url = _clean(base_url, href, set())
     if not url:
         return []
     h1 = soup.select_one("h1.product_title.entry-title")
@@ -122,7 +122,7 @@ def parse_search(html: str, base_url: str) -> list[Candidate]:
                 break
         if a is None:
             continue
-        url = _clean("", base_url, a.get("href"), seen)
+        url = _clean(base_url, a.get("href"), seen)
         if not url:
             continue
         seen.add(url)
