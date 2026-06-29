@@ -13,13 +13,27 @@ Load BEFORE pridávaním nového dodávateľa do párovača alebo ladením parso
 | GRUBE | grube.sk | Shopware | `/search/?q=<q>` | karta `.product-box`, link `a[href*="/p/"]`→`/p/<slug>/<id>/`, názov **de-slugifikovaný z URL** | **JS/bot-gated**: requests dostane 0 boxov → gather cez **headless Playwright** (`scripts/gather_grube.py`, fetcher vstrekne page do gather linky; `systemd-run` detached + auto-resume kvôli ~40 min behu). 31 % má code |
 | LUKO | luko.cz | Shoptet | `/vyhladavani/?string=<6-cifr.kód>` | scope `.products.products-block .product`, názov `[data-micro="name"]`, link `a.name`/`a.image` | **EXAKTNÝ kód v názve = bez AI** (viď gotcha nižšie). Statické SSR, cookie-gated (warmup). 35/38 napárovaných deterministicky. |
 
-`/export/*` feedy nie sú verejné (huntingshop 302, wetland 404) → scrapujeme hľadanie.
+### Batch 2 (2026-06-29): 9 dodávateľov cez ZDIEĽANÉ platform-parsery
+
+Veľa dodávateľov beží na rovnakej platforme → namiesto nového súboru na každého **použi zdieľaný platform-parser** (`src/parovanie/suppliers/*_generic.py`), len pridaj `config.SUPPLIERS` + zaregistruj v `client.PARSERS`:
+
+| Zdieľaný parser | Platforma | Dodávatelia | Selektor / gotcha |
+|---|---|---|---|
+| `shoptet_generic.parse_search` | Shoptet | ZUBÍČEK (zubicek.cz), VIRGINIASHOP (virginiashop.sk), THERMVISIA (tenolix.cz) | scope `.products.products-block .product`, link `a.name`/`a.image`, názov `[data-micro="name"]`. **`?string=` NIE `?q=`** (q vráti homepage). zubicek je ČESKÝ (SK názvy) → slabý name-match, prísny AI |
+| `prestashop_generic.parse_search` | PrestaShop | TTHUNT (tthunt.sk), LESONA (lesona.sk), LASTING (shop.lasting.eu) | scope `#js-product-list`, karta `article.product-miniature`, link+názov z `h1/h2/h3.product-title a` (téma sa líši!) alebo `.product-miniature__title a.link`; `#/variant` fragment → `urldefrag` |
+| `woocommerce_generic.parse_search` | WooCommerce | LOVTEK (lovtek.sk), PYRA (pyra.eu) | `?s=<q>&post_type=product`. **DUAL MODE**: 1 presná zhoda → WooCommerce 301 na detail (`og:type=product`/`body.single-product`) → vráť 1 kandidáta z canonical+h1; inak scope `div.products` |
+| `fomei.parse_search` | custom ASP.NET | FOMEI SLOVAKIA (fomei.com) | **`?ProductsSearch=` NIE `?search=`** (search je decoy → celý katalóg). scope `div.boxPl`, karta `div.plWrap[data-shop-product]`, link `a[href*="-detail-"]`, názov `h2.plWrapTitle` |
+
+Hunting & Fishing (49 produktov) **vynechaný — nemá verejný eshop** (gmail veľkoobchod), viď #58.
+
+**Dávkový postup (recon → build → gather → verify → merge):** recon 10 dodávateľov paralelne (Workflow, web research + curl) → postav 4 platform-parsery + fixtúry + testy → `gather_supplier.py SUPPLIER data/out_<slug>` paralelne (rôzne hosty) → `build_verify_input.py` → AI overenie (Workflow, dávky ~28, **prísne — URL kŕmi auto-objednávku, -1 radšej než zlý link**) → zlúč verdikty do `ai_verdicts.json` → `add_supplier_review_data.py data/out_<slug>` sekvenčne → `url_from_marketing_xml.py` → restart. Výsledok: 808 produktov, 457 AI-matched, zvyšok do ručného review poolu.
+> **Bash gotcha pri zber-driveri:** `local slug="$1" out="data/out_$slug"` v JEDNOM `local` → `$slug` ešte NIE je viditeľný pri `out=` → prázdny slug, všetky zbery do `data/out_` (poprepisujú sa). Daj `out=` na samostatný `local`.
 
 ## Pridanie nového dodávateľa
 
-1. **Recon** (curl s browser UA): nájdi search URL + či sú výsledky v statickom HTML alebo cez JS (ak JS → Playwright). Pozri `<meta name="generator">` / `x-powered-by` hlavičku na platformu.
-2. `config.SUPPLIERS[<MENO>]` = base_url + `search_url_template` s `{q}`.
-3. `suppliers/<meno>.py` s `parse_search(html, base_url) -> list[Candidate]` — **scopuj na kontajner výsledkov**, nie celý `a[href]` (inak chytíš nav + „odporúčané" karusel). Over selektor proti uloženej fixtúre.
+1. **Recon** (curl s browser UA): nájdi search URL + či sú výsledky v statickom HTML alebo cez JS (ak JS → Playwright). Pozri `<meta name="generator">` / `x-powered-by` hlavičku na platformu. **Ak je to Shoptet/PrestaShop/WooCommerce → použi zdieľaný `*_generic` parser (vyššie), nepíš nový.**
+2. `config.SUPPLIERS[<MENO>]` = base_url + `search_url_template` s `{q}` (kľúč = `supplier.upper()` z exportu — `load_rows` filtruje exaktne).
+3. Len pre NOVÚ platformu: `suppliers/<meno>.py` s `parse_search(html, base_url) -> list[Candidate]` — **scopuj na kontajner výsledkov**, nie celý `a[href]` (inak chytíš nav + „odporúčané" karusel). Over selektor proti uloženej fixtúre.
 4. Zaregistruj parser v `client.PARSERS`.
 5. Fixtúry do `tests/fixtures/` (uložené HTML), testy bez živej siete.
 
