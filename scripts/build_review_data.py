@@ -10,7 +10,7 @@ import re
 
 import requests
 
-from parovanie.export_helpers import row_images, state_of
+from parovanie.export_helpers import current_of, row_images
 from parovanie.url_resolver import assign_urls
 
 csv.field_size_limit(10**9)
@@ -38,7 +38,10 @@ with open(SRC, encoding="cp1250", errors="replace") as f:
         code2pair[c] = (row.get("pairCode") or "").strip()
         code2cur[c] = ((row.get("productVisibility") or "").strip(),
                        (row.get("availabilityInStock") or "").strip(),
-                       (row.get("availabilityOutOfStock") or "").strip())
+                       (row.get("availabilityOutOfStock") or "").strip(),
+                       (row.get("price") or "").strip(),
+                       (row.get("standardPrice") or "").strip(),
+                       (row.get("stock") or "").strip())
         code2img[c] = row_images(row)
 
 recs = json.load(open(f"{OUT}/candidates.json", encoding="utf-8"))
@@ -58,20 +61,19 @@ for i, r in enumerate(recs):
     ci = v["chosen_i"] if v else -1
     cands = r["candidates"]
     matched = isinstance(ci, int) and 0 <= ci < len(cands)
-    _vis, _ais, _aos = code2cur.get(vcodes[0], ("?", "", "")) if vcodes else ("?", "", "")
-    _a = _ais or _aos
+    _vis, _ais, _aos, _price, _std, _stock = (
+        code2cur.get(vcodes[0], ("?", "", "", "", "", "")) if vcodes
+        else ("?", "", "", "", "", ""))
     # 3 states (1 Skladom / 2 Nie je skladom / 3 Už sa nebude predávať); detailOnly
     # (drop-ship, sellable via link) is NOT off. resync_export.py later refreshes
-    # this from the live catalog.
-    _state = state_of(_vis, _a)
-    _off = _state != 1
+    # this from the live catalog. current_of carries OUR price/std/stock for the card.
     out.append({
         "idx": i, "key": r["pair_key"], "supplier": r["supplier"], "name": r["name"],
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",
         "variant_codes": vcodes,
         "our_images": our_imgs[:6],
         "our_url": None,  # filled below by the image-aware, dedup-safe resolver
-        "current": {"state": _state, "off": _off, "vis": _vis, "avail": _a},
+        "current": current_of(_vis, _ais, _aos, _price, _std, _stock),
         "ai_status": "matched" if matched else "unmatched",
         "ai_chosen_url": cands[ci]["url"] if matched else "",
         "ai_reason": v["reason"] if v else "",
