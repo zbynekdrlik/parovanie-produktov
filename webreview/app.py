@@ -234,6 +234,7 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
         rows.append({
             "key": f"{order}|{code}",
             "orderCode": order,
+            "orderDate": (r.get("date") or "").strip()[:10],   # YYYY-MM-DD (drop time)
             "itemCode": code,
             "size": (r.get("itemVariantName") or "").strip(),
             "qty": (r.get("itemAmount") or "").strip(),

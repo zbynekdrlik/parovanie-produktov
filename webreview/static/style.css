@@ -107,6 +107,7 @@ a.supurl:hover { text-decoration: underline; }
 .toorder-row .to-qty { font-weight: 700; color: #065f46; font-size: 13px; min-width: 52px; }
 .toorder-row .to-name { color: #4b5563; font-size: 13px; flex: 1; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
+.toorder-row .to-date { color: #6b7280; font-size: 12px; flex: 0 0 auto; white-space: nowrap; }
 .toorder-row .to-order { color: #6d28d9; text-decoration: none; font-weight: 600; font-size: 12px;
   flex: 0 0 auto; background: #ede9fe; padding: 3px 8px; border-radius: 6px; white-space: nowrap; }
 .toorder-row .to-order:hover { background: #ddd6fe; text-decoration: underline; }
