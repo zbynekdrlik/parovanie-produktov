@@ -22,11 +22,11 @@ class PlaywrightFetcher:
     """fetch(url) -> rendered HTML. Reuses one headless page; dismisses the cookie
     consent once; waits for the Shopware product grid before returning."""
 
-    def __init__(self):
+    def __init__(self, base: str = "https://www.grube.sk/"):
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(headless=True)
         self._page = self._browser.new_context(user_agent=UA).new_page()
-        self._page.goto("https://www.grube.sk/", wait_until="domcontentloaded", timeout=40000)
+        self._page.goto(base, wait_until="domcontentloaded", timeout=40000)
         for sel in ("button#onetrust-accept-btn-handler",
                     "button[data-testid='uc-accept-all-button']",
                     "#usercentrics-root >>> button[data-testid='uc-accept-all-button']"):
@@ -36,11 +36,11 @@ class PlaywrightFetcher:
             except Exception:  # noqa: BLE001
                 pass
 
-    def __call__(self, url: str) -> str:
+    def __call__(self, url: str, wait_selector: str = ".product-box") -> str:
         self._page.goto(url, wait_until="domcontentloaded", timeout=40000)
         try:
-            self._page.wait_for_selector(".product-box", timeout=8000)
-        except Exception:  # noqa: BLE001 — a no-results page has no product boxes; that's fine
+            self._page.wait_for_selector(wait_selector, timeout=8000)
+        except Exception:  # noqa: BLE001 — detail pages / no-results pages may lack the selector; continue with whatever rendered
             pass
         return self._page.content()
 
