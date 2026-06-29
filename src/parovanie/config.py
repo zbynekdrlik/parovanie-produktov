@@ -50,6 +50,65 @@ SUPPLIERS: dict[str, SupplierConfig] = {
         # (scripts/gather_luko.py). Static SSR results, cookie-gated (session warm-up).
         search_url_template="https://www.luko.cz/vyhledavani/?string={q}",
     ),
+    # --- batch 2: 9 new suppliers (recon 2026-06-29) — by platform ---
+    # Shoptet (same parser family as LUKO; static SSR, cookie-gated → session warm-up)
+    "ZUBÍČEK": SupplierConfig(
+        name="ZUBÍČEK",
+        base_url="https://www.zubicek.cz",
+        # Manufacturer's own CZECH Shoptet eshop; forestshop names are Slovak, so name
+        # matching is weak → rely on the code-in-name query + strict AI verify.
+        search_url_template="https://www.zubicek.cz/vyhledavani/?string={q}",
+    ),
+    "VIRGINIASHOP": SupplierConfig(
+        name="VIRGINIASHOP",
+        base_url="https://www.virginiashop.sk",
+        search_url_template="https://www.virginiashop.sk/vyhladavanie/?string={q}",
+    ),
+    "THERMVISIA": SupplierConfig(
+        name="THERMVISIA",
+        base_url="https://www.tenolix.cz",
+        # ThermVisia's B2C shop is tenolix.cz. MUST use ?string= (the ?q= param silently
+        # returns the homepage). Strict matching: 0-hit search returns look-alike
+        # "did you mean" cards, so AI verify must prefer -1 over a wrong guess.
+        search_url_template="https://www.tenolix.cz/vyhledavani/?string={q}",
+    ),
+    # PrestaShop 1.7 (same parser family as WETLAND; #/variant URL fragment → urldefrag)
+    "TTHUNT": SupplierConfig(
+        name="TTHUNT",
+        base_url="https://www.tthunt.sk",
+        search_url_template="https://www.tthunt.sk/vyhladavanie?controller=search&s={q}",
+    ),
+    "LESONA": SupplierConfig(
+        name="LESONA",
+        base_url="https://lesona.sk",
+        search_url_template="https://lesona.sk/vyhladavanie?controller=search&s={q}",
+    ),
+    "LASTING": SupplierConfig(
+        name="LASTING",
+        base_url="https://shop.lasting.eu",
+        # Use the standard PS search (controller=search), NOT the Leo top-bar search
+        # (controller=productsearch is AJAX/JS-only → empty in static HTML).
+        search_url_template="https://shop.lasting.eu/cs/vyhledavani?controller=search&s={q}",
+    ),
+    # WooCommerce (WordPress ?s= product search; an EXACT single match 301s to the
+    # product page → the parser also handles the single-product redirect form)
+    "LOVTEK": SupplierConfig(
+        name="LOVTEK",
+        base_url="https://www.lovtek.sk",
+        search_url_template="https://www.lovtek.sk/?s={q}&post_type=product",
+    ),
+    "PYRA": SupplierConfig(
+        name="PYRA",
+        base_url="https://pyra.eu",
+        search_url_template="https://pyra.eu/?s={q}&post_type=product",
+    ),
+    # Custom ASP.NET/EasyWeb. The real search param is ?ProductsSearch= (?search= is a
+    # decoy that returns the whole catalog unfiltered).
+    "FOMEI SLOVAKIA": SupplierConfig(
+        name="FOMEI SLOVAKIA",
+        base_url="https://www.fomei.com",
+        search_url_template="https://www.fomei.com/sk/produkty?ProductsSearch={q}",
+    ),
 }
 
 USER_AGENT = (

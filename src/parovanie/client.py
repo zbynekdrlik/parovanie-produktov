@@ -10,6 +10,12 @@ import requests
 from parovanie import config
 from parovanie.models import Candidate
 from parovanie.suppliers import wetland, betalov, odimon, trigona, grube, luko
+from parovanie.suppliers import (
+    shoptet_generic,
+    prestashop_generic,
+    woocommerce_generic,
+    fomei,
+)
 
 log = logging.getLogger("parovanie.client")
 
@@ -20,6 +26,19 @@ PARSERS: dict[str, Callable[[str, str], list[Candidate]]] = {
     "TRIGONA": trigona.parse_search,
     "GRUBE": grube.parse_search,
     "LUKO": luko.parse_search,
+    # batch 2 — Shoptet family
+    "ZUBÍČEK": shoptet_generic.parse_search,
+    "VIRGINIASHOP": shoptet_generic.parse_search,
+    "THERMVISIA": shoptet_generic.parse_search,
+    # batch 2 — PrestaShop family
+    "TTHUNT": prestashop_generic.parse_search,
+    "LESONA": prestashop_generic.parse_search,
+    "LASTING": prestashop_generic.parse_search,
+    # batch 2 — WooCommerce family
+    "LOVTEK": woocommerce_generic.parse_search,
+    "PYRA": woocommerce_generic.parse_search,
+    # batch 2 — custom
+    "FOMEI SLOVAKIA": fomei.parse_search,
 }
 
 
