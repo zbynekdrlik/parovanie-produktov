@@ -30,3 +30,16 @@ def test_build_skips_non_grube_and_unmatched():
             _erow("WL/1", "9", supplier="WETLAND", **{"variant:Veľkosť (všetko)": "S"})]
     out = build_grube_codes(decisions, itemids, rows)
     assert set(out) == {"60645/S"}    # XS unmatched, WETLAND excluded
+
+
+def test_build_grube_codes_fails_loud_on_nongrube_code_collision():
+    import pytest
+    decisions = {"GRUBE|395": {"status": "manual", "url": "https://www.grube.sk/p/x/154773/"}}
+    itemids = {"154773": {"S": "1547734523"}}
+    rows = [_erow("60645/S", "395", **{"variant:Veľkosť (všetko)": "S"}),
+            # SAME code 60645/S also exists as a NON-grube product (duplicate-code export)
+            {"code": "60645/S", "pairCode": "999", "supplier": "WETLAND",
+             "variant:Bunda veľkosť": "", "variant:Nohavice veľkosť": "",
+             "variant:Veľkosť (všetko)": "", "variant:Veľkosť číslo": ""}]
+    with pytest.raises(ValueError):
+        build_grube_codes(decisions, itemids, rows)

@@ -368,7 +368,7 @@ function renderOrderRow(o) {
     chip.title = 'Kopírovať grube kód';
     chip.onclick = () => navigator.clipboard && navigator.clipboard.writeText(o.grubeItemId);
     row.appendChild(chip);
-    if (o.grubeDeUrl) {                           // server už zaručil https://
+    if (o.grubeDeUrl && /^https?:\/\//.test(o.grubeDeUrl)) {   // server + client guard: len http(s)
       const de = el('a', 'to-link');
       de.href = o.grubeDeUrl; de.target = '_blank'; de.rel = 'noopener';
       de.textContent = '🇩🇪 .de';

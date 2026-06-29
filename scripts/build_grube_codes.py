@@ -45,6 +45,15 @@ def build_grube_codes(decisions, itemids, export_rows):
             size = size_by_code.get(code)
             out[code] = {"itemId": iid, "size": "" if size in (None, MULTI_AXIS) else size,
                          "deUrl": pair_de[pair], "productId": pid}
+
+    # Shoptet matches imports by `code` alone: a code shared with a non-GRUBE
+    # product would overwrite THAT product's externalCode. Fail loud, never write.
+    nongrube = {r["code"] for r in export_rows if r.get("supplier") != "GRUBE"}
+    collisions = sorted(c for c in out if c in nongrube)
+    if collisions:
+        raise ValueError(
+            "GRUBE externalCode codes also exist on non-GRUBE products "
+            "(Shoptet matches by code → would overwrite them): " + ", ".join(collisions[:10]))
     return out
 
 

@@ -53,6 +53,13 @@ def test_parse_variants_excludes_cross_sell():
     assert all(v.startswith("154773") and len(v) == 10 for v in got.values())
 
 
+def test_parse_variants_foreign_offer_excluded_by_prefix():
+    own = '"name":"Größe L.","price":"1","priceCurrency":"EUR","sku":"1547734524"'
+    foreign = '"name":"Größe L.","price":"1","priceCurrency":"EUR","sku":"6165695125"'
+    # foreign sku does NOT start with 154773 -> excluded by prefix; only own L remains
+    assert parse_variants(own + foreign, "154773") == {"L": "1547734524"}
+
+
 def test_parse_variants_no_own_offers_returns_empty():
     html = FIX.read_text(encoding="utf-8")
     assert parse_variants(html, "999999") == {}    # no own-prefixed sku -> link-only
