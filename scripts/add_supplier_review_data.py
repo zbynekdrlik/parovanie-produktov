@@ -17,7 +17,7 @@ import sys
 
 import requests
 
-from parovanie.export_helpers import row_images, state_of
+from parovanie.export_helpers import current_of, row_images
 from parovanie.url_resolver import assign_urls
 
 csv.field_size_limit(10**9)
@@ -41,7 +41,10 @@ with open(SRC, encoding="cp1250", errors="replace") as f:
         code2pair[c] = (row.get("pairCode") or "").strip()
         code2cur[c] = ((row.get("productVisibility") or "").strip(),
                        (row.get("availabilityInStock") or "").strip(),
-                       (row.get("availabilityOutOfStock") or "").strip())
+                       (row.get("availabilityOutOfStock") or "").strip(),
+                       (row.get("price") or "").strip(),
+                       (row.get("standardPrice") or "").strip(),
+                       (row.get("stock") or "").strip())
         code2img[c] = row_images(row)
 
 new = []
@@ -58,16 +61,16 @@ for i, r in enumerate(recs):
     ci = v["chosen_i"] if v else -1
     cands = r["candidates"]
     matched = isinstance(ci, int) and 0 <= ci < len(cands)
-    _vis, _ais, _aos = code2cur.get(vcodes[0], ("?", "", "")) if vcodes else ("?", "", "")
-    _a = _ais or _aos
-    _state = state_of(_vis, _a)
+    _vis, _ais, _aos, _price, _std, _stock = (
+        code2cur.get(vcodes[0], ("?", "", "", "", "", "")) if vcodes
+        else ("?", "", "", "", "", ""))
     new.append({
         "key": r["pair_key"], "supplier": r["supplier"], "name": r["name"],
         "pairCode": code2pair.get(vcodes[0], "") if vcodes else "",
         "variant_codes": vcodes,
         "our_images": our_imgs[:6],
         "our_url": None,
-        "current": {"state": _state, "off": _state != 1, "vis": _vis, "avail": _a},
+        "current": current_of(_vis, _ais, _aos, _price, _std, _stock),
         "ai_status": "matched" if matched else "unmatched",
         "ai_chosen_url": cands[ci]["url"] if matched else "",
         "ai_reason": v["reason"] if v else "",

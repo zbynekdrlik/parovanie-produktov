@@ -11,7 +11,7 @@ import json
 from collections import defaultdict
 
 from parovanie.config import SUPPLIERS
-from parovanie.export_helpers import row_images, state_of
+from parovanie.export_helpers import current_of, row_images
 
 csv.field_size_limit(10**9)
 SRC = "data/products.csv"
@@ -52,10 +52,8 @@ for p in rd:
     if g and g["codes"]:
         p["variant_codes"] = g["codes"]
         p["our_images"] = g["images"][:6]
-        a = g["ais"] or g["aos"]
-        st = state_of(g["vis"], a)
-        p["current"] = {"state": st, "off": st != 1, "vis": g["vis"], "avail": a,
-                        "price": g["price"], "std": g["std"], "stock": g["stock"]}
+        p["current"] = current_of(g["vis"], g["ais"], g["aos"],
+                                   g["price"], g["std"], g["stock"])
         synced += 1
     else:
         # not found by name in current export (renamed/removed) — flag, keep old
