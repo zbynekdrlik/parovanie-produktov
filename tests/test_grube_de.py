@@ -1,6 +1,6 @@
 import pathlib
 
-from parovanie.grube_de import parse_variants, to_grube_de
+from parovanie.grube_de import MULTI_AXIS, parse_variants, resolve_size, to_grube_de
 
 FIX = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_154773.html"
 
@@ -54,3 +54,34 @@ def test_parse_variants_multicolor_returns_empty():
     html = ('"name":"Farbe oliv. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547734524"'
             '"name":"Farbe braun. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547739999"')
     assert parse_variants(html, "154773") == {}
+
+
+def _row(**kw):
+    base = {c: "" for c in [
+        "variant:Bunda veľkosť", "variant:Nohavice veľkosť",
+        "variant:Veľkosť (všetko)", "variant:Veľkosť číslo"]}
+    base.update(kw)
+    return base
+
+
+def test_resolve_size_single_letter_column():
+    assert resolve_size(_row(**{"variant:Veľkosť (všetko)": "L"})) == "L"
+
+
+def test_resolve_size_numeric_column():
+    assert resolve_size(_row(**{"variant:Veľkosť číslo": "48"})) == "48"
+
+
+def test_resolve_size_multi_axis_komplet():
+    r = _row(**{"variant:Bunda veľkosť": "3XL", "variant:Nohavice veľkosť": "46"})
+    assert resolve_size(r) is MULTI_AXIS
+
+
+def test_resolve_size_one_size_no_columns():
+    assert resolve_size(_row()) is None
+
+
+def test_resolve_size_ignores_code_suffix():
+    # caller passes only the row; resolve_size never sees the code -> proven by API
+    r = _row(**{"variant:Veľkosť (všetko)": "L"})
+    assert resolve_size(r) == "L"

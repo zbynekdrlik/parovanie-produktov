@@ -41,3 +41,38 @@ def parse_variants(html: str, product_id: str) -> dict[str, str]:
     if any(len(ids) > 1 for ids in size2ids.values()):   # color/length axis -> ambiguous
         return {}
     return {size: next(iter(ids)) for size, ids in size2ids.items()}
+
+
+class _MultiAxis:
+    __slots__ = ()
+
+    def __repr__(self):
+        return "MULTI_AXIS"
+
+
+MULTI_AXIS = _MultiAxis()
+
+# Validated against the live export (reader E). Order does not matter; we only
+# count populated and read the single one. Bunda+Nohavice together => multi-axis.
+SIZE_COLUMNS = [
+    "variant:Bunda veľkosť",
+    "variant:Nohavice veľkosť",
+    "variant:Veľkosť (všetko)",
+    "variant:Veľkosť číslo",
+]
+
+
+def resolve_size(row: dict):
+    """Forestshop variant size label from the export row's variant:* columns.
+    NEVER parsed from the code suffix (unreliable: 997/S77, 62093/39/40, 61933//M,
+    disambiguators 3XL2). Returns the clean label, None (one-size), or MULTI_AXIS."""
+    bunda = (row.get("variant:Bunda veľkosť") or "").strip()
+    nohav = (row.get("variant:Nohavice veľkosť") or "").strip()
+    if bunda and nohav:
+        return MULTI_AXIS
+    populated = [(row.get(c) or "").strip() for c in SIZE_COLUMNS if (row.get(c) or "").strip()]
+    if len(populated) == 1:
+        return populated[0]
+    if len(populated) == 0:
+        return None
+    return MULTI_AXIS  # >1 different size columns populated -> multi-axis, link-only
