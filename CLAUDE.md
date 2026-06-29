@@ -1,13 +1,14 @@
 # parovanie_produktov
 
-Nástroj: páruje forestshop (Shoptet) produkty na produktové stránky dodávateľov a píše URL do `textProperty10` (pre auto-doobjednávanie). Detail: `README.md`, spec v `docs/superpowers/specs/`.
+Nástroj: páruje forestshop (Shoptet) produkty na produktové stránky dodávateľov a píše URL do `internalNote` (pre auto-doobjednávanie; `textProperty*` sa CSV importom NEdá nastaviť — starý omyl). Detail: `README.md`, spec v `docs/superpowers/specs/`.
 
 ## Playbook router
 Load the matching skill BEFORE working on that area (don't re-derive):
 - shoptet eshop / export / import / polia produktov / textProperty / vypredané/vypnuté → load `.claude/skills/shoptet`
 - dodávatelia / recon webu / pridanie dodávateľa / parsovanie výsledkov → load `.claude/skills/suppliers`
 - deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`
-- webreview web (review tab / Na objednanie / per-riadkové stavy / api endpointy) → load `.claude/skills/webreview`
+- webreview web (review tab / Na objednanie / per-riadkové stavy / api endpointy / úložiská párov) → load `.claude/skills/webreview`
+- import párov z Discord vlákna cez n8n (forwardnuté notifikácie → páry) → load `.claude/skills/discord-import`
 
 ## Always
 - Kódovanie I/O = **cp1250** na ČÍTANIE exportu; **import CSV = UTF-8 s BOM** (`utf-8-sig`), `;`, CRLF (cp1250 import → mojibake `č`→`è`).
