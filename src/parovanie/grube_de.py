@@ -76,3 +76,35 @@ def resolve_size(row: dict):
     if len(populated) == 0:
         return None
     return MULTI_AXIS  # >1 different size columns populated -> multi-axis, link-only
+
+
+_LETTER_ALIASES = {"2XL": "XXL", "XXXL": "3XL", "XXXXL": "4XL", "XXXXXL": "5XL"}
+
+
+def normalize_size(label: str) -> str:
+    """Trim; uppercase letter sizes; apply 2XL->XXL etc. Numeric kept as-is."""
+    s = (label or "").strip()
+    up = s.upper()
+    return _LETTER_ALIASES.get(up, up if up and up[0].isalpha() else s)
+
+
+def match_variant_codes(rows: list[dict], grube_sizes: dict[str, str]) -> dict[str, str]:
+    """{forestshop code: grube itemId} for EXACT-matched sizes only.
+    Excludes multi-axis, one-size, and any size with no exact grube label.
+    Raises ValueError if two grube labels normalize to one (silent-fold guard)."""
+    norm_grube: dict[str, str] = {}
+    for lbl, iid in grube_sizes.items():
+        n = normalize_size(lbl)
+        if n in norm_grube and norm_grube[n] != iid:
+            raise ValueError(f"grube size collision: {lbl!r} folds onto existing {n!r}")
+        norm_grube[n] = iid
+
+    out: dict[str, str] = {}
+    for row in rows:
+        size = resolve_size(row)
+        if size is None or size is MULTI_AXIS:
+            continue
+        iid = norm_grube.get(normalize_size(size))
+        if iid:
+            out[row["code"]] = iid
+    return out
