@@ -317,8 +317,18 @@ function renderOrderRow(o) {
 }
 
 function renderToOrder() {
-  const cnt = {};
-  for (const o of ORDERS) { const s = o.supplier || '—'; cnt[s] = (cnt[s] || 0) + 1; }
+  // Priorita = najstaršia objednávka prvá. Čísla objednávok sú chronologické
+  // (nižšie = staršie), takže urgentnosť dodávateľa = jeho najnižšie orderCode;
+  // v rámci dodávateľa od najstaršej. Tá najstaršia sa musí vybaviť čo najskôr.
+  const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? Infinity : n; };
+  const cnt = {}, oldest = {};
+  for (const o of ORDERS) {
+    const s = o.supplier || '—';
+    cnt[s] = (cnt[s] || 0) + 1;
+    oldest[s] = Math.min(oldest[s] ?? Infinity, oNum(o));
+  }
+  // dodávateľ s najstaršou nevybavenou objednávkou hore; zhoda → abecedne
+  const byPriority = (a, b) => (oldest[a] - oldest[b]) || (a < b ? -1 : a > b ? 1 : 0);
   const fbar = document.getElementById('filters'); fbar.innerHTML = '';
   const mk = (key, lbl) => {
     const b = el('button', ORDER_SUPPLIER === key ? 'active' : '', lbl);
@@ -326,13 +336,14 @@ function renderToOrder() {
     return b;
   };
   fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`));
-  for (const s of Object.keys(cnt).sort()) fbar.appendChild(mk(s, `${s} (${cnt[s]})`));
+  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${s} (${cnt[s]})`));
   const list = document.getElementById('list'); list.innerHTML = '';
   const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || (o.supplier || '—') === ORDER_SUPPLIER);
   document.getElementById('empty').hidden = shown.length > 0;
   const groups = {};
   for (const o of shown) { const s = o.supplier || '—'; (groups[s] = groups[s] || []).push(o); }
-  for (const sup of Object.keys(groups).sort()) {
+  for (const sup of Object.keys(groups).sort(byPriority)) {
+    groups[sup].sort((a, b) => oNum(a) - oNum(b));   // v rámci dodávateľa: najstaršia objednávka prvá
     list.appendChild(el('div', 'toorder-supplier', `${sup} — ${groups[sup].length} položiek`));
     for (const o of groups[sup]) list.appendChild(renderOrderRow(o));
   }
