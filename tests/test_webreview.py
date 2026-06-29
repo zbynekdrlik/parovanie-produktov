@@ -358,6 +358,16 @@ def test_pairings_summary_excludes_stale_uploaded_keys(monkeypatch, tmp_path):
     assert j["total_products"] == 1 and j["total_uploaded"] == 0 and j["remaining"] == 1
 
 
+def test_pairings_loader_coerces_non_dict_state(monkeypatch, tmp_path):
+    # a stray JSON array repeating a valid key would, unfiltered, make total_uploaded
+    # exceed total_products (the invariant this PR guards). The loader must coerce to {}.
+    tok = _arm_pairings(monkeypatch, tmp_path, {})              # no new decisions
+    (tmp_path / "uploaded.json").write_text('["k1", "k1"]', encoding="utf-8")
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j["total_products"] == 1 and j["total_uploaded"] == 0 and j["remaining"] == 1
+
+
 def test_pairings_blocked_when_codes_missing(monkeypatch, tmp_path):
     # a paired product with no variant codes yields 0 import rows — the response flags
     # `blocked` so the notifier warns instead of staying silent.

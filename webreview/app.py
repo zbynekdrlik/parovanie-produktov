@@ -670,9 +670,12 @@ def _load_uploaded():
     or changed ones. Missing/corrupt → empty (treat everything as new)."""
     try:
         with open(PAIRINGS_STATE, encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    # always a {key: url} map — a stray JSON array could repeat a key and break the
+    # "total_uploaded never exceeds total_products" invariant in _pairing_summary
+    return d if isinstance(d, dict) else {}
 
 
 def _save_uploaded(d):
@@ -694,7 +697,7 @@ def _pairing_summary(uploaded):
     Only keys still present in the current review set count, so a product removed
     since its upload can't push the ratio past total (e.g. avoid "Spolu 105 / 100")."""
     valid = {p.get("key") for p in PRODUCTS}
-    total = len(valid)
+    total = len(valid)  # distinct product keys (de-dups), same unit as `up` below
     up = sum(1 for k in uploaded if k in valid)
     return {"total_products": total, "total_uploaded": up,
             "remaining": max(0, total - up), "review_url": PUBLIC_URL}
