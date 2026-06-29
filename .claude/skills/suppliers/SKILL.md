@@ -11,6 +11,7 @@ Load BEFORE pridávaním nového dodávateľa do párovača alebo ladením parso
 | ODIMON | odimon.sk | BUXUS | `/vysledky-vyhladavania?term=<q>` | scope `.product-list__results`, karta = `a.product-card` (celý link), názov z `img[alt]/[title]` | statické HTML, cookie-gated (warmup GET homepage). Kód-search funguje (AH5→Alpenheat AH5 hore). 76 % má externalCode |
 | TRIGONA | trigona.sk | Unisite | **SEO-path** `/eshop/searchstring/<q>/searchtype/all/searchsubmit/1/action/search/cid/0.xhtml` | karta `div.Product`, link `a[href*="/p-"]`, názov `.ProductName` | **POZOR**: `index.php?page=` form ticho redirectuje na generický výpis (nefiltruje!) — reálny search je SEO-path z JS autosuggestu. Statické HTML. 58 % má code |
 | GRUBE | grube.sk | Shopware | `/search/?q=<q>` | karta `.product-box`, link `a[href*="/p/"]`→`/p/<slug>/<id>/`, názov **de-slugifikovaný z URL** | **JS/bot-gated**: requests dostane 0 boxov → gather cez **headless Playwright** (`scripts/gather_grube.py`, fetcher vstrekne page do gather linky; `systemd-run` detached + auto-resume kvôli ~40 min behu). 31 % má code |
+| LUKO | luko.cz | Shoptet | `/vyhladavani/?string=<6-cifr.kód>` | scope `.products.products-block .product`, názov `[data-micro="name"]`, link `a.name`/`a.image` | **EXAKTNÝ kód v názve = bez AI** (viď gotcha nižšie). Statické SSR, cookie-gated (warmup). 35/38 napárovaných deterministicky. |
 
 `/export/*` feedy nie sú verejné (huntingshop 302, wetland 404) → scrapujeme hľadanie.
 
@@ -42,11 +43,23 @@ Surové fuzzy-párovanie podľa názvu je ~50 % zlé (supplier model-názvy ≠ 
 
 Výsledok Betalov+Wetland: 784/969 napárovaných, 185 prísne zamietnutých.
 
+### Skratka: dodávateľov kód v NAŠOM názve = exaktné párovanie, BEZ AI (LUKO)
+
+Keď forestshop nosí dodávateľov vlastný kód priamo v názve produktu (LUKO: jediné 6-ciferné číslo, napr. „Košeľa LUKO ALPINA … **034230**"), je to **exaktný join-kľúč** — nie fuzzy. Vtedy NEpoužívaj top-K + AI Workflow; namiesto toho `scripts/gather_luko.py`:
+
+1. `luko.extract_code(name)` vytiahne to jediné 6-cif. číslo (presne jedno, inak None).
+2. Hľadaj na dodávateľovi PODĽA kódu (`/vyhladavani/?string=<kód>`), parsuj výsledkový blok.
+3. `luko.choose_exact(code, cands)` = index kandidáta, ktorého **NÁZOV** obsahuje presný kód — práve jeden, inak `-1`.
+4. Gather zapíše `candidates.json` + `ai_verdicts.json` ROVNAKÉHO tvaru ako AI-pipeline → `add_supplier_review_data.py` ich zhltne bez zmeny. (Žiadny verify-Workflow.)
+
+LUKO: **35/38** deterministicky, 3 bezpečne nenapárované (2 ten istý kód = klasik+slim → nejednoznačné, 1 stiahnutý).
+
 ## Gotchas
 
 - **Forestshop URL produktu — AUTORITATÍVNE z marketing XML `ORIG_URL`** (`scripts/url_from_marketing_xml.py`): marketingový export `productsMarketing.xml?patternId=-23` (URL+hash v `data/.shoptet_admin` `SHOPTET_MARKETING_XML_URL`, gitignored) má `<ORIG_URL>` = reálnu stránku produktu pre KAŽDÝ kód (aj `detailOnly`, ktoré v sitemape NIE sú). Match podľa **presného CODE** → žiadne hádanie, žiadny zlý link. Toto je hlavný zdroj `our_url` — spusti po `build_review_data`/`add_supplier_review_data` (XML je 59 MB, lxml `recover=True` kvôli malformed tokenom). **POZOR — ber LEN vlastný `<CODE>` SHOPITEMu + `<VARIANT>` kódy, NIE `el.iter()` cez celý SHOPITEM**: kódy v `<RELATED_PRODUCTS>` (cross-sell) patria INÉMU produktu → `setdefault` by namapoval cudzí kód na zlú URL (manažér: AH5 vložky `60648` → Nitecore P30, lebo 60648 je v P30 RELATED_PRODUCTS; opravilo 309 produktov). Opravilo 595 produktov čo odkazovali na `?string=` search (manažér hlásil) → 4 zostali None. **Sitemap resolver (`url_resolver.assign_urls`) je teraz len FALLBACK** pre tých pár bez XML matchu.
 - **Sitemap fallback** — kánonický resolver je `parovanie.url_resolver` (`assign_urls`), **NEkopíruj logiku**. Match: exact názov-slug → ak nie, kandidáti = sitemap slugy ktorých tokeny ⊇ tokeny názvu. **Pozor — číslo v názve sa zahodí ako digit token**, takže „Moor Padded 367" a „393" majú rovnaké tokeny a kolidujú; rozlišuje sa **slugom z názvu OBRÁZKA** (`15233_…waistcoat-vesta` → vyberie `…-waistcoat`). Pravidlá: zlý link je horší než žiadny → nejednoznačné = `None` (UI padne na search); dva RÔZNE produkty nikdy nesmú zdieľať jednu URL (dedup ponechá najsilnejší match, zvyšok `None`); rovnaký názov-slug = ozajstný katalógový duplikát (ten istý produkt 2×) → obe nechá. ~645/969 priamych URL; zvyšok fallback `…/vyhladavanie/?string=<name>` (**`?q=` presmeruje na homepage, nepouživaj**). **Opraviť URL na existujúcom `review_data.json` bez plného rebuildu: `scripts/reresolve_urls.py`** (in-place, idempotentný, padne ak zostane kolízia).
 - **`productVisibility: detailOnly`** = produkt dostupný LEN cez priamy odkaz (nie v sitemap/vyhľadávaní). Mnohé naše drop-ship produkty sú také → sitemap (3378) < katalóg (4513). URL sa nedá z poľa; `resolve_urls.py` overí slug-kandidátov cez HTTP 200 (názov-slug, bez generického slova, `polovnicke-/polovnicka-` prefix). Tak vznikne 791/969 priamych URL; zvyšok fallback `?string=`.
+- **Shoptet slug môže byť ZASTARANÝ — páruj podľa NÁZVU, nie slugu (LUKO):** po premenovaní produktu si Shoptet ponechá starý slug v URL (kód `024245` žije na `…-model-022263/`), takže „kód v URL" dá falošný miss/zlý link. Aktuálny kód je vždy v **názve** karty (`[data-micro="name"]`) aj v H1 detailu. Preto `choose_exact` páruje na `code in candidate.name`, NIE na slug. Overené: všetkých 7 „slug≠kód" zhôd malo presný kód vo vlastnom H1 → 0 zlých linkov. Ten istý kód s 2 výsledkami (klasik/slim) = nejednoznačné → `-1` (radšej žiadny link, manažérov strach zo zlého linku).
 - **Obrázky z produktovej stránky: ver LEN `og:image`** — gallery selektory ťahajú aj „súvisiace/odporúčané" produkty (zlé obrázky). og:image je spoľahlivo hlavný produkt.
 - **Katalóg driftuje** (produkty sa prečíslujú/preskladnia) — zber je snapshot, kódy starnú. Po refreshi exportu spusti `resync_export.py`: rejoin každého produktu na AKTUÁLNY export podľa `(supplier, name)` → čerstvé kódy/obrázky/stav. Inak import sadne na zlý/neexistujúci kód.
 - **„off" = NEpredajný** (hidden/blocked ALEBO availability vypredané/„predaj skončil"/nedostupné). **`detailOnly` NIE je off** (drop-ship, predajný cez link) — inak ukáže skladové produkty ako vypnuté.
