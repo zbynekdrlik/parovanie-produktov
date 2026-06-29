@@ -69,7 +69,11 @@ def live_server(tmp_path_factory):
         "code;date;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
         "20260900;2026-05-20 09:00:00;Vybavuje sa;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
         "20260750;2026-05-02 11:30:00;Vybavuje sa;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
-        "20260700;2026-04-24 19:14:05;Vybavuje sa;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n",
+        "20260700;2026-04-24 19:14:05;Vybavuje sa;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n"
+        # 88/Z arrived WITHOUT a supplier (empty itemSupplier) → groups under '—' and
+        # shows the inline supplier-assign field; NEWEST order (20260999) so '—' sorts
+        # LAST and never disturbs the ORBIS-first / within-BETALOV ordering assertions.
+        "20260999;2026-05-25 10:00:00;Vybavuje sa;Bez Dodavatela Test;1;88/Z;Veľkosť: Z;\r\n",
         encoding="cp1250")
     env = {
         **os.environ,

@@ -144,6 +144,28 @@ def _save_waiting(d: dict) -> None:
     os.replace(tmp, WAITING)
 
 
+# Supplier assigned on the Na-objednanie tab for an order line that arrived WITHOUT a
+# supplier: {forestshop_code: supplier_name}. Keyed by code (a property of the product,
+# like order_pairings) so it applies across every order line of that product and is the
+# natural key for the eshop write-back. Same safe gitignored store; NEVER pruned →
+# survives deploy. Written back to the eshop `supplier` field by the nightly upload.
+SUPPLIER_ASSIGN = os.path.join(OUT, "supplier_assignments.json")
+
+
+def _load_supplier_assign() -> dict:
+    if os.path.exists(SUPPLIER_ASSIGN):
+        with open(SUPPLIER_ASSIGN, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_supplier_assign(d: dict) -> None:
+    tmp = SUPPLIER_ASSIGN + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SUPPLIER_ASSIGN)
+
+
 # at startup, prune orphan decisions whose key matches no product (e.g. a stale
 # 'None'/'bad' from before stable keys) so the progress count == the import count
 _VALID_KEYS = {p.get("key") for p in PRODUCTS}
@@ -406,6 +428,10 @@ def api_import():
         ("import_links.csv", import_builder.LINK_HEADER, link),
         ("import_states.csv", import_builder.STATE_HEADER,
          import_builder.state_rows(PRODUCTS, dec, CODE2PAIR)),
+        # supplier write-back: only code;pairCode;supplier (own file → can't wipe
+        # internalNote/state). Independent column from the link rows, so no exclude.
+        ("import_suppliers.csv", import_builder.SUPPLIER_HEADER,
+         import_builder.supplier_rows(_load_supplier_assign(), CODE2PAIR)),
     ]
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -507,6 +533,39 @@ def api_order_pair():
     return jsonify({"ok": True})
 
 
+@app.route("/api/order-supplier", methods=["POST"])
+def api_order_supplier():
+    """Assign/clear a supplier name for a forestshop order code (keyed by itemCode).
+    Lets the manager fill in the supplier for an order line that arrived without one;
+    the row then regroups under that supplier on the tab and the name is written back
+    to the eshop `supplier` field by the nightly upload. Empty supplier clears it.
+    Mirrors /api/order-pair (same code guard); the supplier name reaches a CSV, so a
+    leading formula char is rejected here AND escaped at the CSV sink (_csv_safe)."""
+    body = request.get_json(force=True)
+    code = str(body.get("code") or "").strip()
+    supplier = str(body.get("supplier") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "missing code"}), 400
+    # forestshop codes always start alphanumeric — a leading formula char (=,+,-,@,…)
+    # is malformed or a CSV-injection attempt; reject at the source.
+    if code[:1] in _FORMULA_LEAD:
+        return jsonify({"ok": False, "error": "invalid code"}), 400
+    # supplier name is written verbatim into the import CSV's `supplier` column — a
+    # leading formula char would be a CSV-injection vector; real names start
+    # alphanumeric, so reject it here too (belt-and-braces with _csv_safe at the sink).
+    if supplier and supplier[:1] in _FORMULA_LEAD:
+        return jsonify({"ok": False, "error": "invalid supplier"}), 400
+    with _lock:
+        d = _load_supplier_assign()
+        if supplier:
+            d[code] = supplier
+        else:
+            d.pop(code, None)
+        _save_supplier_assign(d)
+    log.info("order-supplier code=%s supplier=%s", code, supplier)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/orders")
 def api_orders():
     """To-order list: forestshop 'Vybavuje sa' items joined to supplier reorder
@@ -521,12 +580,16 @@ def api_orders():
     ordered = _load_ordered()
     waiting = _load_waiting()
     pairings = _load_order_pairings()
+    assigns = _load_supplier_assign()
     for r in rows:
         r["ordered"] = bool(ordered.get(r["key"]))
         r["waiting"] = bool(waiting.get(r["key"]))   # 'čaká sa' — deferred active line
         # supplierUrl stays the reviewed-decision link (read-only); pairUrl is the
         # inline-entered one (editable on the tab). A row is "paired" if either is set.
         r["pairUrl"] = pairings.get(r["itemCode"], "")
+        # supplier manually assigned for an order line that arrived without one — the
+        # tab groups by (assignedSupplier OR supplier), so this regroups the row.
+        r["assignedSupplier"] = assigns.get(r["itemCode"], "")
     return jsonify({"orders": rows})
 
 
@@ -790,6 +853,116 @@ def n8n_upload_pairings():
     log.info("n8n pairings: rc=%s processed=%s products=%d", rc, parsed.get("processed"), len(new_keys))
     if not ok:
         log.error("n8n pairings FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
+    return jsonify(result), (200 if ok else 502)
+
+
+# --------------------------------------------------------------------------- #
+# n8n → nightly upload of assigned supplier names (→ eshop `supplier` field)
+# --------------------------------------------------------------------------- #
+SUPPLIERS_STATE = os.path.join(OUT, "uploaded_suppliers.json")
+
+
+def _load_uploaded_suppliers():
+    """{code: supplier} already written back to the eshop — so the nightly job only
+    sends new or changed assignments. Missing/corrupt → empty (everything is new).
+    Always a dict (a stray array could repeat a code and break the summary invariant)."""
+    try:
+        with open(SUPPLIERS_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_uploaded_suppliers(d):
+    tmp = SUPPLIERS_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, SUPPLIERS_STATE)
+
+
+def _supplier_summary(uploaded, assigns):
+    """Totals for the n8n summary notification: assigned codes, how many are already
+    written back (uploaded value still matches the current assignment), how many remain.
+    A changed name counts as remaining (uploaded != current), matching new_supplier_keys."""
+    valid = {c for c, s in assigns.items() if (c or "").strip() and (s or "").strip()}
+    total = len(valid)
+    up = sum(1 for c in valid if uploaded.get(c) == assigns.get(c))
+    return {"total_assigned": total, "total_uploaded": up,
+            "remaining": max(0, total - up), "review_url": PUBLIC_URL}
+
+
+@app.route("/api/n8n/upload-suppliers", methods=["POST"])
+def n8n_upload_suppliers():
+    """Write newly assigned supplier names back to the eshop `supplier` field. Reads
+    the local supplier assignments, builds code;pairCode;supplier for only the codes
+    not yet uploaded (or whose name changed), runs the careful import, records what
+    went up. Bearer-auth'd; dry_run=1 reaches the import without changing anything.
+    Touches ONLY the supplier column — links/state/prices are left untouched."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {token}".encode() if token else b""
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n suppliers: unauthorized call from %s", _client_ip())
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    assigns = _load_supplier_assign()
+    uploaded = _load_uploaded_suppliers()
+    new_codes = import_builder.new_supplier_keys(assigns, uploaded)
+    products = [{"code": c, "supplier": assigns[c]} for c in new_codes]
+    if not new_codes:
+        log.info("n8n suppliers: 0 new assignments")
+        return jsonify({"ok": True, "count": 0, "products": [],
+                        **_supplier_summary(uploaded, assigns)}), 200
+
+    rows = import_builder.supplier_rows({c: assigns[c] for c in new_codes}, CODE2PAIR)
+    if not rows:
+        log.warning("n8n suppliers: %d new codes but 0 import rows", len(new_codes))
+        return jsonify({"ok": True, "count": 0, "products": products,
+                        "message": "no import rows", "blocked": len(new_codes),
+                        **_supplier_summary(uploaded, assigns)}), 200
+
+    os.makedirs(OUT, exist_ok=True)
+    out_fd, out_path = tempfile.mkstemp(prefix="import_suppliers_", suffix=".csv", dir=OUT)
+    with os.fdopen(out_fd, "w", encoding="utf-8-sig", newline="") as f:
+        from parovanie.writer import shoptet_writer
+        w = shoptet_writer(f)
+        w.writerow(import_builder.SUPPLIER_HEADER)
+        # formula-injection guard at the sink (defense-in-depth alongside the endpoint
+        # reject) — the supplier name is free text written into a CSV cell
+        w.writerows([_csv_safe(c) for c in row] for row in rows)
+
+    if not _import_lock.acquire(blocking=False):
+        log.warning("n8n suppliers: another import already running")
+        _safe_unlink(out_path)
+        return jsonify({"ok": False, "error": "import already running"}), 409
+    log.info("n8n suppliers: %d codes, %d rows, dry_run=%s", len(new_codes), len(rows), dry)
+    try:
+        rc, out, err = run_import(out_path, dry_run=dry, timeout=900)
+        parsed = parse_import_log(out)
+        ok = rc == 0
+        if ok and not dry:                   # record only after a real success (inside the lock)
+            for c in new_codes:
+                uploaded[c] = (assigns[c] or "").strip()
+            _save_uploaded_suppliers(uploaded)
+    except subprocess.TimeoutExpired:
+        log.error("n8n suppliers: subprocess timeout — killed import group")
+        _safe_unlink(out_path)
+        return jsonify({"ok": False, "error": "import timeout"}), 504
+    finally:
+        _import_lock.release()
+
+    if ok:
+        _safe_unlink(out_path)
+    result = {"ok": ok, "exit_code": rc, "count": len(new_codes), "rows": len(rows),
+              "dry_run": dry, "processed": parsed.get("processed"),
+              "updated": parsed.get("updated"), "failed": parsed.get("failed"),
+              "products": products, "stdout_tail": (out or "")[-800:],
+              **_supplier_summary(uploaded, assigns)}
+    log.info("n8n suppliers: rc=%s processed=%s codes=%d", rc, parsed.get("processed"), len(new_codes))
+    if not ok:
+        log.error("n8n suppliers FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
     return jsonify(result), (200 if ok else 502)
 
 

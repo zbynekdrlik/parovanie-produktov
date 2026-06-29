@@ -91,6 +91,7 @@ def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
     monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
     monkeypatch.setattr(webapp, "_load_decisions",
         lambda: {"BETALOV|231": {"status": "good", "url": "https://www.huntingshop.eu/x"}})
     j = _client().get("/api/orders").get_json()
@@ -98,6 +99,7 @@ def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
     assert j["orders"][0]["supplierUrl"] == "https://www.huntingshop.eu/x"
     assert j["orders"][0]["ordered"] is False
     assert j["orders"][0]["waiting"] is False
+    assert j["orders"][0]["assignedSupplier"] == ""
 
 
 def test_order_pair_endpoint_persists(monkeypatch, tmp_path):
@@ -165,6 +167,7 @@ def test_orders_exposes_inline_pair_url(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "CODE2PAIR", {})
     monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
     monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
     j = _client().get("/api/orders").get_json()
     assert j["orders"][0]["supplierUrl"] == "" and j["orders"][0]["pairUrl"] == ""
@@ -186,6 +189,72 @@ def test_import_zip_includes_inline_pairings(monkeypatch, tmp_path):
     z = zipfile.ZipFile(io.BytesIO(r.data))
     links = z.read("import_links.csv").decode("utf-8-sig")
     assert "60028/XL;555;https://supplier/inline" in links
+
+
+# --- supplier assignment (order line without a supplier) -------------------- #
+def test_order_supplier_endpoint_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    c = _client()
+    r = c.post("/api/order-supplier", json={"code": "88/Z", "supplier": "BETALOV"})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert webapp._load_supplier_assign()["88/Z"] == "BETALOV"
+    # empty supplier clears the assignment
+    c.post("/api/order-supplier", json={"code": "88/Z", "supplier": ""})
+    assert "88/Z" not in webapp._load_supplier_assign()
+
+
+def test_order_supplier_requires_code(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    r = _client().post("/api/order-supplier", json={"code": "", "supplier": "BETALOV"})
+    assert r.status_code == 400
+
+
+def test_order_supplier_rejects_formula_code_and_supplier(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    c = _client()
+    # formula-leading code rejected
+    assert c.post("/api/order-supplier",
+                  json={"code": "=cmd", "supplier": "BETALOV"}).status_code == 400
+    # formula-leading supplier name rejected (CSV-injection into the supplier column)
+    assert c.post("/api/order-supplier",
+                  json={"code": "88/Z", "supplier": "=HYPERLINK(1)"}).status_code == 400
+    assert webapp._load_supplier_assign() == {}
+    # a real supplier name with a leading alnum is accepted
+    assert c.post("/api/order-supplier",
+                  json={"code": "88/Z", "supplier": "JŠ SERVIS"}).status_code == 200
+
+
+def test_orders_exposes_assigned_supplier(monkeypatch, tmp_path):
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261060;Vybavuje sa;Bez dod;1;88/Z;Veľkosť: Z;\r\n")   # NO itemSupplier
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {})
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    j = _client().get("/api/orders").get_json()
+    assert j["orders"][0]["supplier"] == "" and j["orders"][0]["assignedSupplier"] == ""
+    _client().post("/api/order-supplier", json={"code": "88/Z", "supplier": "ORBIS"})
+    j2 = _client().get("/api/orders").get_json()
+    assert j2["orders"][0]["assignedSupplier"] == "ORBIS"
+    assert j2["orders"][0]["supplier"] == ""   # original order supplier stays empty/separate
+
+
+def test_import_zip_includes_supplier_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"88/Z": "777"})
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    webapp._save_supplier_assign({"88/Z": "BETALOV"})
+    r = _client().get("/api/import")
+    assert r.status_code == 200
+    import zipfile
+    sup = zipfile.ZipFile(io.BytesIO(r.data)).read("import_suppliers.csv").decode("utf-8-sig")
+    assert sup.splitlines()[0] == "code;pairCode;supplier"
+    assert "88/Z;777;BETALOV" in sup
 
 
 def test_supplier_meta_parses_price_and_availability():
@@ -487,3 +556,81 @@ def test_import_multipart_file_path(monkeypatch, tmp_path):
         content_type="multipart/form-data",
         headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 200 and r.get_json()["rows"] == 1
+
+
+# --- n8n nightly supplier write-back (assigned names → eshop `supplier`) ----- #
+def _arm_suppliers(monkeypatch, tmp_path, assigns, token="secret-tok"):
+    cred = tmp_path / ".shoptet_admin"
+    cred.write_text(f"N8N_IMPORT_TOKEN={token}\n", encoding="utf-8")
+    monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    monkeypatch.setattr(webapp, "SUPPLIERS_STATE", str(tmp_path / "uploaded_suppliers.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"88/Z": "777"})
+    webapp._save_supplier_assign(assigns)
+    return token
+
+
+def test_suppliers_rejects_without_token(monkeypatch, tmp_path):
+    _arm_suppliers(monkeypatch, tmp_path, {})
+    assert _client().post("/api/n8n/upload-suppliers").status_code == 401
+
+
+def test_suppliers_zero_new_returns_count_0(monkeypatch, tmp_path):
+    tok = _arm_suppliers(monkeypatch, tmp_path, {})
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+    r = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200 and r.get_json()["count"] == 0
+
+
+def test_suppliers_uploads_csv_and_marks_uploaded(monkeypatch, tmp_path):
+    tok = _arm_suppliers(monkeypatch, tmp_path, {"88/Z": "BETALOV"})
+    seen = {}
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rd = list(_csv.reader(f, delimiter=";"))
+        seen["header"] = rd[0]
+        seen["rows"] = rd[1:]
+        return 0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""
+
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    j = _client().post("/api/n8n/upload-suppliers",
+                       headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j["ok"] and j["count"] == 1
+    # the import file carries ONLY code;pairCode;supplier (no internalNote/state → safe)
+    assert seen["header"] == ["code", "pairCode", "supplier"]
+    assert ["88/Z", "777", "BETALOV"] in seen["rows"]
+    assert j["products"][0] == {"code": "88/Z", "supplier": "BETALOV"}
+    assert j["total_assigned"] == 1 and j["total_uploaded"] == 1 and j["remaining"] == 0
+    # uploaded state recorded → a second call sends nothing
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run again")))
+    r2 = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
+    assert r2.get_json()["count"] == 0
+
+
+def test_suppliers_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
+    tok = _arm_suppliers(monkeypatch, tmp_path, {"88/Z": "WETLAND"})
+    monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (0, "spracované=1", ""))
+    r = _client().post("/api/n8n/upload-suppliers?dry_run=1", headers={"Authorization": f"Bearer {tok}"})
+    assert r.get_json()["dry_run"] is True
+    # dry-run must NOT persist → still 1 new on the next (real) call
+    monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (0, "spracované=1", ""))
+    r2 = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
+    assert r2.get_json()["count"] == 1
+
+
+def test_suppliers_failed_import_does_not_mark_uploaded(monkeypatch, tmp_path):
+    # A FAILED import (rc != 0) must NOT record the assignment as uploaded.
+    tok = _arm_suppliers(monkeypatch, tmp_path, {"88/Z": "ODIMON"})
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (1, "chyba", "boom"))
+    r = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 502 and r.get_json()["ok"] is False
+    # not marked → a later successful call still sends it
+    ok_run = lambda p, dry_run=False, timeout=300: (0, "spracované=1", "")  # noqa: E731
+    monkeypatch.setattr(webapp, "run_import", ok_run)
+    r2 = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
+    assert r2.get_json()["count"] == 1

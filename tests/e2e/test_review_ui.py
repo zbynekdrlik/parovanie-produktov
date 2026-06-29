@@ -164,3 +164,83 @@ def test_toorder_waiting_marker_toggles_and_persists(page, live_server):
     assert "waiting" not in (row.get_attribute("class") or "")
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_toorder_assign_supplier_for_no_supplier_row(page, live_server):
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    page.goto(live_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    # 88/Z arrived WITHOUT a supplier → it shows the inline supplier-assign input,
+    # and ORBIS currently holds only its own line (77/X).
+    row = page.locator(".toorder-row[data-code='88/Z']")
+    assert row.locator("input.to-supinput").count() == 1
+    assert "ORBIS (1)" in page.locator("#filters").inner_text()
+
+    # Assign ORBIS → the row regroups under ORBIS (filter count 1→2); the input is
+    # replaced by a 🏷️ supplier tag + a small ✏️ to fix a wrong name (same as URL).
+    row.locator("input.to-supinput").fill("ORBIS")
+    with page.expect_response(
+            lambda r: "/api/order-supplier" in r.url and r.request.method == "POST"):
+        row.locator(".to-supsave").click()
+    page.wait_for_selector(".toorder-row[data-code='88/Z'] .to-suptag")
+    row = page.locator(".toorder-row[data-code='88/Z']")
+    assert "ORBIS" in row.locator(".to-suptag").inner_text()
+    assert row.locator("input.to-supinput").count() == 0
+    assert row.locator(".to-supedit").count() == 1
+    assert "ORBIS (2)" in page.locator("#filters").inner_text()
+
+    # Persists across reload (server-side supplier_assignments.json).
+    page.reload()
+    page.wait_for_selector(".toorder-row[data-code='88/Z'] .to-suptag")
+    assert "ORBIS (2)" in page.locator("#filters").inner_text()
+
+    # ✏️ reveals the editor; clearing it returns the row to the '—' group — also leaves
+    # the shared fixture server pristine for any later test.
+    page.locator(".toorder-row[data-code='88/Z'] .to-supedit").click()
+    page.wait_for_selector(".toorder-row[data-code='88/Z'] input.to-supinput")
+    page.locator(".toorder-row[data-code='88/Z'] input.to-supinput").fill("")
+    with page.expect_response(
+            lambda r: "/api/order-supplier" in r.url and r.request.method == "POST"):
+        page.locator(".toorder-row[data-code='88/Z'] .to-supsave").click()
+    page.wait_for_selector(".toorder-row[data-code='88/Z'] input.to-supinput")
+    assert "ORBIS (1)" in page.locator("#filters").inner_text()
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_toorder_assigned_supplier_name_is_html_escaped(page, live_server):
+    # a supplier name is free text → it must be HTML-escaped everywhere it renders
+    # (group header + filter label both go through the innerHTML-based el() helper).
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    page.goto(live_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row[data-code='88/Z']")
+
+    row = page.locator(".toorder-row[data-code='88/Z']")
+    row.locator("input.to-supinput").fill("<i>x</i>")
+    with page.expect_response(
+            lambda r: "/api/order-supplier" in r.url and r.request.method == "POST"):
+        row.locator(".to-supsave").click()
+
+    # the name renders as literal text, NOT as an <i> element (no XSS sink)
+    page.wait_for_selector(".toorder-row[data-code='88/Z'] .to-suptag")
+    assert page.locator(".toorder-supplier i").count() == 0
+    assert page.locator("#filters i").count() == 0
+    assert "<i>x</i>" in page.locator(".toorder-supplier", has_text="<i>x</i>").inner_text()
+
+    # cleanup: clear it so the shared fixture server is left pristine
+    page.locator(".toorder-row[data-code='88/Z'] .to-supedit").click()
+    page.wait_for_selector(".toorder-row[data-code='88/Z'] input.to-supinput")
+    page.locator(".toorder-row[data-code='88/Z'] input.to-supinput").fill("")
+    with page.expect_response(
+            lambda r: "/api/order-supplier" in r.url and r.request.method == "POST"):
+        page.locator(".toorder-row[data-code='88/Z'] .to-supsave").click()
+    page.wait_for_selector(".toorder-row[data-code='88/Z'] input.to-supinput")
+
+    assert console == [], f"console not clean: {console}"

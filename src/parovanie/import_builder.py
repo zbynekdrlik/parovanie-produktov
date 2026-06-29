@@ -21,6 +21,13 @@ Three eshop states (see .claude/skills/shoptet):
 LINK_HEADER = ["code", "pairCode", "internalNote"]
 STATE_HEADER = ["code", "pairCode", "productVisibility", "stock",
                 "availabilityInStock", "availabilityOutOfStock"]
+# Supplier write-back: the ONLY columns a supplier-assign CSV sets. `supplier` is a
+# Shoptet product field present in the pattern-14 export; split out so a present-but-
+# empty cell can't wipe internalNote/state/prices. NOTE: export-presence does NOT prove
+# CSV import-settability (textProperty1..20 are exported yet ignored on import — see
+# .claude/skills/shoptet). Import-settability MUST be verified live via an export
+# read-back before trusting the nightly write-back (same check the pairings path uses).
+SUPPLIER_HEADER = ["code", "pairCode", "supplier"]
 
 # Restock import (vypredané → skladom): the ONLY columns a restock CSV may set.
 # An upstream feed (n8n) carries extra info columns (name, prices, supplier, …);
@@ -72,6 +79,22 @@ def new_pairing_keys(decisions, uploaded):
     return out
 
 
+def new_supplier_keys(assignments, uploaded):
+    """Forestshop codes ready for the nightly supplier write-back: assigned a
+    non-empty supplier name that was NOT yet uploaded (new code) or whose name
+    changed since the last upload. `assignments`/`uploaded` are {code: supplier}.
+    Keeps the upload incremental — only genuinely new/changed assignments go up."""
+    out = []
+    for code, sup in assignments.items():
+        c = (code or "").strip()
+        s = (sup or "").strip()
+        if not c or not s:
+            continue
+        if uploaded.get(c) != s:
+            out.append(code)   # original key (callers index assignments[c] with it)
+    return out
+
+
 def link_rows(products, decisions, code2pair):
     """Reorder-link rows → `internalNote` = URL, one per variant, for good/manual
     decisions with a URL. Only code;pairCode;internalNote (no state columns → the
@@ -115,6 +138,26 @@ def order_pairing_rows(order_pairings, code2pair, exclude_codes=None):
             continue
         seen.add(code)
         rows.append([code, code2pair.get(code, ""), url])
+    return rows
+
+
+def supplier_rows(assignments, code2pair, exclude_codes=None):
+    """Supplier write-back rows from supplier names assigned on the 'Na objednanie'
+    tab. `assignments` is {forestshop_code: supplier_name} — the manager fills in the
+    supplier for an order line that arrived without one. Emits code;pairCode;supplier
+    (only the `supplier` column → internalNote/state/prices left untouched). Each code
+    once; empty code/supplier dropped; `exclude_codes` skipped. Shoptet aborts the
+    whole import on a duplicate code, so dedup is mandatory. Pure → unit-testable."""
+    exclude = exclude_codes or set()
+    rows = []
+    seen = set()
+    for code, sup in assignments.items():
+        code = (code or "").strip()
+        sup = (sup or "").strip()
+        if not code or not sup or code in exclude or code in seen:
+            continue
+        seen.add(code)
+        rows.append([code, code2pair.get(code, ""), sup])
     return rows
 
 

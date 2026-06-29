@@ -111,6 +111,18 @@ a.supurl:hover { text-decoration: underline; }
 .toorder-row .to-pairedit { background: transparent; border: 0; cursor: pointer; font-size: 13px;
   padding: 2px 4px; flex: 0 0 auto; opacity: .55; }
 .toorder-row .to-pairedit:hover { opacity: 1; }
+/* doplnenie dodávateľa (pre riadky bez dodávateľa) — rovnaký štýl ako párovanie URL */
+.toorder-row .to-supplier { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.toorder-row .to-supinput { width: 140px; padding: 5px 7px; border: 1px solid #d1d5db;
+  border-radius: 6px; font-size: 12px; }
+.toorder-row .to-supsave { background: #0d9488; color: #fff; border: 0; border-radius: 6px;
+  padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.toorder-row .to-supsave:hover { background: #0f766e; }
+.toorder-row .to-suptag { background: #ccfbf1; color: #0f5132; font-size: 12px; font-weight: 600;
+  padding: 3px 8px; border-radius: 10px; flex: 0 0 auto; white-space: nowrap; }
+.toorder-row .to-supedit { background: transparent; border: 0; cursor: pointer; font-size: 13px;
+  padding: 2px 4px; flex: 0 0 auto; opacity: .55; }
+.toorder-row .to-supedit:hover { opacity: 1; }
 .toorder-row .to-size { font-weight: 600; font-size: 13px; min-width: 90px; }
 .toorder-row .to-qty { font-weight: 700; color: #065f46; font-size: 13px; min-width: 52px; }
 .toorder-row .to-name { color: #4b5563; font-size: 13px; flex: 1; overflow: hidden;

@@ -1,7 +1,7 @@
 let PRODUCTS = [];
 let DECISIONS = {};         // key -> {status, url}
 let FILTER = 'unreviewed';
-let ORDERS = [];            // [{key, orderCode, itemCode, size, qty, supplier, name, supplierUrl, ordered}]
+let ORDERS = [];            // [{key, orderCode, itemCode, size, qty, supplier, name, supplierUrl, ordered, assignedSupplier}]
 let ORDERED = {};           // key -> true (ordered/objednané)
 let WAITING = {};           // key -> true (čaká sa — deferred active line)
 let ORDER_SUPPLIER = 'all';
@@ -297,6 +297,43 @@ function pairEditor(o, row, focus) {
   return pair;
 }
 
+// effective supplier for grouping: a manually-assigned supplier wins over the
+// order-given one (empty for lines that arrived without a supplier → '—')
+const effSup = (o) => (o.assignedSupplier || o.supplier || '—');
+
+// Inline supplier assign: fill in the supplier for an order line that arrived WITHOUT
+// one. Persists per forestshop code; the row then regroups under that supplier and the
+// name is written back to the eshop `supplier` field by the nightly upload.
+async function saveSupplier(o, supplier, row) {
+  const r = await fetch('/api/order-supplier', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: o.itemCode, supplier })
+  });
+  if (!r.ok) return;
+  // assignment is keyed by itemCode (a product property) → apply to EVERY order line
+  // of that code, so all sibling lines regroup together (not just the clicked one)
+  for (const x of ORDERS) if (x.itemCode === o.itemCode) x.assignedSupplier = supplier;
+  renderToOrder();                 // re-render: the row(s) move into the supplier group
+}
+
+// supplier editor (text input with known-supplier autocomplete + save) — used for an
+// unassigned no-supplier row and when ✏️-editing an already-assigned one
+function supplierEditor(o, row, focus) {
+  const wrap = el('div', 'to-supplier');
+  const inp = el('input', 'to-supinput'); inp.type = 'text';
+  inp.placeholder = o.assignedSupplier ? 'upraviť dodávateľa…' : 'doplniť dodávateľa…';
+  inp.value = o.assignedSupplier || '';
+  inp.setAttribute('list', 'known-suppliers');   // autocomplete from existing suppliers
+  const save = el('button', 'to-supsave', '💾 Uložiť');
+  save.title = 'Priradiť dodávateľa — položka sa zaradí pod neho a zapíše sa do eshopu';
+  const doSave = () => saveSupplier(o, inp.value.trim(), row);
+  save.onclick = doSave;
+  inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
+  wrap.appendChild(inp); wrap.appendChild(save);
+  if (focus) setTimeout(() => inp.focus(), 0);
+  return wrap;
+}
+
 function renderOrderRow(o) {
   const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : '') + (WAITING[o.key] ? ' waiting' : ''));
   row.dataset.key = o.key; row.dataset.code = o.itemCode;
@@ -326,6 +363,21 @@ function renderOrderRow(o) {
   row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
   row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
   row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));
+  // supplier assign — ONLY for order lines that arrived WITHOUT a supplier. Same shape
+  // as the URL pairing: doplniť → svieti názov + malá ✏️ na opravu.
+  if (!o.supplier) {
+    if (o.assignedSupplier) {
+      const tag = el('span', 'to-suptag', '🏷️ ' + escapeHtml(o.assignedSupplier));
+      tag.title = 'Doplnený dodávateľ (zapíše sa do eshopu)';
+      row.appendChild(tag);
+      const sed = el('button', 'to-supedit', '✏️');
+      sed.title = 'Zmeniť / opraviť dodávateľa';
+      sed.onclick = () => { tag.replaceWith(supplierEditor(o, row, true)); sed.remove(); };
+      row.appendChild(sed);
+    } else {
+      row.appendChild(supplierEditor(o, row, false));
+    }
+  }
   if (o.orderDate) {
     const d = el('span', 'to-date', '📅 ' + fmtDate(o.orderDate));
     d.title = 'Dátum objednávky';
@@ -360,9 +412,16 @@ function renderToOrder() {
   // (nižšie = staršie), takže urgentnosť dodávateľa = jeho najnižšie orderCode;
   // v rámci dodávateľa od najstaršej. Tá najstaršia sa musí vybaviť čo najskôr.
   const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? Infinity : n; };
+  // datalist of known supplier names (avoid typo-fragmented groups) — distinct real
+  // suppliers seen across orders, both order-given and manually assigned
+  const known = [...new Set(ORDERS.flatMap(o => [o.supplier, o.assignedSupplier]).filter(Boolean))].sort();
+  let dl = document.getElementById('known-suppliers');
+  if (!dl) { dl = el('datalist'); dl.id = 'known-suppliers'; document.body.appendChild(dl); }
+  dl.innerHTML = '';
+  for (const s of known) { const opt = document.createElement('option'); opt.value = s; dl.appendChild(opt); }
   const cnt = {}, oldest = {};
   for (const o of ORDERS) {
-    const s = o.supplier || '—';
+    const s = effSup(o);
     cnt[s] = (cnt[s] || 0) + 1;
     oldest[s] = Math.min(oldest[s] ?? Infinity, oNum(o));
   }
@@ -375,15 +434,17 @@ function renderToOrder() {
     return b;
   };
   fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`));
-  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${s} (${cnt[s]})`));
+  // escapeHtml: a supplier name is manually assignable (free text) → never trust it in
+  // the innerHTML-based el() helper (filter label + group header below)
+  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${escapeHtml(s)} (${cnt[s]})`));
   const list = document.getElementById('list'); list.innerHTML = '';
-  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || (o.supplier || '—') === ORDER_SUPPLIER);
+  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || effSup(o) === ORDER_SUPPLIER);
   document.getElementById('empty').hidden = shown.length > 0;
   const groups = {};
-  for (const o of shown) { const s = o.supplier || '—'; (groups[s] = groups[s] || []).push(o); }
+  for (const o of shown) { const s = effSup(o); (groups[s] = groups[s] || []).push(o); }
   for (const sup of Object.keys(groups).sort(byPriority)) {
     groups[sup].sort((a, b) => oNum(a) - oNum(b));   // v rámci dodávateľa: najstaršia objednávka prvá
-    list.appendChild(el('div', 'toorder-supplier', `${sup} — ${groups[sup].length} položiek`));
+    list.appendChild(el('div', 'toorder-supplier', `${escapeHtml(sup)} — ${groups[sup].length} položiek`));
     for (const o of groups[sup]) list.appendChild(renderOrderRow(o));
   }
 }
