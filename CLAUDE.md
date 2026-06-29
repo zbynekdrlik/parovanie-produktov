@@ -7,6 +7,7 @@ Load the matching skill BEFORE working on that area (don't re-derive):
 - shoptet eshop / export / import / polia produktov / textProperty / vypredané/vypnuté → load `.claude/skills/shoptet`
 - dodávatelia / recon webu / pridanie dodávateľa / parsovanie výsledkov → load `.claude/skills/suppliers`
 - deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`
+- webreview web (review tab / Na objednanie / per-riadkové stavy / api endpointy) → load `.claude/skills/webreview`
 
 ## Always
 - Kódovanie I/O = **cp1250** na ČÍTANIE exportu; **import CSV = UTF-8 s BOM** (`utf-8-sig`), `;`, CRLF (cp1250 import → mojibake `č`→`è`).
