@@ -166,6 +166,20 @@ def _save_supplier_assign(d: dict) -> None:
     os.replace(tmp, SUPPLIER_ASSIGN)
 
 
+# GRUBE per-size externalCode store (durable, built by scripts/build_grube_codes.py):
+# {code: {itemId, size, deUrl, productId}}. Read-only here — feeds the externalCode
+# write-back CSV. Missing/corrupt → {} (the file may not exist until the first gather).
+GRUBE_CODES = os.path.join(OUT, "grube_codes.json")
+
+
+def _load_grube_codes() -> dict:
+    try:
+        with open(GRUBE_CODES, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 # at startup, prune orphan decisions whose key matches no product (e.g. a stale
 # 'None'/'bad' from before stable keys) so the progress count == the import count
 _VALID_KEYS = {p.get("key") for p in PRODUCTS}
@@ -432,6 +446,10 @@ def api_import():
         # internalNote/state). Independent column from the link rows, so no exclude.
         ("import_suppliers.csv", import_builder.SUPPLIER_HEADER,
          import_builder.supplier_rows(_load_supplier_assign(), CODE2PAIR)),
+        # GRUBE per-size externalCode write-back: only code;pairCode;externalCode (own
+        # file → can't wipe internalNote/state). Independent column, so no exclude.
+        ("import_externalcode.csv", import_builder.EXTERNALCODE_HEADER,
+         import_builder.externalcode_rows(_load_grube_codes(), CODE2PAIR)),
     ]
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:

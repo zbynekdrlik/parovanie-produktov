@@ -18,6 +18,8 @@ Three eshop states (see .claude/skills/shoptet):
   3. Už sa nebude predávať — detailOnly + 'Predaj výrobku skončil' (page kept for Google).
 """
 
+from parovanie.grube_de import to_grube_de
+
 LINK_HEADER = ["code", "pairCode", "internalNote"]
 STATE_HEADER = ["code", "pairCode", "productVisibility", "stock",
                 "availabilityInStock", "availabilityOutOfStock"]
@@ -34,6 +36,12 @@ SUPPLIER_HEADER = ["code", "pairCode", "supplier"]
 # Shoptet imports every recognised header, so we must keep ONLY these — otherwise
 # the feed could silently overwrite prices/names on the live eshop.
 RESTOCK_COLS = ["code", "pairCode", "productVisibility", "availabilityInStock", "stock"]
+
+# GRUBE per-size externalCode write-back: the ONLY columns this CSV sets. Own file
+# (own header) so a present-but-empty cell can't wipe internalNote/state/prices.
+# externalCode is variant-level importable (verified live, Task 1). GRUBE-only is
+# guaranteed by the source store (grube_codes.json is built only for GRUBE).
+EXTERNALCODE_HEADER = ["code", "pairCode", "externalCode"]
 
 _VYPREDANE = "Vypredané"
 _SKONCIL = "Predaj výrobku skončil"
@@ -100,7 +108,12 @@ def link_rows(products, decisions, code2pair):
     decisions with a URL. Only code;pairCode;internalNote (no state columns → the
     eshop's stock/visibility is left untouched). Each `code` appears ONCE — Shoptet
     aborts the whole import on a duplicate code, and the catalog has duplicate
-    products that share variant codes (first pairing wins)."""
+    products that share variant codes (first pairing wins).
+
+    GRUBE-only: a GRUBE product's URL is rebuilt to the canonical grube.de detail
+    URL (productId-rebuild via `to_grube_de`, strips mangled slug/query/single-size
+    #itemId); a non-grube product's URL is written verbatim. Fallback to the raw URL
+    if `to_grube_de` can't parse a productId."""
     rows = []
     seen = set()
     for p in products:
@@ -109,6 +122,8 @@ def link_rows(products, decisions, code2pair):
             continue
         if d.get("status") in ("good", "manual") and (d.get("url") or "").strip():
             url = d["url"].strip()
+            if p.get("supplier") == "GRUBE":
+                url = to_grube_de(url) or url
             for c in p["variant_codes"]:
                 if c in seen:
                     continue
@@ -158,6 +173,28 @@ def supplier_rows(assignments, code2pair, exclude_codes=None):
             continue
         seen.add(code)
         rows.append([code, code2pair.get(code, ""), sup])
+    return rows
+
+
+def externalcode_rows(grube_codes, code2pair, exclude_codes=None):
+    """GRUBE per-size externalCode write-back rows: code;pairCode;externalCode from
+    `grube_codes` ({code: {itemId, ...}}, the durable grube_codes.json store, GRUBE-only
+    by construction). The externalCode is the grube per-size `itemId`; it MUST be a
+    non-empty purely-numeric string — an empty/non-numeric cell is dropped (an empty
+    cell would WIPE the existing externalCode, a non-numeric one is junk and could be a
+    formula-injection lead). Each code once, first-wins; `exclude_codes` skipped. Shoptet
+    aborts the whole import on a duplicate code, so dedup is mandatory. Pure → testable."""
+    exclude = exclude_codes or set()
+    rows = []
+    seen = set()
+    for code, info in grube_codes.items():
+        if code in exclude or code in seen:
+            continue
+        iid = str(info.get("itemId", "")).strip()
+        if not iid or not iid.isdigit():
+            continue
+        seen.add(code)
+        rows.append([code, code2pair.get(code, ""), iid])
     return rows
 
 
