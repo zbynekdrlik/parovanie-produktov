@@ -45,10 +45,10 @@ def test_export_route_shape():
 # --- Na objednanie (to-order tab) ------------------------------------------- #
 def test_build_to_order_rows_filters_and_joins():
     orders = (
-        "code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20261045;Vybavuje sa;Polokošeľa HART;1;61247/L;Veľkosť: L;BETALOV\r\n"
-        "20261099;Vybavená;Iné;1;99999/M;Veľkosť: M;ORBIS\r\n"
-        "20261045;Vybavuje sa;Kuriér;1;SHIPPING11;;\r\n"
+        "code;date;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20261045;2026-04-24 19:14:05;Vybavuje sa;Polokošeľa HART;1;61247/L;Veľkosť: L;BETALOV\r\n"
+        "20261099;2026-05-01 10:00:00;Vybavená;Iné;1;99999/M;Veľkosť: M;ORBIS\r\n"
+        "20261045;2026-04-24 19:14:05;Vybavuje sa;Kuriér;1;SHIPPING11;;\r\n"
     )
     products = [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa HART",
                  "variant_codes": ["61247/L"], "pairCode": "231"}]
@@ -59,7 +59,15 @@ def test_build_to_order_rows_filters_and_joins():
     assert r["itemCode"] == "61247/L" and r["qty"] == "1" and r["supplier"] == "BETALOV"
     assert r["size"] == "Veľkosť: L"
     assert r["key"] == "20261045|61247/L"
+    assert r["orderDate"] == "2026-04-24"      # date column, time dropped
     assert r["supplierUrl"] == "https://www.huntingshop.eu/x"
+
+
+def test_build_to_order_rows_missing_date_is_empty():
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261045;Vybavuje sa;X;1;61247/L;L;BETALOV\r\n")
+    rows = webapp.build_to_order_rows(orders, [], {}, {})
+    assert rows[0]["orderDate"] == ""          # no date column → graceful empty
 
 
 def test_ordered_endpoint_persists(monkeypatch, tmp_path):

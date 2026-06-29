@@ -116,4 +116,8 @@ def test_toorder_oldest_first_ordering(page, live_server):
     codes = page.locator(".toorder-row").evaluate_all("els => els.map(e => e.dataset.code)")
     assert codes.index("2/M") < codes.index("1/M"), codes
 
+    # The order date renders on the row, formatted DD.MM.YYYY (ORBIS = 2026-04-24).
+    dt = page.locator(".toorder-row[data-code='77/X'] .to-date").first.inner_text()
+    assert dt.strip().endswith("24.04.2026"), dt
+
     assert console == [], f"console not clean: {console}"

@@ -81,6 +81,7 @@ function matchesFilter(p) {
 }
 
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
+function fmtDate(iso) { const p = (iso || '').split('-'); return p.length === 3 ? `${p[2]}.${p[1]}.${p[0]}` : (iso || ''); }  // 2026-04-24 → 24.04.2026
 function escapeHtml(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function badge(s) {
   const t = { good: '✓ Dobré', manual: '✓ Vybraný link',
@@ -305,6 +306,11 @@ function renderOrderRow(o) {
   row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
   row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
   row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));
+  if (o.orderDate) {
+    const d = el('span', 'to-date', '📅 ' + fmtDate(o.orderDate));
+    d.title = 'Dátum objednávky';
+    row.appendChild(d);
+  }
   if (o.orderCode) {
     const oa = el('a', 'to-order');
     oa.href = 'https://www.forestshop.sk/admin/objednavky-detail/?code=' + encodeURIComponent(o.orderCode);

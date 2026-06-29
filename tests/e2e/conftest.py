@@ -66,10 +66,10 @@ def live_server(tmp_path_factory):
     # oldest order (20260700) so its group sorts ABOVE BETALOV (oldest 20260750),
     # beating the old alphabetical order; within BETALOV 2/M (20260750) precedes 1/M.
     (out / "orders_cache.csv").write_text(
-        "code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20260900;Vybavuje sa;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
-        "20260750;Vybavuje sa;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
-        "20260700;Vybavuje sa;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n",
+        "code;date;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20260900;2026-05-20 09:00:00;Vybavuje sa;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
+        "20260750;2026-05-02 11:30:00;Vybavuje sa;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
+        "20260700;2026-04-24 19:14:05;Vybavuje sa;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n",
         encoding="cp1250")
     env = {
         **os.environ,
