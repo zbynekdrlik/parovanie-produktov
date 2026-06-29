@@ -1,4 +1,8 @@
-from parovanie.grube_de import to_grube_de
+import pathlib
+
+from parovanie.grube_de import parse_variants, to_grube_de
+
+FIX = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_154773.html"
 
 
 def test_to_grube_de_strips_query_and_fragment():
@@ -22,3 +26,31 @@ def test_to_grube_de_entity_mangled_slug():
 def test_to_grube_de_non_product_url_returns_none():
     assert to_grube_de("https://www.grube.sk/search/?q=hose") is None
     assert to_grube_de("") is None
+
+
+def test_parse_variants_grand_nord():
+    html = FIX.read_text(encoding="utf-8")
+    got = parse_variants(html, "154773")
+    assert got == {       # authoritative, from the page's own schema.org Offers
+        "S": "1547734535", "M": "1547734598", "L": "1547734524", "XL": "1547734570",
+        "XXL": "1547734593", "3XL": "1547734523", "4XL": "1547734553", "5XL": "1547734519",
+    }
+
+
+def test_parse_variants_excludes_cross_sell():
+    html = FIX.read_text(encoding="utf-8")
+    got = parse_variants(html, "154773")
+    assert "6165695125" not in got.values()       # cross-sell Nordforest itemId
+    assert all(v.startswith("154773") and len(v) == 10 for v in got.values())
+
+
+def test_parse_variants_no_own_offers_returns_empty():
+    html = FIX.read_text(encoding="utf-8")
+    assert parse_variants(html, "999999") == {}    # no own-prefixed sku -> link-only
+
+
+def test_parse_variants_multicolor_returns_empty():
+    # a size mapping to >1 itemId (two colors) -> ambiguous -> link-only
+    html = ('"name":"Farbe oliv. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547734524"'
+            '"name":"Farbe braun. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547739999"')
+    assert parse_variants(html, "154773") == {}
