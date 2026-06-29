@@ -257,6 +257,57 @@ def test_import_zip_includes_supplier_file(monkeypatch, tmp_path):
     assert "88/Z;777;BETALOV" in sup
 
 
+# --- GRUBE per-size code on Na objednanie ----------------------------------- #
+def test_orders_attach_grube_code(monkeypatch, tmp_path):
+    # _attach_grube joins the durable grube_codes store onto an order row by its
+    # forestshop variant code (itemCode) → grubeItemId (copyable code) + grubeDeUrl.
+    monkeypatch.setattr(webapp, "GRUBE_CODES", str(tmp_path / "gc.json"))
+    (tmp_path / "gc.json").write_text(
+        '{"60645/L": {"itemId": "1547734519", "size": "L",'
+        ' "deUrl": "https://www.grube.de/p/x/154773/", "productId": "154773"}}',
+        encoding="utf-8")
+    r = webapp._attach_grube({"itemCode": "60645/L"})
+    assert r["grubeItemId"] == "1547734519"
+    assert r["grubeDeUrl"] == "https://www.grube.de/p/x/154773/"
+    # a code with no grube entry → empty fields (non-grube / link-only line)
+    r2 = webapp._attach_grube({"itemCode": "99999/X"})
+    assert r2["grubeItemId"] == "" and r2["grubeDeUrl"] == ""
+
+
+def test_orders_attach_grube_rejects_non_https_deurl(monkeypatch, tmp_path):
+    # the deUrl reaches an <a href> on the client → only https:// passes the server
+    # guard; javascript:/data:/http:// are dropped (never reach the DOM).
+    monkeypatch.setattr(webapp, "GRUBE_CODES", str(tmp_path / "gc.json"))
+    (tmp_path / "gc.json").write_text(
+        '{"X/1": {"itemId": "123", "deUrl": "javascript:alert(1)"},'
+        ' "X/2": {"itemId": "456", "deUrl": "http://insecure/x"}}', encoding="utf-8")
+    r1 = webapp._attach_grube({"itemCode": "X/1"})
+    assert r1["grubeItemId"] == "123" and r1["grubeDeUrl"] == ""   # code kept, url dropped
+    r2 = webapp._attach_grube({"itemCode": "X/2"})
+    assert r2["grubeDeUrl"] == ""                                  # plain http rejected too
+
+
+def test_orders_route_attaches_grube_fields(monkeypatch, tmp_path):
+    # full /api/orders wiring: a GRUBE order line carries grubeItemId + grubeDeUrl.
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261045;Vybavuje sa;Bunda Grand Nord;1;60645/L;Veľkosť: L;GRUBE\r\n")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {})
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    monkeypatch.setattr(webapp, "GRUBE_CODES", str(tmp_path / "gc.json"))
+    (tmp_path / "gc.json").write_text(
+        '{"60645/L": {"itemId": "1547734519",'
+        ' "deUrl": "https://www.grube.de/p/x/154773/"}}', encoding="utf-8")
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    j = _client().get("/api/orders").get_json()
+    assert j["orders"][0]["grubeItemId"] == "1547734519"
+    assert j["orders"][0]["grubeDeUrl"] == "https://www.grube.de/p/x/154773/"
+
+
 def test_supplier_meta_parses_price_and_availability():
     html = '<meta property="product:price:amount" content="12.50"> Skladom dnes'
     price, avail = webapp._supplier_meta(html)

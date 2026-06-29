@@ -75,6 +75,15 @@ def live_server(tmp_path_factory):
         # LAST and never disturbs the BETALOV-first / within-BETALOV ordering assertions.
         "20260001;2026-01-05 10:00:00;Vybavuje sa;Bez Dodavatela Test;1;88/Z;Veľkosť: Z;\r\n",
         encoding="cp1250")
+    # GRUBE per-size code store: attaches a copyable itemId chip + .de link onto the
+    # 1/M order row (its itemCode matches), exercising the Task-10 renderOrderRow path.
+    # Keyed by the BETALOV 1/M row so it never adds/removes a row or changes a group
+    # count → the existing to-order assertions are untouched.
+    (out / "grube_codes.json").write_text(
+        json.dumps({"1/M": {"itemId": "1547734519", "size": "M",
+                            "deUrl": "https://www.grube.de/p/x/154773/",
+                            "productId": "154773"}}, ensure_ascii=False),
+        encoding="utf-8")
     env = {
         **os.environ,
         "WEBREVIEW_OUT": str(out),

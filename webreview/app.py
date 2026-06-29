@@ -180,6 +180,27 @@ def _load_grube_codes() -> dict:
         return {}
 
 
+def _attach_grube(r, store=None):
+    """Attach the GRUBE per-size order code + grube.de link to an order row, keyed by
+    its forestshop variant code (r['itemCode']). Mutates and returns r so it's both a
+    tiny unit-testable helper and usable inline in the api_orders loop.
+
+    - r['grubeItemId'] = the per-size grube itemId (copyable code) or '' (non-grube /
+      unmatched line — most rows).
+    - r['grubeDeUrl']  = the grube.de order link, but ONLY if it is https:// (it lands
+      in an <a href> on the client; a non-https value is dropped server-side so a
+      javascript:/data:/http url can never reach the DOM).
+
+    `store` (the grube_codes map) may be passed once per request; else loaded here."""
+    if store is None:
+        store = _load_grube_codes()
+    g = store.get((r.get("itemCode") or "").strip()) or {}
+    r["grubeItemId"] = str(g.get("itemId", "") or "")
+    de = str(g.get("deUrl", "") or "")
+    r["grubeDeUrl"] = de if de.startswith("https://") else ""
+    return r
+
+
 # at startup, prune orphan decisions whose key matches no product (e.g. a stale
 # 'None'/'bad' from before stable keys) so the progress count == the import count
 _VALID_KEYS = {p.get("key") for p in PRODUCTS}
@@ -599,6 +620,7 @@ def api_orders():
     waiting = _load_waiting()
     pairings = _load_order_pairings()
     assigns = _load_supplier_assign()
+    grube = _load_grube_codes()                      # loaded once per request
     for r in rows:
         r["ordered"] = bool(ordered.get(r["key"]))
         r["waiting"] = bool(waiting.get(r["key"]))   # 'čaká sa' — deferred active line
@@ -608,6 +630,8 @@ def api_orders():
         # supplier manually assigned for an order line that arrived without one — the
         # tab groups by (assignedSupplier OR supplier), so this regroups the row.
         r["assignedSupplier"] = assigns.get(r["itemCode"], "")
+        # GRUBE per-size code chip + .de link (empty for every non-GRUBE / unmatched row)
+        _attach_grube(r, grube)
     return jsonify({"orders": rows})
 
 
