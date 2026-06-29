@@ -61,3 +61,36 @@ def test_toorder_tab_lists_items_and_checkbox_persists(page, live_server):
     assert page.locator(".toorder-row input[type='checkbox']").first.is_checked()
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_toorder_deeplink_and_inline_pairing(page, live_server):
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    # ?tab=toorder deep-link (Discord posts this) opens the to-order tab directly.
+    page.goto(live_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    # The unpaired ORBIS line (code 77/X, not in the review set) shows an inline
+    # pairing field instead of a reorder link.
+    row = page.locator(".toorder-row[data-code='77/X']")
+    inp = row.locator("input.to-pairurl")
+    assert inp.count() == 1
+    inp.fill("https://supplier.test/rukavice")
+    with page.expect_response(
+            lambda r: "/api/order-pair" in r.url and r.request.method == "POST"):
+        row.locator(".to-pairsave").click()
+
+    # Saving re-renders the row as a reorder link carrying the entered URL.
+    page.wait_for_selector(".toorder-row[data-code='77/X'] a.to-link")
+    href = page.locator(".toorder-row[data-code='77/X'] a.to-link").first.get_attribute("href")
+    assert href == "https://supplier.test/rukavice"
+
+    # Persists server-side: survives a reload.
+    page.reload()
+    page.wait_for_selector(".toorder-row[data-code='77/X'] a.to-link")
+    assert (page.locator(".toorder-row[data-code='77/X'] a.to-link").first
+            .get_attribute("href") == "https://supplier.test/rukavice")
+
+    assert console == [], f"console not clean: {console}"

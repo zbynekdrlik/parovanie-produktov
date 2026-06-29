@@ -89,6 +89,94 @@ def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
     assert j["orders"][0]["ordered"] is False
 
 
+def test_order_pair_endpoint_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    c = _client()
+    r = c.post("/api/order-pair", json={"code": "60028/XL", "url": "https://www.huntingshop.eu/v"})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert webapp._load_order_pairings()["60028/XL"] == "https://www.huntingshop.eu/v"
+    # clearing (empty url) removes the pairing
+    c.post("/api/order-pair", json={"code": "60028/XL", "url": ""})
+    assert "60028/XL" not in webapp._load_order_pairings()
+
+
+def test_order_pair_rejects_non_http_url(monkeypatch, tmp_path):
+    # server guard must match the client (^https?://) — block javascript:/data: AND
+    # malformed 'httpfoo'/'http' that the lax startswith("http") used to let through.
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    for bad in ("javascript:alert(1)", "data:text/html,x", "httpfoo://x", "http", "ftp://x"):
+        r = _client().post("/api/order-pair", json={"code": "X", "url": bad})
+        assert r.status_code == 400, f"should reject {bad!r}"
+    assert webapp._load_order_pairings() == {}
+
+
+def test_order_pair_rejects_formula_code(monkeypatch, tmp_path):
+    # a code beginning with a spreadsheet formula trigger is a CSV-injection attempt
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    for bad in ('=HYPERLINK("http://evil","x")', "+1", "-cmd", "@SUM"):
+        r = _client().post("/api/order-pair", json={"code": bad, "url": "https://supplier/x"})
+        assert r.status_code == 400, f"should reject code {bad!r}"
+    assert webapp._load_order_pairings() == {}
+    # a real code with an interior dash / space is still accepted
+    assert _client().post("/api/order-pair",
+                          json={"code": "61449 JELEN", "url": "https://supplier/x"}).status_code == 200
+
+
+def test_order_pair_requires_code(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    r = _client().post("/api/order-pair", json={"code": "", "url": "https://x"})
+    assert r.status_code == 400
+
+
+def test_import_zip_formula_escapes_codes(monkeypatch, tmp_path):
+    # defense-in-depth: even a formula-leading code already sitting in the store
+    # (bypassing the endpoint guard) is neutralized with a leading ' in the export.
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {})
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    webapp._save_order_pairings({'=HYPERLINK("http://evil","x")': "https://supplier/x"})
+    r = _client().get("/api/import")
+    import zipfile
+    raw = zipfile.ZipFile(io.BytesIO(r.data)).read("import_links.csv").decode("utf-8-sig")
+    rows = list(_csv.reader(io.StringIO(raw), delimiter=";"))
+    # CSV-parsed back: the code cell is neutralized with a leading ' (text, not formula)
+    assert rows[1][0].startswith("'=HYPERLINK")
+
+
+def test_orders_exposes_inline_pair_url(monkeypatch, tmp_path):
+    # an ordered item OUTSIDE the review dataset (no product, no decision) — the
+    # inline pairing must still attach to it and surface as pairUrl.
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261050;Vybavuje sa;Vesta;1;99999/X;Veľkosť: X;ORBIS\r\n")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {})
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    j = _client().get("/api/orders").get_json()
+    assert j["orders"][0]["supplierUrl"] == "" and j["orders"][0]["pairUrl"] == ""
+    _client().post("/api/order-pair", json={"code": "99999/X", "url": "https://supplier/z"})
+    j2 = _client().get("/api/orders").get_json()
+    assert j2["orders"][0]["pairUrl"] == "https://supplier/z"
+    assert j2["orders"][0]["supplierUrl"] == ""   # decision link stays separate from inline
+
+
+def test_import_zip_includes_inline_pairings(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"60028/XL": "555"})
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    webapp._save_order_pairings({"60028/XL": "https://supplier/inline"})
+    r = _client().get("/api/import")
+    assert r.status_code == 200
+    import zipfile
+    z = zipfile.ZipFile(io.BytesIO(r.data))
+    links = z.read("import_links.csv").decode("utf-8-sig")
+    assert "60028/XL;555;https://supplier/inline" in links
+
+
 def test_supplier_meta_parses_price_and_availability():
     html = '<meta property="product:price:amount" content="12.50"> Skladom dnes'
     price, avail = webapp._supplier_meta(html)

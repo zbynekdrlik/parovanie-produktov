@@ -101,6 +101,28 @@ def _save_ordered(d: dict) -> None:
     os.replace(tmp, ORDERED)
 
 
+# Inline pairings entered on the Na-objednanie tab: {forestshop_code: supplier_url}.
+# Lets the manager paste a reorder URL straight onto an order line he's ordering —
+# covers ANY ordered code, not only the review-dataset subset (decisions.json). Same
+# safe load/save as ordered/decisions; NEVER pruned (an order code may be outside the
+# review set, so a prune would wrongly drop it). Gitignored data/out → survives deploy.
+ORDER_PAIRINGS = os.path.join(OUT, "order_pairings.json")
+
+
+def _load_order_pairings() -> dict:
+    if os.path.exists(ORDER_PAIRINGS):
+        with open(ORDER_PAIRINGS, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_order_pairings(d: dict) -> None:
+    tmp = ORDER_PAIRINGS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ORDER_PAIRINGS)
+
+
 # at startup, prune orphan decisions whose key matches no product (e.g. a stale
 # 'None'/'bad' from before stable keys) so the progress count == the import count
 _VALID_KEYS = {p.get("key") for p in PRODUCTS}
@@ -322,6 +344,18 @@ def api_decision():
     return jsonify({"ok": True})
 
 
+# CSV/spreadsheet formula-injection guard. A cell beginning with one of these is a
+# live formula when the file is opened in Excel/LibreOffice. Real forestshop codes,
+# pairCodes and http(s) URLs never start with these, so legit cells are untouched
+# (Shoptet matching unaffected); a malicious cell is prefixed with ' → inert text.
+_FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value):
+    s = str(value)
+    return "'" + s if s[:1] in _FORMULA_LEAD else s
+
+
 def _csv_response(header, rows, filename):
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
@@ -340,9 +374,14 @@ def api_import():
     #   import_links.csv  = code;pairCode;internalNote (reorder URL in the private field)
     #   import_states.csv = code;pairCode;productVisibility;stock;availability (Vypredané / Predaj skončil)
     dec = _load_decisions()
+    # reviewed pairings (decisions) + inline pairings from the Na-objednanie tab.
+    # A reviewed decision is authoritative, so inline rows skip any code it already
+    # covers (Shoptet aborts on a duplicate code).
+    link = import_builder.link_rows(PRODUCTS, dec, CODE2PAIR)
+    link += import_builder.order_pairing_rows(
+        _load_order_pairings(), CODE2PAIR, exclude_codes={r[0] for r in link})
     files = [
-        ("import_links.csv", import_builder.LINK_HEADER,
-         import_builder.link_rows(PRODUCTS, dec, CODE2PAIR)),
+        ("import_links.csv", import_builder.LINK_HEADER, link),
         ("import_states.csv", import_builder.STATE_HEADER,
          import_builder.state_rows(PRODUCTS, dec, CODE2PAIR)),
     ]
@@ -352,7 +391,7 @@ def api_import():
             s = io.StringIO()
             w = csv.writer(s, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
             w.writerow(header)
-            w.writerows(rows)
+            w.writerows([_csv_safe(c) for c in row] for row in rows)   # formula-injection guard
             z.writestr(name, s.getvalue().encode("utf-8-sig"))
     return Response(buf.getvalue(), content_type="application/zip",
                     headers={"Content-Disposition": 'attachment; filename="import_forestshop.zip"'})
@@ -394,6 +433,37 @@ def api_ordered():
     return jsonify({"ok": True})
 
 
+@app.route("/api/order-pair", methods=["POST"])
+def api_order_pair():
+    """Save/clear an inline supplier reorder URL for a forestshop order code
+    (keyed by itemCode). Mirrors /api/decision but keyed by the forestshop product
+    code, so it covers order lines that are NOT in the review dataset. Empty url
+    clears the pairing. The URL then shows as the row's reorder link and is included
+    in the import (import_builder.order_pairing_rows)."""
+    body = request.get_json(force=True)
+    code = str(body.get("code") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "missing code"}), 400
+    # forestshop codes always start alphanumeric — a leading formula char (=,+,-,@,…)
+    # is either malformed or a CSV-injection attempt; reject it at the source.
+    if code[:1] in _FORMULA_LEAD:
+        return jsonify({"ok": False, "error": "invalid code"}), 400
+    # authoritative URL guard (matches the client) — only real http(s) links reach
+    # the import's internalNote; blocks javascript:/data: and malformed 'httpfoo'.
+    if url and not re.match(r"^https?://", url):
+        return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+    with _lock:
+        d = _load_order_pairings()
+        if url:
+            d[code] = url
+        else:
+            d.pop(code, None)
+        _save_order_pairings(d)
+    log.info("order-pair code=%s url=%s", code, url)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/orders")
 def api_orders():
     """To-order list: forestshop 'Vybavuje sa' items joined to supplier reorder
@@ -406,8 +476,12 @@ def api_orders():
         return jsonify({"orders": [], "error": str(e)})
     rows = build_to_order_rows(csv_bytes, PRODUCTS, _load_decisions(), CODE2PAIR)
     ordered = _load_ordered()
+    pairings = _load_order_pairings()
     for r in rows:
         r["ordered"] = bool(ordered.get(r["key"]))
+        # supplierUrl stays the reviewed-decision link (read-only); pairUrl is the
+        # inline-entered one (editable on the tab). A row is "paired" if either is set.
+        r["pairUrl"] = pairings.get(r["itemCode"], "")
     return jsonify({"orders": rows})
 
 
