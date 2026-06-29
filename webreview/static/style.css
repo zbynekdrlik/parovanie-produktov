@@ -16,6 +16,9 @@ header { position: sticky; top: 0; z-index: 10; background: #1f2937; color: #fff
   border-radius: 4px; pointer-events: none; }
 
 main { max-width: 1200px; margin: 14px auto; padding: 0 12px; display: flex; flex-direction: column; gap: 12px; }
+/* „Na objednanie" tab = od kraja po kraj — zoznam má veľa stĺpcov (názov, dodávateľ,
+   párovacia URL), 1200px cap nechával ~720px nevyužitých a názov produktu sa orezával */
+body.toorder-wide main { max-width: none; }
 .card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
   display: grid; grid-template-columns: 1fr 1fr; overflow: hidden; border: 2px solid transparent; }
 .card.good { border-color: #34d399; }
