@@ -6,11 +6,14 @@ from parovanie.import_builder import (
     LINK_HEADER,
     RESTOCK_COLS,
     STATE_HEADER,
+    SUPPLIER_HEADER,
     link_rows,
     new_pairing_keys,
+    new_supplier_keys,
     order_pairing_rows,
     sanitize_csv,
     state_rows,
+    supplier_rows,
 )
 
 
@@ -194,3 +197,29 @@ def test_order_pairing_rows_dedupes_codes_that_normalize_equal():
     # two keys that strip to the same code keep only the first
     rows = order_pairing_rows({"X": "https://a", "X ": "https://b"}, {})
     assert [r[0] for r in rows] == ["X"]
+
+
+# --- supplier_rows: supplier names assigned on the Na-objednanie tab --------- #
+def test_supplier_rows_emit_supplier_with_paircode():
+    rows = supplier_rows({"60028/XL": "BETALOV", "13325": "WETLAND"},
+                         {"60028/XL": "500"})
+    assert ["60028/XL", "500", "BETALOV"] in rows
+    assert ["13325", "", "WETLAND"] in rows   # empty pairCode kept (code-only match)
+    assert SUPPLIER_HEADER == ["code", "pairCode", "supplier"]
+
+
+def test_supplier_rows_skip_empty_supplier_and_blank_code():
+    rows = supplier_rows({"A": "", "   ": "BETALOV", "B": "  WETLAND  "}, {})
+    assert rows == [["B", "", "WETLAND"]]   # empty supplier + blank code dropped, value trimmed
+
+
+def test_supplier_rows_excludes_and_dedupes_codes():
+    # a code already handled elsewhere is excluded; codes normalizing equal keep first.
+    assert supplier_rows({"A/1": "X", "C/1": "Y"}, {}, exclude_codes={"A/1"}) == [["C/1", "", "Y"]]
+    assert [r[0] for r in supplier_rows({"X": "A", "X ": "B"}, {})] == ["X"]
+
+
+def test_new_supplier_keys_only_new_or_changed():
+    assigns = {"new": "BETALOV", "blank": "", "  ": "X", "same": "WETLAND", "changed": "ODIMON"}
+    uploaded = {"same": "WETLAND", "changed": "TRIGONA"}
+    assert set(new_supplier_keys(assigns, uploaded)) == {"new", "changed"}
