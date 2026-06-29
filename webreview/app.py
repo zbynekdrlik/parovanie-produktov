@@ -101,6 +101,28 @@ def _save_ordered(d: dict) -> None:
     os.replace(tmp, ORDERED)
 
 
+# Inline pairings entered on the Na-objednanie tab: {forestshop_code: supplier_url}.
+# Lets the manager paste a reorder URL straight onto an order line he's ordering —
+# covers ANY ordered code, not only the review-dataset subset (decisions.json). Same
+# safe load/save as ordered/decisions; NEVER pruned (an order code may be outside the
+# review set, so a prune would wrongly drop it). Gitignored data/out → survives deploy.
+ORDER_PAIRINGS = os.path.join(OUT, "order_pairings.json")
+
+
+def _load_order_pairings() -> dict:
+    if os.path.exists(ORDER_PAIRINGS):
+        with open(ORDER_PAIRINGS, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_order_pairings(d: dict) -> None:
+    tmp = ORDER_PAIRINGS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ORDER_PAIRINGS)
+
+
 # at startup, prune orphan decisions whose key matches no product (e.g. a stale
 # 'None'/'bad' from before stable keys) so the progress count == the import count
 _VALID_KEYS = {p.get("key") for p in PRODUCTS}
@@ -340,9 +362,14 @@ def api_import():
     #   import_links.csv  = code;pairCode;internalNote (reorder URL in the private field)
     #   import_states.csv = code;pairCode;productVisibility;stock;availability (Vypredané / Predaj skončil)
     dec = _load_decisions()
+    # reviewed pairings (decisions) + inline pairings from the Na-objednanie tab.
+    # A reviewed decision is authoritative, so inline rows skip any code it already
+    # covers (Shoptet aborts on a duplicate code).
+    link = import_builder.link_rows(PRODUCTS, dec, CODE2PAIR)
+    link += import_builder.order_pairing_rows(
+        _load_order_pairings(), CODE2PAIR, exclude_codes={r[0] for r in link})
     files = [
-        ("import_links.csv", import_builder.LINK_HEADER,
-         import_builder.link_rows(PRODUCTS, dec, CODE2PAIR)),
+        ("import_links.csv", import_builder.LINK_HEADER, link),
         ("import_states.csv", import_builder.STATE_HEADER,
          import_builder.state_rows(PRODUCTS, dec, CODE2PAIR)),
     ]
@@ -394,6 +421,31 @@ def api_ordered():
     return jsonify({"ok": True})
 
 
+@app.route("/api/order-pair", methods=["POST"])
+def api_order_pair():
+    """Save/clear an inline supplier reorder URL for a forestshop order code
+    (keyed by itemCode). Mirrors /api/decision but keyed by the forestshop product
+    code, so it covers order lines that are NOT in the review dataset. Empty url
+    clears the pairing. The URL then shows as the row's reorder link and is included
+    in the import (import_builder.order_pairing_rows)."""
+    body = request.get_json(force=True)
+    code = str(body.get("code") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "missing code"}), 400
+    if url and not url.startswith("http"):
+        return jsonify({"ok": False, "error": "url must start with http"}), 400
+    with _lock:
+        d = _load_order_pairings()
+        if url:
+            d[code] = url
+        else:
+            d.pop(code, None)
+        _save_order_pairings(d)
+    log.info("order-pair code=%s url=%s", code, url)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/orders")
 def api_orders():
     """To-order list: forestshop 'Vybavuje sa' items joined to supplier reorder
@@ -406,8 +458,12 @@ def api_orders():
         return jsonify({"orders": [], "error": str(e)})
     rows = build_to_order_rows(csv_bytes, PRODUCTS, _load_decisions(), CODE2PAIR)
     ordered = _load_ordered()
+    pairings = _load_order_pairings()
     for r in rows:
         r["ordered"] = bool(ordered.get(r["key"]))
+        # supplierUrl stays the reviewed-decision link (read-only); pairUrl is the
+        # inline-entered one (editable on the tab). A row is "paired" if either is set.
+        r["pairUrl"] = pairings.get(r["itemCode"], "")
     return jsonify({"orders": rows})
 
 

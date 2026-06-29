@@ -8,6 +8,7 @@ from parovanie.import_builder import (
     STATE_HEADER,
     link_rows,
     new_pairing_keys,
+    order_pairing_rows,
     sanitize_csv,
     state_rows,
 )
@@ -161,3 +162,35 @@ def test_undecided_products_excluded_from_both():
     products = [{"key": "k4", "variant_codes": ["D"]}]
     assert link_rows(products, {}, {"D": "400"}) == []
     assert state_rows(products, {}, {"D": "400"}) == []
+
+
+# --- order_pairing_rows: inline pairings from the Na-objednanie tab ----------- #
+def test_order_pairing_rows_emit_internalnote_with_paircode():
+    rows = order_pairing_rows(
+        {"60028/XL": "https://supplier/a", "13325": "https://supplier/b"},
+        {"60028/XL": "500", "13325": ""})
+    assert ["60028/XL", "500", "https://supplier/a"] in rows
+    assert ["13325", "", "https://supplier/b"] in rows   # empty pairCode kept (code-only match)
+    assert len(rows) == 2
+
+
+def test_order_pairing_rows_skip_empty_url_and_blank_code():
+    rows = order_pairing_rows(
+        {"A": "", "   ": "https://x", "B": "  https://supplier/c  "}, {})
+    # empty url dropped, blank code dropped, surrounding whitespace trimmed
+    assert rows == [["B", "", "https://supplier/c"]]
+
+
+def test_order_pairing_rows_excludes_codes_already_in_decisions():
+    # a code covered by a reviewed decision (link_rows) must NOT be re-emitted —
+    # Shoptet aborts the whole import on a duplicate code.
+    rows = order_pairing_rows(
+        {"A/1": "https://inline", "C/1": "https://inline2"},
+        {"A/1": "1", "C/1": "3"}, exclude_codes={"A/1"})
+    assert rows == [["C/1", "3", "https://inline2"]]
+
+
+def test_order_pairing_rows_dedupes_codes_that_normalize_equal():
+    # two keys that strip to the same code keep only the first
+    rows = order_pairing_rows({"X": "https://a", "X ": "https://b"}, {})
+    assert [r[0] for r in rows] == ["X"]

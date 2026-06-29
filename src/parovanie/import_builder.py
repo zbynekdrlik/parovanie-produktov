@@ -94,6 +94,30 @@ def link_rows(products, decisions, code2pair):
     return rows
 
 
+def order_pairing_rows(order_pairings, code2pair, exclude_codes=None):
+    """Reorder-link rows from INLINE pairings entered on the 'Na objednanie' tab.
+
+    `order_pairings` is {forestshop_code: supplier_url} — the manager pastes the
+    supplier reorder URL straight onto an order line while ordering it. Emits
+    code;pairCode;internalNote (same shape as link_rows) so these reach the eshop's
+    private 'Interná poznámka' field exactly like a review pairing. `exclude_codes`
+    (codes already covered by a reviewed decision via link_rows) are skipped so a
+    code is never imported twice — Shoptet aborts the whole import on a duplicate
+    code, and a reviewed decision is the authoritative source. Each code once; empty
+    URLs dropped. Pure → unit-testable."""
+    exclude = exclude_codes or set()
+    rows = []
+    seen = set()
+    for code, url in order_pairings.items():
+        code = (code or "").strip()
+        url = (url or "").strip()
+        if not code or not url or code in exclude or code in seen:
+            continue
+        seen.add(code)
+        rows.append([code, code2pair.get(code, ""), url])
+    return rows
+
+
 def state_rows(products, decisions, code2pair):
     """Stock-state rows → visibility/availability, one per variant:
       - unavailable (state 2): visible, stock 0, 'Vypredané'.

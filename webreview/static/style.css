@@ -96,7 +96,13 @@ a.supurl:hover { text-decoration: underline; }
 .toorder-row .to-link { color: #2563eb; text-decoration: none; font-weight: 600; font-size: 13px;
   flex: 0 0 auto; min-width: 110px; }
 .toorder-row .to-link:hover { text-decoration: underline; }
-.toorder-row .to-nolink { color: #9ca3af; font-size: 12px; min-width: 110px; flex: 0 0 auto; }
+.toorder-row .to-pair { display: flex; align-items: center; gap: 6px; flex: 1 1 320px; min-width: 230px; }
+.toorder-row .to-pcode { color: #9ca3af; font-size: 12px; flex: 0 0 auto; }
+.toorder-row .to-pairurl { flex: 1 1 auto; min-width: 110px; padding: 5px 7px; border: 1px solid #d1d5db;
+  border-radius: 6px; font-size: 12px; }
+.toorder-row .to-pairsave { flex: 0 0 auto; background: #6d28d9; color: #fff; border: 0; border-radius: 6px;
+  padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.toorder-row .to-pairsave:hover { background: #5b21b6; }
 .toorder-row .to-size { font-weight: 600; font-size: 13px; min-width: 90px; }
 .toorder-row .to-qty { font-weight: 700; color: #065f46; font-size: 13px; min-width: 52px; }
 .toorder-row .to-name { color: #4b5563; font-size: 13px; flex: 1; overflow: hidden;
@@ -107,4 +113,5 @@ a.supurl:hover { text-decoration: underline; }
 @media (max-width: 760px) {
   .toorder-row { flex-wrap: wrap; gap: 6px 10px; }
   .toorder-row .to-name { flex-basis: 100%; white-space: normal; }
+  .toorder-row .to-pair { flex-basis: 100%; }
 }
