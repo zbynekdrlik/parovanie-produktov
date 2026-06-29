@@ -201,9 +201,7 @@ git commit -m "feat: grube.de URL normalizer (productId-rebuild, strips query/fr
 - Consumes: nič (HTML string + productId).
 - Produces: `parse_variants(html: str, product_id: str) -> dict[str, str]` mapping size label → own itemId. Empty dict on count mismatch (→ link-only).
 
-- [ ] **Step 1: Save the fixture (one real multi-size .de page)**
-
-Implementer: open `https://www.grube.de/p/x/154773/` in a browser/Playwright, save full rendered HTML to `tests/fixtures/grube_de_detail_154773.html`. It MUST contain: 8 `label.radio-input` (S..5XL), the 8 own itemIds `1547734523,1547734598,1547734519,1547734593,1547734524,1547734570,1547734535,1547734553`, AND ≥1 `a[data-track-id="associatedProduct"]` cross-sell anchor with a foreign itemId (e.g. `6165695125`) to prove exclusion.
+- [ ] **Step 1: Fixture already saved** — `tests/fixtures/grube_de_detail_154773.html` (rendered grube.de `/p/x/154773/`, 2.2 MB). Verified to contain 8 schema.org `Offer` objects each `"name":"Farbe oliv. Größe <SIZE>.","price":"…","priceCurrency":"EUR","sku":"<itemId>"` (quotes `\"`-escaped — JSON in JSON), single color `oliv`, AND cross-sell foreign itemId `6165695125` to prove exclusion. **The authoritative size↔itemId association is the Offer `Größe <SIZE>` + `sku`, NOT a positional radio zip** (the radio order does NOT match itemId source order — verified).
 
 - [ ] **Step 2: Write failing test**
 
@@ -217,9 +215,9 @@ FIX = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_154773.html"
 def test_parse_variants_grand_nord():
     html = FIX.read_text(encoding="utf-8")
     got = parse_variants(html, "154773")
-    assert got == {
-        "S": "1547734523", "M": "1547734598", "L": "1547734519", "XL": "1547734593",
-        "XXL": "1547734524", "3XL": "1547734570", "4XL": "1547734535", "5XL": "1547734553",
+    assert got == {       # authoritative, from the page's own schema.org Offers
+        "S": "1547734535", "M": "1547734598", "L": "1547734524", "XL": "1547734570",
+        "XXL": "1547734593", "3XL": "1547734523", "4XL": "1547734553", "5XL": "1547734519",
     }
 
 def test_parse_variants_excludes_cross_sell():
@@ -228,10 +226,15 @@ def test_parse_variants_excludes_cross_sell():
     assert "6165695125" not in got.values()       # cross-sell Nordforest itemId
     assert all(v.startswith("154773") and len(v) == 10 for v in got.values())
 
-def test_parse_variants_count_mismatch_returns_empty():
-    # productId with no matching own-prefixed itemIds -> link-only
+def test_parse_variants_no_own_offers_returns_empty():
     html = FIX.read_text(encoding="utf-8")
-    assert parse_variants(html, "999999") == {}
+    assert parse_variants(html, "999999") == {}    # no own-prefixed sku -> link-only
+
+def test_parse_variants_multicolor_returns_empty():
+    # a size mapping to >1 itemId (two colors) -> ambiguous -> link-only
+    html = ('"name":"Farbe oliv. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547734524"'
+            '"name":"Farbe braun. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547739999"')
+    assert parse_variants(html, "154773") == {}
 ```
 
 - [ ] **Step 3: Run test to verify it fails**
@@ -239,42 +242,36 @@ def test_parse_variants_count_mismatch_returns_empty():
 Run: `PYTHONPATH=src .venv/bin/pytest tests/test_grube_de.py -q`
 Expected: FAIL (parse_variants not defined).
 
-- [ ] **Step 4: Implement** (pin selectors against the saved fixture)
+- [ ] **Step 4: Implement** (schema.org Offer parsing — authoritative)
 
 ```python
 # src/parovanie/grube_de.py (append)
-import json as _json
 
-# size radio labels: <label class="radio-input" for="var[import:...]_N_1">S</label>
-_RADIO = re.compile(
-    r'<label[^>]*class="[^"]*\bradio-input\b[^"]*"[^>]*\bfor="[^"]*_(\d+)_\d+"[^>]*>\s*([^<\s][^<]*?)\s*</label>',
-    re.S,
-)
-_ITEMID = re.compile(r'itemId["\']?\s*[:=]\s*["\']?(\d{8,})')
+# schema.org Offer: "name":"[Farbe X. ]Größe <SIZE>.","price":"…","priceCurrency":"EUR","sku":"<itemId>"
+_OFFER = re.compile(r'"name":"([^"]*?)","price":"[^"]*","priceCurrency":"EUR","sku":"(\d+)"')
+_GROESSE = re.compile(r"Größe\s*([^.\"]+)")
 
 
 def parse_variants(html: str, product_id: str) -> dict[str, str]:
-    """{size_label: itemId} for ONE rendered grube.de detail page.
-    Own itemIds only (prefix==productId AND len==len(productId)+4) — excludes
-    cross-sell associatedProduct anchors. Returns {} (link-only) if the count
-    of own itemIds != count of size radios (page changed / mismatch)."""
-    radios = [(int(idx), label.strip()) for idx, label in _RADIO.findall(html)]
-    radios.sort(key=lambda t: t[0])
-    labels = [lbl for _, lbl in radios]
-
+    """{size_label: itemId} for ONE rendered grube.de detail page, parsed from the
+    page's own schema.org Offer objects (name carries 'Größe <SIZE>', sku is the itemId).
+    Own offers only (sku prefix==productId AND len==len(productId)+4) — cross-sell
+    associatedProduct itemIds are excluded by the prefix. Returns {} (link-only) when
+    a size maps to >1 itemId (multi-color / multi-axis — ambiguous) or no own offer."""
+    text = html.replace('\\"', '"')          # unescape JSON-in-JSON
     want_len = len(product_id) + 4
-    own, seen = [], set()
-    for iid in _ITEMID.findall(html):
-        if iid.startswith(product_id) and len(iid) == want_len and iid not in seen:
-            seen.add(iid)
-            own.append(iid)
-
-    if not labels or len(own) != len(labels):
+    size2ids: dict[str, set] = {}
+    for name, sku in _OFFER.findall(text):
+        if not (sku.startswith(product_id) and len(sku) == want_len):
+            continue
+        m = _GROESSE.search(name)
+        if not m:
+            continue
+        size2ids.setdefault(m.group(1).strip(), set()).add(sku)
+    if any(len(ids) > 1 for ids in size2ids.values()):   # color/length axis -> ambiguous
         return {}
-    return dict(zip(labels, own))
+    return {size: next(iter(ids)) for size, ids in size2ids.items()}
 ```
-
-Note: the order of own itemIds in the page source must align with the radio order. If the fixture proves they don't, the implementer reads each itemId from inside its radio's variant config block instead (the `_ITEMID` regex scoped per option) — pin the exact extraction against the fixture so the test passes deterministically. Keep the prefix+length filter and the count-assert invariants regardless.
 
 - [ ] **Step 5: Run test to verify it passes**
 
@@ -521,10 +518,9 @@ def __call__(self, url, wait_selector=".product-box"):
 import json
 from scripts.gather_grube_itemids import gather_itemids
 
-FAKE = {  # productId -> html snippet with own itemIds + radios
-  "154773": '<label class="radio-input" for="v_0_1">S</label>'
-            '<label class="radio-input" for="v_1_1">M</label>'
-            'itemId:"1547734523" itemId:"1547734598"',
+FAKE = {  # productId -> html with schema.org Offer objects (matches parse_variants)
+  "154773": '"name":"Größe S.","price":"1","priceCurrency":"EUR","sku":"1547734523"'
+            '"name":"Größe M.","price":"1","priceCurrency":"EUR","sku":"1547734598"',
 }
 
 def test_gather_itemids_writes_map(tmp_path):
