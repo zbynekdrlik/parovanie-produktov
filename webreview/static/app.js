@@ -360,6 +360,21 @@ function renderOrderRow(o) {
     // nenapárované → políčko na vloženie URL (otvára produkt pri objednávaní)
     row.appendChild(pairEditor(o, row, false));
   }
+  // GRUBE per-veľkosť kód: kopírovateľný čip + .de objednávacia linka. GRUBE nemá B2B
+  // auto-objednávanie, takže manažér skopíruje presný veľkostný kód do e-mailu.
+  if (o.grubeItemId) {
+    const chip = el('span', 'to-grube');
+    chip.textContent = o.grubeItemId;            // .textContent → auto-escaped, never innerHTML
+    chip.title = 'Kopírovať grube kód';
+    chip.onclick = () => navigator.clipboard && navigator.clipboard.writeText(o.grubeItemId);
+    row.appendChild(chip);
+    if (o.grubeDeUrl && /^https?:\/\//.test(o.grubeDeUrl)) {   // server + client guard: len http(s)
+      const de = el('a', 'to-link');
+      de.href = o.grubeDeUrl; de.target = '_blank'; de.rel = 'noopener';
+      de.textContent = '🇩🇪 .de';
+      row.appendChild(de);
+    }
+  }
   row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
   row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
   row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));

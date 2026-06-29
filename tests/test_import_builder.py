@@ -3,10 +3,12 @@ import csv
 import pytest
 
 from parovanie.import_builder import (
+    EXTERNALCODE_HEADER,
     LINK_HEADER,
     RESTOCK_COLS,
     STATE_HEADER,
     SUPPLIER_HEADER,
+    externalcode_rows,
     link_rows,
     new_pairing_keys,
     new_supplier_keys,
@@ -223,3 +225,73 @@ def test_new_supplier_keys_only_new_or_changed():
     assigns = {"new": "BETALOV", "blank": "", "  ": "X", "same": "WETLAND", "changed": "ODIMON"}
     uploaded = {"same": "WETLAND", "changed": "TRIGONA"}
     assert set(new_supplier_keys(assigns, uploaded)) == {"new", "changed"}
+
+
+# --- externalcode_rows: GRUBE per-size itemId write-back (Task 8) ------------- #
+def test_externalcode_rows_basic():
+    gc = {"60645/L": {"itemId": "1547734519"}, "60645/S": {"itemId": "1547734523"}}
+    rows = externalcode_rows(gc, {"60645/L": "395", "60645/S": "395"})
+    assert EXTERNALCODE_HEADER == ["code", "pairCode", "externalCode"]
+    assert sorted(rows) == [["60645/L", "395", "1547734519"],
+                            ["60645/S", "395", "1547734523"]]
+
+
+def test_externalcode_rows_drops_empty_and_nonnumeric():
+    # empty itemId would WIPE the existing externalCode cell; non-numeric is junk /
+    # possible formula-injection lead — both dropped so only a real itemId is written.
+    gc = {"a": {"itemId": ""}, "b": {"itemId": "=EVIL"}, "c": {"itemId": "1234567890"}}
+    rows = externalcode_rows(gc, {"c": "9"})
+    assert rows == [["c", "9", "1234567890"]]
+
+
+def test_externalcode_rows_dedup_first_wins_and_exclude():
+    gc = {"x": {"itemId": "1111111111"}}
+    assert externalcode_rows(gc, {"x": "9"}, exclude_codes={"x"}) == []   # excluded
+    # missing itemId key entirely (no 'itemId') is treated as empty -> dropped
+    assert externalcode_rows({"y": {}}, {"y": "9"}) == []
+
+
+def test_externalcode_rows_all_numeric_guard():
+    gc = {"60645/L": {"itemId": "1547734519"}}
+    rows = externalcode_rows(gc, {"60645/L": "395"})
+    assert all(len(r) == 3 and r[2].isdigit() for r in rows)
+
+
+# --- link_rows GRUBE internalNote normalization (Task 9) --------------------- #
+def test_link_rows_grube_url_normalized_to_de():
+    # a GRUBE product's note URL is rebuilt to the canonical grube.de detail URL
+    products = [{"key": "GRUBE|395", "supplier": "GRUBE", "variant_codes": ["60645/L"]}]
+    decisions = {"GRUBE|395": {"status": "manual",
+                               "url": "https://www.grube.sk/p/grand-nord/154773/?q=a#itemId=1"}}
+    rows = link_rows(products, decisions, {"60645/L": "395"})
+    note = [r for r in rows if r[0] == "60645/L"][0][2]
+    assert note == "https://www.grube.de/p/x/154773/"
+
+
+def test_link_rows_nongrube_url_unchanged():
+    # a non-grube product's note URL is written verbatim (no normalization)
+    products = [{"key": "WETLAND|9", "supplier": "WETLAND", "variant_codes": ["WL/1"]}]
+    decisions = {"WETLAND|9": {"status": "manual", "url": "https://www.wetland.sk/p/foo"}}
+    rows = link_rows(products, decisions, {"WL/1": "9"})
+    note = [r for r in rows if r[0] == "WL/1"][0][2]
+    assert note == "https://www.wetland.sk/p/foo"
+
+
+def test_link_rows_scoping_is_by_supplier_not_url_host():
+    # anti-cheat: a NON-GRUBE product whose URL happens to be a grube.sk product URL
+    # must stay VERBATIM — the normalization is gated on supplier=="GRUBE", not the host.
+    products = [{"key": "OTHER|1", "supplier": "WETLAND", "variant_codes": ["O/1"]}]
+    decisions = {"OTHER|1": {"status": "manual",
+                             "url": "https://www.grube.sk/p/grand-nord/154773/?q=a#itemId=1"}}
+    rows = link_rows(products, decisions, {"O/1": "1"})
+    note = [r for r in rows if r[0] == "O/1"][0][2]
+    assert note == "https://www.grube.sk/p/grand-nord/154773/?q=a#itemId=1"
+
+
+def test_link_rows_grube_unparseable_url_falls_back_to_raw():
+    # GRUBE product but URL has no /p/<slug>/<id>/ -> to_grube_de is None -> keep raw
+    products = [{"key": "GRUBE|7", "supplier": "GRUBE", "variant_codes": ["G/1"]}]
+    decisions = {"GRUBE|7": {"status": "good", "url": "https://www.grube.sk/search/?q=hose"}}
+    rows = link_rows(products, decisions, {"G/1": "7"})
+    note = [r for r in rows if r[0] == "G/1"][0][2]
+    assert note == "https://www.grube.sk/search/?q=hose"

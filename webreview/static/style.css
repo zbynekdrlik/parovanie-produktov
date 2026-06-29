@@ -123,6 +123,11 @@ a.supurl:hover { text-decoration: underline; }
 .toorder-row .to-supsave:hover { background: #0f766e; }
 .toorder-row .to-suptag { background: #ccfbf1; color: #0f5132; font-size: 12px; font-weight: 600;
   padding: 3px 8px; border-radius: 10px; flex: 0 0 auto; white-space: nowrap; }
+/* GRUBE per-veľkosť kód — kopírovateľný čip (klik → clipboard) */
+.toorder-row .to-grube { background: #eef; border: 1px solid #99c; color: #1e1e6b;
+  border-radius: 4px; padding: 1px 6px; font-family: monospace; font-size: 12px;
+  cursor: pointer; flex: 0 0 auto; white-space: nowrap; }
+.toorder-row .to-grube:hover { background: #dde; }
 .toorder-row .to-supedit { background: transparent; border: 0; cursor: pointer; font-size: 13px;
   padding: 2px 4px; flex: 0 0 auto; opacity: .55; }
 .toorder-row .to-supedit:hover { opacity: 1; }

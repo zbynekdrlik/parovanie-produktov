@@ -40,13 +40,15 @@ def load_credentials(path):
 
 
 EXPECTED_HEADER = ["code", "pairCode", "internalNote", "productVisibility",
-                   "stock", "availabilityInStock", "availabilityOutOfStock"]
+                   "stock", "availabilityInStock", "availabilityOutOfStock",
+                   "externalCode"]
 
 
 def classify_row(row):
     """Classify one generated import row by its column values (mirrors
     import_builder link_rows / state_rows). A link carries the reorder URL in the
-    private `internalNote` field."""
+    private `internalNote` field; an externalCode write-back row carries the grube
+    per-size itemId in `externalCode` with no internalNote/visibility/stock."""
     if (row.get("internalNote") or "").strip():
         return "link"
     vis = (row.get("productVisibility") or "").strip().lower()
@@ -56,6 +58,10 @@ def classify_row(row):
         return "discontinued"
     if vis == "visible" and "vypredan" in avail:
         return "unavailable"
+    if ((row.get("externalCode") or "").strip()
+            and not vis and not avail.strip()
+            and not (row.get("stock") or "").strip()):
+        return "externalcode"
     return "other"
 
 
@@ -69,7 +75,8 @@ def preflight_csv(path):
         with open(path, encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f, delimiter=";")
             columns = reader.fieldnames or []
-            counts = {"link": 0, "unavailable": 0, "discontinued": 0, "other": 0}
+            counts = {"link": 0, "unavailable": 0, "discontinued": 0,
+                      "externalcode": 0, "other": 0}
             total = 0
             for row in reader:
                 total += 1

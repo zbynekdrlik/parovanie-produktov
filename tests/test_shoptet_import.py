@@ -150,3 +150,26 @@ def test_parse_import_log_real_failed_line_not_fooled_by_chybou():
 def test_parse_import_log_czech_success_line():
     r = parse_import_log("Import doběhl úspěšně. Zpracováno: 9. Upraveno: 4.")
     assert r["processed"] == 9 and r["updated"] == 4 and r["failed"] is None
+
+
+def test_classify_externalcode_row():
+    # an externalCode write-back row: externalCode set, no internalNote / visibility
+    assert classify_row({"code": "60645/L", "pairCode": "395",
+                         "externalCode": "1547734519"}) == "externalcode"
+
+
+def test_classify_row_externalcode_does_not_shadow_link():
+    # a link row (internalNote set) stays "link" even if externalCode is also present
+    assert classify_row({"internalNote": "https://h/x", "productVisibility": "",
+                         "externalCode": "1547734519"}) == "link"
+
+
+def test_preflight_counts_externalcode(tmp_path):
+    # UTF-8-BOM CSV with the externalCode header + one row -> plan counts it
+    p = tmp_path / "ext.csv"
+    with open(p, "w", encoding="utf-8-sig", newline="") as f:
+        f.write("code;pairCode;externalCode\r\n60645/L;395;1547734519\r\n")
+    plan = preflight_csv(str(p))
+    assert plan["total"] == 1
+    assert plan["externalcode"] == 1
+    assert plan["other"] == 0
