@@ -83,16 +83,22 @@ def test_toorder_deeplink_and_inline_pairing(page, live_server):
             lambda r: "/api/order-pair" in r.url and r.request.method == "POST"):
         row.locator(".to-pairsave").click()
 
-    # Saving re-renders the row as a reorder link carrying the entered URL.
+    # Saving makes the row look like the other paired rows: a 🔗 link with the entered
+    # URL, the input GONE, leaving only a small ✏️ edit icon.
     page.wait_for_selector(".toorder-row[data-code='77/X'] a.to-link")
-    href = page.locator(".toorder-row[data-code='77/X'] a.to-link").first.get_attribute("href")
-    assert href == "https://supplier.test/rukavice"
+    assert row.locator("a.to-link").first.get_attribute("href") == "https://supplier.test/rukavice"
+    assert row.locator("input.to-pairurl").count() == 0
+    assert row.locator(".to-pairedit").count() == 1
 
-    # Persists server-side: survives a reload.
+    # ✏️ reveals the editor again to fix a wrong link.
+    row.locator(".to-pairedit").click()
+    assert row.locator("input.to-pairurl").count() == 1
+
+    # Persists server-side: after reload it's still the paired (link + edit) look.
     page.reload()
     page.wait_for_selector(".toorder-row[data-code='77/X'] a.to-link")
-    assert (page.locator(".toorder-row[data-code='77/X'] a.to-link").first
-            .get_attribute("href") == "https://supplier.test/rukavice")
+    assert (row.locator("a.to-link").first.get_attribute("href") == "https://supplier.test/rukavice")
+    assert row.locator("input.to-pairurl").count() == 0
 
     assert console == [], f"console not clean: {console}"
 

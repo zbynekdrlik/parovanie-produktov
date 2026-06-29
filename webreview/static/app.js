@@ -269,6 +269,24 @@ async function savePairUrl(o, url, row) {
   row.replaceWith(renderOrderRow(o));
 }
 
+// inline-pairing editor (code + URL input + save) — used for an unpaired row and
+// when ✏️-editing an already-paired one
+function pairEditor(o, row, focus) {
+  const pair = el('div', 'to-pair');
+  pair.appendChild(el('span', 'to-pcode', escapeHtml(o.itemCode || '')));
+  const inp = el('input', 'to-pairurl'); inp.type = 'url';
+  inp.placeholder = o.pairUrl ? 'upraviť párovaciu URL…' : 'vlož párovaciu URL dodávateľa…';
+  inp.value = o.pairUrl || '';
+  const save = el('button', 'to-pairsave', '💾 Spárovať');
+  save.title = 'Uložiť párovaciu URL — objaví sa ako odkaz a pôjde do importu';
+  const doSave = () => savePairUrl(o, inp.value.trim(), row);
+  save.onclick = doSave;
+  inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
+  pair.appendChild(inp); pair.appendChild(save);
+  if (focus) setTimeout(() => inp.focus(), 0);
+  return pair;
+}
+
 function renderOrderRow(o) {
   const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : ''));
   row.dataset.key = o.key; row.dataset.code = o.itemCode;
@@ -277,31 +295,23 @@ function renderOrderRow(o) {
   cb.onchange = () => { saveOrdered(o.key, cb.checked); row.classList.toggle('done', cb.checked); };
   row.appendChild(cb);
   if (o.supplierUrl) {
-    // reviewed decision link — authoritative, shown read-only
+    // reviewed decision link — authoritative, read-only (mení sa v párovacom tabe)
     const a = el('a', 'to-link'); a.href = o.supplierUrl; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
+  } else if (o.pairUrl) {
+    // inline-napárované → svieti rovnako ako ostatné napárované (🔗 odkaz) +
+    // malá ✏️ na opravu, ak dal zlú URL
+    const a = el('a', 'to-link'); a.href = o.pairUrl; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = '🔗 ' + (o.itemCode || 'link'); a.title = o.pairUrl;
+    row.appendChild(a);
+    const edit = el('button', 'to-pairedit', '✏️');
+    edit.title = 'Zmeniť / opraviť párovaciu URL';
+    edit.onclick = () => { a.replaceWith(pairEditor(o, row, true)); edit.remove(); };
+    row.appendChild(edit);
   } else {
-    // no reviewed decision → inline pairing field: paste the supplier reorder URL
-    // right here (he opens the product to order it anyway). Saved → shows as a link
-    // and goes into the import.
-    const pair = el('div', 'to-pair');
-    pair.appendChild(el('span', 'to-pcode', escapeHtml(o.itemCode || '')));
-    if (o.pairUrl) {
-      const a = el('a', 'to-link'); a.href = o.pairUrl; a.target = '_blank'; a.rel = 'noopener';
-      a.textContent = '🔗'; a.title = o.pairUrl;
-      pair.appendChild(a);
-    }
-    const inp = el('input', 'to-pairurl'); inp.type = 'url';
-    inp.placeholder = o.pairUrl ? 'upraviť párovaciu URL…' : 'vlož párovaciu URL dodávateľa…';
-    inp.value = o.pairUrl || '';
-    const save = el('button', 'to-pairsave', o.pairUrl ? '💾' : '💾 Spárovať');
-    save.title = 'Uložiť párovaciu URL — objaví sa ako odkaz a pôjde do importu';
-    const doSave = () => savePairUrl(o, inp.value.trim(), row);
-    save.onclick = doSave;
-    inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
-    pair.appendChild(inp); pair.appendChild(save);
-    row.appendChild(pair);
+    // nenapárované → políčko na vloženie URL (otvára produkt pri objednávaní)
+    row.appendChild(pairEditor(o, row, false));
   }
   row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
   row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
