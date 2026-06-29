@@ -37,16 +37,22 @@ verdicts: list[dict] = []
 for i, p in enumerate(products):
     code = extract_code(p.name)
     cands = []
+    err = None
     if code:
         try:
             cands = client.search("LUKO", code)
         except Exception as e:  # noqa: BLE001 — degrade per-item, never abort the batch
+            err = str(e)
             print(f"  [{i}] {p.name[:50]!r} code={code} SEARCH-ERR {e}")
     ci = choose_exact(code, cands)
     if not code:
         reason = "V názve nie je jednoznačný 6-miestny kód LUKO."
     elif ci != -1:
         reason = f"Presná zhoda kódu {code} v názve produktu LUKO."
+    elif err:
+        # a fetch failure must NOT be persisted as "sold out" — it is a transient/systemic
+        # error to retry, visibly distinct from a genuine 0-result miss.
+        reason = f"Vyhľadávanie LUKO pre kód {code} zlyhalo ({err}) — skús znova."
     elif not cands:
         reason = f"Kód {code} sa na LUKO nenašiel (vypredané/stiahnuté)."
     else:

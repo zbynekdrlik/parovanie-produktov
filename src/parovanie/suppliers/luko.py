@@ -42,7 +42,12 @@ def parse_search(html: str, base_url: str) -> list[Candidate]:
     url = absolute product URL with any ``#`` fragment stripped). Deduplicated by URL.
     """
     soup = BeautifulSoup(html, "lxml")
-    scope = soup.select_one(".products.products-block") or soup
+    # The results grid MUST be present; without it, degrade to no results rather than
+    # scrape every ``.product`` on the page (header / cart / cross-sell) — a wrong link
+    # feeds auto-ordering, so "no recognizable grid" means no match, never scrape-all.
+    scope = soup.select_one(".products.products-block")
+    if scope is None:
+        return []
 
     out: list[Candidate] = []
     seen: set[str] = set()
@@ -56,7 +61,9 @@ def parse_search(html: str, base_url: str) -> list[Candidate]:
         if not href:
             continue
         url, _ = urldefrag(urljoin(base_url + "/", href))
-        if not url.startswith(base_url) or url in seen:
+        # host-boundary check: ``base_url + "/"`` so a look-alike host
+        # (e.g. www.luko.cz.evil.com) cannot satisfy a bare prefix match.
+        if not url.startswith(base_url + "/") or url in seen:
             continue
         seen.add(url)
         nm = card.select_one('[data-micro="name"]') or card.select_one("a.name")
@@ -85,5 +92,11 @@ def choose_exact(code: str | None, candidates: list[Candidate]) -> int:
     """
     if not code:
         return -1
-    hits = [i for i, c in enumerate(candidates) if code in (c.name or "")]
+    # Bounded match (``\bcode\b``), mirroring extract_code: a substring match would
+    # false-hit a name where the code sits inside a longer digit run (024245 in
+    # 0242450) and, if the real product is absent, return a WRONG link to auto-ordering.
+    # NOTE: the chosen product's URL slug may carry a DIFFERENT 6-digit number (Shoptet
+    # keeps a stale slug after a rename) — that is fine, the name is the source of truth.
+    pat = re.compile(rf"\b{re.escape(code)}\b")
+    hits = [i for i, c in enumerate(candidates) if pat.search(c.name or "")]
     return hits[0] if len(hits) == 1 else -1

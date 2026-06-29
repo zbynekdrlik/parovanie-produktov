@@ -80,3 +80,25 @@ def test_choose_exact_rejects_different_code_only():
     # a result whose name carries a DIFFERENT code must not match
     cands = [Candidate(name="Pánská košile model 999999", url=BASE + "/a/")]
     assert choose_exact("034230", cands) == -1
+
+
+def test_choose_exact_rejects_code_inside_longer_digit_run():
+    # code 024245 must NOT match when it is a substring of a longer digit run —
+    # a false hit would feed a WRONG product to auto-ordering.
+    cands = [Candidate(name="Pánská košile model 0242450", url=BASE + "/a/")]
+    assert choose_exact("024245", cands) == -1
+
+
+def test_parse_returns_empty_without_results_grid():
+    # No .products.products-block grid → MUST return [] (never fall back to scraping
+    # stray .product elements across the whole page: header/cart/cross-sell).
+    html = '<div class="product"><a class="name" href="/x/"><span data-micro="name">model 034230</span></a></div>'
+    assert parse_search(html, BASE) == []
+
+
+def test_parse_rejects_lookalike_host():
+    # a look-alike host (luko.cz.evil.com) must NOT pass the base-url check
+    html = ('<div class="products products-block"><div class="product">'
+            '<a class="name" href="https://www.luko.cz.evil.com/x/">'
+            '<span data-micro="name">model 034230</span></a></div></div>')
+    assert parse_search(html, BASE) == []

@@ -123,6 +123,27 @@ def _save_order_pairings(d: dict) -> None:
     os.replace(tmp, ORDER_PAIRINGS)
 
 
+# Per-line "čaká sa" flag (key='<orderCode>|<itemCode>'): an ACTIVE order line that
+# can't be stocked yet — waiting on the supplier, batching more items, or deferred by
+# agreement with the customer. Independent of "objednané". Same safe gitignored store;
+# NEVER pruned → survives deploy.
+WAITING = os.path.join(OUT, "waiting_items.json")
+
+
+def _load_waiting() -> dict:
+    if os.path.exists(WAITING):
+        with open(WAITING, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_waiting(d: dict) -> None:
+    tmp = WAITING + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, WAITING)
+
+
 # at startup, prune orphan decisions whose key matches no product (e.g. a stale
 # 'None'/'bad' from before stable keys) so the progress count == the import count
 _VALID_KEYS = {p.get("key") for p in PRODUCTS}
@@ -434,6 +455,27 @@ def api_ordered():
     return jsonify({"ok": True})
 
 
+@app.route("/api/waiting", methods=["GET", "POST"])
+def api_waiting():
+    """Per-line 'čaká sa' flag (key='<orderCode>|<itemCode>'): active order line that
+    can't be stocked yet. GET -> the map; POST {key, waiting} toggles a single line.
+    Same shape as /api/ordered, independent state."""
+    if request.method == "GET":
+        return jsonify({"waiting": _load_waiting()})
+    body = request.get_json(force=True)
+    key = str(body.get("key"))
+    waiting = bool(body.get("waiting"))
+    with _lock:
+        d = _load_waiting()
+        if waiting:
+            d[key] = True
+        else:
+            d.pop(key, None)
+        _save_waiting(d)
+    log.info("waiting key=%s waiting=%s", key, waiting)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/order-pair", methods=["POST"])
 def api_order_pair():
     """Save/clear an inline supplier reorder URL for a forestshop order code
@@ -477,9 +519,11 @@ def api_orders():
         return jsonify({"orders": [], "error": str(e)})
     rows = build_to_order_rows(csv_bytes, PRODUCTS, _load_decisions(), CODE2PAIR)
     ordered = _load_ordered()
+    waiting = _load_waiting()
     pairings = _load_order_pairings()
     for r in rows:
         r["ordered"] = bool(ordered.get(r["key"]))
+        r["waiting"] = bool(waiting.get(r["key"]))   # 'čaká sa' — deferred active line
         # supplierUrl stays the reviewed-decision link (read-only); pairUrl is the
         # inline-entered one (editable on the tab). A row is "paired" if either is set.
         r["pairUrl"] = pairings.get(r["itemCode"], "")
