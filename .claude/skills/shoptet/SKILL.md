@@ -21,6 +21,7 @@ Preto sa import **rozdelí podľa polí** — každý súbor/riadok nesie LEN st
 - **`import_links.csv`** = `code;pairCode;internalNote` — objednávacia linka do **privátneho poľa `internalNote`** (žiadne state stĺpce → vis/stock/avail ostanú nedotknuté).
 - **`import_states.csv`** = `code;pairCode;productVisibility;stock;availabilityInStock;availabilityOutOfStock` — stavy (nie skladom / nebude predávať; žiadny internalNote → linka nedotknutá).
 - **Kódovanie UTF-8 (s BOM)** (cp1250 → mojibake `č`→`è`), `;`, CRLF. **VŽDY `code` + `pairCode`.** Kódovanie aj párovanie (podľa `code`) Shoptet rieši sám.
+- **`VÝSLEDOK: upravené=N` je PRODUKTOVÁ úroveň, nie variantová** — 15 variantov 2 produktov → `upravené=2/3` (nie 15). NIKDY never tomu číslu; over zápis vždy **čerstvým export read-backom** (stiahni export, porovnaj `externalCode`/`internalNote` po `code`). `spracované` = počet riadkov, `zlyhania=None` = 0 nezhôd kódov.
 
 ## TRI STAVY produktu (overené z dát eshopu — DOHODNUTÉ)
 
