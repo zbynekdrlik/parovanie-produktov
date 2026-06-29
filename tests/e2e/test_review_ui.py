@@ -103,7 +103,7 @@ def test_toorder_deeplink_and_inline_pairing(page, live_server):
     assert console == [], f"console not clean: {console}"
 
 
-def test_toorder_oldest_first_ordering(page, live_server):
+def test_toorder_newest_first_ordering(page, live_server):
     console = []
     page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
             if m.type in ("error", "warning") else None)
@@ -111,16 +111,16 @@ def test_toorder_oldest_first_ordering(page, live_server):
     page.goto(live_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-supplier")
 
-    # The oldest pending order is most urgent → its supplier group sorts to the top.
-    # ORBIS holds order 20260700 (oldest); BETALOV's oldest is 20260750 → ORBIS first,
-    # beating the old alphabetical order (BETALOV would have been first).
+    # Newest orders on top (like Shoptet) → the supplier with the newest pending order
+    # sorts first. BETALOV holds 1/M = 20260900 (newest); ORBIS's newest is 20260700 →
+    # BETALOV first.
     headers = page.locator(".toorder-supplier").all_inner_texts()
-    assert headers[0].startswith("ORBIS"), headers
-    assert any(h.startswith("BETALOV") for h in headers), headers
+    assert headers[0].startswith("BETALOV"), headers
+    assert any(h.startswith("ORBIS") for h in headers), headers
 
-    # Within BETALOV the older order (2/M = 20260750) precedes the newer (1/M = 20260900).
+    # Within BETALOV the newer order (1/M = 20260900) precedes the older (2/M = 20260750).
     codes = page.locator(".toorder-row").evaluate_all("els => els.map(e => e.dataset.code)")
-    assert codes.index("2/M") < codes.index("1/M"), codes
+    assert codes.index("1/M") < codes.index("2/M"), codes
 
     # The order date renders on the row, formatted DD.MM.YYYY (ORBIS = 2026-04-24).
     dt = page.locator(".toorder-row[data-code='77/X'] .to-date").first.inner_text()

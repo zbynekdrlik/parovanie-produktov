@@ -408,10 +408,10 @@ function renderOrderRow(o) {
 }
 
 function renderToOrder() {
-  // Priorita = najstaršia objednávka prvá. Čísla objednávok sú chronologické
-  // (nižšie = staršie), takže urgentnosť dodávateľa = jeho najnižšie orderCode;
-  // v rámci dodávateľa od najstaršej. Tá najstaršia sa musí vybaviť čo najskôr.
-  const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? Infinity : n; };
+  // Najnovšie objednávky hore — Marek je tak naučený zo Shoptetu. Čísla objednávok sú
+  // chronologické (vyššie = novšie); dodávateľ s NAJNOVŠOU objednávkou hore, v rámci
+  // dodávateľa od najnovšej. Ne-číselné orderCode = -Infinity (nikdy nedominuje vrch).
+  const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
   // datalist of known supplier names (avoid typo-fragmented groups) — distinct real
   // suppliers seen across orders, both order-given and manually assigned
   const known = [...new Set(ORDERS.flatMap(o => [o.supplier, o.assignedSupplier]).filter(Boolean))].sort();
@@ -419,14 +419,14 @@ function renderToOrder() {
   if (!dl) { dl = el('datalist'); dl.id = 'known-suppliers'; document.body.appendChild(dl); }
   dl.innerHTML = '';
   for (const s of known) { const opt = document.createElement('option'); opt.value = s; dl.appendChild(opt); }
-  const cnt = {}, oldest = {};
+  const cnt = {}, newest = {};
   for (const o of ORDERS) {
     const s = effSup(o);
     cnt[s] = (cnt[s] || 0) + 1;
-    oldest[s] = Math.min(oldest[s] ?? Infinity, oNum(o));
+    newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
   }
-  // dodávateľ s najstaršou nevybavenou objednávkou hore; zhoda → abecedne
-  const byPriority = (a, b) => (oldest[a] - oldest[b]) || (a < b ? -1 : a > b ? 1 : 0);
+  // dodávateľ s NAJNOVŠOU objednávkou hore; zhoda → abecedne
+  const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
   const fbar = document.getElementById('filters'); fbar.innerHTML = '';
   const mk = (key, lbl) => {
     const b = el('button', ORDER_SUPPLIER === key ? 'active' : '', lbl);
@@ -443,7 +443,7 @@ function renderToOrder() {
   const groups = {};
   for (const o of shown) { const s = effSup(o); (groups[s] = groups[s] || []).push(o); }
   for (const sup of Object.keys(groups).sort(byPriority)) {
-    groups[sup].sort((a, b) => oNum(a) - oNum(b));   // v rámci dodávateľa: najstaršia objednávka prvá
+    groups[sup].sort((a, b) => oNum(b) - oNum(a));   // v rámci dodávateľa: najnovšia objednávka prvá
     list.appendChild(el('div', 'toorder-supplier', `${escapeHtml(sup)} — ${groups[sup].length} položiek`));
     for (const o of groups[sup]) list.appendChild(renderOrderRow(o));
   }
@@ -452,6 +452,7 @@ function renderToOrder() {
 function render() {
   renderTabs();
   const toorder = ACTIVE_TAB === 'toorder';
+  document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = toorder ? 'none' : '';
   const dls = document.querySelector('.downloads'); if (dls) dls.style.display = toorder ? 'none' : '';
   if (toorder) { renderToOrder(); return; }
