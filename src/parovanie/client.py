@@ -9,7 +9,7 @@ import requests
 
 from parovanie import config
 from parovanie.models import Candidate
-from parovanie.suppliers import wetland, betalov, odimon, trigona, grube
+from parovanie.suppliers import wetland, betalov, odimon, trigona, grube, luko
 
 log = logging.getLogger("parovanie.client")
 
@@ -19,6 +19,7 @@ PARSERS: dict[str, Callable[[str, str], list[Candidate]]] = {
     "ODIMON": odimon.parse_search,
     "TRIGONA": trigona.parse_search,
     "GRUBE": grube.parse_search,
+    "LUKO": luko.parse_search,
 }
 
 
