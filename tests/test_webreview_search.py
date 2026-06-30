@@ -104,3 +104,50 @@ def test_search_pair_rejects_empty_url(client):
 def test_search_pair_unknown_paircode_404(client):
     assert client.post("/api/search-pair",
                        json={"pairCode": "999", "url": "https://x.sk/"}).status_code == 404
+
+
+def test_promote_current_reflects_hidden_visibility(tmp_path, monkeypatch):
+    """Regression: _current_for_paircode must scan the export's `productVisibility`
+    column (there is NO `visibility` column — build_review_data.py / resync_export.py
+    both read productVisibility). Reading the wrong name left vis="" so state_of never
+    applied the hidden/blocked rule and the promoted snapshot wrongly showed state 1
+    (sellable) for a visibility-hidden product — the snapshot-drift bug CLAUDE.md warns
+    about. This FAILS on the buggy `visibility` read and PASSES after the fix."""
+    # A real cp1250 export row (full column set the promote-time scan reads) for a
+    # visibility-hidden product. ais/aos empty so the ONLY thing pushing it off-sale
+    # is productVisibility=hidden — isolating the column-name bug.
+    csv_path = tmp_path / "products.csv"
+    header = ("code;pairCode;name;supplier;productVisibility;availabilityInStock;"
+              "availabilityOutOfStock;price;standardPrice;stock;defaultImage")
+    row = "77001/L;900;Bunda Hidden;GRUBE;hidden;;;12.50;19.90;3;i.jpg"
+    csv_path.write_text(header + "\r\n" + row + "\r\n", encoding="cp1250")
+
+    catalog = webapp.build_catalog_index(
+        [{"code": "77001/L", "pairCode": "900", "name": "Bunda Hidden",
+          "supplier": "GRUBE", "defaultImage": "i.jpg"}], review_keys=set())
+    monkeypatch.setattr(webapp, "CATALOG", catalog)
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "DECISIONS", str(tmp_path / "decisions.json"))
+    monkeypatch.setattr(webapp, "DATA", str(tmp_path / "review_data.json"))
+    monkeypatch.setattr(webapp, "SRC", str(csv_path))   # real export the scan reads
+    monkeypatch.setattr(webapp, "_CODE2URL", {})
+    with open(webapp.DATA, "w", encoding="utf-8") as f:
+        json.dump([], f)
+    client = webapp.app.test_client()
+
+    r = client.post("/api/search-pair",
+                    json={"pairCode": "900", "url": "https://www.grube.de/p/x/154773/"})
+    assert r.status_code == 200 and r.get_json()["promoted"] is True
+
+    # Expected snapshot DERIVED from current_of on the real hidden-visibility input —
+    # not a guessed literal. For productVisibility=hidden, state_of returns 3
+    # ("Už sa nebude predávať"), off=True, vis="hidden".
+    expected = webapp.current_of("hidden", "", "", "12.50", "19.90", "3")
+    assert expected["state"] == 3 and expected["off"] is True and expected["vis"] == "hidden"
+
+    promoted = [p for p in webapp.PRODUCTS if p["key"] == "900"][0]
+    assert promoted["current"]["vis"] == expected["vis"]      # "hidden", not ""
+    assert promoted["current"]["state"] == expected["state"]  # 3, not 1
+    assert promoted["current"]["off"] is expected["off"]      # True, not False
+    # the priced fields still flow through (same arg order as the canonical producers)
+    assert promoted["current"]["price"] == "12.50" and promoted["current"]["std"] == "19.90"

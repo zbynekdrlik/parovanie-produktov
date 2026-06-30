@@ -545,15 +545,21 @@ def _current_for_paircode(pair: str) -> dict:
         with open(SRC, encoding="cp1250", errors="replace") as f:
             for r in csv.DictReader(f, delimiter=";"):
                 if (r.get("pairCode") or "").strip() == pair:
+                    # Column names + arg order MUST match build_review_data.py /
+                    # resync_export.py (productVisibility — there is NO "visibility"
+                    # column; reading the wrong one left vis="" so hidden/blocked
+                    # products never got state 3 — snapshot drift).
                     return current_of(
-                        (r.get("visibility") or "").strip(),
+                        (r.get("productVisibility") or "").strip(),
                         (r.get("availabilityInStock") or "").strip(),
                         (r.get("availabilityOutOfStock") or "").strip(),
                         (r.get("price") or "").strip(),
                         (r.get("standardPrice") or "").strip(),
                         (r.get("stock") or "").strip(),
                     )
-    except OSError as e:
+    except (OSError, csv.Error) as e:
+        # Best-effort contract: a missing/unreadable export OR a malformed row
+        # (csv.Error — NUL byte / oversized field) degrades to {}, never a 500.
         log.warning("current_for_paircode scan failed pair=%s: %r", pair, e)
     return {}
 
