@@ -7,6 +7,7 @@ CODE2PAIR / DATA / DECISIONS / SRC / _CODE2URL) so each test runs against a
 small in-memory catalog and a tmp store — never the real 56 MB export or the
 59 MB marketing XML.
 """
+import importlib
 import json
 import os
 import sys
@@ -225,3 +226,52 @@ def test_promote_current_reflects_hidden_visibility(tmp_path, monkeypatch):
     assert promoted["current"]["off"] is expected["off"]      # True, not False
     # the priced fields still flow through (same arg order as the canonical producers)
     assert promoted["current"]["price"] == "12.50" and promoted["current"]["std"] == "19.90"
+
+
+def test_load_catalog_in_review_keyed_by_paircode_at_real_call_site(tmp_path, monkeypatch):
+    """C1 at the REAL module-load call site (app.py line ~92):
+
+        CODE2PAIR, CATALOG = _load_catalog(SRC, {p.get("pairCode") for p in PRODUCTS})
+
+    Every other test in this file monkeypatches CATALOG directly, so none of them
+    would fail if line 92 were reverted to `{p.get("key") for p in PRODUCTS}`. This
+    test boots the app through importlib.reload against fixture env paths
+    (WEBREVIEW_OUT / WEBREVIEW_PRODUCTS — same vars tests/e2e/conftest.py uses), so the
+    real comprehension at line 92 runs: a 'GRUBE|425'-keyed review entry has bare
+    pairCode '425', the catalog is grouped by the bare pairCode '425', so review_keys
+    MUST be the bare pairCodes for the in_review flag to land. Reverting line 92 to
+    collect `key` makes review_keys={'GRUBE|425'} → '425' not in it → in_review False
+    → this assertion FAILS (verified RED)."""
+    out = tmp_path / "out"
+    out.mkdir()
+    # ONE already-in-review product keyed 'GRUBE|425' (the dominant SUPPLIER|pairCode
+    # scheme); its BARE pairCode is '425'. Loaded into PRODUCTS at module load.
+    (out / "review_data.json").write_text(json.dumps([{
+        "idx": 0, "key": "GRUBE|425", "pairCode": "425", "supplier": "GRUBE",
+        "name": "Bunda Tradition", "variant_codes": ["60611/L"], "our_images": [],
+        "our_url": "", "ai_status": "manual", "ai_chosen_url": "", "ai_reason": "",
+        "candidates": [], "current": {},
+    }], ensure_ascii=False), encoding="utf-8")
+    # A cp1250 Shoptet-export row whose pairCode is the bare '425' (real column set).
+    products_csv = tmp_path / "products.csv"
+    header = ("code;pairCode;name;supplier;productVisibility;availabilityInStock;"
+              "availabilityOutOfStock;price;standardPrice;stock;defaultImage")
+    row = "60611/L;425;Bunda Tradition;GRUBE;visible;Skladom;Vypredané;12,50;15,00;3;i.jpg"
+    products_csv.write_text(header + "\r\n" + row + "\r\n", encoding="cp1250")
+
+    monkeypatch.setenv("WEBREVIEW_OUT", str(out))
+    monkeypatch.setenv("WEBREVIEW_PRODUCTS", str(products_csv))
+    try:
+        # REAL boot: PRODUCTS <- review_data.json, then line 92 builds CATALOG with
+        # review_keys = {p.get("pairCode") ...} over the freshly loaded PRODUCTS.
+        importlib.reload(webapp)
+        assert webapp.PRODUCTS[0]["key"] == "GRUBE|425"   # composite key, bare pairCode 425
+        assert "425" in webapp.CATALOG                     # catalog grouped by bare pairCode
+        assert webapp.CATALOG["425"]["in_review"] is True  # line-92 contract (was False on C1)
+    finally:
+        # Restore the module to a hermetic empty state. Point the env at MISSING fixture
+        # paths so this final reload returns ({}, {}) instantly and NEVER parses the real
+        # 56 MB data/products.csv (done while monkeypatch's setenv is still active).
+        monkeypatch.setenv("WEBREVIEW_OUT", str(tmp_path / "empty_out"))
+        monkeypatch.setenv("WEBREVIEW_PRODUCTS", str(tmp_path / "no_export.csv"))
+        importlib.reload(webapp)
