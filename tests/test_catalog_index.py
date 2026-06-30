@@ -1,4 +1,9 @@
-from parovanie.catalog_index import normalize_text, build_catalog_index, search_catalog
+from parovanie.catalog_index import (
+    normalize_text,
+    build_catalog_index,
+    search_catalog,
+    supplier_from_url,
+)
 
 
 def _row(code, pair, name, supplier="WETLAND", img=""):
@@ -54,3 +59,38 @@ def test_search_limit():
     rows = [_row(f"c{i}", str(i), "Spolocny nazov") for i in range(60)]
     cat = build_catalog_index(rows)
     assert len(search_catalog(cat, "spolocny", limit=50)) == 50
+
+
+def test_search_accent_insensitive_through_search_path():
+    # Accent-less query matches an accented stored name THROUGH search_catalog
+    # (not just the normalize_text unit) — closes Task 1's review gap.
+    cat = build_catalog_index([_row("x/1", "700", "Bundá ČIERNA")])
+    assert [e["pairCode"] for e in search_catalog(cat, "bunda")] == ["700"]
+
+
+class _Cfg:
+    def __init__(self, base_url):
+        self.base_url = base_url
+
+
+_SUP = {
+    "WETLAND": _Cfg("https://www.wetland.sk"),
+    "BETALOV": _Cfg("https://www.huntingshop.eu"),
+    "GRUBE": _Cfg("https://www.grube.sk"),
+    "ODIMON": _Cfg("https://www.odimon.sk"),
+}
+
+
+def test_supplier_from_url_matches_host():
+    assert supplier_from_url("https://www.wetland.sk/p/x", _SUP) == "WETLAND"
+    assert supplier_from_url("https://wetland.sk/p/x", _SUP) == "WETLAND"
+    assert supplier_from_url("https://www.huntingshop.eu/h?search=x", _SUP) == "BETALOV"
+
+
+def test_supplier_from_url_grube_de_maps_to_grube():
+    assert supplier_from_url("https://www.grube.de/p/x/154773/", _SUP) == "GRUBE"
+
+
+def test_supplier_from_url_unknown_returns_empty():
+    assert supplier_from_url("https://example.com/x", _SUP) == ""
+    assert supplier_from_url("", _SUP) == ""

@@ -3,6 +3,7 @@ Shoptet export rows; grouped per product (pairCode). Search is accent-insensitiv
 substring over name / supplier / variant code. No live network, no fuzzy ranking."""
 import unicodedata
 from typing import Iterable
+from urllib.parse import urlparse
 
 
 def normalize_text(s: str) -> str:
@@ -56,3 +57,28 @@ def search_catalog(catalog: dict, q: str, limit: int = 50) -> list:
             if len(results) >= limit:
                 break
     return results
+
+
+def _host(url: str) -> str:
+    """Lowercased host of `url`, with a leading `www.` PREFIX stripped (not lstrip)."""
+    h = (urlparse(url or "").netloc or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def supplier_from_url(url: str, suppliers: dict) -> str:
+    """Infer supplier key from a pasted product URL's host vs SUPPLIERS base_url
+    hosts. grube.de/grube.sk both -> GRUBE. Unknown host -> ''. Only used to set the
+    `supplier` field so link_rows applies GRUBE .de normalization correctly."""
+    host = _host(url)
+    if not host:
+        return ""
+    if "grube.de" in host or "grube.sk" in host:
+        return "GRUBE"
+    for name, cfg in suppliers.items():
+        base = getattr(cfg, "base_url", None)
+        if base is None and isinstance(cfg, dict):
+            base = cfg.get("base_url", "")
+        bhost = _host(base or "")
+        if bhost and (host == bhost or host.endswith("." + bhost)):
+            return name
+    return ""
