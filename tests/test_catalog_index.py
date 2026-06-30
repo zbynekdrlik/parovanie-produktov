@@ -3,6 +3,7 @@ from parovanie.catalog_index import (
     build_catalog_index,
     search_catalog,
     supplier_from_url,
+    build_promoted_entry,
 )
 
 
@@ -94,3 +95,20 @@ def test_supplier_from_url_grube_de_maps_to_grube():
 def test_supplier_from_url_unknown_returns_empty():
     assert supplier_from_url("https://example.com/x", _SUP) == ""
     assert supplier_from_url("", _SUP) == ""
+
+
+def test_build_promoted_entry_shape():
+    ce = {"pairCode": "425", "name": "Bunda Tradition", "supplier": "GRUBE",
+          "variant_codes": ["60611/L", "60611/M"], "image": "img.jpg"}
+    cur = {"state": 1, "off": False, "vis": "visible", "avail": "", "price": "99,00", "std": "", "stock": "3"}
+    e = build_promoted_entry(ce, cur, "https://www.forestshop.sk/x/", "GRUBE", 2600)
+    assert e["key"] == "425" and e["pairCode"] == "425"
+    assert e["variant_codes"] == ["60611/L", "60611/M"]
+    assert e["our_images"] == ["img.jpg"]
+    assert e["candidates"] == [] and e["ai_status"] == "unmatched"
+    assert e["supplier"] == "GRUBE"
+    assert e["our_url"] == "https://www.forestshop.sk/x/"
+    assert e["current"] == cur and e["idx"] == 2600
+    # supplier falls back to catalog supplier when inferred is empty
+    e2 = build_promoted_entry(ce, cur, None, "", 1)
+    assert e2["supplier"] == "GRUBE" and e2["our_url"] is None and e2["our_images"] == ["img.jpg"]

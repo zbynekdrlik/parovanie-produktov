@@ -82,3 +82,25 @@ def supplier_from_url(url: str, suppliers: dict) -> str:
         if bhost and (host == bhost or host.endswith("." + bhost)):
             return name
     return ""
+
+
+def build_promoted_entry(catalog_entry: dict, current: dict, our_url, supplier: str, idx: int) -> dict:
+    """Minimal review_data entry for a catalog product paired for the first time via
+    search. Shape mirrors build_review_data so link_rows + the UI card consume it.
+    `supplier` is the URL-inferred key; falls back to the catalog row's supplier."""
+    img = catalog_entry.get("image")
+    return {
+        "idx": idx,
+        "supplier": supplier or catalog_entry.get("supplier", ""),
+        "name": catalog_entry["name"],
+        "pairCode": catalog_entry["pairCode"],
+        "variant_codes": list(catalog_entry["variant_codes"]),
+        "our_images": [img] if img else [],
+        "ai_status": "unmatched",
+        "ai_chosen_url": "",
+        "ai_reason": "Ručne pridané cez vyhľadávanie.",
+        "candidates": [],
+        "our_url": our_url,
+        "key": catalog_entry["pairCode"],
+        "current": current,
+    }
