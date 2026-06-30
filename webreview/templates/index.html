@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrola párovania — Forestshop</title>
-  <link rel="stylesheet" href="/static/style.css?v=23">
+  <link rel="stylesheet" href="/static/style.css?v=24">
 </head>
 <body>
   <header>
@@ -18,7 +18,12 @@
   </header>
   <main id="list"></main>
   <div id="empty" class="empty" hidden>Žiadne produkty v tomto filtri.</div>
+  <section id="tab-search" hidden>
+    <input id="searchBox" type="search" autocomplete="off"
+           placeholder="Hľadať produkt podľa názvu, dodávateľa alebo kódu…">
+    <div id="searchResults"></div>
+  </section>
   <footer class="appfoot"><span id="version" data-testid="version">…</span></footer>
-  <script src="/static/app.js?v=23"></script>
+  <script src="/static/app.js?v=24"></script>
 </body>
 </html>

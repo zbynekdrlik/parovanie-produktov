@@ -144,3 +144,34 @@ a.supurl:hover { text-decoration: underline; }
   .toorder-row .to-name { flex-basis: 100%; white-space: normal; }
   .toorder-row .to-pair { flex-basis: 100%; }
 }
+
+/* Hľadať / opraviť (catalog search) tab */
+#tab-search { max-width: 1200px; margin: 14px auto; padding: 0 12px;
+  display: flex; flex-direction: column; gap: 10px; }
+#searchBox { width: 100%; padding: 11px 14px; border: 1px solid #d1d5db; border-radius: 8px;
+  font-size: 15px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+#searchBox:focus { outline: 2px solid #34d399; border-color: #34d399; }
+#searchResults { display: flex; flex-direction: column; gap: 8px; }
+.search-row { background: #fff; border: 1px solid #e5e7eb; border-radius: 9px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.06); overflow: hidden; }
+.search-row .srch-head { display: flex; gap: 12px; align-items: center; padding: 9px 12px; cursor: pointer; }
+.search-row .srch-head:hover { background: #f9fafb; }
+.search-row .srch-thumb { width: 54px; height: 54px; flex: 0 0 54px; background: #f7f7f9;
+  border: 1px solid #eee; border-radius: 6px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center; }
+.search-row .srch-thumb img { width: 54px; height: 54px; object-fit: contain; }
+.search-row .srch-main { flex: 1; min-width: 0; }
+.search-row .srch-name { font-weight: 600; font-size: 14px; line-height: 1.25;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-row .srch-meta { font-size: 12px; color: #6b7280; margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.search-row .srch-link { margin-top: 2px; }
+.search-row .srch-panel { padding: 0 12px 12px; }
+.search-row .srch-saved { font-size: 13px; font-weight: 600; color: #065f46;
+  background: #d1fae5; border-radius: 6px; padding: 6px 10px; }
+.sbadge { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 10px;
+  flex: 0 0 auto; white-space: nowrap; }
+.sbadge.inreview { background: #dbeafe; color: #1e40af; }
+.sbadge.new { background: #fef3c7; color: #92400e; }
+.sbadge.paired { background: #d1fae5; color: #065f46; }
+.srch-empty { text-align: center; color: #6b7280; padding: 24px; }
