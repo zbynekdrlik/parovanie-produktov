@@ -1,0 +1,58 @@
+"""Catalog-wide product search index (pure). Built once at app start from the
+Shoptet export rows; grouped per product (pairCode). Search is accent-insensitive
+substring over name / supplier / variant code. No live network, no fuzzy ranking."""
+import unicodedata
+from typing import Iterable
+
+
+def normalize_text(s: str) -> str:
+    """Lowercase + strip diacritics (NFKD) for accent-insensitive matching."""
+    if not s:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
+
+
+def build_catalog_index(rows: Iterable[dict], review_keys=None) -> dict:
+    """Group export variant rows into {pairCode: entry}. Each `row` needs at least
+    code, pairCode, name, supplier, defaultImage. `review_keys` marks in_review.
+    First row of a pairCode supplies name/supplier/image; codes accumulate."""
+    review_keys = review_keys or set()
+    out: dict = {}
+    for r in rows:
+        pc = (r.get("pairCode") or "").strip()
+        code = (r.get("code") or "").strip()
+        if not pc or not code:
+            continue
+        e = out.get(pc)
+        if e is None:
+            name = (r.get("name") or "").strip()
+            e = out[pc] = {
+                "pairCode": pc,
+                "name": name,
+                "supplier": (r.get("supplier") or "").strip(),
+                "variant_codes": [],
+                "image": (r.get("defaultImage") or "").strip(),
+                "name_norm": normalize_text(name),
+                "in_review": pc in review_keys,
+            }
+        if code not in e["variant_codes"]:
+            e["variant_codes"].append(code)
+    return out
+
+
+def search_catalog(catalog: dict, q: str, limit: int = 50) -> list:
+    """Up to `limit` product entries whose name (accent-insensitive), supplier, or
+    any variant code contains `q`. Query shorter than 2 chars (normalized) -> []."""
+    qn = normalize_text(q)
+    if len(qn) < 2:
+        return []
+    results = []
+    for e in catalog.values():
+        if (qn in e["name_norm"]
+                or qn in normalize_text(e["supplier"])
+                or any(qn in normalize_text(c) for c in e["variant_codes"])):
+            results.append(e)
+            if len(results) >= limit:
+                break
+    return results
