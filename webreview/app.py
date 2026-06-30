@@ -85,7 +85,11 @@ def _load_catalog(path, review_keys):
     return code2pair, build_catalog_index(rows, review_keys)
 
 
-CODE2PAIR, CATALOG = _load_catalog(SRC, {p.get("key") for p in PRODUCTS})
+# review_keys are the products' BARE pairCodes — build_catalog_index marks a catalog
+# entry in_review via `pairCode in review_keys`, and the index is grouped by bare
+# pairCode. Most review entries are keyed "SUPPLIER|pairCode" (e.g. GRUBE|425), so
+# collecting `key` here marked every such product not-in-review (C1). Collect pairCode.
+CODE2PAIR, CATALOG = _load_catalog(SRC, {p.get("pairCode") for p in PRODUCTS})
 log.info("catalog: %d products indexed (%d codes) from %s", len(CATALOG), len(CODE2PAIR), SRC)
 
 
@@ -601,8 +605,10 @@ def _our_url_for_paircode(pair: str):
 
 def _search_result(e: dict) -> dict:
     """Shape one catalog entry for /api/search. idx + our_url come from the matching
-    in-review product (if any) so the UI can deep-link an already-paired item."""
-    p = next((x for x in PRODUCTS if x.get("key") == e["pairCode"]), None)
+    in-review product (if any) so the UI can deep-link an already-paired item. Match by
+    pairCode — most review entries are keyed "SUPPLIER|pairCode", so a key==pairCode test
+    missed them and dropped the our_url/idx deep-link (C1)."""
+    p = next((x for x in PRODUCTS if x.get("pairCode") == e["pairCode"]), None)
     return {
         "pairCode": e["pairCode"],
         "name": e["name"],
@@ -640,24 +646,41 @@ def api_search_pair():
     ce = CATALOG.get(pair)
     if not ce:
         return jsonify({"ok": False, "error": "unknown pairCode"}), 404
+    # Match an already-in-review product by pairCode — NOT by key. Most review entries are
+    # keyed "SUPPLIER|pairCode" (e.g. GRUBE|425); a key==pair test missed every such entry
+    # → it wrongly promoted a DUPLICATE bare-key entry AND wrote the decision under "425"
+    # where link_rows (which reads dec["GRUBE|425"]) never finds it, silently dropping the
+    # manager's corrected URL while the card showed a false "napárované ✓" (C1).
+    in_review = any(p.get("pairCode") == pair for p in PRODUCTS)
+    # The two heavy read-only scans (55 MB cp1250 export + 59 MB marketing XML) depend
+    # ONLY on `pair`, never on mutable state → compute them OUTSIDE the lock so a promote
+    # never stalls every other write endpoint for seconds. Needed only when promoting a
+    # genuinely NEW catalog product; an existing entry just gets its decision rewritten.
+    if not in_review:
+        snapshot = _current_for_paircode(pair)
+        our_url = _our_url_for_paircode(pair)
+        supplier = supplier_from_url(url, config.SUPPLIERS)
     with _lock:
-        promoted = False
-        if not any(p.get("key") == pair for p in PRODUCTS):
-            supplier = supplier_from_url(url, config.SUPPLIERS)
-            entry = build_promoted_entry(
-                ce, _current_for_paircode(pair), _our_url_for_paircode(pair),
-                supplier, len(PRODUCTS))
+        # re-check under the lock (append-only store → monotonic; a tiny TOCTOU on
+        # concurrent same-pair promotes is fine — single manager user — and this dedups)
+        existing = next((p for p in PRODUCTS if p.get("pairCode") == pair), None)
+        if existing is None:
+            entry = build_promoted_entry(ce, snapshot, our_url, supplier, len(PRODUCTS))
             PRODUCTS.append(entry)
             _save_products(PRODUCTS)
             ce["in_review"] = True   # keep the catalog snapshot consistent for re-search
+            target_key = pair        # promoted entry's key == pair (self-consistent)
             promoted = True
             log.info("search-pair promoted key=%s supplier=%s codes=%d our_url=%s",
                      pair, entry["supplier"], len(entry["variant_codes"]), entry["our_url"])
+        else:
+            target_key = existing["key"]   # write under the REAL key (e.g. GRUBE|425)
+            promoted = False
         dec = _load_decisions()
-        dec[pair] = {"status": "manual", "url": url}
+        dec[target_key] = {"status": "manual", "url": url}
         _save_decisions(dec)
-    log.info("search-pair decision key=%s url=%s promoted=%s", pair, url, promoted)
-    return jsonify({"ok": True, "promoted": promoted, "key": pair})
+    log.info("search-pair decision key=%s url=%s promoted=%s", target_key, url, promoted)
+    return jsonify({"ok": True, "promoted": promoted, "key": target_key})
 
 
 @app.route("/api/ordered", methods=["GET", "POST"])

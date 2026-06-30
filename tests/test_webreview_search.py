@@ -106,6 +106,80 @@ def test_search_pair_unknown_paircode_404(client):
                        json={"pairCode": "999", "url": "https://x.sk/"}).status_code == 404
 
 
+# --------------------------------------------------------------------------- #
+# C1 regression: a review entry is keyed "SUPPLIER|pairCode" for MOST suppliers
+# (1586/2555 live entries have '|' in key); only BETALOV + most WETLAND use a bare
+# pairCode. The catalog index is grouped by the BARE pairCode, so the search feature
+# must match an in-review product by pairCode (NOT key) and write decisions under the
+# entry's REAL key — else a SUPPLIER|pairCode product shows the wrong badge, the manual
+# panel opens instead of the candidates panel, a DUPLICATE bare-key entry is written, and
+# the manager's corrected URL lands under a key link_rows never reads (silently dropped).
+# --------------------------------------------------------------------------- #
+def _build_catalog_with_review(rows, products):
+    """Build CATALOG exactly as webreview/app.py does at load (line ~88): review_keys are
+    the products' BARE pairCodes, NOT their composite 'SUPPLIER|pairCode' keys."""
+    return webapp.build_catalog_index(
+        rows, review_keys={p.get("pairCode") for p in products})
+
+
+@pytest.fixture
+def supplier_key_client(tmp_path, monkeypatch):
+    """An ALREADY-in-review product keyed 'GRUBE|425' (the dominant scheme) whose bare
+    pairCode is '425'; the catalog is indexed by the bare pairCode '425'."""
+    products = [{
+        "idx": 7, "key": "GRUBE|425", "pairCode": "425", "supplier": "GRUBE",
+        "name": "Bunda Tradition", "variant_codes": ["60611/L"], "our_images": [],
+        "our_url": "https://www.forestshop.sk/bunda-tradition/",
+        "ai_status": "manual", "ai_chosen_url": "https://www.grube.de/old/",
+        "ai_reason": "", "candidates": [], "current": {},
+    }]
+    catalog = _build_catalog_with_review([
+        {"code": "60611/L", "pairCode": "425", "name": "Bunda Tradition",
+         "supplier": "GRUBE", "defaultImage": "i.jpg"},
+    ], products)
+    monkeypatch.setattr(webapp, "CATALOG", catalog)
+    monkeypatch.setattr(webapp, "PRODUCTS", products)
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"60611/L": "425"})
+    monkeypatch.setattr(webapp, "DECISIONS", str(tmp_path / "decisions.json"))
+    monkeypatch.setattr(webapp, "DATA", str(tmp_path / "review_data.json"))
+    monkeypatch.setattr(webapp, "SRC", str(tmp_path / "no_export.csv"))
+    monkeypatch.setattr(webapp, "_CODE2URL", {})
+    with open(webapp.DATA, "w", encoding="utf-8") as f:
+        json.dump(products, f)
+    return webapp.app.test_client()
+
+
+def test_search_supplier_keyed_product_is_in_review_with_our_url(supplier_key_client):
+    """C1: a 'SUPPLIER|pairCode'-keyed product must show in_review=True AND expose its
+    our_url/idx. _search_result matched the in-review product by `key == pairCode`, false
+    for every 'GRUBE|425'-style entry → the deep-link our_url/idx was dropped (None)."""
+    res = supplier_key_client.get("/api/search?q=tradition").get_json()["results"]
+    assert len(res) == 1
+    r = res[0]
+    assert r["pairCode"] == "425"
+    assert r["in_review"] is True                                       # contract (line 88)
+    assert r["our_url"] == "https://www.forestshop.sk/bunda-tradition/"  # was None (C1)
+    assert r["idx"] == 7                                                # was None (C1)
+
+
+def test_search_pair_existing_supplier_key_no_dup_decision_under_real_key(supplier_key_client):
+    """C1 core: re-pairing a 'SUPPLIER|pairCode' product from search must NOT append a
+    duplicate bare-key entry, and MUST write the decision under the REAL key 'GRUBE|425'
+    (where link_rows reads it) — not under the bare '425' (which is silently dropped)."""
+    r = supplier_key_client.post(
+        "/api/search-pair", json={"pairCode": "425", "url": "https://www.grube.de/new/"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["promoted"] is False        # existing → not promoted (was True → a dup!)
+    assert body["key"] == "GRUBE|425"        # decision target = real key (was "425")
+    # no duplicate appended: still exactly ONE product for pairCode 425
+    assert sum(1 for p in webapp.PRODUCTS if p.get("pairCode") == "425") == 1
+    dec = json.load(open(webapp.DECISIONS))
+    assert dec["GRUBE|425"]["status"] == "manual"
+    assert dec["GRUBE|425"]["url"] == "https://www.grube.de/new/"   # reaches link_rows
+    assert "425" not in dec                  # NOT written under the bare pairCode
+
+
 def test_promote_current_reflects_hidden_visibility(tmp_path, monkeypatch):
     """Regression: _current_for_paircode must scan the export's `productVisibility`
     column (there is NO `visibility` column — build_review_data.py / resync_export.py

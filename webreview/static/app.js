@@ -546,7 +546,10 @@ function openSearchRow(res, panel, badge, link) {
   if (!panel.hidden) { panel.hidden = true; panel.innerHTML = ''; return; }   // toggle closed
   panel.innerHTML = '';
   if (res.in_review) {
-    const product = PRODUCTS.find(p => p.key === res.pairCode);
+    // match by pairCode, NOT key — most review entries are keyed "SUPPLIER|pairCode"
+    // (e.g. GRUBE|425), so a key===pairCode lookup missed them and wrongly opened the
+    // manual-promote panel instead of the existing candidates panel (C1)
+    const product = PRODUCTS.find(p => p.pairCode === res.pairCode);
     if (product) { panel.appendChild(resolutionPanel(product)); panel.hidden = false; return; }
   }
   // not in review (or its product not loaded client-side) → manual promote-and-pair

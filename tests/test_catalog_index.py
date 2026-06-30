@@ -34,6 +34,20 @@ def test_build_skips_rows_without_code_or_paircode():
     assert build_catalog_index(rows) == {}
 
 
+def test_in_review_keyed_by_bare_paircode_not_composite_key():
+    """C1 contract (webreview/app.py line ~88): review_keys passed to build_catalog_index
+    are the products' BARE pairCodes, NOT their composite 'SUPPLIER|pairCode' keys. A
+    product keyed 'GRUBE|425' is in_review iff its pairCode '425' is in the set, so the
+    app must collect {p['pairCode']}. Collecting {p['key']} (the C1 bug) put 'GRUBE|425'
+    in the set, which never equals the catalog's bare pairCode '425' → every supplier-keyed
+    product was wrongly marked not-in-review."""
+    rows = [_row("60611/L", "425", "Bunda Tradition", supplier="GRUBE")]
+    # correct contract: review_keys = bare pairCodes → in_review True
+    assert build_catalog_index(rows, review_keys={"425"})["425"]["in_review"] is True
+    # the C1 bug: review_keys = composite keys → never matches bare pairCode → False
+    assert build_catalog_index(rows, review_keys={"GRUBE|425"})["425"]["in_review"] is False
+
+
 def test_search_by_name_accent_insensitive():
     cat = build_catalog_index([_row("4931/S", "512", "Mikina GARDE HART")])
     # Accent-insensitive positive: query without diacritics matches the name.
