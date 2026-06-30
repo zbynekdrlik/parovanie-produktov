@@ -26,7 +26,10 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, jsonify, request, send_from_directory, Response
 
-from parovanie import __version__, import_builder
+from parovanie import __version__, config, import_builder
+from parovanie.catalog_index import (
+    build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
+from parovanie.export_helpers import current_of
 from parovanie.shoptet_import import parse_import_log
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -57,16 +60,37 @@ except FileNotFoundError:
     PRODUCTS = []
     log.warning("review data missing: %s — starting with 0 products", DATA)
 
-# code -> pairCode (Shoptet import needs BOTH code and pairCode present)
+# ONE cp1250 pass over the Shoptet export builds BOTH:
+#   CODE2PAIR — code -> pairCode (the Shoptet import needs both present), and
+#   CATALOG   — the catalog-wide search index grouped per pairCode (canonical
+#               build_catalog_index), powering /api/search + promote-on-pair.
 SRC = os.environ.get("WEBREVIEW_PRODUCTS") or os.path.join(ROOT, "data", "products.csv")
-CODE2PAIR = {}
-if os.path.exists(SRC):
+
+
+def _load_catalog(path, review_keys):
+    """Single cp1250 pass over the Shoptet export → (code2pair, catalog). Missing
+    export → ({}, {}) (the app already tolerates a dataless boot). `rows` is held only
+    for the duration of the build, then released."""
+    code2pair: dict = {}
+    rows: list = []
+    if not os.path.exists(path):
+        return code2pair, {}
     csv.field_size_limit(10**9)
-    with open(SRC, encoding="cp1250", errors="replace") as _f:
+    with open(path, encoding="cp1250", errors="replace") as _f:
         for _row in csv.DictReader(_f, delimiter=";"):
             _c = (_row.get("code") or "").strip()
             if _c:
-                CODE2PAIR[_c] = (_row.get("pairCode") or "").strip()
+                code2pair[_c] = (_row.get("pairCode") or "").strip()
+            rows.append(_row)
+    return code2pair, build_catalog_index(rows, review_keys)
+
+
+# review_keys are the products' BARE pairCodes — build_catalog_index marks a catalog
+# entry in_review via `pairCode in review_keys`, and the index is grouped by bare
+# pairCode. Most review entries are keyed "SUPPLIER|pairCode" (e.g. GRUBE|425), so
+# collecting `key` here marked every such product not-in-review (C1). Collect pairCode.
+CODE2PAIR, CATALOG = _load_catalog(SRC, {p.get("pairCode") for p in PRODUCTS})
+log.info("catalog: %d products indexed (%d codes) from %s", len(CATALOG), len(CODE2PAIR), SRC)
 
 
 def _load_decisions() -> dict:
@@ -498,6 +522,165 @@ def api_export():
                      "variant_codes": p["variant_codes"], "status": d.get("status"),
                      "url": d.get("url", "")})
     return jsonify({"decisions": rows})
+
+
+# --------------------------------------------------------------------------- #
+# Catalog search + promote-on-pair (CATALOG built at startup from the export)
+# --------------------------------------------------------------------------- #
+def _save_products(products) -> None:
+    """Atomic write of review_data.json (tmp + os.replace). Mirrors the other _save_*
+    stores; ensure_ascii=False to keep the Slovak names readable, like build_review_data."""
+    tmp = DATA + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(products, f, ensure_ascii=False)
+    os.replace(tmp, DATA)
+
+
+def _current_for_paircode(pair: str) -> dict:
+    """Build the eshop-side `current` snapshot for a freshly paired catalog product by
+    scanning the Shoptet export for the FIRST row of its pairCode. A rare manual action,
+    so a one-off cp1250 scan is acceptable. Column mapping mirrors build_review_data's
+    current_of() call. Missing export / no matching row -> {} (the card just renders
+    without our-side state — never a 500)."""
+    if not os.path.exists(SRC):
+        return {}
+    csv.field_size_limit(10**9)
+    try:
+        with open(SRC, encoding="cp1250", errors="replace") as f:
+            for r in csv.DictReader(f, delimiter=";"):
+                if (r.get("pairCode") or "").strip() == pair:
+                    # Column names + arg order MUST match build_review_data.py /
+                    # resync_export.py (productVisibility — there is NO "visibility"
+                    # column; reading the wrong one left vis="" so hidden/blocked
+                    # products never got state 3 — snapshot drift).
+                    return current_of(
+                        (r.get("productVisibility") or "").strip(),
+                        (r.get("availabilityInStock") or "").strip(),
+                        (r.get("availabilityOutOfStock") or "").strip(),
+                        (r.get("price") or "").strip(),
+                        (r.get("standardPrice") or "").strip(),
+                        (r.get("stock") or "").strip(),
+                    )
+    except (OSError, csv.Error) as e:
+        # Best-effort contract: a missing/unreadable export OR a malformed row
+        # (csv.Error — NUL byte / oversized field) degrades to {}, never a 500.
+        log.warning("current_for_paircode scan failed pair=%s: %r", pair, e)
+    return {}
+
+
+# Lazily-built {code: ORIG_URL} from the marketing XML — None = not yet attempted.
+_CODE2URL = None
+
+
+def _our_url_for_paircode(pair: str):
+    """Best-effort forestshop our_url for a promoted product, from the marketing XML's
+    ORIG_URL (the authoritative eshop URL) by exact variant code. Built once and cached.
+    ANY failure (missing XML, parse error, scripts not importable) -> None, which is an
+    acceptable result (the UI falls back to a search link)."""
+    global _CODE2URL
+    ce = CATALOG.get(pair)
+    if not ce or not ce.get("variant_codes"):
+        return None
+    if _CODE2URL is None:
+        _CODE2URL = {}
+        try:
+            mx = os.path.join(OUT, "marketing.xml")
+            if os.path.exists(mx):
+                # scripts/ is not on sys.path; load the pure function from the file.
+                import importlib.util
+                _p = os.path.join(ROOT, "scripts", "url_from_marketing_xml.py")
+                _spec = importlib.util.spec_from_file_location("_uxml", _p)
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _CODE2URL = _mod.build_code2url(mx)
+                log.info("our_url: marketing XML loaded (%d codes)", len(_CODE2URL))
+        except Exception as e:  # noqa: BLE001 — best-effort; our_url=None is acceptable
+            log.warning("our_url marketing-XML resolve failed: %r", e)
+            _CODE2URL = {}
+    for c in ce["variant_codes"]:
+        if c in _CODE2URL:
+            return _CODE2URL[c]
+    return None
+
+
+def _search_result(e: dict) -> dict:
+    """Shape one catalog entry for /api/search. idx + our_url come from the matching
+    in-review product (if any) so the UI can deep-link an already-paired item. Match by
+    pairCode — most review entries are keyed "SUPPLIER|pairCode", so a key==pairCode test
+    missed them and dropped the our_url/idx deep-link (C1)."""
+    p = next((x for x in PRODUCTS if x.get("pairCode") == e["pairCode"]), None)
+    return {
+        "pairCode": e["pairCode"],
+        "name": e["name"],
+        "supplier": e["supplier"],
+        "codes": e["variant_codes"],
+        "image": e["image"],
+        "in_review": e["in_review"],
+        "our_url": (p or {}).get("our_url"),
+        "idx": (p or {}).get("idx"),
+    }
+
+
+@app.route("/api/search")
+def api_search():
+    """Accent-insensitive catalog search over name / supplier / variant code (pure
+    search_catalog over the startup CATALOG). Empty/short query -> no results."""
+    q = request.args.get("q", "")
+    return jsonify({"results": [_search_result(e) for e in search_catalog(CATALOG, q)]})
+
+
+@app.route("/api/search-pair", methods=["POST"])
+def api_search_pair():
+    """Manually pair a catalog product to a supplier URL from the search box. If the
+    product is not yet in the review set it is PROMOTED (a minimal review_data entry
+    built from the catalog row + the export `current` snapshot + best-effort our_url),
+    appended to PRODUCTS and persisted; then a `manual` decision is recorded. The URL
+    must be http(s) (else 400); an unknown pairCode -> 404."""
+    body = request.get_json(silent=True) or {}
+    pair = str(body.get("pairCode") or "").strip()
+    url = str(body.get("url") or "").strip()
+    # authoritative URL guard (matches /api/order-pair) — blocks javascript:/data: and
+    # malformed values from reaching the import's internalNote / a CSV cell.
+    if not re.match(r"^https?://", url):
+        return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+    ce = CATALOG.get(pair)
+    if not ce:
+        return jsonify({"ok": False, "error": "unknown pairCode"}), 404
+    # Match an already-in-review product by pairCode — NOT by key. Most review entries are
+    # keyed "SUPPLIER|pairCode" (e.g. GRUBE|425); a key==pair test missed every such entry
+    # → it wrongly promoted a DUPLICATE bare-key entry AND wrote the decision under "425"
+    # where link_rows (which reads dec["GRUBE|425"]) never finds it, silently dropping the
+    # manager's corrected URL while the card showed a false "napárované ✓" (C1).
+    in_review = any(p.get("pairCode") == pair for p in PRODUCTS)
+    # The two heavy read-only scans (55 MB cp1250 export + 59 MB marketing XML) depend
+    # ONLY on `pair`, never on mutable state → compute them OUTSIDE the lock so a promote
+    # never stalls every other write endpoint for seconds. Needed only when promoting a
+    # genuinely NEW catalog product; an existing entry just gets its decision rewritten.
+    if not in_review:
+        snapshot = _current_for_paircode(pair)
+        our_url = _our_url_for_paircode(pair)
+        supplier = supplier_from_url(url, config.SUPPLIERS)
+    with _lock:
+        # re-check under the lock (append-only store → monotonic; a tiny TOCTOU on
+        # concurrent same-pair promotes is fine — single manager user — and this dedups)
+        existing = next((p for p in PRODUCTS if p.get("pairCode") == pair), None)
+        if existing is None:
+            entry = build_promoted_entry(ce, snapshot, our_url, supplier, len(PRODUCTS))
+            PRODUCTS.append(entry)
+            _save_products(PRODUCTS)
+            ce["in_review"] = True   # keep the catalog snapshot consistent for re-search
+            target_key = pair        # promoted entry's key == pair (self-consistent)
+            promoted = True
+            log.info("search-pair promoted key=%s supplier=%s codes=%d our_url=%s",
+                     pair, entry["supplier"], len(entry["variant_codes"]), entry["our_url"])
+        else:
+            target_key = existing["key"]   # write under the REAL key (e.g. GRUBE|425)
+            promoted = False
+        dec = _load_decisions()
+        dec[target_key] = {"status": "manual", "url": url}
+        _save_decisions(dec)
+    log.info("search-pair decision key=%s url=%s promoted=%s", target_key, url, promoted)
+    return jsonify({"ok": True, "promoted": promoted, "key": target_key})
 
 
 @app.route("/api/ordered", methods=["GET", "POST"])

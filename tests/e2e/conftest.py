@@ -1,5 +1,7 @@
 """E2E harness: boot webreview/app.py against a fixture data dir on a free port,
 drive it with a real Chromium via pytest-playwright."""
+import csv
+import io
 import json
 import os
 import socket
@@ -87,6 +89,76 @@ def live_server(tmp_path_factory):
     env = {
         **os.environ,
         "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+# 1x1 transparent PNG — a hermetic data: URI for the catalog product's defaultImage so
+# the search row's <img src> loads with NO network request (clean console in CI). The
+# value embeds a ';' (image/png;base64) so the ';'-delimited CSV writer quotes it and
+# the app's DictReader reads it back as one field.
+_PNG_1x1 = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+            "AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
+
+
+def _write_catalog_csv(path):
+    """Write a cp1250 Shoptet-export fixture with ONE catalog product that is NOT in
+    the review set, so /api/search returns it as a 'nenapárované' (not-yet-paired) row
+    and the manual promote-and-pair path is exercised. Columns are exactly the ones
+    app.py reads (`code`/`pairCode` for CODE2PAIR; name/supplier/defaultImage for the
+    catalog index; the rest feed the `current` snapshot built on promote)."""
+    header = ["code", "pairCode", "name", "supplier", "productVisibility",
+              "availabilityInStock", "availabilityOutOfStock", "price",
+              "standardPrice", "stock", "defaultImage"]
+    # name carries diacritics → also exercises the accent-insensitive search (query
+    # 'hladaci' normalizes to match 'Hľadací …'). pairCode SRCHP9 is unique (not an
+    # order code, not a review key) so it can't collide with the other E2E fixtures.
+    row = ["SRCH9001", "SRCHP9", "Hľadací Test Produkt", "TESTSUP", "visible",
+           "Skladom", "Vypredané", "12,50", "15,00", "7", _PNG_1x1]
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    w.writerow(header)
+    w.writerow(row)
+    with open(path, "w", encoding="cp1250", newline="") as f:
+        f.write(buf.getvalue())
+
+
+@pytest.fixture(scope="function")
+def search_server(tmp_path_factory):
+    """Isolated webreview instance for the catalog-search / re-pair E2E. It gets its
+    OWN tmp out-dir + products.csv, so promoting a product (a write to review_data.json
+    + decisions.json + a mutation of the in-memory PRODUCTS/CATALOG) is fully contained
+    and can NEVER leak into the shared session `live_server` the other E2E tests drive —
+    no cross-test store reset needed."""
+    out = tmp_path_factory.mktemp("wr_search_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    # One minimal in-review product so PRODUCTS is non-empty (keeps the review tab's
+    # progress off a 0/0 division). It is NOT in the catalog → never returned by search.
+    (out / "review_data.json").write_text(json.dumps([{
+        "idx": 0, "supplier": "INÝ", "name": "Iný Produkt", "pairCode": "DUMMY1",
+        "variant_codes": ["D1"], "our_images": [], "ai_status": "unmatched",
+        "ai_chosen_url": "", "ai_reason": "", "candidates": [], "our_url": "",
+        "key": "DUMMY1", "current": {},
+    }], ensure_ascii=False), encoding="utf-8")
+    products_csv = out / "products.csv"
+    _write_catalog_csv(products_csv)
+    env = {
+        **os.environ,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(products_csv),
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
     }

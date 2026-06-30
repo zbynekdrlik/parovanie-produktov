@@ -224,7 +224,8 @@ function renderFilters() {
 }
 
 // ---- Na objednanie (to-order) tab ---------------------------------------- //
-const TABS = [['review', '🔍 Kontrola párovania'], ['toorder', '📋 Na objednanie']];
+const TABS = [['review', '🔍 Kontrola párovania'], ['toorder', '📋 Na objednanie'],
+  ['search', '🔎 Hľadať / opraviť']];
 
 function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
@@ -240,6 +241,7 @@ async function switchTab(tab) {
   ACTIVE_TAB = tab; localStorage.setItem('tab', tab); window.scrollTo(0, 0);
   if (tab === 'toorder' && !ORDERS.length) await loadOrders();
   render();
+  if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
 
 async function loadOrders() {
@@ -464,12 +466,143 @@ function renderToOrder() {
   }
 }
 
+// ---- Hľadať / opraviť (catalog search + re-pair) tab --------------------- //
+// Search the whole catalog (in-review AND not-yet-paired products) and re-pair
+// straight from the result row: an in-review hit reuses the SAME resolutionPanel
+// as the review tab; a not-in-review hit gets a manual-URL panel that promotes +
+// pairs the product via /api/search-pair, flipping the badge in-place.
+let SEARCH_T = null;     // debounce timer
+let SEARCH_SEQ = 0;      // request token — drop stale responses (fast typing)
+
+function initSearch() {
+  const box = document.getElementById('searchBox');
+  if (!box) return;
+  box.addEventListener('input', () => {
+    clearTimeout(SEARCH_T);
+    SEARCH_T = setTimeout(() => runSearch(box.value), 250);
+  });
+}
+
+async function runSearch(q) {
+  const out = document.getElementById('searchResults');
+  if (!out) return;
+  if ((q || '').trim().length < 2) { out.innerHTML = ''; return; }   // <2 znaky → nič
+  const seq = ++SEARCH_SEQ;
+  let data;
+  try {
+    data = await (await fetch('/api/search?q=' + encodeURIComponent(q))).json();
+  } catch (_) { return; }                       // network blip — keep the console clean
+  if (seq !== SEARCH_SEQ) return;               // a newer query superseded this one
+  out.innerHTML = '';
+  const results = (data && data.results) || [];
+  if (!results.length) { out.appendChild(el('div', 'srch-empty', 'Nič sa nenašlo.')); return; }
+  for (const res of results) out.appendChild(renderSearchRow(res));
+}
+
+function searchBadge(res) {
+  return res.in_review ? el('span', 'sbadge inreview', 'v appke')
+                       : el('span', 'sbadge new', 'nenapárované');
+}
+
+// compact result row: thumb · name/meta/our-link · badge, with an inline panel below
+function renderSearchRow(res) {
+  const row = el('div', 'search-row');
+  row.dataset.key = res.pairCode;
+
+  const head = el('div', 'srch-head');
+  const thumb = el('div', 'srch-thumb');
+  if (res.image) { const im = el('img'); im.src = res.image; im.loading = 'lazy'; im.alt = ''; thumb.appendChild(im); }
+  else thumb.appendChild(el('span', 'noimg', 'bez obrázka'));
+  head.appendChild(thumb);
+
+  const main = el('div', 'srch-main');
+  const nm = el('div', 'srch-name'); nm.textContent = res.name || '(produkt)';   // .textContent → XSS-safe
+  main.appendChild(nm);
+  const meta = el('div', 'srch-meta');
+  meta.textContent = (res.supplier || '—') + ' · '
+    + ((res.codes || []).join(', ') || 'bez kódu');
+  main.appendChild(meta);
+  const link = el('div', 'srch-link');                 // our_url now / paired URL after save
+  if (res.our_url) {
+    const a = el('a', 'supurl'); a.href = res.our_url; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = '↗ náš produkt';
+    a.onclick = (e) => e.stopPropagation();            // link click ≠ open panel
+    link.appendChild(a);
+  }
+  main.appendChild(link);
+  head.appendChild(main);
+
+  const badge = searchBadge(res);
+  head.appendChild(badge);
+
+  const panel = el('div', 'srch-panel'); panel.hidden = true;
+  head.onclick = () => openSearchRow(res, panel, badge, link);
+  row.appendChild(head);
+  row.appendChild(panel);
+  return row;
+}
+
+function openSearchRow(res, panel, badge, link) {
+  if (!panel.hidden) { panel.hidden = true; panel.innerHTML = ''; return; }   // toggle closed
+  panel.innerHTML = '';
+  if (res.in_review) {
+    // match by pairCode, NOT key — most review entries are keyed "SUPPLIER|pairCode"
+    // (e.g. GRUBE|425), so a key===pairCode lookup missed them and wrongly opened the
+    // manual-promote panel instead of the existing candidates panel (C1)
+    const product = PRODUCTS.find(p => p.pairCode === res.pairCode);
+    if (product) { panel.appendChild(resolutionPanel(product)); panel.hidden = false; return; }
+  }
+  // not in review (or its product not loaded client-side) → manual promote-and-pair
+  panel.appendChild(manualPairPanel(res, panel, badge, link));
+  panel.hidden = false;
+}
+
+// manual-only re-pair: paste a supplier URL → /api/search-pair promotes + records a
+// `manual` decision. On success flip the badge to 'napárované ✓' and show the URL,
+// IN-PLACE (no full re-render, no scroll reset).
+function manualPairPanel(res, panel, badge, link) {
+  const wrap = el('div', 'panel');
+  const mr = el('div', 'manualrow');
+  const inp = el('input'); inp.type = 'url';
+  inp.placeholder = 'Vlož URL produktovej stránky dodávateľa…';
+  const save = el('button', 'btn good sm', 'Uložiť odkaz');
+  const doSave = async () => {
+    const v = inp.value.trim();
+    if (!/^https?:\/\//.test(v)) return;             // client guard (server re-checks)
+    save.disabled = true;
+    let r;
+    try {
+      r = await fetch('/api/search-pair', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pairCode: res.pairCode, url: v })
+      });
+    } catch (_) { save.disabled = false; return; }
+    if (!r.ok) { save.disabled = false; return; }
+    res.in_review = true;                            // a re-click can now open resolutionPanel
+    badge.className = 'sbadge paired'; badge.textContent = 'napárované ✓';
+    link.innerHTML = '';
+    const a = el('a', 'supurl'); a.href = v; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = '🔗 ' + v; a.onclick = (e) => e.stopPropagation();
+    link.appendChild(a);
+    panel.innerHTML = ''; panel.appendChild(el('div', 'srch-saved', '✓ Odkaz uložený'));
+  };
+  save.onclick = doSave;
+  inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
+  mr.appendChild(inp); mr.appendChild(save); wrap.appendChild(mr);
+  return wrap;
+}
+
 function render() {
   renderTabs();
   const toorder = ACTIVE_TAB === 'toorder';
+  const search = ACTIVE_TAB === 'search';
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
-  const prog = document.querySelector('.progress'); if (prog) prog.style.display = toorder ? 'none' : '';
-  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = toorder ? 'none' : '';
+  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search) ? 'none' : '';
+  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search) ? 'none' : '';
+  const filt = document.getElementById('filters'); if (filt) filt.style.display = search ? 'none' : '';
+  const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
+  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = search ? 'none' : '';
+  if (search) { document.getElementById('empty').hidden = true; return; }
   if (toorder) { renderToOrder(); return; }
   const keepY = window.scrollY;
   renderFilters();
@@ -514,8 +647,9 @@ async function init() {
   ORDER_SUPPLIER = localStorage.getItem('orderSupplier') || 'all';
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
-  if (qTab === 'toorder' || qTab === 'review') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
+  if (qTab === 'toorder' || qTab === 'review' || qTab === 'search') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
   if (ACTIVE_TAB === 'toorder') await loadOrders();
+  initSearch();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
   if (y) window.scrollTo(0, y);
