@@ -71,6 +71,16 @@ Keď máš hotový pár `forestshop_kód → supplier_url` pre produkt, ktorý v
 - **Prázdny pairCode import TOLERUJE** — jednovariantové produkty (nože/termosky) majú v Shoptete pairCode prázdny aj v čerstvom exporte; `code;;url` sa nahrá OK (overené: stovky už-nahraných párov majú prázdny pairCode). Nie je to dôvod refreshovať export.
 - Export refresh = len `products.csv` (`SHOPTET_EXPORT_URL` v `.shoptet_admin`, **má `&` → NEdá sa `source`-núť, ťahaj `grep|cut`**) obnoví CODE2PAIR (variantové produkty získajú pairCode); plný `resync_export.py` (mení review kódy) NETREBA len kvôli pairCode.
 
+## Tab „🔎 Hľadať / opraviť" = celokatalógové vyhľadávanie + promote-on-pair
+
+In-app verzia manuálneho promote vyššie — manažér nájde a napáruje produkt MIMO review setu rovno z webu (nemusí sa skriptovať). Pure logika žije v `src/parovanie/catalog_index.py` (otestované); `app.py` ju len drôtuje.
+
+- **`CATALOG` index sa stavia PRI ŠTARTE** z `data/products.csv` v **tom istom cp1250 prechode** ako `CODE2PAIR` (`_load_catalog`), cez `catalog_index.build_catalog_index`. Zoskupené per `pairCode`; prvý riadok dáva name/supplier/image, kódy sa akumulujú; `name_norm` = NFKD bez diakritiky; `in_review` flag = kľúč je v `PRODUCTS`.
+- **`GET /api/search?q=`** = server-side substring filter cez `catalog_index.search_catalog` (názov/kód/dodávateľ, **accent-insensitive**, top 50, `<2` znaky normalizované → `[]`). `_search_result` dolepí `idx`/`our_url` z review položky (deep-link na už napárovaný produkt).
+- **`POST /api/search-pair {pairCode,url}`**: ak `pairCode` nie je v review_data, **POVÝŠI** ho — `build_promoted_entry` z catalog riadku + `current` snapshot + best-effort `our_url`; pripojí do `PRODUCTS` a atomicky zapíše `review_data.json`; potom vždy zapíše `decision {status:"manual", url}` cez živý store. Odtiaľ ho `link_rows` emituje na eshop (rovnako ako manuálny promote). URL musí byť `^https?://` (inak 400), neznámy `pairCode` → 404.
+- **GOTCHA — promote `current` MUSÍ čítať stĺpec `productVisibility`, NIE `visibility`** (`_current_for_paircode` → `current_of`). Žiadny `visibility` stĺpec v exporte neexistuje → zlý názov nechá `vis=""` a skryté/blokované produkty nikdy nedostanú stav 3 (snapshot drift bug). `current_of` arg-poradie/stĺpce zrkadli `build_review_data`/`resync_export`. Chýbajúci/nečitateľný export → `{}` (karta sa renderuje bez nášho stavu, nikdy 500).
+- Dodávateľ sa odvodí z **domény URL** (`supplier_from_url`: grube.de/grube.sk → GRUBE, inak match na `SUPPLIERS[*].base_url` host, neznámy → `""`). `our_url` best-effort z marketing XML (`build_code2url` podľa variant kódu, cached; akékoľvek zlyhanie → `None`).
+
 ## Živé Playwright overenie bez znečistenia dát
 
 To-order flagy píšu do živých stores. Pri overovaní na živom webe **toggluj on→off** (skonči v pôvodnom stave) a potom over `data/out/<store>.json` že je zase `{}` (resp. pôvodný počet) — nikdy nenechaj reálnu objednávku označenú z testu.
