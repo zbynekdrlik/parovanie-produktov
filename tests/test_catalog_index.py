@@ -83,6 +83,78 @@ def test_search_accent_insensitive_through_search_path():
     assert [e["pairCode"] for e in search_catalog(cat, "bunda")] == ["700"]
 
 
+# ---- new: multi-word / word-boundary / ranked search --------------------- #
+
+def _search_cat():
+    """Catalog exercising the four failure classes: a percussion jacket, a knife,
+    socks (the ponožky→ponozky trap that CONTAINS 'noz'), and a coded product."""
+    rows = [
+        _row("A1", "1", "Pánska bunda Percussion Predator"),
+        _row("A2/S", "1", "Pánska bunda Percussion Predator"),
+        _row("B1", "2", "Poľovnícky nôž Morakniv"),
+        _row("C1", "3", "Poľovnícke ponožky Dr. Hunter"),
+        _row("60024/L", "4", "Lovecké nohavice", supplier="GRUBE"),
+    ]
+    return build_catalog_index(rows)
+
+
+def test_build_adds_name_words_tokens():
+    """build_catalog_index precomputes name_words = alnum word-tokens of name_norm."""
+    cat = build_catalog_index([_row("x", "1", "Pánska Bunda Percussion")])
+    assert cat["1"]["name_words"] == ["panska", "bunda", "percussion"]
+    # existing keys preserved
+    assert cat["1"]["name_norm"] == "panska bunda percussion"
+
+
+def test_search_multiword_order_independent_is_the_core_regression():
+    """CORE regression: 'percussion bunda' AND 'bunda percussion' BOTH find the
+    jacket. Old contiguous-substring search returned 0 for the natural word order."""
+    cat = _search_cat()
+    a = search_catalog(cat, "percussion bunda")
+    b = search_catalog(cat, "bunda percussion")
+    assert a and b                              # both non-empty (old: percussion bunda → [])
+    assert a[0]["pairCode"] == "1"
+    assert b[0]["pairCode"] == "1"
+    assert "1" in [e["pairCode"] for e in a]
+    assert "1" in [e["pairCode"] for e in b]
+
+
+def test_search_word_boundary_noz_is_knife_not_socks():
+    """'noz'/'nôž' returns the KNIFE, never the SOCKS — 'ponozky' CONTAINS 'noz' but
+    does not START a word with it, so word-boundary matching excludes it (old bug)."""
+    for q in ("noz", "nôž"):
+        codes = [e["pairCode"] for e in search_catalog(_search_cat(), q)]
+        assert "2" in codes, f"{q!r} must find the knife"
+        assert "3" not in codes, f"{q!r} must NOT return socks (ponozky)"
+
+
+def test_search_by_code_substring_still_works():
+    """Short/numeric variant codes still match by substring."""
+    res = search_catalog(_search_cat(), "60024")
+    assert res and res[0]["pairCode"] == "4"
+
+
+def test_search_ranking_whole_word_and_exact_before_prefix():
+    """RANKING: for two products both matching a term, the WHOLE-WORD / exact-name
+    match ranks before a mere prefix/partial match."""
+    rows = [
+        _row("p", "10", "Zimná bundaska pánska"),   # 'bunda' only a PREFIX of 'bundaska'
+        _row("w", "20", "Bunda"),                    # 'bunda' whole word AND exact name
+    ]
+    cat = build_catalog_index(rows)
+    ordered = [e["pairCode"] for e in search_catalog(cat, "bunda")]
+    assert ordered[0] == "20"                        # exact/whole-word first
+    assert set(ordered) == {"10", "20"}              # both are candidates
+
+
+def test_search_all_terms_must_match_and():
+    """A product is a candidate only if EVERY term matches (order-independent AND)."""
+    cat = _search_cat()
+    # 'percussion' matches the jacket, 'morakniv' matches only the knife → no product
+    # has BOTH → empty.
+    assert search_catalog(cat, "percussion morakniv") == []
+
+
 class _Cfg:
     def __init__(self, base_url):
         self.base_url = base_url

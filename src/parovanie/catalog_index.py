@@ -1,9 +1,14 @@
 """Catalog-wide product search index (pure). Built once at app start from the
-Shoptet export rows; grouped per product (pairCode). Search is accent-insensitive
-substring over name / supplier / variant code. No live network, no fuzzy ranking."""
+Shoptet export rows; grouped per product (pairCode). Search is accent-insensitive,
+multi-word, order-independent, word-boundary-aware and relevance-RANKED over
+name / supplier / variant code. No live network. Pure stdlib (re, unicodedata)."""
+import re
 import unicodedata
 from typing import Iterable
 from urllib.parse import urlparse
+
+# split a normalized string into alnum word-tokens (drop punctuation / whitespace)
+_WORD_SPLIT = re.compile(r"[^a-z0-9]+")
 
 
 def normalize_text(s: str) -> str:
@@ -12,6 +17,11 @@ def normalize_text(s: str) -> str:
         return ""
     nfkd = unicodedata.normalize("NFKD", s)
     return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
+
+
+def _words(norm: str) -> list:
+    """Alnum word-tokens of an already-normalized string (empties dropped)."""
+    return [t for t in _WORD_SPLIT.split(norm) if t]
 
 
 def build_catalog_index(rows: Iterable[dict], review_keys=None) -> dict:
@@ -28,13 +38,15 @@ def build_catalog_index(rows: Iterable[dict], review_keys=None) -> dict:
         e = out.get(pc)
         if e is None:
             name = (r.get("name") or "").strip()
+            name_norm = normalize_text(name)
             e = out[pc] = {
                 "pairCode": pc,
                 "name": name,
                 "supplier": (r.get("supplier") or "").strip(),
                 "variant_codes": [],
                 "image": (r.get("defaultImage") or "").strip(),
-                "name_norm": normalize_text(name),
+                "name_norm": name_norm,
+                "name_words": _words(name_norm),
                 "in_review": pc in review_keys,
             }
         if code not in e["variant_codes"]:
@@ -43,20 +55,67 @@ def build_catalog_index(rows: Iterable[dict], review_keys=None) -> dict:
 
 
 def search_catalog(catalog: dict, q: str, limit: int = 50) -> list:
-    """Up to `limit` product entries whose name (accent-insensitive), supplier, or
-    any variant code contains `q`. Query shorter than 2 chars (normalized) -> []."""
+    """Up to `limit` product entries best matching `q`, ranked by relevance.
+
+    Multi-word and ORDER-INDEPENDENT: a product is a candidate only when EVERY
+    query term matches something (logical AND, any order). Per term the best of:
+      3  the term is a WHOLE word of the name (word-boundary),
+      2  a name word STARTS WITH the term (prefix — excludes mid-word garbage like
+         'ponozky' for 'noz', since 'ponozky' does not start with 'noz'),
+      2  the term is a substring of a variant code (codes are short/numeric),
+      1  the supplier starts with / equals the term.
+    A term scoring 0 disqualifies the product. Score = sum of per-term bests, plus
+    ranking bonuses (+100 exact code, +20 code substring, +50 exact name, +5 the
+    whole query appears contiguously in the name). Sorted score DESC, then shorter
+    name first. Accent-insensitive throughout. Query < 2 norm chars -> []."""
     qn = normalize_text(q)
     if len(qn) < 2:
         return []
-    results = []
+    terms = _words(qn)
+    if not terms:
+        return []
+
+    scored = []
     for e in catalog.values():
-        if (qn in e["name_norm"]
-                or qn in normalize_text(e["supplier"])
-                or any(qn in normalize_text(c) for c in e["variant_codes"])):
-            results.append(e)
-            if len(results) >= limit:
+        name_words = e["name_words"]
+        name_norm = e["name_norm"]
+        sup_norm = normalize_text(e["supplier"])
+        codes_norm = [normalize_text(c) for c in e["variant_codes"]]
+
+        total = 0
+        matched_all = True
+        for t in terms:
+            best = 0
+            if t in name_words:
+                best = 3
+            elif any(w.startswith(t) for w in name_words):
+                best = 2
+            if best < 2 and any(t in c for c in codes_norm):
+                best = 2
+            if best < 1 and (sup_norm.startswith(t) or sup_norm == t):
+                best = 1
+            if best == 0:
+                matched_all = False
                 break
-    return results
+            total += best
+        if not matched_all:
+            continue
+
+        # relevance bonuses (whole-query, not per-term)
+        if any(qn == c for c in codes_norm):
+            total += 100
+        elif any(qn in c for c in codes_norm):
+            total += 20
+        if qn == name_norm:
+            total += 50
+        if qn in name_norm:
+            total += 5
+
+        scored.append((total, len(e["name"]), e))
+
+    # score DESC, then shorter (more precise) name first — stable tiebreak
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [e for _, _, e in scored[:limit]]
 
 
 def _host(url: str) -> str:
