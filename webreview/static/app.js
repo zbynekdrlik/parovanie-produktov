@@ -197,9 +197,18 @@ function renderCard(p) {
     const act = el('div', 'actions');
     const g = el('button', 'btn good', '✓ Dobré');
     g.onclick = () => saveDecision(p, 'good', p.ai_chosen_url);
-    const bad = el('button', 'btn bad', '✗ Zlé');
-    bad.onclick = () => { expanded.add(p.key); render(); };   // only reveals options, does NOT move card
-    act.appendChild(g); act.appendChild(bad); right.appendChild(act);
+    // '✗ Zlé' expanded to 3 direct one-click actions (same status strings/calls the
+    // resolutionPanel uses — surfaced on the card so no panel-open is needed first):
+    const pick = el('button', 'btn ghost sm', 'vyber url');
+    pick.onclick = () => { expanded.add(p.key); render(); };   // opens panel to pick/paste a URL — does NOT move card
+    const unav = el('button', 'btn warn sm', '📦 Nie je skladom');
+    unav.title = 'visible + Vypredané, stock 0 — dočasne, ostáva na re-kontrolu';
+    unav.onclick = () => saveDecision(p, 'unavailable', '');
+    const disc = el('button', 'btn ghost sm', '🚫 Už sa nebude predávať');
+    disc.title = 'detailOnly + Predaj výrobku skončil — link ostane pre Google';
+    disc.onclick = () => saveDecision(p, 'discontinued', '');
+    act.appendChild(g); act.appendChild(pick); act.appendChild(unav); act.appendChild(disc);
+    right.appendChild(act);
   } else {
     if (p.ai_status === 'unmatched' && p.ai_reason) right.appendChild(el('div', 'reason', '🤖 AI nenašla istú zhodu: ' + escapeHtml(p.ai_reason)));
     right.appendChild(resolutionPanel(p));

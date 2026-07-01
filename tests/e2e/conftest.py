@@ -105,6 +105,37 @@ def live_server(tmp_path_factory):
             proc.kill()
 
 
+@pytest.fixture(scope="function")
+def matched_server(tmp_path_factory):
+    """Isolated webreview instance holding ONE undecided matched product, for the
+    matched-card 3-button E2E. Function-scoped + its own out-dir so the decisions this
+    test writes (unavailable/discontinued, each undone) can never leak into — nor be
+    perturbed by — the shared session `live_server` (whose BETALOV|p1 is left decided
+    'good' by test_approve_match). Reuses `_fixture_products` for the matched product."""
+    out = tmp_path_factory.mktemp("wr_matched_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "review_data.json").write_text(
+        json.dumps(_fixture_products(base), ensure_ascii=False), encoding="utf-8")
+    env = {
+        **os.environ,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 # 1x1 transparent PNG — a hermetic data: URI for the catalog product's defaultImage so
 # the search row's <img src> loads with NO network request (clean console in CI). The
 # value embeds a ';' (image/png;base64) so the ';'-delimited CSV writer quotes it and
