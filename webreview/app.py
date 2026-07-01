@@ -645,12 +645,27 @@ def _our_url_for_paircode(pair: str):
     return None
 
 
-def _search_result(e: dict) -> dict:
+def _search_result(e: dict, decisions=None) -> dict:
     """Shape one catalog entry for /api/search. idx + our_url come from the matching
     in-review product (if any) so the UI can deep-link an already-paired item. Match by
     pairCode — most review entries are keyed "SUPPLIER|pairCode", so a key==pairCode test
-    missed them and dropped the our_url/idx deep-link (C1)."""
+    missed them and dropped the our_url/idx deep-link (C1).
+
+    price/stock/state come from the catalog entry (the manager's "almost no data"
+    complaint). `paired_url` = the in-review product's CURRENT decision URL (good/manual
+    only), read under the entry's REAL key; a GRUBE product's URL is DISPLAY-normalized
+    to grube.de (mirrors /api/products — storage untouched). `decisions` is loaded ONCE
+    per request by the caller."""
     p = next((x for x in PRODUCTS if x.get("pairCode") == e["pairCode"]), None)
+    paired_url = None
+    if p is not None and decisions is not None:
+        d = decisions.get(p.get("key"))
+        if isinstance(d, dict) and d.get("status") in ("good", "manual"):
+            url = (d.get("url") or "").strip()
+            if url:
+                if p.get("supplier") == "GRUBE":
+                    url = import_builder.to_grube_de(url) or url
+                paired_url = url
     return {
         "pairCode": e["pairCode"],
         "name": e["name"],
@@ -660,6 +675,10 @@ def _search_result(e: dict) -> dict:
         "in_review": e["in_review"],
         "our_url": (p or {}).get("our_url"),
         "idx": (p or {}).get("idx"),
+        "price": e.get("price", ""),
+        "stock": e.get("stock", 0),
+        "state": e.get("state", 1),
+        "paired_url": paired_url,
     }
 
 
@@ -668,7 +687,8 @@ def api_search():
     """Accent-insensitive catalog search over name / supplier / variant code (pure
     search_catalog over the startup CATALOG). Empty/short query -> no results."""
     q = request.args.get("q", "")
-    return jsonify({"results": [_search_result(e) for e in search_catalog(CATALOG, q)]})
+    dec = _load_decisions()   # once per request, not per result
+    return jsonify({"results": [_search_result(e, dec) for e in search_catalog(CATALOG, q)]})
 
 
 @app.route("/api/search-pair", methods=["POST"])

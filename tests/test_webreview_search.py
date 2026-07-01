@@ -21,8 +21,12 @@ import app as webapp  # noqa: E402
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     catalog = webapp.build_catalog_index([
+        # 425 carries the commerce columns (price/stock/state flow to /api/search);
+        # 512 stays minimal → the endpoint must serve safe defaults for it.
         {"code": "60611/L", "pairCode": "425", "name": "Bunda Tradition",
-         "supplier": "GRUBE", "defaultImage": "i.jpg"},
+         "supplier": "GRUBE", "defaultImage": "i.jpg", "productVisibility": "visible",
+         "availabilityInStock": "Skladom", "availabilityOutOfStock": "Vypredané",
+         "price": "119", "stock": "4"},
         {"code": "4931/S", "pairCode": "512", "name": "Mikina GARDE",
          "supplier": "WETLAND", "defaultImage": ""},
     ], review_keys=set())
@@ -58,6 +62,30 @@ def test_search_result_shape_and_in_review_after_promote(client):
     client.post("/api/search-pair", json={"pairCode": "425", "url": "https://www.grube.de/x/"})
     res2 = client.get("/api/search?q=tradition").get_json()["results"][0]
     assert res2["in_review"] is True and res2["idx"] == 0
+
+
+def test_search_result_carries_price_stock_state(client):
+    """Manager complaint: search rows show 'almost no data'. /api/search must expose
+    the entry's OUR price, summed stock and 3-state classification."""
+    r = client.get("/api/search?q=tradition").get_json()["results"][0]
+    assert r["price"] == "119"
+    assert r["stock"] == 4
+    assert r["state"] == 1
+    # a product whose export rows lack the commerce columns → safe defaults
+    r2 = client.get("/api/search?q=garde").get_json()["results"][0]
+    assert r2["price"] == "" and r2["stock"] == 0 and r2["state"] == 1
+
+
+def test_search_paired_url_null_without_review_or_decision(client):
+    r = client.get("/api/search?q=tradition").get_json()["results"][0]
+    assert r["paired_url"] is None
+
+
+def test_search_paired_url_appears_after_search_pair(client):
+    client.post("/api/search-pair",
+                json={"pairCode": "425", "url": "https://www.grube.de/p/x/154773/"})
+    r = client.get("/api/search?q=tradition").get_json()["results"][0]
+    assert r["paired_url"] == "https://www.grube.de/p/x/154773/"
 
 
 def test_search_pair_promotes_and_writes_decision(client):
@@ -179,6 +207,27 @@ def test_search_pair_existing_supplier_key_no_dup_decision_under_real_key(suppli
     assert dec["GRUBE|425"]["status"] == "manual"
     assert dec["GRUBE|425"]["url"] == "https://www.grube.de/new/"   # reaches link_rows
     assert "425" not in dec                  # NOT written under the bare pairCode
+
+
+def test_search_paired_url_reads_decision_under_real_key_and_grube_normalizes(supplier_key_client):
+    """An in-review product's CURRENT decision URL is exposed as `paired_url` — read
+    under the entry's REAL key ('GRUBE|425'), and for a GRUBE product the DISPLAY is
+    normalized to grube.de (mirrors /api/products; storage untouched)."""
+    sk = "https://www.grube.sk/p/slug/619850/"
+    with open(webapp.DECISIONS, "w", encoding="utf-8") as f:
+        json.dump({"GRUBE|425": {"status": "manual", "url": sk}}, f)
+    r = supplier_key_client.get("/api/search?q=tradition").get_json()["results"][0]
+    assert r["paired_url"] == "https://www.grube.de/p/x/619850/"
+    # storage untouched — decisions.json still holds the manager's .sk URL
+    assert json.load(open(webapp.DECISIONS))["GRUBE|425"]["url"] == sk
+
+
+def test_search_paired_url_null_for_non_link_decision(supplier_key_client):
+    """A state-only decision (unavailable/discontinued) carries no supplier URL."""
+    with open(webapp.DECISIONS, "w", encoding="utf-8") as f:
+        json.dump({"GRUBE|425": {"status": "unavailable", "url": ""}}, f)
+    r = supplier_key_client.get("/api/search?q=tradition").get_json()["results"][0]
+    assert r["paired_url"] is None
 
 
 def test_promote_current_reflects_hidden_visibility(tmp_path, monkeypatch):

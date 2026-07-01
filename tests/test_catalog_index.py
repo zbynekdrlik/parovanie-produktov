@@ -11,6 +11,14 @@ def _row(code, pair, name, supplier="WETLAND", img=""):
     return {"code": code, "pairCode": pair, "name": name, "supplier": supplier, "defaultImage": img}
 
 
+def _crow(code, pair, name, supplier="WETLAND", vis="visible", ais="", aos="",
+          price="", stock=""):
+    """Export row WITH the commerce columns (the real Shoptet export carries them)."""
+    return {**_row(code, pair, name, supplier),
+            "productVisibility": vis, "availabilityInStock": ais,
+            "availabilityOutOfStock": aos, "price": price, "stock": stock}
+
+
 def test_normalize_strips_diacritics_and_lowercases():
     assert normalize_text("Bundá ČIERNA") == "bunda cierna"
     assert normalize_text("") == ""
@@ -81,6 +89,61 @@ def test_search_accent_insensitive_through_search_path():
     # (not just the normalize_text unit) — closes Task 1's review gap.
     cat = build_catalog_index([_row("x/1", "700", "Bundá ČIERNA")])
     assert [e["pairCode"] for e in search_catalog(cat, "bunda")] == ["700"]
+
+
+# ---- commerce fields (price / stock / state) per catalog entry ----------- #
+# The manager complained search results show "almost no data" — each entry must
+# aggregate OUR price, summed variant stock and the 3-state eshop classification
+# (via the canonical export_helpers current_of/state_of — never re-derived).
+
+def test_entry_carries_price_stock_state():
+    e = build_catalog_index(
+        [_crow("4931/S", "512", "Mikina GARDE", ais="Skladom", price="119", stock="3")])["512"]
+    assert e["price"] == "119"
+    assert e["stock"] == 3
+    assert e["state"] == 1
+
+
+def test_state_is_best_across_variants_mixed_1_and_3():
+    """One sellable variant (state 1) + one hidden (state 3) → entry state 1."""
+    rows = [_crow("A/S", "9", "X", vis="hidden"),
+            _crow("A/M", "9", "X", ais="Skladom")]
+    assert build_catalog_index(rows)["9"]["state"] == 1
+
+
+def test_state_all_variants_3():
+    rows = [_crow("A/S", "9", "X", vis="hidden"),
+            _crow("A/M", "9", "X", vis="blocked")]
+    assert build_catalog_index(rows)["9"]["state"] == 3
+
+
+def test_state_2_beats_3_when_no_variant_sellable():
+    """avail arg mirrors current_of: availabilityInStock or availabilityOutOfStock."""
+    rows = [_crow("A/S", "9", "X", aos="Vypredané"),
+            _crow("A/M", "9", "X", vis="hidden")]
+    assert build_catalog_index(rows)["9"]["state"] == 2
+
+
+def test_stock_sums_across_variants_nonnumeric_counts_zero():
+    rows = [_crow("A/S", "9", "X", stock="3"),
+            _crow("A/M", "9", "X", stock="xx"),
+            _crow("A/L", "9", "X", stock=""),
+            _crow("A/XL", "9", "X", stock="4")]
+    assert build_catalog_index(rows)["9"]["stock"] == 7
+
+
+def test_price_is_first_nonempty_across_variants():
+    rows = [_crow("A/S", "9", "X", price=""),
+            _crow("A/M", "9", "X", price="49,90"),
+            _crow("A/L", "9", "X", price="59,90")]
+    assert build_catalog_index(rows)["9"]["price"] == "49,90"
+
+
+def test_minimal_rows_without_commerce_columns_get_defaults():
+    """Existing minimal fixtures (code/pairCode/name/supplier/defaultImage only)
+    must not crash — defaults: price '' / stock 0 / state 1."""
+    e = build_catalog_index([_row("4931/S", "512", "Mikina")])["512"]
+    assert e["price"] == "" and e["stock"] == 0 and e["state"] == 1
 
 
 # ---- new: multi-word / word-boundary / ranked search --------------------- #
