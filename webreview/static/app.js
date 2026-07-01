@@ -520,8 +520,13 @@ function renderSearchRow(res) {
 
   const head = el('div', 'srch-head');
   const thumb = el('div', 'srch-thumb');
-  if (res.image) { const im = el('img'); im.src = res.image; im.loading = 'lazy'; im.alt = ''; thumb.appendChild(im); }
-  else thumb.appendChild(el('span', 'noimg', 'bez obrázka'));
+  if (res.image) {
+    const im = el('img'); im.src = res.image; im.loading = 'lazy'; im.alt = '';
+    // broken catalog CDN image (404) → degrade to the same 'bez obrázka' placeholder
+    // instead of a broken-image icon + a dirty console error
+    im.onerror = () => im.replaceWith(el('span', 'noimg', 'bez obrázka'));
+    thumb.appendChild(im);
+  } else thumb.appendChild(el('span', 'noimg', 'bez obrázka'));
   head.appendChild(thumb);
 
   const main = el('div', 'srch-main');
