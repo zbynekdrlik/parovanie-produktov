@@ -298,7 +298,7 @@ def _supplier_meta(html: str):
 # Na objednanie: forestshop "Vybavuje sa" orders → supplier reorder links
 # --------------------------------------------------------------------------- #
 ORDERS_CACHE = os.path.join(OUT, "orders_cache.csv")
-ORDERS_MAXAGE = 300   # s — refresh the cached orders export at most every 5 min
+ORDERS_MAXAGE = 1800  # s — refresh the cached orders export at most every 30 min (Marek: raz za pol hodinu stačí)
 
 
 def _cred(key: str):
