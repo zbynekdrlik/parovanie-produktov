@@ -81,6 +81,10 @@ In-app verzia manuálneho promote vyššie — manažér nájde a napáruje prod
 - **GOTCHA — promote `current` MUSÍ čítať stĺpec `productVisibility`, NIE `visibility`** (`_current_for_paircode` → `current_of`). Žiadny `visibility` stĺpec v exporte neexistuje → zlý názov nechá `vis=""` a skryté/blokované produkty nikdy nedostanú stav 3 (snapshot drift bug). `current_of` arg-poradie/stĺpce zrkadli `build_review_data`/`resync_export`. Chýbajúci/nečitateľný export → `{}` (karta sa renderuje bez nášho stavu, nikdy 500).
 - Dodávateľ sa odvodí z **domény URL** (`supplier_from_url`: grube.de/grube.sk → GRUBE, inak match na `SUPPLIERS[*].base_url` host, neznámy → `""`). `our_url` best-effort z marketing XML (`build_code2url` podľa variant kódu, cached; akékoľvek zlyhanie → `None`).
 
+## e2e gotcha — `saveDecision` render je SYNC pred `await fetch` → serializuj POSTy
+
+`saveDecision(p,status,url)` synchronne updatne `DECISIONS` + `render()` a AŽ POTOM `await fetch('/api/decision')` → POST odletí ONESKORENE. V e2e kde klikáš viac tlačidiel za sebou (napr. 📦 → ↩ Vrátiť → 🚫), sa POST z predošlej akcie (`undo`) stihne vypustiť **do `expect_response` okna ĎALŠEJ akcie** → zachytíš zlý request (`assert 'undo' == 'discontinued'`). Lokálne (rýchle) prejde, na CI (pomalšie) padne = flaky. **Fix: KAŽDÝ `/api/decision` POST konzumuj vo VLASTNOM `with page.expect_response("**/api/decision")` — vrátane každého `↩ Vrátiť` (undo)** — pred ďalšou akciou; medzi akciami `wait_for_selector` na cieľový stav (nie `sleep`/`wait_for_timeout`).
+
 ## Živé Playwright overenie bez znečistenia dát
 
 To-order flagy píšu do živých stores. Pri overovaní na živom webe **toggluj on→off** (skonči v pôvodnom stave) a potom over `data/out/<store>.json` že je zase `{}` (resp. pôvodný počet) — nikdy nenechaj reálnu objednávku označenú z testu.
