@@ -32,3 +32,5 @@ Overené 2026-06-29: set `60645/L` externalCode cez `code;pairCode;externalCode`
 ## Gather je .sk, .de len pre kódy+linky (decouple)
 
 NEprepínaj `config.SUPPLIERS["GRUBE"].base_url` na .de — `grube.parse_search` filtruje `url.startswith(base_url)`, search renderuje na .sk → flip by ticho vrátil 0 kandidátov. Gather/search ostáva .sk (productId zdieľaný); .de sa odvodí cez `to_grube_de`. (.de search gather = issue, ak treba.)
+
+**GRUBE .de platí AJ pre ZOBRAZENIE na webe, nielen eshop.** Zdroj kandidátov je .sk (zber), takže `review_data` + `decisions` držia .sk URL. `link_rows` (eshop internalNote) + „Na objednanie" čip normalizujú na .de, ale **review/search karta + `resolutionPanel` kandidáti + `ai_chosen_url`** by inak ukázali .sk (manažér: „GRUBE otvára .sk"). Preto `/api/products` robí **serve-time .de normalizáciu** (len GRUBE, cez `to_grube_de`, LEN zobrazenie — uložené .sk párovania sa NEMENIA, kópie nie mutácia). Jedno miesto pokrýva review kartu aj search tab (obe cez `resolutionPanel`). Test: `tests/test_webreview_grube_de.py`.
