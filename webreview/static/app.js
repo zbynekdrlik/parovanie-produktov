@@ -549,7 +549,7 @@ function renderSearchRow(res) {
     const chip = el('span', 'curbadge ' + ({ 1: 'st1', 2: 'st2', 3: 'st3' }[res.state]));
     chip.textContent = stLbl;
     comm.appendChild(chip);
-    if (res.state === 1 && res.stock) {
+    if (res.state === 1 && res.stock > 0) {   // Shoptet stock môže byť záporný (backorder) — „(-150 ks)" je šum
       const st = el('span', 'srch-stock');
       st.textContent = '(' + res.stock + ' ks)';
       comm.appendChild(st);
