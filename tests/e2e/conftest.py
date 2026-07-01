@@ -145,23 +145,29 @@ _PNG_1x1 = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
 
 
 def _write_catalog_csv(path):
-    """Write a cp1250 Shoptet-export fixture with ONE catalog product that is NOT in
-    the review set, so /api/search returns it as a 'nenapárované' (not-yet-paired) row
-    and the manual promote-and-pair path is exercised. Columns are exactly the ones
-    app.py reads (`code`/`pairCode` for CODE2PAIR; name/supplier/defaultImage for the
-    catalog index; the rest feed the `current` snapshot built on promote)."""
+    """Write a cp1250 Shoptet-export fixture with TWO catalog products: one NOT in
+    the review set (SRCHP9 — /api/search returns it 'nenapárované', exercising the
+    manual promote-and-pair path) and one IN review (DUMMY1 — clicking its result must
+    open the FULL review card). Columns are exactly the ones app.py reads
+    (`code`/`pairCode` for CODE2PAIR; name/supplier/defaultImage for the catalog index;
+    the commerce columns feed the search rows' price/stock/state + the promote-time
+    `current` snapshot)."""
     header = ["code", "pairCode", "name", "supplier", "productVisibility",
               "availabilityInStock", "availabilityOutOfStock", "price",
               "standardPrice", "stock", "defaultImage"]
-    # name carries diacritics → also exercises the accent-insensitive search (query
-    # 'hladaci' normalizes to match 'Hľadací …'). pairCode SRCHP9 is unique (not an
-    # order code, not a review key) so it can't collide with the other E2E fixtures.
-    row = ["SRCH9001", "SRCHP9", "Hľadací Test Produkt", "TESTSUP", "visible",
-           "Skladom", "Vypredané", "12,50", "15,00", "7", _PNG_1x1]
+    # names carry diacritics → also exercise the accent-insensitive search (query
+    # 'hladaci' normalizes to match 'Hľadací …'). pairCodes SRCHP9/DUMMY1 are unique
+    # (not order codes) so they can't collide with the other E2E fixtures.
+    rows = [
+        ["SRCH9001", "SRCHP9", "Hľadací Test Produkt", "TESTSUP", "visible",
+         "Skladom", "Vypredané", "12,50", "15,00", "7", _PNG_1x1],
+        ["D1", "DUMMY1", "Kontrolný Produkt V Appke", "TESTSUP", "visible",
+         "Skladom", "Vypredané", "89,90", "", "2", _PNG_1x1],
+    ]
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
     w.writerow(header)
-    w.writerow(row)
+    w.writerows(rows)
     with open(path, "w", encoding="cp1250", newline="") as f:
         f.write(buf.getvalue())
 
@@ -176,13 +182,21 @@ def search_server(tmp_path_factory):
     out = tmp_path_factory.mktemp("wr_search_out")
     port = _free_port()
     base = f"http://127.0.0.1:{port}"
-    # One minimal in-review product so PRODUCTS is non-empty (keeps the review tab's
-    # progress off a 0/0 division). It is NOT in the catalog → never returned by search.
+    # One in-review MATCHED product (also keeps the review tab's progress off a 0/0
+    # division). Its pairCode DUMMY1 IS in the fixture catalog, so /api/search returns
+    # it in_review — clicking that result must open the FULL review card (with the
+    # '✓ Dobré' decision button). Keyed 'SUPPLIER|pairCode' (the dominant scheme).
+    # ai_chosen_url points back at the local server (204 favicon) so the card's lazy
+    # /api/images fetch stays hermetic — no outbound network in CI.
+    img_url = f"{base}/favicon.ico"
     (out / "review_data.json").write_text(json.dumps([{
-        "idx": 0, "supplier": "INÝ", "name": "Iný Produkt", "pairCode": "DUMMY1",
-        "variant_codes": ["D1"], "our_images": [], "ai_status": "unmatched",
-        "ai_chosen_url": "", "ai_reason": "", "candidates": [], "our_url": "",
-        "key": "DUMMY1", "current": {},
+        "idx": 0, "supplier": "TESTSUP", "name": "Kontrolný Produkt V Appke",
+        "pairCode": "DUMMY1", "variant_codes": ["D1"], "our_images": [],
+        "ai_status": "matched", "ai_chosen_url": img_url, "ai_reason": "kód sedí",
+        "candidates": [{"name": "Kontrolný u dodávateľa", "url": img_url}],
+        "our_url": "", "key": "TESTSUP|DUMMY1",
+        "current": {"state": 1, "off": False, "vis": "visible", "avail": "Skladom",
+                    "price": "89,90", "std": "", "stock": "2"},
     }], ensure_ascii=False), encoding="utf-8")
     products_csv = out / "products.csv"
     _write_catalog_csv(products_csv)

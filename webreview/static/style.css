@@ -169,6 +169,16 @@ a.supurl:hover { text-decoration: underline; }
 .search-row .srch-panel { padding: 0 12px 12px; }
 .search-row .srch-saved { font-size: 13px; font-weight: 600; color: #065f46;
   background: #d1fae5; border-radius: 6px; padding: 6px 10px; }
+/* commerce line na výsledku: cena · stavový chip · sklad (chip reusuje .curbadge.stN) */
+.search-row .srch-comm { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
+.search-row .srch-comm .curbadge { margin: 0; }
+.search-row .srch-price { font-size: 12px; font-weight: 600; color: #1f2937; }
+.search-row .srch-stock { font-size: 12px; color: #6b7280; }
+/* dva odkazy (náš produkt + dodávateľ) vedľa seba — a.supurl je inak display:block */
+.search-row .srch-link a.supurl { display: inline-block; margin-right: 12px; max-width: 340px; }
+/* plná review karta vnorená v paneli výsledku — bez dvojitého tieňa (border-color
+   nechávame na stavových triedach .card.good/.manual/…) */
+.search-row .srch-panel .card { box-shadow: none; }
 .sbadge { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 10px;
   flex: 0 0 auto; white-space: nowrap; }
 .sbadge.inreview { background: #dbeafe; color: #1e40af; }

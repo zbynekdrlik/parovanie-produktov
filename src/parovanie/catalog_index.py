@@ -1,14 +1,26 @@
 """Catalog-wide product search index (pure). Built once at app start from the
 Shoptet export rows; grouped per product (pairCode). Search is accent-insensitive,
 multi-word, order-independent, word-boundary-aware and relevance-RANKED over
-name / supplier / variant code. No live network. Pure stdlib (re, unicodedata)."""
+name / supplier / variant code. No live network, no IO — pure stdlib plus the
+canonical 3-state classifier from parovanie.export_helpers (never duplicated)."""
 import re
 import unicodedata
 from typing import Iterable
 from urllib.parse import urlparse
 
+from parovanie.export_helpers import current_of
+
 # split a normalized string into alnum word-tokens (drop punctuation / whitespace)
 _WORD_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def _stock_int(v) -> int:
+    """Variant `stock` cell → int (decimal-comma tolerated); non-numeric/empty → 0."""
+    s = (str(v) if v is not None else "").strip().replace(",", ".")
+    try:
+        return int(float(s)) if s else 0
+    except ValueError:
+        return 0
 
 
 def normalize_text(s: str) -> str:
@@ -27,7 +39,16 @@ def _words(norm: str) -> list:
 def build_catalog_index(rows: Iterable[dict], review_keys=None) -> dict:
     """Group export variant rows into {pairCode: entry}. Each `row` needs at least
     code, pairCode, name, supplier, defaultImage. `review_keys` marks in_review.
-    First row of a pairCode supplies name/supplier/image; codes accumulate."""
+    First row of a pairCode supplies name/supplier/image; codes accumulate.
+
+    Commerce fields (the search rows were "almost no data" without them):
+      price = first non-empty `price` across the entry's rows (string as-is),
+      stock = int sum of parseable variant `stock` values (non-numeric → 0),
+      state = BEST (lowest) 3-state classification across variant rows — 1 if ANY
+              variant is sellable, else 2 if any is Vypredané, else 3. Classified by
+              the canonical export_helpers.current_of (which feeds state_of with
+              availabilityInStock or availabilityOutOfStock) — never re-derived.
+    Rows without those columns (minimal fixtures) default to "" / 0 / 1."""
     review_keys = review_keys or set()
     out: dict = {}
     for r in rows:
@@ -48,9 +69,21 @@ def build_catalog_index(rows: Iterable[dict], review_keys=None) -> dict:
                 "name_norm": name_norm,
                 "name_words": _words(name_norm),
                 "in_review": pc in review_keys,
+                "price": "",
+                "stock": 0,
+                "state": 3,   # min()-folded below; a column-less row classifies as 1
             }
         if code not in e["variant_codes"]:
             e["variant_codes"].append(code)
+        # commerce aggregation — EVERY variant row contributes (incl. the first)
+        if not e["price"]:
+            e["price"] = (r.get("price") or "").strip()
+        e["stock"] += _stock_int(r.get("stock"))
+        st = current_of((r.get("productVisibility") or "").strip(),
+                        (r.get("availabilityInStock") or "").strip(),
+                        (r.get("availabilityOutOfStock") or "").strip())["state"]
+        if st < e["state"]:
+            e["state"] = st
     return out
 
 

@@ -536,12 +536,40 @@ function renderSearchRow(res) {
   meta.textContent = (res.supplier || '—') + ' · '
     + ((res.codes || []).join(', ') || 'bez kódu');
   main.appendChild(meta);
+  // commerce line — NAŠA cena + eshop stav (rovnaké labely ako filtre) + sklad;
+  // toto bolo manažérovo „nie sú tam skoro žiadne údaje"
+  const comm = el('div', 'srch-comm');
+  if (res.price) {
+    const pr = el('span', 'srch-price');
+    pr.textContent = '💶 ' + res.price + (String(res.price).includes('€') ? '' : ' €');
+    comm.appendChild(pr);
+  }
+  const stLbl = { 1: '🟢 Skladom', 2: '📦 Nie skladom', 3: '🚫 Nepredáva sa' }[res.state];
+  if (stLbl) {
+    const chip = el('span', 'curbadge ' + ({ 1: 'st1', 2: 'st2', 3: 'st3' }[res.state]));
+    chip.textContent = stLbl;
+    comm.appendChild(chip);
+    if (res.state === 1 && res.stock) {
+      const st = el('span', 'srch-stock');
+      st.textContent = '(' + res.stock + ' ks)';
+      comm.appendChild(st);
+    }
+  }
+  if (comm.childNodes.length) main.appendChild(comm);
   const link = el('div', 'srch-link');                 // our_url now / paired URL after save
   if (res.our_url) {
     const a = el('a', 'supurl'); a.href = res.our_url; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '↗ náš produkt';
     a.onclick = (e) => e.stopPropagation();            // link click ≠ open panel
     link.appendChild(a);
+  }
+  if (res.paired_url) {
+    // aktuálne rozhodnutie (good/manual) — priamy odkaz na dodávateľa; GRUBE už
+    // display-normalizované na .de serverom
+    const pa = el('a', 'supurl'); pa.href = res.paired_url; pa.target = '_blank'; pa.rel = 'noopener';
+    pa.textContent = '🔗 dodávateľ';
+    pa.onclick = (e) => e.stopPropagation();           // link click ≠ open panel
+    link.appendChild(pa);
   }
   main.appendChild(link);
   head.appendChild(main);
@@ -564,7 +592,11 @@ function openSearchRow(res, panel, badge, link) {
     // (e.g. GRUBE|425), so a key===pairCode lookup missed them and wrongly opened the
     // manual-promote panel instead of the existing candidates panel (C1)
     const product = PRODUCTS.find(p => p.pairCode === res.pairCode);
-    if (product) { panel.appendChild(resolutionPanel(product)); panel.hidden = false; return; }
+    // FULL review card (obrázky, náš stav/cena, stav párovania, decision buttony) —
+    // holý resolutionPanel ukazoval „skoro žiadne údaje". saveDecision→render() na
+    // search tabe early-returnuje (#searchResults ostáva), karta sa len live-nerefreshne
+    // po rozhodnutí — rovnaké akceptované správanie ako mal panel.
+    if (product) { panel.appendChild(renderCard(product)); panel.hidden = false; return; }
   }
   // not in review (or its product not loaded client-side) → manual promote-and-pair
   panel.appendChild(manualPairPanel(res, panel, badge, link));
