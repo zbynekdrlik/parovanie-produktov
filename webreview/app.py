@@ -390,9 +390,51 @@ def api_version():
     return Response(f"v{__version__}", content_type="text/plain; charset=utf-8")
 
 
+def _grube_de_display(products, decisions):
+    """Serve-time DISPLAY normalization for /api/products: a GRUBE product's
+    supplier URLs are rebuilt to the canonical grube.DE detail URL in the RESPONSE
+    only (review card AND search tab both render these hrefs). GRUBE == grube.de
+    (German availability); the eshop internalNote + 'Na objednanie' chip already
+    normalize via import_builder.link_rows — this mirrors the SAME rebuild on the
+    display path (import_builder.to_grube_de, productId-based).
+
+    The manager's stored .sk pairings are PRESERVED: in-memory PRODUCTS is never
+    mutated and decisions.json is never rewritten — only SHALLOW COPIES of the
+    GRUBE entries are swapped. Non-GRUBE products/decisions are returned unchanged.
+    Fallback to the raw URL when to_grube_de can't parse a productId."""
+    to_de = import_builder.to_grube_de
+    out_products = []
+    grube_keys = set()
+    for p in products:
+        if p.get("supplier") != "GRUBE":
+            out_products.append(p)
+            continue
+        grube_keys.add(p.get("key"))
+        q = dict(p)                                   # shallow copy — don't mutate PRODUCTS
+        cands = p.get("candidates")
+        if cands:
+            new_cands = []
+            for c in cands:
+                url = c.get("url")
+                if url:
+                    c = {**c, "url": to_de(url) or url}
+                new_cands.append(c)                   # url-less candidate kept as-is
+            q["candidates"] = new_cands
+        ai_url = p.get("ai_chosen_url")
+        if ai_url:
+            q["ai_chosen_url"] = to_de(ai_url) or ai_url
+        out_products.append(q)
+    out_decisions = {}
+    for k, d in decisions.items():
+        if k in grube_keys and isinstance(d, dict) and (d.get("url") or "").strip():
+            d = {**d, "url": to_de(d["url"]) or d["url"]}   # shallow copy of GRUBE decision
+        out_decisions[k] = d
+    return {"products": out_products, "decisions": out_decisions}
+
+
 @app.route("/api/products")
 def api_products():
-    return jsonify({"products": PRODUCTS, "decisions": _load_decisions()})
+    return jsonify(_grube_de_display(PRODUCTS, _load_decisions()))
 
 
 @app.route("/api/images")
