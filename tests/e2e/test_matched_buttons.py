@@ -28,23 +28,34 @@ def test_matched_card_three_direct_buttons(page, matched_server):
     # 'Nezrevidované' filter drops it) and we can watch the in-place re-render.
     page.get_by_role("button", name="Všetky", exact=True).click()
 
+    # Every /api/decision POST is CONSUMED in its OWN expect_response window before
+    # the next action begins — otherwise a late-flushing undo POST bleeds into the
+    # next button's window and the wrong request is captured (the CI race). Note
+    # saveDecision() calls render() synchronously BEFORE `await fetch`, so the UI is
+    # already re-rendered when the POST fires; consuming the response is what proves
+    # the POST landed before we open the next window (wait_for_selector alone can't).
+
+    def click_and_assert_status(button_name, expected_status):
+        """Click a mutating button, consume its /api/decision POST, assert the status."""
+        with page.expect_response(
+                lambda r: "/api/decision" in r.url
+                and r.request.method == "POST") as resp:
+            page.get_by_role("button", name=button_name, exact=True).click()
+        assert json.loads(resp.value.request.post_data)["status"] == expected_status
+
     # '📦 Nie je skladom' → one click writes status 'unavailable' (the panel's status).
-    with page.expect_response(
-            lambda r: "/api/decision" in r.url and r.request.method == "POST") as ri:
-        page.get_by_role("button", name="📦 Nie je skladom", exact=True).click()
-    assert json.loads(ri.value.request.post_data)["status"] == "unavailable"
-    # Card re-renders to the unavailable state (shows '↩ Vrátiť'); undo it.
+    click_and_assert_status("📦 Nie je skladom", "unavailable")
+    # Card re-renders to the unavailable state (shows '↩ Vrátiť'); undo it and
+    # consume the undo POST (client sends status 'undo' → server un-decides).
     page.wait_for_selector("button:has-text('↩ Vrátiť')")
-    page.get_by_role("button", name="↩ Vrátiť", exact=True).click()
+    click_and_assert_status("↩ Vrátiť", "undo")
+    # After undo the matched card's own buttons are back; wait for them.
     page.wait_for_selector("button:has-text('vyber url')")
 
     # '🚫 Už sa nebude predávať' → one click writes status 'discontinued'; undo.
-    with page.expect_response(
-            lambda r: "/api/decision" in r.url and r.request.method == "POST") as ri:
-        page.get_by_role("button", name="🚫 Už sa nebude predávať", exact=True).click()
-    assert json.loads(ri.value.request.post_data)["status"] == "discontinued"
+    click_and_assert_status("🚫 Už sa nebude predávať", "discontinued")
     page.wait_for_selector("button:has-text('↩ Vrátiť')")
-    page.get_by_role("button", name="↩ Vrátiť", exact=True).click()
+    click_and_assert_status("↩ Vrátiť", "undo")
     page.wait_for_selector("button:has-text('vyber url')")
 
     # 'vyber url' opens the resolution panel (candidate row + manual-URL input).
