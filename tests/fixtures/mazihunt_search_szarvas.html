@@ -1,0 +1,1518 @@
+<!DOCTYPE html>
+<!--[if IE]><![endif]-->
+<!--[if IE 8 ]><html dir="ltr" lang="hu" class="ie8"><![endif]-->
+<!--[if IE 9 ]><html dir="ltr" lang="hu" class="ie9"><![endif]-->
+<!--[if (gt IE 9)|!(IE)]><!-->
+<html dir="ltr" lang="hu">
+<!--<![endif]-->
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Keresés - szarvas</title>
+<base href="https://wildzone.eu/" />
+			
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<link href="https://wildzone.eu/index.php?route=product/search" rel="canonical" />
+<script src="catalog/view/javascript/jquery/jquery-2.1.1.min.js" type="text/javascript"></script>
+<link href="catalog/view/javascript/bootstrap/css/bootstrap.min.css" rel="stylesheet" media="screen" />
+<script src="catalog/view/javascript/bootstrap/js/bootstrap.min.js" type="text/javascript"></script>
+<link rel="stylesheet" type="text/css" href="catalog/view/theme/cosyone/stylesheet/stylesheet.css" />
+<link rel="stylesheet" type="text/css" href="catalog/view/theme/cosyone/stylesheet/grid/1140.css" />
+<link href="catalog/view/javascript/font-awesome/css/font-awesome.min.css" rel="stylesheet" type="text/css" />
+<link rel="stylesheet" type="text/css" href="catalog/view/theme/cosyone/stylesheet/responsive.css" />
+<link rel="stylesheet" type="text/css" href="catalog/view/theme/cosyone/stylesheet/d_ajax_search.css" media="screen" />
+<link rel="stylesheet" type="text/css" href="//fonts.googleapis.com/css?family=Roboto:400,300,500,700&amp;subset=latin,latin-ext" media="screen" />
+
+<script type="text/javascript" src="catalog/view/theme/cosyone/js/owl.carousel.min.js"></script>
+<script type="text/javascript" src="catalog/view/theme/cosyone/js/cosyone_common.js"></script>
+<script type="text/javascript" src="catalog/view/theme/cosyone/js/countdown/jquery.countdown_en.js"></script>
+<!--[if IE 8]>
+<link rel="stylesheet" type="text/css" href="catalog/view/theme/cosyone/stylesheet/ie8.css" />
+<![endif]-->
+<script>
+  (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+  (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+  m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+  })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+
+  ga('create', 'UA-1474375-39', 'auto');
+  ga('send', 'pageview');
+
+</script><!-- Custom css -->
+<style>
+.cart_bottom_line .button {
+display: none;
+}
+.breadcrumb_wrapper {
+    background: #ffffff !important;
+    margin-bottom: 0;
+}
+.breadcrumb {
+    padding-top: 0;
+    padding-bottom: 0;
+}
+.product-grid .item:hover:before {
+-webkit-box-shadow: 0px 1px 5px 0px rgba(0,0,0,0.5);
+-moz-box-shadow: 0px 1px 5px 0px rgba(0,0,0,0.5);
+box-shadow: 0px 1px 5px 0px rgba(0,0,0,0.5);
+}
+
+.action1 .box-single {
+color: #ffffff;
+}
+
+.breadcrumb_wrapper {
+   border-bottom-style: ridge;
+   background-color: #444;
+   margin-bottom: 20px;
+}
+
+.header1, .header2 {
+  margin-bottom: 0px;
+  background-color: #565E3B;
+}
+
+.container .menu_border {
+background: #565E3B;
+}
+
+.login_drop_heading {
+ background: #C9BCA1;
+}
+
+.currency_current, .language_current {
+ background: #C9BCA1;
+}
+
+.product-grid .item:before {
+background: #fff;
+}
+
+.top_header_drop_down {
+background: #C9BCA1;
+}
+
+#menu ul li .menu_drop_down {
+background: #565E3B;
+}
+
+#menu ul li.col1 .menu_drop_down .column .third {
+background: #565E3B;
+}
+
+#menu .col1 .level2 > a {
+color: #fff;
+}
+
+#menu .col1 .level2 > a:hover {
+color: #C9BCA1;
+}
+
+#menu ul li.col1 .menu_drop_down .column .third a {
+color: #fff;
+}
+
+#menu ul li.col1 .menu_drop_down .column .third a:hover {
+color: #C9BCA1;
+}
+
+.box-heading {
+border-bottom: 5px solid #565e3b;
+font-size: 25px;
+}
+
+.box-heading:after, .box-heading .nav li.active:after {
+background: #C9BCA1;
+height: 2px;
+}
+
+.header_wrapper.sticky_menu.sticky.header1 .menu_wrapper, .header_wrapper.sticky_menu.sticky.header2 .menu_wrapper {
+background: #565E3B;
+opacity: 0.9;
+}
+
+.breadcrumb_wrapper {
+min-height: 15px;
+}
+
+.login_drop_heading {
+border: none;
+}
+
+.currency_current, .language_current {
+border: none;
+}
+
+.outer_container {
+background-image: url("http://wildzone.eu/image/catalog/background/main-background.png");
+background: rgba(215, 210, 207, 0.2);
+}
+
+.product-info {
+background: #fff;
+padding: 15px;
+}
+
+.checkout .panel {
+    padding: 0 6px 6px;
+}
+
+.checkout .panel-default > .panel-heading + .panel-collapse .panel-body {
+    padding: 15px;
+}
+
+/*
+#collapse-shipping-method .method-selection:not(:first-of-type) {
+    display: none;
+}
+*/
+
+.secondary_background, .box.custom.action1 .box-content, a.button.second, a.button.quickview:hover {
+background-color: #c40000 !important;
+}
+
+.category-grid.grid4 .item {
+width: 20%;
+}
+</style>
+<!-- Custom script -->
+<script type="text/javascript">
+$(document).ready(function() {
+$.fn.firstWord = function() {
+  var text = this.text().trim().split(" ");
+  var first = text.shift();
+  this.html((text.length > 0 ? "<strong>"+ first + "</strong> " : first) + text.join(" "));
+};
+
+$('.name > a').each(function(){ $(this).firstWord(); });
+
+$('.checkout .panel').on('click', 'input[type="button"]', function() {
+    var $panel = $(this).closest('.panel');
+    var isNotCompany = !$panel.find('#input-payment-company').val();
+    var $vat = $panel.find('#input-payment-custom-field2');
+    if (isNotCompany) {
+        $vat.val('-');
+    }
+    if (!isNotCompany && $vat.val() === '-') {
+        $vat.val('');
+    }
+});
+
+/*
+$('.checkout .panel').on('click', 'input[type="button"]', function() {
+    var $panel = $(this).closest('.panel');
+    var isNotCompany = !$panel.find('#input-payment-company').val();
+    var $vat = $panel.find('#input-payment-custom-field2');
+    if (isNotCompany) {
+        $vat.val('-');
+    }
+    if (!isNotCompany && $vat.val() === '-') {
+        $vat.val('');
+    }
+});
+
+$('.checkout .panel').on('blur', "#input-payment-company", function() {
+    var $panel = $(this).closest('.panel');
+    var $vat = $panel.find('#input-payment-custom-field2');
+    if (!!$(this).val() && $vat.val() === '-') {
+        $vat.val('');
+    }
+});
+
+$('.checkout .panel').on('blur', "#input-shipping-company", function() {
+    var $panel = $(this).closest('.panel');
+    var $vat = $panel.find('#input-shipping-custom-field2');
+    if (!!$(this).val() && $vat.val() === '-') {
+        $vat.val('');
+    }
+});
+*/});
+</script>
+
+<!-- Custom styling -->
+<style>  
+body { background-image:url('image/catalog/background/main-background.png');}
+</style>
+
+<style>
+/* body */
+body { background-color:#;}
+.outer_container { box-shadow:0px 0px 25px rgba(0, 0, 0, 0.1); }
+/* top line */
+.header_top_line_wrapper {
+	background:#C9BCA1;
+	border-color:#1C1109;
+}
+.header_top_line {
+	color:#000000;
+}
+.promo_message a, 
+.header_top_line .links a,
+.header_top_line .login_drop_heading .log_link,
+.header_top_line .currency_current .head, 
+.header_top_line .language_current .head {
+	color:#000000;
+}
+.header_top_line a:hover, .header_top_line b {
+	color:#bf0000;
+}
+.shortcut .shortcut_heading i {
+	border-color:#;
+}
+#menu {
+	background:#565e3b;
+}
+#menu > ul > li > a, .mobile_menu_trigger,
+#menu .shortcut .shortcut_heading i,
+#menu .shortcut .shortcut_heading .count,
+#menu .shortcut .shortcut_heading .total {
+	color:#ffffff;
+}
+#menu > ul > li:hover > a,
+#menu > ul > li.current > a,
+#menu #cart:hover .shortcut_heading .count,
+#menu #cart:hover .shortcut_heading i,
+#menu #cart:hover .shortcut_heading .total,
+.mobile_menu_trigger, 
+.mobile_menu_trigger:hover {
+	color:#C9BCA1;
+}
+#menu > ul > li:hover > a,
+#menu > ul > li.current > a,
+#menu #cart.shortcut:hover .shortcut_heading,
+.mobile_menu_trigger, 
+.mobile_menu_trigger:hover {
+	background-color:#565e3b;
+}
+.header_main .button-search:hover,
+.rich_banner .primary_background .inner .button:hover,
+.box.custom.info2 .box-single i.fa,
+.rich_banner .info_wrapper a,
+.wishlist .shortcut_heading:hover i, 
+.compare .shortcut_heading:hover i,
+.box.newsletter.boxed.popup .inner .button:hover {
+	color:#565e3b;
+}
+.primary_background,
+.rich_banner .info_wrapper span:before,
+.box.custom.info1 .box-single i.fa,
+#cart.shortcut:hover .shortcut_heading {
+	background-color:#565e3b;
+}
+.box.custom.info1 .box-content, 
+.box.custom.info1 .box-single, 
+.primary_border {
+	border-color:#565e3b !important;
+}
+.secondary_background,
+.box.custom.action1 .box-content,
+a.button.second,
+a.button.quickview:hover {
+	background-color:#8a5e3b;
+}
+.contrast_color,
+.box.custom.action2 .box-content .left,
+.box.custom.action1 .box-content .button,
+a.button.second:hover,
+.rich_banner .secondary_background .inner .button:hover,
+.cart-total tr:last-child td, 
+.cart-total #total tr:last-child > td:last-child,
+table.radio tr.highlight td:nth-child(3) label,
+.cart-info tr.confirm_totals:last-child td {
+	color:#8a5e3b;
+}
+a.button.second:hover {
+	border-color:#8a5e3b;
+}
+#main .offer_background,
+.product-info .hascountdown,
+.deals .hascountdown,
+.deals_wrapper .owl-page.active {
+	background:#8a5e3b;
+}
+.deals_heading, .extended_offer .price-save {
+	color:#8a5e3b;
+}
+.deals_wrapper, .deals_wrapper .owl-page {
+	border-color:#8a5e3b;
+}
+/* link hover */
+a:hover,
+.product-filter a:hover,
+.top_header_drop_down a:hover, 
+.top_header_drop_down .current, 
+#login.top_header_drop_down a.forgotten:hover {
+	color:#565e3b;
+}
+/* sale badge */
+.sale_badge {
+	background-color:#8a5e3b;
+}
+/* price */
+.price, .price-new {
+	color:#8a5e3b;
+}
+/* icon hover color */
+.icon:hover, .slide_arrow_next:hover, .slide_arrow_prev:hover, #cboxprevious:hover:after, #cboxnext:hover:after, #cboxclose:hover:after, #list_view_icon.active, #list_view_icon:hover, #grid_view_icon.active, #grid_view_icon:hover, .currency_current:hover, .language_current:hover, .login_drop_heading:hover, .login_drop_heading.active {
+	background:#;
+}
+/* buttons */
+/* default button */
+a.button, input.button, button.button {
+	background-color:#ffffff;
+	color:#;
+	border-color:#;
+}
+a.button:hover, input.button:hover, button.button:hover {
+	background-color:#FCA51C;
+	color:#000000;
+	border-color:#ffffff;
+}
+/* cart/contrast buttons */
+a.button.contrast, .button.contrast, .sq_icon.contrast, input.button.contrast,
+a.button.active, input.button.active, #button-confirm, .style-2 .add_to_cart { 
+	background-color:#1C1209;
+	color:#;
+	border-color:#;
+}
+a.button.contrast:hover, .button.contrast:hover, .sq_icon.contrast:hover, input.button.contrast:hover,
+a.button.active:hover, input.button.active:hover, #button-confirm:hover, .style-2 .add_to_cart:hover { 
+	background-color:#ffffff;
+	color:#FCA51C;
+	border-color:#FCA51C;
+}
+</style>
+<!-- Custom fonts -->
+<style>
+body, input, textarea, select, .main_font, .buttons, #menu li.custom_block .menu_drop_down p, .sale_badge, small, .sq_icon, .radio label, .checkbox label, .text-danger {
+font-family: 'Roboto', sans-serif;}
+.contrast_font, .control-label, .checkout-content, .box-content ul, .button, .btn, h1, h2, h3, h4, h5, .heading, .price, .title, .box-heading, #menu, .mobile_menu, .nav-tabs a, .cart-info tbody .name a, .checkout-heading {
+font-family: 'Roboto', sans-serif;}
+body, input, textarea, select, .buttons, #menu li.custom_block .menu_drop_down p, .sale_badge, small, .sq_icon, .light_font, h1, .heading, .box-heading, .checkout-heading, .rich_banner .inner h4, .rich_banner .info_wrapper h4, .main_font, .rich_banner .info_wrapper p a, .radio label, .checkbox label, .text-danger {
+	font-weight:300;
+}
+.contrast_font, .control-label, .checkout-content, .box-content ul, .button, h2, h3, h4, h5, .price, .title, #menu, .mobile_menu, .nav-tabs a, .cart-info tbody .name a, .price-old, .deals .hurry .items_left, .product-info h1, .product-info .hurry .items_left {
+	font-weight:400;
+}
+.header_top_line b, .alert a, .buttons .right a, .pull-right b, p a, .agree b {
+	font-weight:500;
+}
+b, .checkout-content h2, .price, .bar .message, .shortcut .shortcut_heading .total, #menu .level2 > a, table.list thead td, #shipping-method table.radio td b, table.radio tr.highlight td:nth-child(3) label, li.open > a, ul.box-filter span, .item.testimonial .heading, .testimonial_list .heading, .deals .hasCountdown i, .extended_offer .amount, .compare-info tr td:first-child, .product-info .options h2, .order-detail, .cart-info tr.confirm_totals td, .cart-info thead td, .cart-total table, .checkout-product thead td, .box.custom.info2 .box-single h3, #cart .name b, #cart .mini-cart-total tr:last-child td {
+	font-weight:700;
+}
+</style>
+
+                            
+
+			<link rel="stylesheet" href="catalog/view/javascript/jquery.cluetip.css" type="text/css" />
+			<script src="catalog/view/javascript/jquery.cluetip.js" type="text/javascript"></script>
+			
+			<script type="text/javascript">
+				$(document).ready(function() {
+				$('a.title').cluetip({splitTitle: '|'});
+				  $('ol.rounded a:eq(0)').cluetip({splitTitle: '|', dropShadow: false, cluetipClass: 'rounded', showtitle: false});
+				  $('ol.rounded a:eq(1)').cluetip({cluetipClass: 'rounded', dropShadow: false, showtitle: false, positionBy: 'mouse'});
+				  $('ol.rounded a:eq(2)').cluetip({cluetipClass: 'rounded', dropShadow: false, showtitle: false, positionBy: 'bottomTop', topOffset: 70});
+				  $('ol.rounded a:eq(3)').cluetip({cluetipClass: 'rounded', dropShadow: false, sticky: true, ajaxCache: false, arrows: true});
+				  $('ol.rounded a:eq(4)').cluetip({cluetipClass: 'rounded', dropShadow: false});  
+				});
+			</script>
+			
+
+        
+
+ 
+        <!-- Google Analytics -->
+<script>
+(function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+(i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+})(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+
+ga('create', 'UA-1474375-39', 'auto');
+ga('require', 'ec');
+
+</script>
+
+      
+</head>
+<body class="product-search">
+<div class="outer_container style-2  ">
+<div class="header_wrapper 
+sticky_menu 
+ 
+header1">
+<div class="header_top_line_wrapper">
+<div class="header_top_line container">
+      <div class="promo_message"><b>Ingyenes szállítás 25 000,- felett</b> történő vásárlás esetén. </div>
+  <div class="links contrast_font">
+  <a href="https://wildzone.eu/account">Fiókom</a>
+  <a href="https://wildzone.eu/wishlist" id="wishlist-total">Kívánságlista (0)</a>
+  <a href="https://wildzone.eu/index.php?route=checkout/cart">Bevásárlókosár</a>
+  <a href="https://wildzone.eu/index.php?route=checkout/checkout">Pénztár</a>
+  </div>
+  <div class="clearfix"></div>
+</div>
+</div>
+<div class="container header">
+<div class="header_main">
+  <div class="header_right"> 
+    <div class="logo"><a href="https://wildzone.eu/"><img src="https://wildzone.eu/image/catalog/wildzone_logo.png" title="Wild Zone" alt="Wild Zone" /></a></div>
+     <div id="search">
+<i class="fa fa-search button-search"></i>
+<input type="text" name="search" class="search_input" placeholder="Keresés" value="szarvas" />
+</div>   <div class="mobile_clear"></div>
+  <!-- Position for header login, lang, curr, in the header main -->
+	    	<div class="login_drop_heading contrast_font">
+  		<a  class="log_link" href="https://wildzone.eu/login"><i class="fa fa-user"></i> Belépés</a>
+   		<div id="login" class="top_header_drop_down">
+   		<div class="top">
+   		<form action="https://wildzone.eu/login" method="post" enctype="multipart/form-data">
+          E-mail cím<br />
+          <input type="text" name="email" class="login_input" value="" />
+          Jelszó<br />
+          <input type="password" name="password" class="login_input" value="" />
+          <input type="submit" value="Bejelentkezés" class="button active" />
+                	</form>
+       	<a href="https://wildzone.eu/index.php?route=account/forgotten" class="forgotten">Elfelejtett jelszó</a>
+      </div>
+      <div id="social_login_header_holder"></div>
+      <div class="bottom">
+   		<span class="heading">Új vevő vagyok</span>
+       	<a href="https://wildzone.eu/register" class="button">Regisztrálás</a>
+      </div>
+	</div>
+	</div>
+	<div class="language_current contrast_font">
+        <a class="head"><img src="image/flags/hu.png" alt="Magyar" title="Magyar" />
+    <i class="fa fa-angle-down"></i></a>
+                <form action="https://wildzone.eu/index.php?route=common/language/language" method="post" enctype="multipart/form-data" id="language">
+ 
+  <div class="top_header_drop_down">
+            <a class="current"><img src="image/flags/hu.png" alt="Magyar" title="Magyar" />Magyar</a>
+                <a href="en">
+    <img src="image/flags/gb.png" alt="English" title="English" />English</a>
+            <input type="hidden" name="code" value="" />
+  <input type="hidden" name="redirect" value="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas" />
+  </div>
+</form>
+</div>
+  	<div class="currency_current contrast_font"> 
+                    <a class="head"> Ft    <i class="fa fa-angle-down"></i></a>
+                    <form action="https://wildzone.eu/index.php?route=common/currency/currency" method="post" enctype="multipart/form-data" id="currency">
+    <div class="top_header_drop_down">
+            <a title="Euro" onclick="$('input[name=\'code\']').attr('value', 'EUR'); $(this).parent().parent().submit();">€ Euro</a>
+                <a class="current"> Ft Forint</a>
+                <a title="US Dollar" onclick="$('input[name=\'code\']').attr('value', 'USD'); $(this).parent().parent().submit();">$ US Dollar</a>
+            <input type="hidden" name="code" value="" />
+  <input type="hidden" name="redirect" value="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas" />
+</div>
+</form>
+</div>
+
+                  </div> <!-- header_right ends -->
+	</div> <!-- header ends -->
+    
+<div class="menu_wrapper">
+<div class="container menu_border"></div>
+<div class="container menu_holder">
+<div id="menu">
+        <div class="shortcuts_wrapper">
+                <div class="shortcut wishlist">
+<a class="shortcut_heading" id="header_wishlist" href="https://wildzone.eu/wishlist"><i class="fa fa-heart"></i><span class="count">0</span></a>
+</div>  
+
+<div class="shortcut compare">dss
+<a class="shortcut_heading" id="header_compare" href="https://wildzone.eu/index.php?route=product/compare"><i class="fa fa-arrow-right"></i><i class="fa fa-arrow-left"></i><span class="count">0</span></a>
+</div>
+        <div id="cart" class="shortcut">
+ <a class="shortcut_heading" href="https://wildzone.eu/index.php?route=checkout/cart" id="cart-total"><i class="fa fa-shopping-cart"></i><span class="count">0</span> <span class="total contrast_font mobile_hide">0 Ft</span></a>
+  <div class="content">
+        <div class="empty main_font">Az Ön bevásárlókosara még üres!</div>
+      </div>
+  </div>        </div>
+ <a class="mobile_menu_trigger up_to_tablet"><i class="fa fa-bars"></i> Menü</a>
+  <ul class="only_desktop">
+	<li class="home only_desktop enabled"><a href="https://wildzone.eu/">Főoldal</a></li>
+                               <li class="col1"><a href="https://wildzone.eu/vadasz-kollekcio" >Vadász Kollekció<i class="fa fa-sort-desc"></i></a>
+                             <div class="menu_drop_down" style="width: 205px">
+          <div class="wrapper">
+          <ul>          <li class="column level2">
+            <a href="https://wildzone.eu/vadasz-kollekcio/uj-termekek-365774357">Új Termékek<i class="fa fa-caret-right"></i></a>
+                                      </li>
+                      <li class="column level2">
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles">Vadász Felszerelés<i class="fa fa-caret-right"></i></a>
+                                        <div class="third">
+              <ul>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/csizmatarto-taska">Csizmatartó Táska </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/derektamasz">Deréktámasz</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyverszij">Fegyverszíj</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyvertarto-pant">Fegyvertartó Pánt </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyvertok">Fegyvertok</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/hangtompito-huzat">Hangtompító huzat</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/kalap-szalag">Kalap szalag</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/lesparna">Lespárna</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/l-szertarto">Lőszertartó</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/l-zsak">Lőzsák</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/tavcs-tarto">Távcsőtartó</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/tavcs-ved">Távcsővédő</a></li>
+                             </ul>
+              </div>
+                          </li>
+                      <li class="column level2">
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k">Vadász Kiegészítők<i class="fa fa-caret-right"></i></a>
+                                        <div class="third">
+              <ul>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/egerpad">Egérpad </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/italtaska">Italtáska</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/mobiltarto">Mobiltartó </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/naptar-933324235">Naptár</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/neszesszer">Neszesszer </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/penztarca">Pénztárca </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/szemuvegtarto">Szemüvegtartó</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/taska">Táska</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/triko-uleshuzat">Trikó üléshuzat </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/ulestakaro">Üléstakaró </a></li>
+                             </ul>
+              </div>
+                          </li>
+                      <li class="column level2">
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles">Vadász Lakásfelszerelés<i class="fa fa-caret-right"></i></a>
+                                        <div class="third">
+              <ul>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/bogre">Bögre </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/diszparna">Díszpárna </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/edenyfogo">Edényfogó </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/falikep">Falikép</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/gyerek-ora">Gyerek Óra</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/gyerekparna">Gyerekpárna</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/konyhaszett">Konyhaszett </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/koteny">Kötény</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/naptar">Naptár</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/ora">Óra </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/poharalatet">Poháralátét </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/puff">Puff </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/tanyeralatet">Tányéralátét </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/terit">Terítő </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/torolkoz-k">Törölközők</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/ul-parna">Ülőpárna</a></li>
+                             </ul>
+              </div>
+                          </li>
+                      <li class="column level2">
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat">Vadász Ruházat<i class="fa fa-caret-right"></i></a>
+                                        <div class="third">
+              <ul>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/derekved">Derékvédő</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/hosszu-ujju-polo">Hosszú ujjú póló</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/kamasli">Kamásli</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/nyakkend">Nyakkendő </a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/polar-ruhazat">Polár ruházat</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/polo">Póló</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/pulover">Pulóver</a></li>
+                              <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/sapka">Sapka </a></li>
+                             </ul>
+              </div>
+                          </li>
+                      </ul>
+          </div><!-- wrapper ends -->
+          </div>
+                  </li>
+                         <li class="col1"><a href="https://wildzone.eu/horgasz-kollekcio" >Horgász Kollekció<i class="fa fa-sort-desc"></i></a>
+                             <div class="menu_drop_down" style="width: 205px">
+          <div class="wrapper">
+          <ul>          <li class="column level2">
+            <a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k">Horgász kiegészítők<i class="fa fa-caret-right"></i></a>
+                                        <div class="third">
+              <ul>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/e-mot-bag-hu">E-MOT Bag</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/mobiltarto-617906095">Mobiltartó</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/neszesszer-1367245424">Neszesszer</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/penztarca-1442803314">Pénztárca</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/taska-1042205655">Táska</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/uleshuzat">Üléshuzat</a></li>
+                             </ul>
+              </div>
+                          </li>
+                      <li class="column level2">
+            <a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles">Horgász Lakásfelszerelés<i class="fa fa-caret-right"></i></a>
+                                        <div class="third">
+              <ul>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/bogre-325734293">Bögre</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/konyha-szett">Konyha Szett</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/koteny-757187112">Kötény</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/ora-151440844">Óra</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/parna">Párna</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/poharalatet-1803185011">Poháralátét</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/puff-639208690">Puff</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/tanyeralatet-189076305">Tányéralátét</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/terit-797043138">Terítő</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/ul-parna-9301663">Ülőpárna</a></li>
+                             </ul>
+              </div>
+                          </li>
+                      <li class="column level2">
+            <a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat">Horgász Ruházat<i class="fa fa-caret-right"></i></a>
+                                        <div class="third">
+              <ul>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/gyereksapka">Gyereksapka</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/polar-ruhazat-145445397">Polár ruházat</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/polo-335642775">Póló</a></li>
+                              <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/sapka-2085264244">Sapka</a></li>
+                             </ul>
+              </div>
+                          </li>
+                      <li class="column level2">
+            <a href="https://wildzone.eu/horgasz-kollekcio/uj-termekek-646958872">Új Termékek<i class="fa fa-caret-right"></i></a>
+                                      </li>
+                      </ul>
+          </div><!-- wrapper ends -->
+          </div>
+                  </li>
+                                		<li><a href="/index.php?route=product/special">Akciós termékek</a></li>
+                		<li><a href="/index.php?route=information/information&amp;information_id=4">Bemutatkozás</a></li>
+                                      </ul>
+    </div> <!-- menu_holder ends -->
+</div> <!-- menu ends -->
+</div> <!-- menu_wrapper ends -->
+
+<div class="clearfix"></div>
+<div class="mobile_menu_wrapper">
+
+<div class="mobile_menu">
+
+	<ul>
+                    <li><a href="https://wildzone.eu/vadasz-kollekcio" >Vadász Kollekció</a>
+                    <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+          <ul>
+                        <li>
+            <a href="https://wildzone.eu/vadasz-kollekcio/uj-termekek-365774357">Új Termékek</a>
+                          </li>
+                        <li>
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles">Vadász Felszerelés</a>
+                            <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+              <ul>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/csizmatarto-taska">Csizmatartó Táska </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/derektamasz">Deréktámasz</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyverszij">Fegyverszíj</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyvertarto-pant">Fegyvertartó Pánt </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyvertok">Fegyvertok</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/hangtompito-huzat">Hangtompító huzat</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/kalap-szalag">Kalap szalag</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/lesparna">Lespárna</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/l-szertarto">Lőszertartó</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/l-zsak">Lőzsák</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/tavcs-tarto">Távcsőtartó</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/tavcs-ved">Távcsővédő</a></li>
+                              </ul>
+                          </li>
+                        <li>
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k">Vadász Kiegészítők</a>
+                            <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+              <ul>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/egerpad">Egérpad </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/italtaska">Italtáska</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/mobiltarto">Mobiltartó </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/naptar-933324235">Naptár</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/neszesszer">Neszesszer </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/penztarca">Pénztárca </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/szemuvegtarto">Szemüvegtartó</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/taska">Táska</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/triko-uleshuzat">Trikó üléshuzat </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/ulestakaro">Üléstakaró </a></li>
+                              </ul>
+                          </li>
+                        <li>
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles">Vadász Lakásfelszerelés</a>
+                            <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+              <ul>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/bogre">Bögre </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/diszparna">Díszpárna </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/edenyfogo">Edényfogó </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/falikep">Falikép</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/gyerek-ora">Gyerek Óra</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/gyerekparna">Gyerekpárna</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/konyhaszett">Konyhaszett </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/koteny">Kötény</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/naptar">Naptár</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/ora">Óra </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/poharalatet">Poháralátét </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/puff">Puff </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/tanyeralatet">Tányéralátét </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/terit">Terítő </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/torolkoz-k">Törölközők</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/ul-parna">Ülőpárna</a></li>
+                              </ul>
+                          </li>
+                        <li>
+            <a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat">Vadász Ruházat</a>
+                            <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+              <ul>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/derekved">Derékvédő</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/hosszu-ujju-polo">Hosszú ujjú póló</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/kamasli">Kamásli</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/nyakkend">Nyakkendő </a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/polar-ruhazat">Polár ruházat</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/polo">Póló</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/pulover">Pulóver</a></li>
+                                <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/sapka">Sapka </a></li>
+                              </ul>
+                          </li>
+                      </ul>
+                  </li>
+                 <li><a href="https://wildzone.eu/horgasz-kollekcio" >Horgász Kollekció</a>
+                    <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+          <ul>
+                        <li>
+            <a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k">Horgász kiegészítők</a>
+                            <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+              <ul>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/e-mot-bag-hu">E-MOT Bag</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/mobiltarto-617906095">Mobiltartó</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/neszesszer-1367245424">Neszesszer</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/penztarca-1442803314">Pénztárca</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/taska-1042205655">Táska</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/uleshuzat">Üléshuzat</a></li>
+                              </ul>
+                          </li>
+                        <li>
+            <a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles">Horgász Lakásfelszerelés</a>
+                            <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+              <ul>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/bogre-325734293">Bögre</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/konyha-szett">Konyha Szett</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/koteny-757187112">Kötény</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/ora-151440844">Óra</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/parna">Párna</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/poharalatet-1803185011">Poháralátét</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/puff-639208690">Puff</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/tanyeralatet-189076305">Tányéralátét</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/terit-797043138">Terítő</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/ul-parna-9301663">Ülőpárna</a></li>
+                              </ul>
+                          </li>
+                        <li>
+            <a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat">Horgász Ruházat</a>
+                            <span class="plus"><i class="fa fa-plus"></i><i class="fa fa-minus"></i></span>
+              <ul>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/gyereksapka">Gyereksapka</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/polar-ruhazat-145445397">Polár ruházat</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/polo-335642775">Póló</a></li>
+                                <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/sapka-2085264244">Sapka</a></li>
+                              </ul>
+                          </li>
+                        <li>
+            <a href="https://wildzone.eu/horgasz-kollekcio/uj-termekek-646958872">Új Termékek</a>
+                          </li>
+                      </ul>
+                  </li>
+                        		<li><a href="/index.php?route=product/special">Akciós termékek</a></li>
+                		<li><a href="/index.php?route=information/information&amp;information_id=4">Bemutatkozás</a></li>
+                                      </ul>
+
+</div>
+</div>
+</div> <!-- header_wrapper ends -->
+</div> <!-- inner conainer ends -->
+<div class="breadcrumb_wrapper"></div>
+<div id="notification" class="container"></div><div class="container">
+  <ul class="breadcrumb">
+        <li><a href="https://wildzone.eu/"><i class="fa fa-home"></i></a></li>
+        <li><a href="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas">Keresés</a></li>
+      </ul>
+  <div class="row"><aside id="column-left" class="col-sm-3 hidden-xs">
+    <div class="box">
+  <div class="box-heading">Kategóriák</div>
+  <div class="box-content box-category">
+	<ul>
+                        <li><a href="https://wildzone.eu/kapucnis-polar" >Kapucnis Polár</a> 
+                            </li>
+                         <li><a href="https://wildzone.eu/vadasz-kollekcio" >Vadász Kollekció</a> 
+                              <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+          <ul>
+                                  <li><a href="https://wildzone.eu/vadasz-kollekcio/uj-termekek-365774357">Új Termékek</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles">Vadász Felszerelés</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/csizmatarto-taska">Csizmatartó Táska </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/derektamasz">Deréktámasz</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyverszij">Fegyverszíj</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyvertarto-pant">Fegyvertartó Pánt </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/fegyvertok">Fegyvertok</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/hangtompito-huzat">Hangtompító huzat</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/kalap-szalag">Kalap szalag</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/lesparna">Lespárna</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/l-szertarto">Lőszertartó</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/l-zsak">Lőzsák</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/tavcs-tarto">Távcsőtartó</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-felszereles/tavcs-ved">Távcsővédő</a></li>
+                                        </ul>
+                          </li>
+                                  <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k">Vadász Kiegészítők</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/egerpad">Egérpad </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/italtaska">Italtáska</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/mobiltarto">Mobiltartó </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/naptar-933324235">Naptár</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/neszesszer">Neszesszer </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/penztarca">Pénztárca </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/szemuvegtarto">Szemüvegtartó</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/taska">Táska</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/triko-uleshuzat">Trikó üléshuzat </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-kiegeszit-k/ulestakaro">Üléstakaró </a></li>
+                                        </ul>
+                          </li>
+                                  <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles">Vadász Lakásfelszerelés</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/bogre">Bögre </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/diszparna">Díszpárna </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/edenyfogo">Edényfogó </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/falikep">Falikép</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/gyerek-ora">Gyerek Óra</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/gyerekparna">Gyerekpárna</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/konyhaszett">Konyhaszett </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/koteny">Kötény</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/naptar">Naptár</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/ora">Óra </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/poharalatet">Poháralátét </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/puff">Puff </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/tanyeralatet">Tányéralátét </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/terit">Terítő </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/torolkoz-k">Törölközők</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-lakasfelszereles/ul-parna">Ülőpárna</a></li>
+                                        </ul>
+                          </li>
+                                  <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat">Vadász Ruházat</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/derekved">Derékvédő</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/hosszu-ujju-polo">Hosszú ujjú póló</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/kamasli">Kamásli</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/nyakkend">Nyakkendő </a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/polar-ruhazat">Polár ruházat</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/polo">Póló</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/pulover">Pulóver</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/vadasz-kollekcio/vadasz-ruhazat/sapka">Sapka </a></li>
+                                        </ul>
+                          </li>
+                      </ul>
+                  </li>
+                         <li><a href="https://wildzone.eu/horgasz-kollekcio" >Horgász Kollekció</a> 
+                              <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+          <ul>
+                                  <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k">Horgász kiegészítők</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/e-mot-bag-hu">E-MOT Bag</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/mobiltarto-617906095">Mobiltartó</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/neszesszer-1367245424">Neszesszer</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/penztarca-1442803314">Pénztárca</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/taska-1042205655">Táska</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-kiegeszit-k/uleshuzat">Üléshuzat</a></li>
+                                        </ul>
+                          </li>
+                                  <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles">Horgász Lakásfelszerelés</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/bogre-325734293">Bögre</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/konyha-szett">Konyha Szett</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/koteny-757187112">Kötény</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/ora-151440844">Óra</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/parna">Párna</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/poharalatet-1803185011">Poháralátét</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/puff-639208690">Puff</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/tanyeralatet-189076305">Tányéralátét</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/terit-797043138">Terítő</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-lakasfelszereles/ul-parna-9301663">Ülőpárna</a></li>
+                                        </ul>
+                          </li>
+                                  <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat">Horgász Ruházat</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/gyereksapka">Gyereksapka</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/polar-ruhazat-145445397">Polár ruházat</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/polo-335642775">Póló</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/horgasz-kollekcio/horgasz-ruhazat/sapka-2085264244">Sapka</a></li>
+                                        </ul>
+                          </li>
+                                  <li><a href="https://wildzone.eu/horgasz-kollekcio/uj-termekek-646958872">Új Termékek</a>
+                                    </li>
+                      </ul>
+                  </li>
+                         <li><a href="https://wildzone.eu/gyerek-kollekcio" >Gyerek kollekció</a> 
+                              <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+          <ul>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/baby-elegant-polo">Baby Elegant Póló</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/elegant-gyerek-polo-41188185">Elegant gyerek póló</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerek-kapucnis-ws-polar">Gyerek Kapucnis WS Polár</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerek-polar-pulover">Gyerek polár pulóver</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerek-torolkoz">Gyerek Törölköző</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerekparnak">Gyerekpárnák</a>
+                                      <div class="sign"><span class="plus">+</span><span class="minus">-</span></div>
+              <ul>
+                                
+                          <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerekparnak/classic-baby-gyerekparna">Classic Baby Gyerekpárna</a></li>
+                                          
+                          <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerekparnak/dreamsoft-parna-1650091782">Dreamsoft Párna</a></li>
+                                        </ul>
+                          </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/gyereksapka-186633582">Gyereksapka</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/nyomott-gyerek-polo-1010883091">Nyomott gyerek póló</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerek-tornazsak">Gyerek tornazsák</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/gyerek-3d-ora">Gyerek 3D óra</a>
+                                    </li>
+                                  <li><a href="https://wildzone.eu/gyerek-kollekcio/ovtaska-1699757360">Övtáska</a>
+                                    </li>
+                      </ul>
+                  </li>
+              </ul>
+  </div>
+</div>
+<script>        
+	$('.box-category li').bind().click(function(e) {
+	$(this).toggleClass("open").find('>ul').stop(true, true).slideToggle(500)
+	.end().siblings().find('>ul').slideUp().parent().removeClass("open");
+	e.stopPropagation();
+	});
+			
+	$('.box-category li a').click(function(e) {
+	e.stopPropagation();
+	});
+</script>  </aside>
+            <div id="content" class="col-sm-9 grid3 search-page">
+      <h1>Keresés - szarvas</h1>
+  <h3 class="margin-b">Keresési feltételek</h3>
+      <div class="row">
+        <div class="col-sm-6 form-group">
+          <input type="text" name="search" value="szarvas" placeholder="Kulcsszavak" id="input-search" class="form-control" />
+        </div>
+        <div class="col-sm-6 form-group">
+          <select name="category_id" class="form-control">
+            <option value="0">Minden kategória</option>
+                                    <option value="227">Kapucnis Polár</option>
+                                                            <option value="59">Vadász Kollekció</option>
+                                                <option value="61">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Új Termékek</option>
+                                                            <option value="63">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Vadász Felszerelés</option>
+                                                <option value="81">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Csizmatartó Táska </option>
+                                                <option value="75">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Deréktámasz</option>
+                                                <option value="72">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Fegyverszíj</option>
+                                                <option value="74">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Fegyvertartó Pánt </option>
+                                                <option value="71">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Fegyvertok</option>
+                                                <option value="236">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Hangtompító huzat</option>
+                                                <option value="79">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Kalap szalag</option>
+                                                <option value="78">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Lespárna</option>
+                                                <option value="77">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Lőszertartó</option>
+                                                <option value="76">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Lőzsák</option>
+                                                <option value="73">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Távcsőtartó</option>
+                                                <option value="80">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Távcsővédő</option>
+                                                            <option value="66">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Vadász Kiegészítők</option>
+                                                <option value="116">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Egérpad </option>
+                                                <option value="176">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Italtáska</option>
+                                                <option value="119">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Mobiltartó </option>
+                                                <option value="118">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Naptár</option>
+                                                <option value="114">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Neszesszer </option>
+                                                <option value="115">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Pénztárca </option>
+                                                <option value="183">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Szemüvegtartó</option>
+                                                <option value="117">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Táska</option>
+                                                <option value="120">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Trikó üléshuzat </option>
+                                                <option value="113">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Üléstakaró </option>
+                                                            <option value="65">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Vadász Lakásfelszerelés</option>
+                                                <option value="110">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bögre </option>
+                                                <option value="99">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Díszpárna </option>
+                                                <option value="100">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Edényfogó </option>
+                                                <option value="104">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Falikép</option>
+                                                <option value="112">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerek Óra</option>
+                                                <option value="178">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerekpárna</option>
+                                                <option value="109">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Konyhaszett </option>
+                                                <option value="94">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Kötény</option>
+                                                <option value="121">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Naptár</option>
+                                                <option value="107">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Óra </option>
+                                                <option value="106">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Poháralátét </option>
+                                                <option value="111">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Puff </option>
+                                                <option value="102">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Tányéralátét </option>
+                                                <option value="103">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Terítő </option>
+                                                <option value="214">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Törölközők</option>
+                                                <option value="105">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Ülőpárna</option>
+                                                            <option value="64">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Vadász Ruházat</option>
+                                                <option value="93">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Derékvédő</option>
+                                                <option value="185">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Hosszú ujjú póló</option>
+                                                <option value="96">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Kamásli</option>
+                                                <option value="98">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Nyakkendő </option>
+                                                <option value="229">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Polár ruházat</option>
+                                                <option value="92">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Póló</option>
+                                                <option value="232">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Pulóver</option>
+                                                <option value="95">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Sapka </option>
+                                                                        <option value="60">Horgász Kollekció</option>
+                                                <option value="70">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Horgász kiegészítők</option>
+                                                <option value="144">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;E-MOT Bag</option>
+                                                <option value="146">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Mobiltartó</option>
+                                                <option value="145">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Neszesszer</option>
+                                                <option value="152">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Pénztárca</option>
+                                                <option value="141">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Táska</option>
+                                                <option value="153">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Üléshuzat</option>
+                                                            <option value="69">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Horgász Lakásfelszerelés</option>
+                                                <option value="156">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Bögre</option>
+                                                <option value="157">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Konyha Szett</option>
+                                                <option value="164">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Kötény</option>
+                                                <option value="162">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Óra</option>
+                                                <option value="155">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Párna</option>
+                                                <option value="161">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Poháralátét</option>
+                                                <option value="154">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Puff</option>
+                                                <option value="159">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Tányéralátét</option>
+                                                <option value="160">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Terítő</option>
+                                                <option value="158">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Ülőpárna</option>
+                                                            <option value="68">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Horgász Ruházat</option>
+                                                <option value="203">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyereksapka</option>
+                                                <option value="233">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Polár ruházat</option>
+                                                <option value="163">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Póló</option>
+                                                <option value="205">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Sapka</option>
+                                                            <option value="67">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Új Termékek</option>
+                                                                        <option value="195">Gyerek kollekció</option>
+                                                <option value="237">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Baby Elegant Póló</option>
+                                                            <option value="196">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Elegant gyerek póló</option>
+                                                            <option value="225">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerek Kapucnis WS Polár</option>
+                                                            <option value="238">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerek polár pulóver</option>
+                                                            <option value="219">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerek Törölköző</option>
+                                                            <option value="202">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerekpárnák</option>
+                                                <option value="200">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Classic Baby Gyerekpárna</option>
+                                                <option value="201">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Dreamsoft Párna</option>
+                                                            <option value="204">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyereksapka</option>
+                                                            <option value="197">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Nyomott gyerek póló</option>
+                                                            <option value="231">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerek tornazsák</option>
+                                                            <option value="198">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Gyerek 3D óra</option>
+                                                            <option value="199">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Övtáska</option>
+                                                          </select>
+        </div>
+        </div>
+        
+        <div class="row">
+        <div class="col-sm-6 form-group">
+          <label class="checkbox-inline main_font">
+                    <input type="checkbox" name="description" value="1" id="description" />
+                    Keresés a termékek leírásában</label>
+        </div>
+        <div class="col-sm-6 form-group">
+          <p><label class="checkbox-inline main_font">
+                        <input type="checkbox" name="sub_category" value="1" />
+                        Alkategóriákban keres</label></p>
+        </div>
+      </div>
+      <div class="form-group">
+      <input type="button" value="Keresés" id="button-search" class="btn btn-primary" />
+      </div>
+      <h3><br />
+Ezeket a termékeket találtuk</h3>
+      
+    <div class="product-filter">
+    <div class="display"> 
+    <a id="grid_view_icon"><i class="fa fa-th"></i></a><a id="list_view_icon"><i class="fa fa-list"></i></a>
+    </div>
+    <div class="limit mobile_hide">Mutat:      <select id="input-limit" onchange="location = this.value;">
+                        <option value="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas&amp;limit=15" selected="selected">15</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas&amp;limit=25">25</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas&amp;limit=50">50</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas&amp;limit=75">75</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;search=szarvas&amp;limit=100">100</option>
+                      </select>
+    </div>
+    <div class="sort">Rendezés:      <select id="input-sort" onchange="location = this.value;">
+                        <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=p.sort_order&amp;order=ASC&amp;search=szarvas" selected="selected">Alapértelmezett</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=pd.name&amp;order=ASC&amp;search=szarvas">Név (A - Z)</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=pd.name&amp;order=DESC&amp;search=szarvas">Név (Z - A)</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=p.price&amp;order=ASC&amp;search=szarvas">Ár (alacsony &gt; magas)</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=p.price&amp;order=DESC&amp;search=szarvas">Ár (magas &gt; alacsony)</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=rating&amp;order=DESC&amp;search=szarvas">Értékelés (legmagasabb)</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=rating&amp;order=ASC&amp;search=szarvas">Értékelés (legalacsonyabb)</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=p.model&amp;order=ASC&amp;search=szarvas">Modell (A - Z)</option>
+                                <option value="https://wildzone.eu/index.php?route=product/search&amp;sort=p.model&amp;order=DESC&amp;search=szarvas">Modell (Z - A)</option>
+                      </select>
+              
+    </div>
+     <div class="compare-link mobile_hide"><a href="https://wildzone.eu/index.php?route=product/compare" id="compare-total">Összehasonlítás (0)</a></div>
+  </div>
+  <div id="main" class="product-grid">
+  <div class="grid_holder">
+    <!--
+    --><div class="item contrast_font product-layout">
+       <div class="image">
+                        <a href="https://wildzone.eu/m-269-1917-prime-polo-szarvas.html?search=szarvas"><img src="https://wildzone.eu/image/cache/catalog/Pöttyös szines szarvasos-262x262.jpg" alt="M-269-1917 Prime póló  szarvas" /></a>
+        
+                <div class="main_quicklook">
+        <a href="https://wildzone.eu/index.php?route=product/quickview&amp;product_id=3842&amp;search=szarvas" rel="nofollow" class="button quickview"><i class="fa fa-eye"></i> Gyorsnézet</a>
+        </div>
+    	        </div><!-- image ends -->
+      <div class="information_wrapper">
+      <div class="left">
+      <div class="name"><a href="https://wildzone.eu/m-269-1917-prime-polo-szarvas.html?search=szarvas">M-269-1917 Prime póló  szarvas</a></div>
+                             </div>
+      <div class="description main_font">Speciális gyártás
+    A nyomott oldal poliészter, a hátoldal és az ujjak pamut.
+    Minőségi, időt á..</div>
+            <div class="price">
+                9.778 Ft                        <br />
+        <span class="price-tax">Nettó: 7.699 Ft</span>
+              </div>
+            <div class="cart">       
+      <button type="submit" class="button contrast" onclick="cart.add('3842', '1');" ><i class="fa fa-shopping-cart"></i> Kosárba</button>
+    </div>  
+    <div class="icons_wrapper">
+    <a class="sq_icon" onclick="wishlist.add('3842');" data-tooltip="Hozzáadás a kívánságlistához"><i class="fa fa-heart"></i></a>
+    <a class="sq_icon compare" onclick="compare.add('3842');" data-tooltip="A termék összehasonlítása"><i class="fa fa-arrow-right"></i><i class="fa fa-arrow-left"></i></a>
+        <a href="https://wildzone.eu/index.php?route=product/quickview&amp;product_id=3842&amp;search=szarvas" rel="nofollow" class="sq_icon qlook quickview" data-tooltip="Gyorsnézet"><i class="fa fa-eye"></i></a>
+        <a class="sq_icon contrast add_to_cart" onclick="cart.add('3842', '1');" data-tooltip="Kosárba"><i class="fa fa-shopping-cart"></i></a>
+    <a class="plain_link wishlist" onclick="wishlist.add('3842');" >Hozzáadás a kívánságlistához</a>
+    <a class="plain_link compare" onclick="compare.add('3842');" >A termék összehasonlítása</a>
+    </div>
+            	</div>
+    </div>
+    <!--
+    --></div>
+    </div>
+  <div class="pagination_holder row">
+        <div class="col-sm-6 text-left"></div>
+        <div class="col-sm-6 text-right">Mutasd 1 tól 1 -ig 1 (1 oldalakat)</div>
+      </div>
+    </div>
+  </div>
+<script type="text/javascript"><!--
+$('#button-search').bind('click', function() {
+	url = 'index.php?route=product/search';
+	
+	var search = $('#content input[name=\'search\']').prop('value');
+	
+	if (search) {
+		url += '&search=' + encodeURIComponent(search);
+	}
+
+	var category_id = $('#content select[name=\'category_id\']').prop('value');
+	
+	if (category_id > 0) {
+		url += '&category_id=' + encodeURIComponent(category_id);
+	}
+	
+	var sub_category = $('#content input[name=\'sub_category\']:checked').prop('value');
+	
+	if (sub_category) {
+		url += '&sub_category=true';
+	}
+		
+	var filter_description = $('#content input[name=\'description\']:checked').prop('value');
+	
+	if (filter_description) {
+		url += '&description=true';
+	}
+
+	location = url;
+});
+
+$('#content input[name=\'search\']').bind('keydown', function(e) {
+	if (e.keyCode == 13) {
+		$('#button-search').trigger('click');
+	}
+});
+
+$('select[name=\'category_id\']').on('change', function() {
+	if (this.value == '0') {
+		$('input[name=\'sub_category\']').prop('disabled', true);
+	} else {
+		$('input[name=\'sub_category\']').prop('disabled', false);
+	}
+});
+
+$('select[name=\'category_id\']').trigger('change');
+--></script> 
+
+
+
+
+<script type="text/javascript">
+$(function() {
+	var pv = $.cookie('product_view');
+	if (pv == 'g') {
+		$('#main').removeClass();
+		$('#main').addClass('product-grid');
+		$('#list_view_icon').removeClass();
+		$('#grid_view_icon').addClass('active');
+	} else if (pv == 'l') {
+		$('#main').removeClass();
+		$('#main').addClass('product-list');
+		$('#grid_view_icon').removeClass();
+		$('#list_view_icon').addClass('active');
+	} else {
+		$('#grid_view_icon').addClass('active');
+	}
+});
+$(document).ready(function() {
+	$('#grid_view_icon').click(function() {
+		$(this).addClass('active');
+		$('#list_view_icon').removeClass();
+		$('#main').fadeOut(300, function() {
+			$(this).removeClass();
+			$(this).addClass('product-grid').fadeIn(300);
+			$.cookie('product_view', 'g');
+		});
+		return false;
+	});
+	$('#list_view_icon').click(function() {
+		$(this).addClass('active');
+		$('#grid_view_icon').removeClass();
+		$('#main').fadeOut(300, function() {
+			$(this).removeClass();
+			$(this).addClass('product-list').fadeIn(300);
+			$.cookie('product_view', 'l');
+		});
+		return false;
+	});
+});
+</script>
+</div>
+<div class="clearfix footer_margin"></div>
+<div class="footer_modules">
+<div class="container">
+<div>
+<div class="footer_modules_wrapper column-3">
+</div>
+</div>
+</div>
+</div>
+<div class="container"><div id="footer">
+	<div class="column">
+	<div class="box-heading heading">
+    Küldetésünk    </div>
+    <div class="custom_block">
+    <p>A célunk, hogy következetesen alkalmazzuk az innovatív gondolkodást mind a termékek tervezésében, mind pedig üzletfeleinkkel történő együtt működésünk során. Így nekik is és a vásárlóinknak is a legjobb értékeket és üzleti lehetőségeket próbáljuk biztosítani.</p><div style="position: fixed; bottom: 0; right: 0; z-index: 20;"><a href="/tamogatas" style="display: inline-block;"><img src="http://wildzone.eu/image/catalog/footer/szechenyi-2020-logo.png" style="width: 220px;"></a></div>    </div>
+    </div><!--
+  --><div class="column">
+    <div class="box-heading heading">Információ</div>
+    <ul class="contrast_font">
+                <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/projekt-tamogatas-hu">Projekt támogatás</a></li>
+            <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/bemutatkozas.html">Bemutatkozás</a></li>
+            <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/szallitasi-informaciok.html">Szállítási információk</a></li>
+            <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/impresszum.html">Impresszum</a></li>
+            <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/szerz-desi-feltetelek.html">Szerződési feltételek</a></li>
+            <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/adatkezeles.html">Adatkezelés</a></li>
+            <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/wz-kockas-b-ros-mintas-termekek.html">WZ kockás-bőrös mintás termékek</a></li>
+                  <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/contact">Kapcsolat</a></li>
+    </ul>
+  </div><!--
+  --><div class="column">
+    <div class="box-heading heading">Extrák</div>
+    <ul class="contrast_font">
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/manufacturer">Márkák</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/index.php?route=account/voucher">Ajándékutalványok</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/affiliates">Partnerek</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/special">Akciók</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/sitemap">Oldaltérkép</a></li>
+    </ul>
+  </div><!--
+  --><div class="column">
+    <div class="box-heading heading">Fiókom</div>
+    <ul class="contrast_font">
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/account">Fiókom</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/index.php?route=account/order">Rendeléseim</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/index.php?route=account/return/add">Visszárúk</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/wishlist">Kívánságlista</a></li>
+      <li><i class="fa fa-caret-right"></i><a href="https://wildzone.eu/index.php?route=account/newsletter">Hírlevél</a></li>
+    </ul>
+  </div>
+</div> <!-- #footer ends --> 
+  <div class="bottom_line"> <a class="scroll_top icon tablet_hide"><i class="fa fa-angle-up"></i></a>
+  <div id="powered">Wild Zone</a>, M-Sector Kft.<br /> &copy; 2010-2026. Minden jog fenntartva.</div>
+     <div id="footer_payment_icon"><img src="image/catalog/footer/payments.png" alt="" /></div>
+      <div class="clearfix"></div>
+  </div>
+<!--
+OpenCart is open source software and you are free to remove the powered by OpenCart if you want, but its generally accepted practise to make a small donation.
+Please donate via PayPal to donate@opencart.com
+//-->
+</div>  <!-- .container ends -->
+</div>  <!-- .outer_container ends -->
+<script type="text/javascript" src="catalog/view/theme/cosyone/js/jquery.cookie.js"></script>
+
+<script type="text/javascript" src="catalog/view/theme/cosyone/js/colorbox/jquery.colorbox-min.js"></script>
+<link href="catalog/view/theme/cosyone/js/colorbox/custom_colorbox.css" rel="stylesheet" type="text/css" />
+
+<script type="text/javascript" src="catalog/view/theme/cosyone/js/quickview.js"></script>
+<script>
+function doquick_search( ev, keywords ) {
+	if( ev.keyCode == 38 || ev.keyCode == 40 ) {
+		return false;
+	}	
+	$('#ajax_search_results').remove();
+	 updown = -1;
+	if( keywords == '' || keywords.length < 1 ) {
+		return false;
+	}
+	keywords = encodeURI(keywords);
+	$.ajax({url: $('base').attr('href') + 'index.php?route=module/d_ajax_search/ajaxsearch&keyword=' + keywords, dataType: 'json', success: function(result) {
+            console.log(result);
+		if( result.length > 0 ) {
+			var html, i;
+			html = '<div id="ajax_search_results" style="width: 237px">';
+			
+			for(i=0;i<result.length;i++) {
+				html += '<div class="s_row">';
+				
+				html += '<div class="live_image s_cell">';
+				if(result[i].thumb){
+					html += '<a href="' + result[i].href + '"><img src="' + result[i].thumb + '" /></a>';
+				}
+				html += '</div>';
+				
+				
+				html += '<div class="s_cell live_name"><span class="name">' + result[i].name + '</span></div>';
+				
+				html += '<div class="s_cell live_price">';
+				if(result[i].special.length > 0){
+					html += '<p class="old-price">' + result[i].price + '</p>';
+					html += '<p class="special price">' + result[i].special + '</p>';
+				} else if (result[i].price.length > 0) {
+					html += '<p class="price">' + result[i].price + '</p>';	
+				}
+				html += '</div>';
+				html += '<a class="link" href="' + result[i].href + '"></a>';
+				html += '</div>';
+				
+			}
+			
+			html += '</div>';
+			
+			if( $('#ajax_search_results').length > 0 ) {
+				$('#ajax_search_results').remove();
+			}
+			$('#search').append(html);
+		}
+	}});
+	return true;
+}
+
+function upDownEvent( ev ) {
+	var elem = document.getElementById('ajax_search_results_body');
+	var fkey = $('#search').find('[name=search]').first();
+	if( elem ) {
+		var length = elem.childNodes.length - 1;
+		if( updown != -1 && typeof(elem.childNodes[updown]) != 'undefined' ) {
+			$(elem.childNodes[updown]).removeClass('selected');
+		}
+		if( ev.keyCode == 38 ) {
+			updown = ( updown > 0 ) ? --updown : updown;	
+		}
+		else if( ev.keyCode == 40 ) {
+			updown = ( updown < length ) ? ++updown : updown;
+		}
+		if( updown >= 0 && updown <= length ) {
+			$(elem.childNodes[updown]).addClass('selected');
+			var text = $(elem.childNodes[updown]).find('.name').html();
+			$('#search').find('[name=search]').first().val(text);
+		}
+	}
+	return false;
+}
+var updown = -1;
+$(document).ready(function(){
+	$('[name=search]').keyup(function(ev){
+		doquick_search(ev, this.value);
+	}).focus(function(ev){
+		doquick_search(ev, this.value);
+	}).keydown(function(ev){
+		upDownEvent( ev );
+	}).blur(function(){
+		window.setTimeout("$('#ajax_search_results').remove();updown=0;", 15000);
+	});
+	$(document).bind('keydown', function(ev) {
+		try {
+			if( ev.keyCode == 13 && $('.selected').length > 0 ) {
+				if($('.selected').find('a').first().attr('href')){
+					document.location.href = $('.selected').find('a').first().attr('href');
+				}
+			}
+		}
+		catch(e) {}
+	});
+});
+</script><!-- Cookie Control -->
+
+<!-- Old IE Control -->
+
+      
+            <script>ga('send', 'pageview');</script> 
+            
+      
+</body></html>
