@@ -109,6 +109,64 @@ SUPPLIERS: dict[str, SupplierConfig] = {
         base_url="https://www.fomei.com",
         search_url_template="https://www.fomei.com/sk/produkty?ProductsSearch={q}",
     ),
+    # --- batch 3: 9 new suppliers (recon 2026-07-03) — all on an EXISTING generic ---
+    # parser (Shoptet / PrestaShop / WooCommerce). Config keys are the export
+    # ``supplier`` string upper-cased (load_rows / client both upper() before lookup),
+    # so accented keys are kept verbatim (cf. ZUBÍČEK).
+    # Shoptet (same parser family as LUKO; static SSR, cookie-gated → session warm-up).
+    # SK locale path is /vyhladavanie/, CZ locale path is /vyhledavani/ — MUST use
+    # ?string= (the ?q= param silently returns the homepage).
+    "JŠ SERVIS": SupplierConfig(
+        name="JŠ SERVIS",
+        base_url="https://www.chiruca.sk",
+        search_url_template="https://www.chiruca.sk/vyhladavanie/?string={q}",
+    ),
+    "HUNTING24": SupplierConfig(
+        name="HUNTING24",
+        base_url="https://www.hunting24.cz",
+        search_url_template="https://www.hunting24.cz/vyhledavani/?string={q}",
+    ),
+    "CITRADE": SupplierConfig(
+        name="CITRADE",
+        base_url="https://www.citrade.cz",
+        search_url_template="https://www.citrade.cz/vyhledavani/?string={q}",
+    ),
+    "SOXLAND": SupplierConfig(
+        name="SOXLAND",
+        base_url="https://www.soxland.sk",
+        search_url_template="https://www.soxland.sk/vyhladavanie/?string={q}",
+    ),
+    "WERRA": SupplierConfig(
+        name="WERRA",
+        base_url="https://www.werra.cz",
+        search_url_template="https://www.werra.cz/vyhledavani/?string={q}",
+    ),
+    "RUTEX": SupplierConfig(
+        name="RUTEX",
+        base_url="https://www.termovel.sk",
+        search_url_template="https://www.termovel.sk/vyhladavanie/?string={q}",
+    ),
+    "CHOCOLENKA": SupplierConfig(
+        name="CHOCOLENKA",
+        base_url="https://www.chocolenka.cz",
+        # Slovak locale on a CZ Shoptet → the search path is /sk/vyhladavanie/.
+        search_url_template="https://www.chocolenka.cz/sk/vyhladavanie/?string={q}",
+    ),
+    # PrestaShop (same parser family as WETLAND; #/variant URL fragment → urldefrag).
+    "DYNAX": SupplierConfig(
+        name="DYNAX",
+        base_url="https://www.dynax.sk",
+        search_url_template=(
+            "https://www.dynax.sk/vyhladavanie?controller=search&search_query={q}"
+        ),
+    ),
+    # WooCommerce (WordPress ?s= product search; an EXACT single match 301s to the
+    # product page → the parser also handles the single-product redirect form).
+    "TATRAGOAT": SupplierConfig(
+        name="TATRAGOAT",
+        base_url="https://tatragoat.sk",
+        search_url_template="https://tatragoat.sk/?s={q}&post_type=product",
+    ),
 }
 
 USER_AGENT = (

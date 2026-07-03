@@ -4,9 +4,11 @@ WooCommerce fulltext search (``?s=<query>&post_type=product``) renders results
 server-side, but the page comes in TWO shapes depending on how many products
 matched — so this parser handles a DUAL MODE:
 
-(A) RESULTS LIST — several matches. The product loop lives in ``div.products``
-    (Flatsome's LOVTEK adds ``row …``; pyra's adds ``products-loop
-    products-grid``). Each card is ``li.product``/``div.product`` with a detail
+(A) RESULTS LIST — several matches. The product loop lives in the WooCommerce
+    results wrapper — ``ul.products`` (canonical) OR ``div.products`` (Flatsome's
+    LOVTEK adds ``row …``; pyra's adds ``products-loop products-grid``; Divi/Extra's
+    tatragoat uses the canonical ``ul.products columns-4``). Each card is
+    ``li.product``/``div.product`` with a detail
     link (``a.woocommerce-LoopProduct-link`` / ``a.woocommerce-loop-product__link``
     / ``.product-title a``) and a title (``.woocommerce-loop-product__title`` /
     ``h2.product-title`` / ``p.product-title``).
@@ -108,7 +110,9 @@ def parse_search(html: str, base_url: str) -> list[Candidate]:
 
     # Mode A: the results grid MUST be present; degrade to no results rather than
     # scrape nav / autocomplete / cross-sell links scattered across the page.
-    scope = soup.select_one("div.products")
+    # WooCommerce's canonical results wrapper is ``ul.products``; some themes
+    # (Flatsome/LOVTEK, pyra) render a ``div.products`` instead — accept both.
+    scope = soup.select_one("ul.products") or soup.select_one("div.products")
     if scope is None:
         return []
 
