@@ -39,6 +39,18 @@ PARSERS: dict[str, Callable[[str, str], list[Candidate]]] = {
     "PYRA": woocommerce_generic.parse_search,
     # batch 2 — custom
     "FOMEI SLOVAKIA": fomei.parse_search,
+    # batch 3 — Shoptet family
+    "JŠ SERVIS": shoptet_generic.parse_search,
+    "HUNTING24": shoptet_generic.parse_search,
+    "CITRADE": shoptet_generic.parse_search,
+    "SOXLAND": shoptet_generic.parse_search,
+    "WERRA": shoptet_generic.parse_search,
+    "RUTEX": shoptet_generic.parse_search,
+    "CHOCOLENKA": shoptet_generic.parse_search,
+    # batch 3 — PrestaShop family
+    "DYNAX": prestashop_generic.parse_search,
+    # batch 3 — WooCommerce family
+    "TATRAGOAT": woocommerce_generic.parse_search,
 }
 
 
