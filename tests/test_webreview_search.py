@@ -64,6 +64,13 @@ def test_search_result_shape_and_in_review_after_promote(client):
     assert res2["in_review"] is True and res2["idx"] == 0
 
 
+def test_search_result_includes_key_equal_paircode_for_normal_product(client):
+    """Every result carries a `key` (the pairCode-or-code identity the client re-pairs
+    by). For a normal product with a pairCode, key == pairCode."""
+    res = client.get("/api/search?q=tradition").get_json()["results"][0]
+    assert res["key"] == "425" == res["pairCode"]
+
+
 def test_search_result_carries_price_stock_state(client):
     """Manager complaint: search rows show 'almost no data'. /api/search must expose
     the entry's OUR price, summed stock and 3-state classification."""
@@ -133,6 +140,72 @@ def test_search_pair_rejects_empty_url(client):
 def test_search_pair_unknown_paircode_404(client):
     assert client.post("/api/search-pair",
                        json={"pairCode": "999", "url": "https://x.sk/"}).status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# BUG 1 end-to-end: a single-variant product with an EMPTY pairCode (čiapky/nože…) is
+# indexed by its CODE, returned by /api/search with key==code, and promoted by /api/
+# search-pair using that `key` — the promoted review entry keeps the code as key and
+# its variant_codes drive the eshop write-back (link_rows emits code;;url).
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def empty_pc_client(tmp_path, monkeypatch):
+    catalog = webapp.build_catalog_index([
+        {"code": "NUZ777", "pairCode": "", "name": "Lovecký nôž Fixed",
+         "supplier": "KNIFESTOCK", "defaultImage": "n.jpg",
+         "productVisibility": "visible", "availabilityInStock": "Skladom",
+         "price": "45", "stock": "2"},
+    ], review_keys=set())
+    monkeypatch.setattr(webapp, "CATALOG", catalog)
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"NUZ777": ""})
+    monkeypatch.setattr(webapp, "DECISIONS", str(tmp_path / "decisions.json"))
+    monkeypatch.setattr(webapp, "DATA", str(tmp_path / "review_data.json"))
+    monkeypatch.setattr(webapp, "SRC", str(tmp_path / "no_export.csv"))
+    monkeypatch.setattr(webapp, "_CODE2URL", {})
+    with open(webapp.DATA, "w", encoding="utf-8") as f:
+        json.dump([], f)
+    return webapp.app.test_client()
+
+
+def test_search_returns_empty_paircode_product_keyed_by_code(empty_pc_client):
+    r = empty_pc_client.get("/api/search?q=lovecky").get_json()["results"]
+    assert len(r) == 1
+    res = r[0]
+    assert res["key"] == "NUZ777" and res["pairCode"] == ""     # keyed by code
+    assert res["codes"] == ["NUZ777"] and res["in_review"] is False
+
+
+def test_search_pair_promotes_empty_paircode_by_key_reaches_link_rows(empty_pc_client):
+    from parovanie import import_builder
+    r = empty_pc_client.post("/api/search-pair",
+                             json={"key": "NUZ777", "url": "https://knifestock.sk/n/"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["promoted"] is True and body["key"] == "NUZ777"
+    # promoted review entry: code as key, empty pairCode, its variant_codes preserved
+    rd = json.load(open(webapp.DATA))
+    e = [p for p in rd if p["key"] == "NUZ777"][0]
+    assert e["pairCode"] == "" and e["variant_codes"] == ["NUZ777"]
+    # decision written under the code key
+    dec = json.load(open(webapp.DECISIONS))
+    assert dec["NUZ777"]["status"] == "manual"
+    # REACHES the eshop import — link_rows emits code;pairCode(empty);url
+    rows = import_builder.link_rows(webapp.PRODUCTS, dec, webapp.CODE2PAIR)
+    assert ["NUZ777", "", "https://knifestock.sk/n/"] in rows
+    # second pair: not promoted again, no duplicate entry
+    r2 = empty_pc_client.post("/api/search-pair",
+                              json={"key": "NUZ777", "url": "https://knifestock.sk/n2/"})
+    assert r2.get_json()["promoted"] is False
+    assert sum(1 for p in webapp.PRODUCTS if p["key"] == "NUZ777") == 1
+
+
+def test_search_pair_accepts_legacy_paircode_field(empty_pc_client):
+    """Back-compat: an old client sending {pairCode:<key>} still promotes (key falls
+    back to the pairCode field)."""
+    r = empty_pc_client.post("/api/search-pair",
+                             json={"pairCode": "NUZ777", "url": "https://knifestock.sk/x/"})
+    assert r.status_code == 200 and r.get_json()["key"] == "NUZ777"
 
 
 # --------------------------------------------------------------------------- #

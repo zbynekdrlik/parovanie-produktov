@@ -85,11 +85,16 @@ def _load_catalog(path, review_keys):
     return code2pair, build_catalog_index(rows, review_keys)
 
 
-# review_keys are the products' BARE pairCodes — build_catalog_index marks a catalog
-# entry in_review via `pairCode in review_keys`, and the index is grouped by bare
-# pairCode. Most review entries are keyed "SUPPLIER|pairCode" (e.g. GRUBE|425), so
-# collecting `key` here marked every such product not-in-review (C1). Collect pairCode.
-CODE2PAIR, CATALOG = _load_catalog(SRC, {p.get("pairCode") for p in PRODUCTS})
+# review_keys is the COVERAGE set that marks a catalog entry in_review. The index is
+# grouped by entry KEY = pairCode-or-code (single-variant products have an EMPTY pairCode
+# → keyed by their own code). Most review entries are keyed "SUPPLIER|pairCode" (e.g.
+# GRUBE|425), so we cannot collect `key` (C1 — every such product wrongly not-in-review).
+# We collect the BARE pairCodes PLUS every variant code; build_catalog_index marks
+# in_review via key-or-any-variant-code membership, so a single-variant reviewed product
+# (empty pairCode) still matches by its code.
+_review_cover = ({p.get("pairCode") for p in PRODUCTS if p.get("pairCode")}
+                 | {c for p in PRODUCTS for c in (p.get("variant_codes") or [])})
+CODE2PAIR, CATALOG = _load_catalog(SRC, _review_cover)
 log.info("catalog: %d products indexed (%d codes) from %s", len(CATALOG), len(CODE2PAIR), SRC)
 
 
@@ -578,19 +583,25 @@ def _save_products(products) -> None:
     os.replace(tmp, DATA)
 
 
-def _current_for_paircode(pair: str) -> dict:
+def _current_for_entry(ce: dict) -> dict:
     """Build the eshop-side `current` snapshot for a freshly paired catalog product by
-    scanning the Shoptet export for the FIRST row of its pairCode. A rare manual action,
-    so a one-off cp1250 scan is acceptable. Column mapping mirrors build_review_data's
-    current_of() call. Missing export / no matching row -> {} (the card just renders
-    without our-side state — never a 500)."""
+    scanning the Shoptet export for the FIRST matching row — matched by pairCode (when
+    the entry has one) OR by variant code (single-variant products have an EMPTY pairCode,
+    so they must be matched by their code). A rare manual action, so a one-off cp1250 scan
+    is acceptable. Column mapping mirrors build_review_data's current_of() call. Missing
+    export / no matching row -> {} (the card just renders without our-side state — never
+    a 500)."""
+    pc = (ce.get("pairCode") or "").strip()
+    codes = set(ce.get("variant_codes") or [])
     if not os.path.exists(SRC):
         return {}
     csv.field_size_limit(10**9)
     try:
         with open(SRC, encoding="cp1250", errors="replace") as f:
             for r in csv.DictReader(f, delimiter=";"):
-                if (r.get("pairCode") or "").strip() == pair:
+                rpc = (r.get("pairCode") or "").strip()
+                rc = (r.get("code") or "").strip()
+                if (pc and rpc == pc) or (rc and rc in codes):
                     # Column names + arg order MUST match build_review_data.py /
                     # resync_export.py (productVisibility — there is NO "visibility"
                     # column; reading the wrong one left vis="" so hidden/blocked
@@ -606,7 +617,7 @@ def _current_for_paircode(pair: str) -> dict:
     except (OSError, csv.Error) as e:
         # Best-effort contract: a missing/unreadable export OR a malformed row
         # (csv.Error — NUL byte / oversized field) degrades to {}, never a 500.
-        log.warning("current_for_paircode scan failed pair=%s: %r", pair, e)
+        log.warning("current_for_entry scan failed key=%s: %r", ce.get("key"), e)
     return {}
 
 
@@ -614,13 +625,12 @@ def _current_for_paircode(pair: str) -> dict:
 _CODE2URL = None
 
 
-def _our_url_for_paircode(pair: str):
+def _our_url_for_entry(ce: dict):
     """Best-effort forestshop our_url for a promoted product, from the marketing XML's
     ORIG_URL (the authoritative eshop URL) by exact variant code. Built once and cached.
     ANY failure (missing XML, parse error, scripts not importable) -> None, which is an
     acceptable result (the UI falls back to a search link)."""
     global _CODE2URL
-    ce = CATALOG.get(pair)
     if not ce or not ce.get("variant_codes"):
         return None
     if _CODE2URL is None:
@@ -645,18 +655,37 @@ def _our_url_for_paircode(pair: str):
     return None
 
 
-def _search_result(e: dict, decisions=None) -> dict:
-    """Shape one catalog entry for /api/search. idx + our_url come from the matching
-    in-review product (if any) so the UI can deep-link an already-paired item. Match by
-    pairCode — most review entries are keyed "SUPPLIER|pairCode", so a key==pairCode test
-    missed them and dropped the our_url/idx deep-link (C1).
+def _review_product_for(e: dict, by_paircode=None, by_code=None):
+    """The in-review product matching a catalog entry, if any. Match by pairCode (when the
+    entry has one) — most review entries are keyed "SUPPLIER|pairCode", so a key==pairCode
+    test missed them (C1) — ELSE by a shared variant code (single-variant products have an
+    empty pairCode, so matching an empty e["pairCode"] against PRODUCTS would wrongly hit
+    every other empty-pairCode product; match by code instead). Lookup maps are built once
+    per request by the caller."""
+    pc = e.get("pairCode")
+    if pc and by_paircode is not None:
+        p = by_paircode.get(pc)
+        if p is not None:
+            return p
+    if by_code is not None:
+        for c in e.get("variant_codes") or []:
+            p = by_code.get(c)
+            if p is not None:
+                return p
+    return None
+
+
+def _search_result(e: dict, decisions=None, by_paircode=None, by_code=None) -> dict:
+    """Shape one catalog entry for /api/search. `key` (pairCode-or-code) is the identity
+    the client re-pairs by. idx + our_url come from the matching in-review product (if
+    any) so the UI can deep-link an already-paired item.
 
     price/stock/state come from the catalog entry (the manager's "almost no data"
     complaint). `paired_url` = the in-review product's CURRENT decision URL (good/manual
     only), read under the entry's REAL key; a GRUBE product's URL is DISPLAY-normalized
     to grube.de (mirrors /api/products — storage untouched). `decisions` is loaded ONCE
     per request by the caller."""
-    p = next((x for x in PRODUCTS if x.get("pairCode") == e["pairCode"]), None)
+    p = _review_product_for(e, by_paircode, by_code)
     paired_url = None
     if p is not None and decisions is not None:
         d = decisions.get(p.get("key"))
@@ -667,6 +696,7 @@ def _search_result(e: dict, decisions=None) -> dict:
                     url = import_builder.to_grube_de(url) or url
                 paired_url = url
     return {
+        "key": e["key"],
         "pairCode": e["pairCode"],
         "name": e["name"],
         "supplier": e["supplier"],
@@ -682,59 +712,94 @@ def _search_result(e: dict, decisions=None) -> dict:
     }
 
 
+def _product_lookups():
+    """{pairCode: product}, {code: product} over PRODUCTS — built once per /api/search so
+    _search_result matches an in-review product in O(1) (by pairCode or shared code)
+    instead of scanning PRODUCTS per result. First writer wins for a shared pairCode/code
+    (single manager user — a tiny ambiguity is fine)."""
+    by_paircode: dict = {}
+    by_code: dict = {}
+    for p in PRODUCTS:
+        pc = p.get("pairCode")
+        if pc and pc not in by_paircode:
+            by_paircode[pc] = p
+        for c in (p.get("variant_codes") or []):
+            by_code.setdefault(c, p)
+    return by_paircode, by_code
+
+
 @app.route("/api/search")
 def api_search():
-    """Accent-insensitive catalog search over name / supplier / variant code (pure
-    search_catalog over the startup CATALOG). Empty/short query -> no results."""
+    """Accent-insensitive catalog search over the whole per-product blob (name / supplier
+    / codes / externalCode / description / category / manufacturer / ean / productNumber)
+    — pure search_catalog over the startup CATALOG. Empty/short query -> no results."""
     q = request.args.get("q", "")
     dec = _load_decisions()   # once per request, not per result
-    return jsonify({"results": [_search_result(e, dec) for e in search_catalog(CATALOG, q)]})
+    by_paircode, by_code = _product_lookups()
+    results = [_search_result(e, dec, by_paircode, by_code)
+               for e in search_catalog(CATALOG, q)]
+    return jsonify({"results": results})
 
 
 @app.route("/api/search-pair", methods=["POST"])
 def api_search_pair():
-    """Manually pair a catalog product to a supplier URL from the search box. If the
-    product is not yet in the review set it is PROMOTED (a minimal review_data entry
-    built from the catalog row + the export `current` snapshot + best-effort our_url),
-    appended to PRODUCTS and persisted; then a `manual` decision is recorded. The URL
-    must be http(s) (else 400); an unknown pairCode -> 404."""
+    """Manually pair a catalog product to a supplier URL from the search box. Identified
+    by `key` (the catalog entry's pairCode-or-code; legacy `pairCode` accepted as a
+    fallback). If the product is not yet in the review set it is PROMOTED (a minimal
+    review_data entry built from the catalog row + the export `current` snapshot +
+    best-effort our_url), appended to PRODUCTS and persisted; then a `manual` decision is
+    recorded. The URL must be http(s) (else 400); an unknown key -> 404."""
     body = request.get_json(silent=True) or {}
-    pair = str(body.get("pairCode") or "").strip()
+    key = str(body.get("key") or body.get("pairCode") or "").strip()
     url = str(body.get("url") or "").strip()
     # authoritative URL guard (matches /api/order-pair) — blocks javascript:/data: and
     # malformed values from reaching the import's internalNote / a CSV cell.
     if not re.match(r"^https?://", url):
         return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
-    ce = CATALOG.get(pair)
+    ce = CATALOG.get(key)
     if not ce:
-        return jsonify({"ok": False, "error": "unknown pairCode"}), 404
-    # Match an already-in-review product by pairCode — NOT by key. Most review entries are
-    # keyed "SUPPLIER|pairCode" (e.g. GRUBE|425); a key==pair test missed every such entry
-    # → it wrongly promoted a DUPLICATE bare-key entry AND wrote the decision under "425"
-    # where link_rows (which reads dec["GRUBE|425"]) never finds it, silently dropping the
-    # manager's corrected URL while the card showed a false "napárované ✓" (C1).
-    in_review = any(p.get("pairCode") == pair for p in PRODUCTS)
+        return jsonify({"ok": False, "error": "unknown key"}), 404
+    # Match an already-in-review product by pairCode (when the entry has one) OR by a
+    # shared variant code. Most review entries are keyed "SUPPLIER|pairCode" (e.g.
+    # GRUBE|425); a key==entry test missed every such entry → it wrongly promoted a
+    # DUPLICATE entry AND wrote the decision under a key link_rows never reads, silently
+    # dropping the manager's corrected URL (C1). Single-variant products (empty pairCode)
+    # match by code — an empty-pairCode == test would collide with every other such item.
+    pc = (ce.get("pairCode") or "").strip()
+    entry_codes = set(ce.get("variant_codes") or [])
+
+    def _find_existing():
+        for p in PRODUCTS:
+            if pc and p.get("pairCode") == pc:
+                return p
+            if entry_codes & set(p.get("variant_codes") or []):
+                return p
+        return None
+
+    in_review = _find_existing() is not None
     # The two heavy read-only scans (55 MB cp1250 export + 59 MB marketing XML) depend
-    # ONLY on `pair`, never on mutable state → compute them OUTSIDE the lock so a promote
-    # never stalls every other write endpoint for seconds. Needed only when promoting a
-    # genuinely NEW catalog product; an existing entry just gets its decision rewritten.
+    # ONLY on the catalog entry, never on mutable state → compute them OUTSIDE the lock so
+    # a promote never stalls every other write endpoint for seconds. Needed only when
+    # promoting a genuinely NEW catalog product; an existing entry just gets its decision
+    # rewritten.
     if not in_review:
-        snapshot = _current_for_paircode(pair)
-        our_url = _our_url_for_paircode(pair)
+        snapshot = _current_for_entry(ce)
+        our_url = _our_url_for_entry(ce)
         supplier = supplier_from_url(url, config.SUPPLIERS)
     with _lock:
         # re-check under the lock (append-only store → monotonic; a tiny TOCTOU on
-        # concurrent same-pair promotes is fine — single manager user — and this dedups)
-        existing = next((p for p in PRODUCTS if p.get("pairCode") == pair), None)
+        # concurrent same-key promotes is fine — single manager user — and this dedups)
+        existing = _find_existing()
         if existing is None:
             entry = build_promoted_entry(ce, snapshot, our_url, supplier, len(PRODUCTS))
             PRODUCTS.append(entry)
             _save_products(PRODUCTS)
             ce["in_review"] = True   # keep the catalog snapshot consistent for re-search
-            target_key = pair        # promoted entry's key == pair (self-consistent)
+            target_key = entry["key"]  # promoted entry's key == pairCode-or-code
             promoted = True
             log.info("search-pair promoted key=%s supplier=%s codes=%d our_url=%s",
-                     pair, entry["supplier"], len(entry["variant_codes"]), entry["our_url"])
+                     target_key, entry["supplier"], len(entry["variant_codes"]),
+                     entry["our_url"])
         else:
             target_key = existing["key"]   # write under the REAL key (e.g. GRUBE|425)
             promoted = False

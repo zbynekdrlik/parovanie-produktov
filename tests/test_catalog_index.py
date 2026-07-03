@@ -37,9 +37,32 @@ def test_build_groups_by_paircode_and_collects_codes():
     assert cat["425"]["supplier"] == "GRUBE"
 
 
-def test_build_skips_rows_without_code_or_paircode():
-    rows = [_row("", "512", "x"), _row("4931/S", "", "x")]
-    assert build_catalog_index(rows) == {}
+def test_build_skips_rows_without_code_but_keeps_empty_paircode():
+    """BUG 1: a row with NO code carries nothing (code is the variant id AND the
+    fallback key) → skip. But an empty-pairCode row WITH a code is a valid
+    single-variant product (čiapky/nože/svietidlá) → it IS indexed now, keyed by its
+    code. (Old code dropped every empty-pairCode row → 2722 products missing.)"""
+    # no code → skipped, even with a pairCode present
+    assert build_catalog_index([_row("", "512", "x")]) == {}
+    # code present, pairCode empty → indexed under the code (was wrongly dropped)
+    cat = build_catalog_index([_row("4931/S", "", "x")])
+    assert set(cat) == {"4931/S"} and cat["4931/S"]["pairCode"] == ""
+
+
+def test_empty_paircode_single_variant_product_indexed_and_searchable():
+    """BUG 1 (the biggest — 'všetky produkty'): single-variant products have an EMPTY
+    pairCode in the Shoptet export and were dropped from the index. Now keyed by their
+    own variant code → present AND findable by name."""
+    cat = build_catalog_index([_row("CIAP123", "", "Čiapka Merino Zimná")])
+    assert "CIAP123" in cat                       # keyed by its code (pairCode is '')
+    e = cat["CIAP123"]
+    assert e["key"] == "CIAP123" and e["pairCode"] == ""
+    assert e["variant_codes"] == ["CIAP123"]
+    assert [x["key"] for x in search_catalog(cat, "merino")] == ["CIAP123"]
+    # does NOT collide with a normal pairCode product in the same index
+    cat2 = build_catalog_index([_row("CIAP123", "", "Čiapka Merino Zimná"),
+                                _row("4931/S", "512", "Mikina GARDE")])
+    assert set(cat2) == {"CIAP123", "512"}
 
 
 def test_in_review_keyed_by_bare_paircode_not_composite_key():
@@ -182,13 +205,60 @@ def test_search_multiword_order_independent_is_the_core_regression():
     assert "1" in [e["pairCode"] for e in b]
 
 
-def test_search_word_boundary_noz_is_knife_not_socks():
-    """'noz'/'nôž' returns the KNIFE, never the SOCKS — 'ponozky' CONTAINS 'noz' but
-    does not START a word with it, so word-boundary matching excludes it (old bug)."""
+def test_search_noz_ranks_knife_first_socks_after():
+    """NEW behaviour (BUG 2 fix): 'noz'/'nôž' now FINDS by substring, but RANKS the
+    knife FIRST — 'noz' is a WHOLE WORD of the knife's name (tier 5) yet only a mid-word
+    substring inside 'ponozky' for the socks (tier 3). The knife therefore ranks above
+    the socks. (Old word-boundary search dropped the socks entirely; the new design
+    keeps every substring hit but orders by relevance, so nothing is 'never found'.)"""
     for q in ("noz", "nôž"):
         codes = [e["pairCode"] for e in search_catalog(_search_cat(), q)]
-        assert "2" in codes, f"{q!r} must find the knife"
-        assert "3" not in codes, f"{q!r} must NOT return socks (ponozky)"
+        assert codes[0] == "2", f"{q!r} must rank the knife first, got {codes}"
+        if "3" in codes:                          # socks may appear — but only AFTER
+            assert codes.index("2") < codes.index("3")
+
+
+def test_search_substring_midword_finds_deerhunter():
+    """BUG 2 ('nikdy nič nevyhľadá'): 'hunter' finds 'Deerhunter …' — a substring in the
+    MIDDLE of a word, which the old whole-word/prefix matching missed entirely (returned
+    []). RED on the old code, GREEN after."""
+    cat = build_catalog_index([_row("DH1", "80", "Bunda Deerhunter Muflon")])
+    assert [e["pairCode"] for e in search_catalog(cat, "hunter")] == ["80"]
+
+
+def test_search_finds_by_externalcode_and_description_not_in_name():
+    """BUG 3 ('hľadať všetko nie len názov'): a product whose NAME does not contain the
+    query but whose externalCode / description / manufacturer / category does → is FOUND.
+    Old search only looked at name/supplier/code → these returned []."""
+    rows = [{"code": "X1", "pairCode": "50", "name": "Lampáš Petromax",
+             "supplier": "WETLAND", "externalCode": "AH5",
+             "shortDescription": "kempingové svietidlo",
+             "description": "Odolný benzínový lampáš pre outdoor.",
+             "manufacturer": "Petromax GmbH", "categoryText": "Svietidlá / Lampáše"}]
+    cat = build_catalog_index(rows)
+    assert [e["pairCode"] for e in search_catalog(cat, "ah5")] == ["50"]          # externalCode
+    assert [e["pairCode"] for e in search_catalog(cat, "benzinovy")] == ["50"]    # description word
+    assert [e["pairCode"] for e in search_catalog(cat, "kempingove")] == ["50"]   # shortDescription
+    assert [e["pairCode"] for e in search_catalog(cat, "svietidla")] == ["50"]    # category
+    # a word present in NONE of the searchable fields still returns nothing
+    assert search_catalog(cat, "nonexistentxyz") == []
+
+
+def test_search_ranking_wholeword_then_name_substring_then_description_only():
+    """RANKING (not tautological): the query is a WHOLE WORD of one name, a mid-word
+    SUBSTRING of a second name, and ONLY in a third's description → all three are FOUND
+    (substring gate) and ordered name-whole-word > name-substring > description-only."""
+    rows = [
+        {"code": "K1", "pairCode": "1", "name": "Poľovnícky nôž", "supplier": "S"},
+        {"code": "K2", "pairCode": "2", "name": "Pánske ponožky", "supplier": "S"},
+        {"code": "K3", "pairCode": "3", "name": "Puzdro na opasok", "supplier": "S",
+         "description": "Vhodné na prenášanie noža a doplnkov."},
+    ]
+    cat = build_catalog_index(rows)
+    codes = [e["pairCode"] for e in search_catalog(cat, "noz")]
+    assert set(codes) == {"1", "2", "3"}          # all three FOUND
+    assert codes[0] == "1"                        # whole-word name ranks first
+    assert codes.index("2") < codes.index("3")    # name-substring before description-only
 
 
 def test_search_by_code_substring_still_works():
