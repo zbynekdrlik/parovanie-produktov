@@ -516,7 +516,7 @@ function searchBadge(res) {
 // compact result row: thumb · name/meta/our-link · badge, with an inline panel below
 function renderSearchRow(res) {
   const row = el('div', 'search-row');
-  row.dataset.key = res.pairCode;
+  row.dataset.key = res.key;   // pairCode-or-code identity (empty-pairCode products keyed by code)
 
   const head = el('div', 'srch-head');
   const thumb = el('div', 'srch-thumb');
@@ -588,10 +588,13 @@ function openSearchRow(res, panel, badge, link) {
   if (!panel.hidden) { panel.hidden = true; panel.innerHTML = ''; return; }   // toggle closed
   panel.innerHTML = '';
   if (res.in_review) {
-    // match by pairCode, NOT key — most review entries are keyed "SUPPLIER|pairCode"
-    // (e.g. GRUBE|425), so a key===pairCode lookup missed them and wrongly opened the
-    // manual-promote panel instead of the existing candidates panel (C1)
-    const product = PRODUCTS.find(p => p.pairCode === res.pairCode);
+    // match by pairCode (when the result has one) OR by a shared variant code — most
+    // review entries are keyed "SUPPLIER|pairCode" (e.g. GRUBE|425), so a key===key
+    // lookup missed them and wrongly opened the manual-promote panel (C1); a
+    // single-variant product (empty pairCode) is matched by its code instead.
+    const product = PRODUCTS.find(p =>
+      (res.pairCode && p.pairCode === res.pairCode) ||
+      (p.variant_codes || []).some(c => (res.codes || []).includes(c)));
     // FULL review card (obrázky, náš stav/cena, stav párovania, decision buttony) —
     // holý resolutionPanel ukazoval „skoro žiadne údaje". saveDecision→render() na
     // search tabe early-returnuje (#searchResults ostáva), karta sa len live-nerefreshne
@@ -620,7 +623,7 @@ function manualPairPanel(res, panel, badge, link) {
     try {
       r = await fetch('/api/search-pair', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ pairCode: res.pairCode, url: v })
+        body: JSON.stringify({ key: res.key, url: v })
       });
     } catch (_) { save.disabled = false; return; }
     if (!r.ok) { save.disabled = false; return; }
