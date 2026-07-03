@@ -24,7 +24,28 @@ Veľa dodávateľov beží na rovnakej platforme → namiesto nového súboru na
 | `woocommerce_generic.parse_search` | WooCommerce | LOVTEK (lovtek.sk), PYRA (pyra.eu) | `?s=<q>&post_type=product`. **DUAL MODE**: 1 presná zhoda → WooCommerce 301 na detail (`og:type=product`/`body.single-product`) → vráť 1 kandidáta z canonical+h1; inak scope `div.products` |
 | `fomei.parse_search` | custom ASP.NET | FOMEI SLOVAKIA (fomei.com) | **`?ProductsSearch=` NIE `?search=`** (search je decoy → celý katalóg). scope `div.boxPl`, karta `div.plWrap[data-shop-product]`, link `a[href*="-detail-"]`, názov `h2.plWrapTitle` |
 
+### Batch 3 (2026-07-03): 8 ďalších dodávateľov cez zdieľané parsery (žiadny nový kód)
+
+Rovnaký vzor — len `config.SUPPLIERS` + `client.PARSERS`. Kľúč = export supplier `.upper()` (`load_rows`+`client` oba upper-case; accented `JŠ SERVIS`/`CHOCOLENKA` zachované). **Shoptet SK cesta `/vyhladavanie/`, CZ `/vyhledavani/`** — použi správnu podľa domény (zlá = 404).
+
+| Parser | Dodávateľ (export) | eshop | search |
+|---|---|---|---|
+| shoptet_generic | JŠ SERVIS | chiruca.sk (SK, distribútor CHIRUCA — páruj podľa MODELU: TORCAZ, SPANIEL…) | `/vyhladavanie/?string=` |
+| shoptet_generic | HUNTING24 | hunting24.cz (CZ, PARD/Alpina) | `/vyhledavani/?string=` |
+| shoptet_generic | CITRADE | citrade.cz (CZ) | `/vyhledavani/?string=` |
+| shoptet_generic | SOXLAND | soxland.sk | `/vyhladavanie/?string=` |
+| shoptet_generic | WERRA | werra.cz (CZ) | `/vyhledavani/?string=` |
+| shoptet_generic | RUTEX | **termovel.sk** (značka TERMOVEL) | `/vyhladavanie/?string=` |
+| shoptet_generic | CHOCOLENKA | chocolenka.cz **/sk/** (SK verzia) | `/sk/vyhladavanie/?string=` |
+| woocommerce_generic | TATRAGOAT | tatragoat.sk (téma Extra/Divi → grid `ul.products`) | `?s=<q>&post_type=product` |
+
+- **`woocommerce_generic` fix (batch 3):** scope teraz `ul.products` OR `div.products` (Divi/Extra téma dáva kánonický `ul.products.columns-N`, starý parser ho míňal). LOVTEK/PYRA regression-clean (majú 0× `ul.products` → fallthrough).
+- **DYNAX** (dynax.sk, PrestaShop, `?controller=search&search_query=`): config pridaný, ale eshop bol v ÚDRŽBE (503) → chýba fixtúra + live-overenie selektora → issue #76.
+- Výsledok batch 3: gather 154 kandidátov → AI verify **113 matched** (prísne) → merge do review (2576→2730). ORBIS/HABO OBUV bez verejného eshopu → #75 (ako Hunting & Fishing #58).
+
 Hunting & Fishing (49 produktov) **vynechaný — nemá verejný eshop** (gmail veľkoobchod), viď #58.
+
+**FMS TRADE (6 produktov) = „Poľovníctvo Komár" na `polovnictvokomar.sk`** (FMS Trade s.r.o., Snina, IČO 48262927; NIE `fmstrade.sk` = iná firma, hliníkové odliatky). Platforma WooCommerce (WordPress). **POZOR — celý FRONT-END je za pluginom „UnderConstructionPage"**: `/`, `/shop/`, `/produkt/<slug>/` aj WooCommerce `?s=` search vracajú len 2.9 KB placeholder „Na stránke sa pracuje" → **zdieľaný `woocommerce_generic` (HTML `?s=`) tu NEFUNGUJE**, verejný eshop reálne zavretý. **ALE WooCommerce Store REST API je otvorené** (plugin `/wp-json/` negatuje): `GET /wp-json/wc/store/products?search=<q>&per_page=100` vracia JSON (name, sku, permalink `/produkt/…`, prices.price v centoch, images). Search **PODĽA MODELU/kódu, NIE značky** — `search=Grisport` → `[]`, `search=Cadria`/`Quatro` → presná zhoda (názvy sú `12811-33, Cadria`). Len ~46 produktov (väčšinou HIKMICRO termovízia + pár Grisport). Ak by sa robil parser: custom JSON fetch na REST, nie HTML. Zatiaľ `has_public_eshop=false` (zákazník sa naň nedostane).
 
 **Dávkový postup (recon → build → gather → verify → merge):** recon 10 dodávateľov paralelne (Workflow, web research + curl) → postav 4 platform-parsery + fixtúry + testy → `gather_supplier.py SUPPLIER data/out_<slug>` paralelne (rôzne hosty) → `build_verify_input.py` → AI overenie (Workflow, dávky ~28, **prísne — URL kŕmi auto-objednávku, -1 radšej než zlý link**) → zlúč verdikty do `ai_verdicts.json` → `add_supplier_review_data.py data/out_<slug>` sekvenčne → `url_from_marketing_xml.py` → restart. Výsledok: 808 produktov, 457 AI-matched, zvyšok do ručného review poolu.
 > **Bash gotcha pri zber-driveri:** `local slug="$1" out="data/out_$slug"` v JEDNOM `local` → `$slug` ešte NIE je viditeľný pri `out=` → prázdny slug, všetky zbery do `data/out_` (poprepisujú sa). Daj `out=` na samostatný `local`.
