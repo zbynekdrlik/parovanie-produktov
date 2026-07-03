@@ -15,6 +15,9 @@ from parovanie.suppliers import (
     prestashop_generic,
     woocommerce_generic,
     fomei,
+    kabernet_generic,
+    magento_generic,
+    opencart_generic,
 )
 
 log = logging.getLogger("parovanie.client")
@@ -51,6 +54,10 @@ PARSERS: dict[str, Callable[[str, str], list[Candidate]]] = {
     "DYNAX": prestashop_generic.parse_search,
     # batch 3 — WooCommerce family
     "TATRAGOAT": woocommerce_generic.parse_search,
+    # batch 3b — new platforms, new parsers
+    "ROSLER": kabernet_generic.parse_search,   # Kabernet CMS (ASP.NET)
+    "RAPPA.CZ": magento_generic.parse_search,  # Magento 1.x
+    "MÁZI HUNT": opencart_generic.parse_search,  # OpenCart
 }
 
 

@@ -167,6 +167,34 @@ SUPPLIERS: dict[str, SupplierConfig] = {
         base_url="https://tatragoat.sk",
         search_url_template="https://tatragoat.sk/?s={q}&post_type=product",
     ),
+    # --- batch 3b: 3 new suppliers, each on a NEW platform + new parser (recon
+    # 2026-07-03). Config keys are the export ``supplier`` string upper-cased
+    # (load_rows / client both upper() before lookup): "Rappa.cz" -> "RAPPA.CZ",
+    # "Mázi Hunt" -> "MÁZI HUNT" (Python .upper() keeps accents in place), "ROSLER".
+    # Kabernet CMS (ASP.NET). Static HTML, no cookies. Sells Victorinox knives;
+    # forestshop name carries the Victorinox CODE, ROSLER name differs → pair by
+    # code downstream (AI verify). See suppliers/kabernet_generic.py.
+    "ROSLER": SupplierConfig(
+        name="ROSLER",
+        base_url="https://www.rosler.sk",
+        search_url_template="https://www.rosler.sk/produkty?q={q}",
+    ),
+    # Magento 1.x. Static HTML; the search param is ?q= (NOT ?string=). See
+    # suppliers/magento_generic.py.
+    "RAPPA.CZ": SupplierConfig(
+        name="RAPPA.CZ",
+        base_url="https://www.rappa.cz",
+        search_url_template="https://www.rappa.cz/sk/catalogsearch/result/?q={q}",
+    ),
+    # OpenCart. Static HTML 200 but cookie-gated (PHPSESSID) → the SearchClient's
+    # homepage warm-up handles it. Hungarian shop (HUF); the code M-xxx-xxxx is the
+    # join key. Product URLs carry a ?search= tracking param → stripped by the
+    # parser. See suppliers/opencart_generic.py.
+    "MÁZI HUNT": SupplierConfig(
+        name="MÁZI HUNT",
+        base_url="https://wildzone.eu",
+        search_url_template="https://wildzone.eu/index.php?route=product/search&search={q}",
+    ),
 }
 
 USER_AGENT = (
