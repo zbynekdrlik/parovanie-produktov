@@ -1,4 +1,4 @@
-"""Generic PrestaShop 1.7 search-result parser shared by several suppliers.
+"""Generic PrestaShop search-result parser shared by several suppliers (1.7 + 1.6).
 
 PrestaShop 1.7 (the same family as ``wetland.py``) renders fulltext search
 results server-side inside ``#js-product-list`` as ``article.product-miniature``
@@ -12,10 +12,17 @@ The result URLs carry a ``#/<id>-<attr>`` default-variant fragment (e.g.
 product appears once regardless of which variant the page pre-selected, and we
 scope STRICTLY to ``#js-product-list`` so the header search autocomplete, nav,
 and cross-sell carousels are never scraped (a wrong link feeds auto-ordering).
+
+PrestaShop **1.6** (HUNTINGLAND, huntingland.sk) uses DIFFERENT markup: the
+results grid is ``#product_list`` / ``.product_list``, cards are
+``div.product-container``, and the link+name is a single ``a.product-name`` (with
+a ``title`` attribute; the href carries a ``?search_query=…&results=N`` tracking
+query that we strip). ``parse_search`` tries 1.7 first and falls back to the 1.6
+branch only when no 1.7 grid is present, so 1.7 behaviour is untouched.
 """
 from __future__ import annotations
 
-from urllib.parse import urldefrag, urljoin
+from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -33,22 +40,72 @@ _TITLE_SELECTORS = (
 )
 
 
-def parse_search(html: str, base_url: str) -> list[Candidate]:
-    """Parse a PrestaShop 1.7 search page → product Candidates.
+def _clean_url(href: str, base_url: str) -> str | None:
+    """Resolve ``href`` against ``base_url``, drop the ``#`` fragment, and enforce
+    the ``base_url + "/"`` host boundary. Returns ``None`` for empty / off-host."""
+    href = (href or "").strip()
+    if not href:
+        return None
+    url, _ = urldefrag(urljoin(base_url + "/", href))
+    if not url.startswith(base_url + "/"):
+        return None
+    return url
 
-    Scopes to ``#js-product-list`` (falling back to ``.products``, the results
-    grid) — without a recognizable grid we return ``[]`` rather than scrape the
-    whole page, because a wrong link feeds auto-ordering. Each
-    ``article.product-miniature`` yields one Candidate: the product detail URL
-    (any ``#`` variant fragment stripped) and the name from the first matching
-    title selector (falling back to the anchor's ``img[alt]``). Deduplicated by URL.
-    """
-    soup = BeautifulSoup(html, "lxml")
-    # The results grid MUST be present; degrade to no results rather than scrape
-    # nav / autocomplete / cross-sell links scattered across the page.
-    scope = soup.select_one("#js-product-list") or soup.select_one(".products")
+
+def _strip_query(url: str) -> str:
+    """Drop a ``?query`` (PS-1.6 appends ``?search_query=…&results=N`` tracking
+    params to result hrefs) so the same product maps to one stable URL."""
+    p = urlsplit(url)
+    return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+
+
+def _parse_16(soup: BeautifulSoup, base_url: str) -> list[Candidate]:
+    """PrestaShop **1.6** fallback: ``#product_list``/``.product_list`` grid,
+    ``div.product-container`` cards, ``a.product-name`` link+name. The 1.6 result
+    hrefs carry a ``?search_query=…`` tracking query → stripped for a stable URL.
+    Returns ``[]`` if the 1.6 grid is absent (never scrape the whole page)."""
+    scope = soup.select_one("#product_list") or soup.select_one(".product_list")
     if scope is None:
         return []
+    out: list[Candidate] = []
+    seen: set[str] = set()
+    for card in scope.select("div.product-container"):
+        a = card.select_one("a.product-name[href]") or card.select_one("a.product-name")
+        if not a:
+            continue
+        url = _clean_url(a.get("href") or "", base_url)
+        if url is None:
+            continue
+        url = _strip_query(url)
+        if url in seen:
+            continue
+        seen.add(url)
+        name = a.get_text(strip=True) or (a.get("title") or "").strip()
+        if not name:
+            img = card.select_one("img[alt]")
+            name = ((img.get("alt") if img else "") or "").strip()
+        out.append(Candidate(name=name, url=url))
+    return out
+
+
+def parse_search(html: str, base_url: str) -> list[Candidate]:
+    """Parse a PrestaShop search page (1.7, else 1.6) → product Candidates.
+
+    Tries the **1.7** markup first: scopes to ``#js-product-list`` (falling back
+    to ``.products``); each ``article.product-miniature`` yields one Candidate —
+    the product detail URL (any ``#`` variant fragment stripped) and the name from
+    the first matching title selector (falling back to ``img[alt]``). If no 1.7
+    grid is present, falls back to the **1.6** branch (``#product_list`` /
+    ``div.product-container`` / ``a.product-name``, with the 1.6 tracking query
+    stripped). If neither markup is recognized, returns ``[]`` rather than scrape
+    the whole page — a wrong link feeds auto-ordering. Deduplicated by URL.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    # 1.7 grid MUST be present for the 1.7 path; degrade to the 1.6 fallback rather
+    # than scrape nav / autocomplete / cross-sell links scattered across the page.
+    scope = soup.select_one("#js-product-list") or soup.select_one(".products")
+    if scope is None:
+        return _parse_16(soup, base_url)
 
     out: list[Candidate] = []
     seen: set[str] = set()
@@ -60,13 +117,8 @@ def parse_search(html: str, base_url: str) -> list[Candidate]:
                 break
         if a is None:
             continue
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
-        url, _ = urldefrag(urljoin(base_url + "/", href))
-        # host-boundary: ``base_url + "/"`` so a look-alike host cannot satisfy a
-        # bare prefix match, and an off-site sponsored card is skipped.
-        if not url.startswith(base_url + "/") or url in seen:
+        url = _clean_url(a.get("href") or "", base_url)
+        if url is None or url in seen:
             continue
         seen.add(url)
         name = a.get_text(strip=True)

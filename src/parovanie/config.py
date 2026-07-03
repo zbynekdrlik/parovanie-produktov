@@ -195,6 +195,47 @@ SUPPLIERS: dict[str, SupplierConfig] = {
         base_url="https://wildzone.eu",
         search_url_template="https://wildzone.eu/index.php?route=product/search&search={q}",
     ),
+    # --- batch 3c: 4 new suppliers (recon 2026-07-03). Three are the first on their
+    # platform → new parser modules; HUNTINGLAND extends the PrestaShop generic with a
+    # 1.6 fallback branch. Config keys are the export ``supplier`` string upper-cased
+    # (load_rows / client both upper() before lookup).
+    # flox.sk platform (vevo.flox.sk CDN, SSID cookie → homepage warm-up). Static SSR;
+    # scope to div.productListSearch (the raw page has a cross-sell /p- carousel).
+    # See suppliers/flox_generic.py.
+    "ROY": SupplierConfig(
+        name="ROY",
+        base_url="https://www.roy.sk",
+        search_url_template="https://www.roy.sk/e/search?word={q}",
+    ),
+    # PrestaShop **1.6** (different markup than the 1.7 suppliers → prestashop_generic
+    # has a 1.6 fallback branch). Static HTML, no warm-up needed; ?search_query= is the
+    # real search param (?s= with a full model string returns 0 results).
+    "HUNTINGLAND": SupplierConfig(
+        name="HUNTINGLAND",
+        base_url="https://www.huntingland.sk",
+        search_url_template="https://www.huntingland.sk/vyhladavanie?search_query={q}",
+    ),
+    # WordPress + **Jigoshop** plugin (NOT WooCommerce → new parser). Cookie-gated
+    # (PHPSESSID) → homepage warm-up. GOTCHA: the BARE ?s= is the real search — adding
+    # &post_type=product is a decoy that returns the whole catalogue. Czech shop (query
+    # in Czech). See suppliers/jigoshop_generic.py.
+    "KOZAP": SupplierConfig(
+        name="KOZAP",
+        base_url="https://www.kozap.cz",
+        search_url_template="https://www.kozap.cz/?s={q}",
+    ),
+    # Custom SPA + JSON REST API (NOT HTML → new parser). The search endpoint returns
+    # JSON {"products":[{id,name,seoName,code,...}]}; the parser json.loads it and
+    # builds URLs https://shop.malfini.com/sk/sk/product/<seoName>. Search matches by
+    # model-name/code only (generic words → 0). See suppliers/malfini.py.
+    "MALFINI": SupplierConfig(
+        name="MALFINI",
+        base_url="https://shop.malfini.com",
+        search_url_template=(
+            "https://shop.malfini.com/api/v4/search/autocomplete"
+            "?query={q}&_country=sk&_language=sk"
+        ),
+    ),
 }
 
 USER_AGENT = (
