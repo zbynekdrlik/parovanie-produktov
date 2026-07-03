@@ -18,6 +18,9 @@ from parovanie.suppliers import (
     kabernet_generic,
     magento_generic,
     opencart_generic,
+    flox_generic,
+    jigoshop_generic,
+    malfini,
 )
 
 log = logging.getLogger("parovanie.client")
@@ -58,6 +61,11 @@ PARSERS: dict[str, Callable[[str, str], list[Candidate]]] = {
     "ROSLER": kabernet_generic.parse_search,   # Kabernet CMS (ASP.NET)
     "RAPPA.CZ": magento_generic.parse_search,  # Magento 1.x
     "MÁZI HUNT": opencart_generic.parse_search,  # OpenCart
+    # batch 3c — 3 new platforms/parsers + HUNTINGLAND on the PS-1.6 generic branch
+    "ROY": flox_generic.parse_search,          # flox.sk platform
+    "HUNTINGLAND": prestashop_generic.parse_search,  # PrestaShop 1.6 (fallback branch)
+    "KOZAP": jigoshop_generic.parse_search,    # WordPress + Jigoshop
+    "MALFINI": malfini.parse_search,           # custom SPA + JSON REST API
 }
 
 
