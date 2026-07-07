@@ -89,6 +89,10 @@ In-app verzia manuálneho promote vyššie — manažér nájde a napáruje prod
 
 To-order flagy píšu do živých stores. Pri overovaní na živom webe **toggluj on→off** (skonči v pôvodnom stave) a potom over `data/out/<store>.json` že je zase `{}` (resp. pôvodný počet) — nikdy nenechaj reálnu objednávku označenú z testu.
 
+## Gotcha — `.card{display:grid}` deti potrebujú `min-width:0`, inak sa button „stratí" na úzkom displeji
+
+`.card` je CSS Grid (`grid-template-columns:1fr 1fr`, mobil `1fr`). Grid ITEM (`.side.left`/`.side.right`) má bez `min-width:0` automatickú minimálnu šírku = min-content jeho OBSAHU — dlhý nezalomiteľný text (candidate name, URL) v `.manualrow`/`.cand` vnútri vie natiahnuť grid TRACK ďaleko za viewport; `.card` samo zostane správne úzke (`overflow:hidden`), ale JEHO VNÚTRO pretečie a zelené tlačidlo („Uložiť URL"/„Vybrať") skončí v odrezanej oblasti — neviditeľné a neklikateľné (#82). Samotné `flex-wrap`/`min-width:0` na `.manualrow`/`.cand` NESTAČÍ, ak `.side` sám o sebe nemá `min-width:0` — fix musí byť na GRID ITEME (`.side{min-width:0}`), flex-level úpravy sú len defense-in-depth. **Krátky test fixture (krátky názov/URL) bug NEREPRODUKUJE** — nič sa nemusí zmenšovať, takže RED nikdy nenastane; na overenie/regression e2e treba REALISTICKY DLHÝ obsah (skutočná dĺžka candidate name + supplier URL). Diagnostika: `page.evaluate("el => ({sw: el.scrollWidth, cw: el.clientWidth})")` na `.card`/`.side.*` — `scrollWidth > clientWidth` = vnútri pretieklo.
+
 ## Gotcha — `gh pr edit` / `gh issue edit` na tomto repo ZLYHÁ (classic Project)
 
 Repo má pripojený classic GitHub Project → `gh pr edit`/`gh issue edit` GraphQL mutácia padá na `Projects (classic) is being deprecated … (repository.pullRequest.projectCards)` a **nič nezmení** (titulok/telo ostanú staré). Použi REST:
