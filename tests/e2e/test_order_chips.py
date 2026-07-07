@@ -51,3 +51,34 @@ def test_order_supplier_chips_colour_by_resolved_state(page, live_server):
         # Restore the shared session store — never leave the fixture line flagged.
         page.request.post(live_server + "/api/instock",
                           data={"key": ORBIS_KEY, "instock": False})
+
+
+def test_order_chip_recolours_live_when_manager_flags_a_line(page, live_server):
+    """The manager's real action: click a line's flag button IN-SESSION (no reload) →
+    the supplier chip must recolour immediately. This guards the #86 core promise; the
+    seed-before-load test above cannot (it never drives the UI toggle)."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+    try:
+        page.goto(live_server + "/?tab=toorder")
+        page.wait_for_selector(".toorder-row")
+
+        orbis = _chip(page, "ORBIS")
+        assert "todo" in (orbis.get_attribute("class") or ""), "ORBIS starts un-flagged (green)"
+
+        # Click ORBIS's only line's '✓ Skladom' button — the exact manager action.
+        page.locator(".toorder-row[data-code='77/X'] .to-instock").click()
+
+        # The chip must flip to done (red) WITHOUT any page reload.
+        page.wait_for_function(
+            "() => { const b=[...document.querySelectorAll('#filters button')]"
+            ".find(x=>/ORBIS/.test(x.textContent)); return b && b.className.includes('done'); }",
+            timeout=3000)
+        orbis = _chip(page, "ORBIS")
+        assert "done" in (orbis.get_attribute("class") or ""), "ORBIS chip should recolour to done live"
+
+        assert console == [], f"console not clean: {console}"
+    finally:
+        page.request.post(live_server + "/api/instock",
+                          data={"key": ORBIS_KEY, "instock": False})
