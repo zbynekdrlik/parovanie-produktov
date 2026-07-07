@@ -124,6 +124,29 @@ def test_unavailable_endpoint_persists(monkeypatch, tmp_path):
     assert "20261045|61247/L" not in c.get("/api/unavailable").get_json()["unavailable"]
 
 
+def test_instock_unavailable_reject_missing_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "instock.json"))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "unavail.json"))
+    c = _client()
+    # a POST with no key must 400, never write a "None"/"" key into the store
+    assert c.post("/api/instock", json={"instock": True}).status_code == 400
+    assert c.post("/api/unavailable", json={"unavailable": True}).status_code == 400
+    assert c.get("/api/instock").get_json()["instock"] == {}
+    assert c.get("/api/unavailable").get_json()["unavailable"] == {}
+
+
+def test_instock_unavailable_tolerate_corrupt_store(monkeypatch, tmp_path):
+    # a hand-corrupted flag store must not 500 the loader (mirrors _load_notes)
+    isf = tmp_path / "instock.json"
+    isf.write_text("{ this is not json", encoding="utf-8")
+    unf = tmp_path / "unavail.json"
+    unf.write_text("[]", encoding="utf-8")  # wrong type
+    monkeypatch.setattr(webapp, "INSTOCK", str(isf))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(unf))
+    assert webapp._load_instock() == {}
+    assert webapp._load_unavailable() == {}
+
+
 def test_orders_route_merges_instock_and_unavailable(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
               "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")

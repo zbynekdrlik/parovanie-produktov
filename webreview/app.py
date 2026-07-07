@@ -184,10 +184,12 @@ UNAVAIL = os.path.join(OUT, "unavailable_items.json")
 
 
 def _load_instock() -> dict:
-    if os.path.exists(INSTOCK):
+    try:
         with open(INSTOCK, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_instock(d: dict) -> None:
@@ -198,10 +200,12 @@ def _save_instock(d: dict) -> None:
 
 
 def _load_unavailable() -> dict:
-    if os.path.exists(UNAVAIL):
+    try:
         with open(UNAVAIL, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_unavailable(d: dict) -> None:
@@ -921,7 +925,9 @@ def api_instock():
     if request.method == "GET":
         return jsonify({"instock": _load_instock()})
     body = request.get_json(force=True)
-    key = str(body.get("key"))
+    key = str(body.get("key") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "error": "key required"}), 400
     instock = bool(body.get("instock"))
     with _lock:
         d = _load_instock()
@@ -941,7 +947,9 @@ def api_unavailable():
     if request.method == "GET":
         return jsonify({"unavailable": _load_unavailable()})
     body = request.get_json(force=True)
-    key = str(body.get("key"))
+    key = str(body.get("key") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "error": "key required"}), 400
     unavailable = bool(body.get("unavailable"))
     with _lock:
         d = _load_unavailable()
