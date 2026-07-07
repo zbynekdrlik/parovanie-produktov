@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zipfile
 from urllib.parse import urljoin
 
@@ -171,6 +172,68 @@ def _save_waiting(d: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
     os.replace(tmp, WAITING)
+
+
+# Per-line "skladom" / "nedostupné" flags (key='<orderCode>|<itemCode>') — two more
+# independent to-order markers, same shape as ordered/waiting. "skladom" = we already
+# have it in stock / it's been restocked; "nedostupné" = the supplier can't deliver it.
+# The manager toggles each on its own; a row can carry any combination. Same safe
+# gitignored stores; NEVER pruned → survive deploy.
+INSTOCK = os.path.join(OUT, "instock_items.json")
+UNAVAIL = os.path.join(OUT, "unavailable_items.json")
+
+
+def _load_instock() -> dict:
+    if os.path.exists(INSTOCK):
+        with open(INSTOCK, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_instock(d: dict) -> None:
+    tmp = INSTOCK + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, INSTOCK)
+
+
+def _load_unavailable() -> dict:
+    if os.path.exists(UNAVAIL):
+        with open(UNAVAIL, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_unavailable(d: dict) -> None:
+    tmp = UNAVAIL + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, UNAVAIL)
+
+
+# Free-form notes for the "📝 Poznámky" tab — a Discord replacement for ad-hoc
+# reminders ("objednať na výmenu betelavo", "pridať spreje do roy"). A plain list of
+# {id, text, done, ts}, newest-first. Same safe gitignored store, atomic save, tolerant
+# of a missing/corrupt file. NOT written to any CSV/import → no formula-injection guard
+# needed, just a length cap on the free text.
+NOTES = os.path.join(OUT, "notes.json")
+NOTE_MAX_LEN = 5000
+
+
+def _load_notes() -> list:
+    try:
+        with open(NOTES, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    return d if isinstance(d, list) else []
+
+
+def _save_notes(d: list) -> None:
+    tmp = NOTES + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, NOTES)
 
 
 # Supplier assigned on the Na-objednanie tab for an order line that arrived WITHOUT a
@@ -851,6 +914,85 @@ def api_waiting():
     return jsonify({"ok": True})
 
 
+@app.route("/api/instock", methods=["GET", "POST"])
+def api_instock():
+    """Per-line 'skladom' flag (key='<orderCode>|<itemCode>') — independent of
+    ordered/waiting/unavailable. GET -> the map; POST {key, instock} toggles one line."""
+    if request.method == "GET":
+        return jsonify({"instock": _load_instock()})
+    body = request.get_json(force=True)
+    key = str(body.get("key"))
+    instock = bool(body.get("instock"))
+    with _lock:
+        d = _load_instock()
+        if instock:
+            d[key] = True
+        else:
+            d.pop(key, None)
+        _save_instock(d)
+    log.info("instock key=%s instock=%s", key, instock)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/unavailable", methods=["GET", "POST"])
+def api_unavailable():
+    """Per-line 'nedostupné' flag (key='<orderCode>|<itemCode>') — independent of
+    ordered/waiting/instock. GET -> the map; POST {key, unavailable} toggles one line."""
+    if request.method == "GET":
+        return jsonify({"unavailable": _load_unavailable()})
+    body = request.get_json(force=True)
+    key = str(body.get("key"))
+    unavailable = bool(body.get("unavailable"))
+    with _lock:
+        d = _load_unavailable()
+        if unavailable:
+            d[key] = True
+        else:
+            d.pop(key, None)
+        _save_unavailable(d)
+    log.info("unavailable key=%s unavailable=%s", key, unavailable)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/notes", methods=["GET", "POST"])
+def api_notes():
+    """Free-form notes list ('📝 Poznámky' tab). GET -> newest-first list; POST {text}
+    appends a new note. Not written to any CSV/import, so no formula-injection guard —
+    just a length cap on the free text."""
+    if request.method == "GET":
+        return jsonify({"notes": _load_notes()})
+    body = request.get_json(force=True)
+    text = str(body.get("text") or "").strip()
+    if not text or len(text) > NOTE_MAX_LEN:
+        return jsonify({"ok": False, "error": f"text must be 1..{NOTE_MAX_LEN} chars"}), 400
+    note = {"id": uuid.uuid4().hex, "text": text, "done": False, "ts": time.time()}
+    with _lock:
+        d = _load_notes()
+        d.insert(0, note)          # newest-first
+        _save_notes(d)
+    log.info("note added id=%s len=%d", note["id"], len(text))
+    return jsonify({"note": note})
+
+
+@app.route("/api/note", methods=["POST"])
+def api_note():
+    """Toggle 'done' or delete a single note by id. Unknown id -> 404."""
+    body = request.get_json(force=True)
+    nid = str(body.get("id") or "")
+    with _lock:
+        d = _load_notes()
+        idx = next((i for i, n in enumerate(d) if n.get("id") == nid), None)
+        if idx is None:
+            return jsonify({"ok": False, "error": "unknown id"}), 404
+        if body.get("delete"):
+            d.pop(idx)
+        elif "done" in body:
+            d[idx]["done"] = bool(body.get("done"))
+        _save_notes(d)
+    log.info("note update id=%s delete=%s done=%s", nid, body.get("delete"), body.get("done"))
+    return jsonify({"ok": True})
+
+
 @app.route("/api/order-pair", methods=["POST"])
 def api_order_pair():
     """Save/clear an inline supplier reorder URL for a forestshop order code
@@ -928,12 +1070,16 @@ def api_orders():
     rows = build_to_order_rows(csv_bytes, PRODUCTS, _load_decisions(), CODE2PAIR)
     ordered = _load_ordered()
     waiting = _load_waiting()
+    instock = _load_instock()
+    unavail = _load_unavailable()
     pairings = _load_order_pairings()
     assigns = _load_supplier_assign()
     grube = _load_grube_codes()                      # loaded once per request
     for r in rows:
         r["ordered"] = bool(ordered.get(r["key"]))
         r["waiting"] = bool(waiting.get(r["key"]))   # 'čaká sa' — deferred active line
+        r["instock"] = bool(instock.get(r["key"]))         # 'skladom' — máme/naskladnené
+        r["unavailable"] = bool(unavail.get(r["key"]))     # 'nedostupné' — u dodávateľa
         # supplierUrl stays the reviewed-decision link (read-only); pairUrl is the
         # inline-entered one (editable on the tab). A row is "paired" if either is set.
         r["pairUrl"] = pairings.get(r["itemCode"], "")

@@ -32,7 +32,13 @@ body.toorder-wide main { max-width: none; }
 .curbadge.off { background: #fee2e2; color: #991b1b; }
 .curbadge.on { background: #d1fae5; color: #065f46; }
 .btn.warn { background: #fca5a5; color: #7f1d1d; }
-.side { padding: 12px; }
+/* #82 — .side is a CSS Grid item (.card{display:grid}); without min-width:0 a grid
+   item's "automatic minimum size" is its content's min-content, which a long
+   unbreakable candidate name/URL can drive far past the viewport — the grid TRACK
+   then renders wider than .card's own box and the excess (incl. this row's green
+   button) lands in the area .card{overflow:hidden} clips: invisible + unclickable on
+   the manager's phone. min-width:0 opts the item out, same fix as flex children. */
+.side { padding: 12px; min-width: 0; }
 .side.left { border-right: 1px solid #eef0f3; }
 .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; margin-bottom: 4px; }
 .pname { font-weight: 600; font-size: 15px; line-height: 1.25; margin-bottom: 4px; }
@@ -58,12 +64,19 @@ a.supurl:hover { text-decoration: underline; }
 .btn.ghost { background: #e5e7eb; color: #374151; }
 .btn.sm { padding: 4px 9px; font-size: 12px; }
 .btn.active { outline: 3px solid #111827; }
-.cand { border-top: 1px solid #f0f0f3; padding: 7px 0; display: flex; gap: 8px; align-items: center; }
+.cand { border-top: 1px solid #f0f0f3; padding: 7px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .cand img { width: 54px; height: 54px; object-fit: contain; background: #f7f7f9; border-radius: 5px; border: 1px solid #eee; }
 .cand .c-main { flex: 1; min-width: 0; }
 .cand .c-name { font-size: 13px; }
-.manualrow { display: flex; gap: 6px; margin-top: 8px; }
-.manualrow input { flex: 1; padding: 7px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+.manualrow { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.manualrow input { flex: 1 1 160px; min-width: 0; padding: 7px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
+/* #82 (cont'd) — flex-wrap on .cand/.manualrow lets each row's OWN min-content
+   collapse to its largest single item instead of the sum of all items (the
+   manual-URL <input> lacked min-width:0 too — its intrinsic min width alone could
+   push the button off); these two rules keep the buttons from shrinking/wrapping
+   mid-label once a row does wrap. Desktop (≥780px) is untouched — wrapping only
+   engages when a line genuinely doesn't fit. */
+.cand .btn, .manualrow .btn { flex-shrink: 0; white-space: nowrap; }
 .badge { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
 .badge.good { background: #d1fae5; color: #065f46; }
 .badge.bad { background: #fee2e2; color: #991b1b; }
@@ -100,6 +113,18 @@ a.supurl:hover { text-decoration: underline; }
   padding: 4px 9px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
 .toorder-row .to-wait:hover { background: #d1d5db; }
 .toorder-row .to-wait.on { background: #f59e0b; color: #422006; }
+/* #84 — 'skladom' (green) / 'nedostupné' (red), two independent per-line flags —
+   same chip shape as 'čaká sa', different colors so the three never look alike. */
+.toorder-row.instock { background: #f0fdf4; box-shadow: inset 4px 0 0 #16a34a; }
+.toorder-row .to-instock { flex: 0 0 auto; background: #e5e7eb; color: #6b7280; border: 0; border-radius: 6px;
+  padding: 4px 9px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.toorder-row .to-instock:hover { background: #d1d5db; }
+.toorder-row .to-instock.on { background: #16a34a; color: #fff; }
+.toorder-row.unavail { background: #fef2f2; box-shadow: inset 4px 0 0 #dc2626; }
+.toorder-row .to-unavail { flex: 0 0 auto; background: #e5e7eb; color: #6b7280; border: 0; border-radius: 6px;
+  padding: 4px 9px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.toorder-row .to-unavail:hover { background: #d1d5db; }
+.toorder-row .to-unavail.on { background: #dc2626; color: #fff; }
 .toorder-row input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; flex: 0 0 auto; }
 .toorder-row .to-link { color: #2563eb; text-decoration: none; font-weight: 600; font-size: 13px;
   flex: 0 0 auto; min-width: 110px; }
@@ -185,3 +210,26 @@ a.supurl:hover { text-decoration: underline; }
 .sbadge.new { background: #fef3c7; color: #92400e; }
 .sbadge.paired { background: #d1fae5; color: #065f46; }
 .srch-empty { text-align: center; color: #6b7280; padding: 24px; }
+
+/* Poznámky (notes) tab — free-form reminders, Discord replacement (#83) */
+#tab-notes { max-width: 800px; margin: 14px auto; padding: 0 12px;
+  display: flex; flex-direction: column; gap: 10px; }
+.note-add { display: flex; flex-direction: column; gap: 8px; background: #fff;
+  border: 1px solid #e5e7eb; border-radius: 9px; padding: 10px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+.note-add textarea { width: 100%; min-height: 64px; padding: 8px 10px; border: 1px solid #d1d5db;
+  border-radius: 6px; font: inherit; font-size: 14px; resize: vertical; }
+.note-add .btn { align-self: flex-end; }
+.note-list { display: flex; flex-direction: column; gap: 8px; }
+.note { background: #fff; border: 1px solid #e5e7eb; border-radius: 9px; padding: 10px 12px;
+  box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+.note.done { opacity: .55; }
+.note.done .note-text { text-decoration: line-through; }
+.note-text { white-space: pre-wrap; word-break: break-word; font-size: 14px; margin-bottom: 6px; }
+.note-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #6b7280; }
+.note-meta .note-ts { flex: 1; }
+.note-meta button { border: 0; border-radius: 6px; padding: 3px 9px; font-size: 12px;
+  font-weight: 600; cursor: pointer; background: #e5e7eb; color: #374151; white-space: nowrap; }
+.note-meta .note-done:hover { background: #d1d5db; }
+.note-meta .note-del { background: #fee2e2; color: #991b1b; }
+.note-meta .note-del:hover { background: #fecaca; }
