@@ -488,24 +488,33 @@ function renderToOrder() {
   if (!dl) { dl = el('datalist'); dl.id = 'known-suppliers'; document.body.appendChild(dl); }
   dl.innerHTML = '';
   for (const s of known) { const opt = document.createElement('option'); opt.value = s; dl.appendChild(opt); }
-  const cnt = {}, newest = {};
+  // A line is "poriešené" (resolved) once the manager put ANY flag on it — objednané,
+  // počkať, skladom, or nedostupné. A supplier chip is RED (done) when EVERY one of its
+  // lines is resolved (nothing left to deal with), GREEN (todo) while any line is still
+  // un-flagged, ORANGE when it is the active filter. `unhandled[s]` counts un-flagged lines.
+  const isHandled = (o) => !!(o.ordered || o.waiting || o.instock || o.unavailable);
+  const cnt = {}, newest = {}, unhandled = {};
   for (const o of ORDERS) {
     const s = effSup(o);
     cnt[s] = (cnt[s] || 0) + 1;
+    if (!isHandled(o)) unhandled[s] = (unhandled[s] || 0) + 1;
     newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
   }
+  const allHandledGlobal = ORDERS.length > 0 && ORDERS.every(isHandled);
   // dodávateľ s NAJNOVŠOU objednávkou hore; zhoda → abecedne
   const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
   const fbar = document.getElementById('filters'); fbar.innerHTML = '';
-  const mk = (key, lbl) => {
-    const b = el('button', ORDER_SUPPLIER === key ? 'active' : '', lbl);
+  const mk = (key, lbl, done) => {
+    const cls = (ORDER_SUPPLIER === key ? 'active ' : '') + (done ? 'done' : 'todo');
+    const b = el('button', cls, lbl);
     b.onclick = () => { ORDER_SUPPLIER = key; localStorage.setItem('orderSupplier', key); window.scrollTo(0, 0); render(); };
     return b;
   };
-  fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`));
+  fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`, allHandledGlobal));
   // escapeHtml: a supplier name is manually assignable (free text) → never trust it in
-  // the innerHTML-based el() helper (filter label + group header below)
-  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${escapeHtml(s)} (${cnt[s]})`));
+  // the innerHTML-based el() helper (filter label + group header below).
+  // done (RED) = this supplier has NO un-flagged line left; todo (GREEN) = still has some.
+  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${escapeHtml(s)} (${cnt[s]})`, !unhandled[s]));
   const list = document.getElementById('list'); list.innerHTML = '';
   const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || effSup(o) === ORDER_SUPPLIER);
   document.getElementById('empty').hidden = shown.length > 0;

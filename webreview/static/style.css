@@ -11,6 +11,12 @@ header { position: sticky; top: 0; z-index: 10; background: #1f2937; color: #fff
 .filters button { background: #374151; color: #cbd5e1; border: 0; padding: 5px 11px;
   border-radius: 6px; cursor: pointer; font-size: 13px; }
 .filters button.active { background: #34d399; color: #06281d; font-weight: 700; }
+/* Na-objednanie supplier chips only (scoped by body.toorder-wide): GREEN = still to
+   resolve, RED = all lines flagged (nothing to deal with), ORANGE = the active chip.
+   The review-tab status filters carry no .todo/.done class, so they stay grey/green. */
+body.toorder-wide .filters button.todo { background: #16a34a; color: #eafff2; }
+body.toorder-wide .filters button.done { background: #dc2626; color: #fee2e2; }
+body.toorder-wide .filters button.active { background: #f59e0b; color: #3b1d00; font-weight: 700; }
 .appfoot { position: fixed; bottom: 6px; right: 10px; z-index: 50; font-size: 11px;
   color: #6b7280; background: rgba(255,255,255,.85); padding: 1px 7px;
   border-radius: 4px; pointer-events: none; }
