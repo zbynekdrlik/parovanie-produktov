@@ -4,6 +4,7 @@ The app tolerates missing data files at import (loads 0 products), so these run
 in CI without the gitignored data/ tree.
 """
 import io
+import json
 import os
 import sys
 
@@ -102,6 +103,75 @@ def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
     assert j["orders"][0]["assignedSupplier"] == ""
 
 
+# --- Na objednanie: 'skladom' / 'nedostupné' per-line flags (#84) --------------- #
+def test_instock_endpoint_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "instock.json"))
+    c = _client()
+    r = c.post("/api/instock", json={"key": "20261045|61247/L", "instock": True})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert c.get("/api/instock").get_json()["instock"]["20261045|61247/L"] is True
+    c.post("/api/instock", json={"key": "20261045|61247/L", "instock": False})
+    assert "20261045|61247/L" not in c.get("/api/instock").get_json()["instock"]
+
+
+def test_unavailable_endpoint_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "unavail.json"))
+    c = _client()
+    r = c.post("/api/unavailable", json={"key": "20261045|61247/L", "unavailable": True})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert c.get("/api/unavailable").get_json()["unavailable"]["20261045|61247/L"] is True
+    c.post("/api/unavailable", json={"key": "20261045|61247/L", "unavailable": False})
+    assert "20261045|61247/L" not in c.get("/api/unavailable").get_json()["unavailable"]
+
+
+def test_instock_unavailable_reject_missing_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "instock.json"))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "unavail.json"))
+    c = _client()
+    # a POST with no key must 400, never write a "None"/"" key into the store
+    assert c.post("/api/instock", json={"instock": True}).status_code == 400
+    assert c.post("/api/unavailable", json={"unavailable": True}).status_code == 400
+    assert c.get("/api/instock").get_json()["instock"] == {}
+    assert c.get("/api/unavailable").get_json()["unavailable"] == {}
+
+
+def test_instock_unavailable_tolerate_corrupt_store(monkeypatch, tmp_path):
+    # a hand-corrupted flag store must not 500 the loader (mirrors _load_notes)
+    isf = tmp_path / "instock.json"
+    isf.write_text("{ this is not json", encoding="utf-8")
+    unf = tmp_path / "unavail.json"
+    unf.write_text("[]", encoding="utf-8")  # wrong type
+    monkeypatch.setattr(webapp, "INSTOCK", str(isf))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(unf))
+    assert webapp._load_instock() == {}
+    assert webapp._load_unavailable() == {}
+
+
+def test_orders_route_merges_instock_and_unavailable(monkeypatch, tmp_path):
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS",
+        [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
+          "variant_codes": ["61247/L"], "pairCode": "231"}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
+    monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "is.json"))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "un.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    j = _client().get("/api/orders").get_json()
+    assert j["orders"][0]["instock"] is False
+    assert j["orders"][0]["unavailable"] is False
+    (tmp_path / "is.json").write_text(
+        json.dumps({"20261045|61247/L": True}), encoding="utf-8")
+    j2 = _client().get("/api/orders").get_json()
+    assert j2["orders"][0]["instock"] is True
+    assert j2["orders"][0]["unavailable"] is False   # independent toggles
+
+
 def test_order_pair_endpoint_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
     c = _client()
@@ -139,6 +209,49 @@ def test_order_pair_requires_code(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
     r = _client().post("/api/order-pair", json={"code": "", "url": "https://x"})
     assert r.status_code == 400
+
+
+# --- Poznámky tab (#83) --------------------------------------------------------- #
+def test_notes_add_persists_and_newest_first(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "NOTES", str(tmp_path / "notes.json"))
+    c = _client()
+    r1 = c.post("/api/notes", json={"text": "prvá poznámka"})
+    assert r1.status_code == 200
+    n1 = r1.get_json()["note"]
+    assert n1["text"] == "prvá poznámka" and n1["done"] is False and n1["id"]
+    r2 = c.post("/api/notes", json={"text": "druhá poznámka"})
+    n2 = r2.get_json()["note"]
+    notes = c.get("/api/notes").get_json()["notes"]
+    assert [n["id"] for n in notes] == [n2["id"], n1["id"]]   # newest-first
+
+
+def test_notes_rejects_empty_and_too_long(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "NOTES", str(tmp_path / "notes.json"))
+    c = _client()
+    assert c.post("/api/notes", json={"text": ""}).status_code == 400
+    assert c.post("/api/notes", json={"text": "   "}).status_code == 400
+    assert c.post("/api/notes", json={"text": "x" * 5001}).status_code == 400
+    assert c.get("/api/notes").get_json()["notes"] == []
+
+
+def test_notes_done_toggle_and_delete(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "NOTES", str(tmp_path / "notes.json"))
+    c = _client()
+    nid = c.post("/api/notes", json={"text": "objednať sprej"}).get_json()["note"]["id"]
+    r = c.post("/api/note", json={"id": nid, "done": True})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert c.get("/api/notes").get_json()["notes"][0]["done"] is True
+    c.post("/api/note", json={"id": nid, "done": False})
+    assert c.get("/api/notes").get_json()["notes"][0]["done"] is False
+    r = c.post("/api/note", json={"id": nid, "delete": True})
+    assert r.status_code == 200
+    assert c.get("/api/notes").get_json()["notes"] == []
+
+
+def test_note_unknown_id_404(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "NOTES", str(tmp_path / "notes.json"))
+    r = _client().post("/api/note", json={"id": "doesnotexist", "done": True})
+    assert r.status_code == 404
 
 
 def test_import_zip_formula_escapes_codes(monkeypatch, tmp_path):

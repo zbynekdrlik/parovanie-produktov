@@ -136,6 +136,61 @@ def matched_server(tmp_path_factory):
             proc.kill()
 
 
+def _longcontent_fixture_products(base: str) -> list:
+    """One undecided matched product with a REALISTIC LONG name/candidate/URL — like a
+    real supplier product page, not the short 'Bunda ALFA' smoke-test fixture. Needed to
+    reproduce #82: with short content the manual-URL/candidate rows already fit a narrow
+    viewport (nothing to shrink), so the clipping bug never triggers. Long unbreakable
+    content is what forces the .card grid track's automatic min-content width past the
+    viewport, so the row (and its green button) overflows into the area .card clips via
+    overflow:hidden — exactly what the manager sees on his phone."""
+    img_url = f"{base}/favicon.ico"
+    long_name = "Poľovnícka bunda Grand Nord Winter Camo XXL Zelená s kapucňou a membránou"
+    long_url = (f"{base}/produkty/polovnicka-bunda-grand-nord-winter-camo-xxl-"
+                "zelena-s-kapucnou-a-membranou.html")
+    return [
+        {
+            "key": "BETALOV|p1", "idx": 0, "supplier": "BETALOV",
+            "name": long_name, "pairCode": "P1",
+            "variant_codes": ["1/M", "1/L"], "our_url": "", "our_images": [],
+            "ai_status": "matched", "ai_chosen_url": img_url, "ai_reason": "kód sedí",
+            "candidates": [{"name": long_name, "url": long_url}],
+            "current": {"state": 1, "price": "99", "std": "", "stock": "3",
+                        "avail": "Skladom"},
+        },
+    ]
+
+
+@pytest.fixture(scope="function")
+def longcontent_matched_server(tmp_path_factory):
+    """Isolated webreview instance holding ONE undecided matched product with a long,
+    realistic name/candidate/URL — used ONLY by the #82 responsive-layout regression
+    (see `_longcontent_fixture_products`). Function-scoped + its own out-dir, same
+    isolation rationale as `matched_server`."""
+    out = tmp_path_factory.mktemp("wr_longcontent_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "review_data.json").write_text(
+        json.dumps(_longcontent_fixture_products(base), ensure_ascii=False), encoding="utf-8")
+    env = {
+        **os.environ,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 # 1x1 transparent PNG — a hermetic data: URI for the catalog product's defaultImage so
 # the search row's <img src> loads with NO network request (clean console in CI). The
 # value embeds a ';' (image/png;base64) so the ';'-delimited CSV writer quotes it and

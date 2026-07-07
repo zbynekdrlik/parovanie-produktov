@@ -244,3 +244,58 @@ def test_toorder_assigned_supplier_name_is_html_escaped(page, live_server):
     page.wait_for_selector(".toorder-row[data-code='88/Z'] input.to-supinput")
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_toorder_instock_and_unavailable_flags_toggle_and_persist(page, live_server):
+    """#84 — the two independent 'skladom' / 'nedostupné' per-line flags, cloned from
+    the 'čaká sa' toggle pattern. Toggled on the 2/M row (already used by the waiting
+    test above, which cleans up after itself — independent stores, no interference)."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    page.goto(live_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    row = page.locator(".toorder-row[data-code='2/M']")
+    instock_btn = row.locator(".to-instock")
+    unavail_btn = row.locator(".to-unavail")
+    assert instock_btn.count() == 1 and unavail_btn.count() == 1
+    assert "Skladom" in instock_btn.inner_text()
+    assert "Nedostupné" in unavail_btn.inner_text()
+    assert "on" not in (instock_btn.get_attribute("class") or "")
+    assert "on" not in (unavail_btn.get_attribute("class") or "")
+    assert "instock" not in (row.get_attribute("class") or "")
+    assert "unavail" not in (row.get_attribute("class") or "")
+
+    # Toggle 'skladom' on — row highlights green, persists across reload.
+    with page.expect_response(
+            lambda r: "/api/instock" in r.url and r.request.method == "POST"):
+        instock_btn.click()
+    assert "on" in (row.locator(".to-instock").get_attribute("class") or "")
+    assert "instock" in (row.get_attribute("class") or "")
+
+    page.reload()
+    page.wait_for_selector(".toorder-row[data-code='2/M']")
+    row = page.locator(".toorder-row[data-code='2/M']")
+    assert "instock" in (row.get_attribute("class") or "")
+    assert "on" in (row.locator(".to-instock").get_attribute("class") or "")
+
+    # Toggle 'nedostupné' on too — independent of 'skladom', both stay active together.
+    with page.expect_response(
+            lambda r: "/api/unavailable" in r.url and r.request.method == "POST"):
+        row.locator(".to-unavail").click()
+    assert "unavail" in (row.get_attribute("class") or "")
+    assert "instock" in (row.get_attribute("class") or "")   # still on
+
+    # Toggle both off — leaves the shared fixture server pristine.
+    with page.expect_response(
+            lambda r: "/api/instock" in r.url and r.request.method == "POST"):
+        row.locator(".to-instock").click()
+    with page.expect_response(
+            lambda r: "/api/unavailable" in r.url and r.request.method == "POST"):
+        row.locator(".to-unavail").click()
+    assert "instock" not in (row.get_attribute("class") or "")
+    assert "unavail" not in (row.get_attribute("class") or "")
+
+    assert console == [], f"console not clean: {console}"

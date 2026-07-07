@@ -4,6 +4,9 @@ let FILTER = 'unreviewed';
 let ORDERS = [];            // [{key, orderCode, itemCode, size, qty, supplier, name, supplierUrl, ordered, assignedSupplier}]
 let ORDERED = {};           // key -> true (ordered/objednané)
 let WAITING = {};           // key -> true (čaká sa — deferred active line)
+let INSTOCK = {};           // key -> true (skladom — máme/naskladnené)
+let UNAVAIL = {};           // key -> true (nedostupné — u dodávateľa)
+let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'review';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
@@ -234,7 +237,7 @@ function renderFilters() {
 
 // ---- Na objednanie (to-order) tab ---------------------------------------- //
 const TABS = [['review', '🔍 Kontrola párovania'], ['toorder', '📋 Na objednanie'],
-  ['search', '🔎 Hľadať / opraviť']];
+  ['search', '🔎 Hľadať / opraviť'], ['notes', '📝 Poznámky']];
 
 function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
@@ -249,6 +252,7 @@ function renderTabs() {
 async function switchTab(tab) {
   ACTIVE_TAB = tab; localStorage.setItem('tab', tab); window.scrollTo(0, 0);
   if (tab === 'toorder' && !ORDERS.length) await loadOrders();
+  if (tab === 'notes' && !NOTES.length) await loadNotes();
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
@@ -258,7 +262,9 @@ async function loadOrders() {
     ORDERS = (await (await fetch('/api/orders')).json()).orders || [];
     ORDERED = (await (await fetch('/api/ordered')).json()).ordered || {};
     WAITING = (await (await fetch('/api/waiting')).json()).waiting || {};
-  } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; }
+    INSTOCK = (await (await fetch('/api/instock')).json()).instock || {};
+    UNAVAIL = (await (await fetch('/api/unavailable')).json()).unavailable || {};
+  } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; }
 }
 
 async function saveOrdered(key, ordered) {
@@ -274,6 +280,22 @@ async function saveWaiting(key, waiting) {
   await fetch('/api/waiting', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key, waiting })
+  });
+}
+
+async function saveInstock(key, instock) {
+  if (instock) INSTOCK[key] = true; else delete INSTOCK[key];
+  await fetch('/api/instock', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, instock })
+  });
+}
+
+async function saveUnavailable(key, unavailable) {
+  if (unavailable) UNAVAIL[key] = true; else delete UNAVAIL[key];
+  await fetch('/api/unavailable', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, unavailable })
   });
 }
 
@@ -346,7 +368,8 @@ function supplierEditor(o, row, focus) {
 }
 
 function renderOrderRow(o) {
-  const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : '') + (WAITING[o.key] ? ' waiting' : ''));
+  const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : '') + (WAITING[o.key] ? ' waiting' : '')
+    + (INSTOCK[o.key] ? ' instock' : '') + (UNAVAIL[o.key] ? ' unavail' : ''));
   row.dataset.key = o.key; row.dataset.code = o.itemCode;
   const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!ORDERED[o.key];
   cb.title = 'Označiť ako objednané';
@@ -430,6 +453,26 @@ function renderOrderRow(o) {
     row.classList.toggle('waiting', on);
   };
   row.appendChild(w);
+  // 'skladom' — už máme / naskladnené, a 'nedostupné' — u dodávateľa nedostupné.
+  // Independent toggles, same shape as 'čaká sa' (synchronous DOM update + async POST).
+  const inStk = el('button', 'to-instock' + (INSTOCK[o.key] ? ' on' : ''), '✓ Skladom');
+  inStk.title = 'Máme skladom / naskladnené';
+  inStk.onclick = () => {
+    const on = !INSTOCK[o.key];
+    saveInstock(o.key, on);
+    inStk.classList.toggle('on', on);
+    row.classList.toggle('instock', on);
+  };
+  row.appendChild(inStk);
+  const unavailBtn = el('button', 'to-unavail' + (UNAVAIL[o.key] ? ' on' : ''), '✗ Nedostupné');
+  unavailBtn.title = 'U dodávateľa nedostupné';
+  unavailBtn.onclick = () => {
+    const on = !UNAVAIL[o.key];
+    saveUnavailable(o.key, on);
+    unavailBtn.classList.toggle('on', on);
+    row.classList.toggle('unavail', on);
+  };
+  row.appendChild(unavailBtn);
   return row;
 }
 
@@ -641,16 +684,96 @@ function manualPairPanel(res, panel, badge, link) {
   return wrap;
 }
 
+// ---- Poznámky (notes) tab — free-form reminders, Discord replacement ----- //
+async function loadNotes() {
+  try {
+    NOTES = (await (await fetch('/api/notes')).json()).notes || [];
+  } catch (_) { NOTES = []; }
+}
+
+async function addNote(text) {
+  const r = await fetch('/api/notes', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text })
+  });
+  if (!r.ok) return;
+  const j = await r.json();
+  NOTES.unshift(j.note);
+  renderNotes();
+}
+
+async function toggleNoteDone(n) {
+  n.done = !n.done;
+  renderNotes();
+  await fetch('/api/note', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: n.id, done: n.done })
+  });
+}
+
+async function deleteNote(n) {
+  NOTES = NOTES.filter((x) => x.id !== n.id);
+  renderNotes();
+  await fetch('/api/note', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: n.id, delete: true })
+  });
+}
+
+function fmtNoteTs(ts) {
+  const d = new Date(ts * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function renderNoteCard(n) {
+  const card = el('div', 'note' + (n.done ? ' done' : ''));
+  const txt = el('div', 'note-text'); txt.textContent = n.text;   // .textContent → XSS-safe
+  card.appendChild(txt);
+  const meta = el('div', 'note-meta');
+  const ts = el('span', 'note-ts'); ts.textContent = fmtNoteTs(n.ts);
+  meta.appendChild(ts);
+  const doneBtn = el('button', 'note-done', n.done ? '↩ Vrátiť' : '✓ Hotovo');
+  doneBtn.onclick = () => toggleNoteDone(n);
+  meta.appendChild(doneBtn);
+  const delBtn = el('button', 'note-del', '✕ Zmazať');
+  delBtn.onclick = () => { if (confirm('Zmazať poznámku?')) deleteNote(n); };
+  meta.appendChild(delBtn);
+  card.appendChild(meta);
+  return card;
+}
+
+function renderNotes() {
+  const wrap = document.getElementById('tab-notes');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const addBox = el('div', 'note-add');
+  const ta = el('textarea');
+  ta.placeholder = 'Nová poznámka… (napr. „objednať na výmenu betelavo“, „pridať spreje do roy“)';
+  const btn = el('button', 'btn good sm', 'Pridať');
+  const doAdd = () => { const v = ta.value.trim(); if (v) addNote(v); };
+  btn.onclick = doAdd;
+  ta.onkeydown = (e) => { if (e.key === 'Enter' && e.ctrlKey) { e.preventDefault(); doAdd(); } };
+  addBox.appendChild(ta); addBox.appendChild(btn);
+  wrap.appendChild(addBox);
+  const list = el('div', 'note-list');
+  for (const n of NOTES) list.appendChild(renderNoteCard(n));
+  wrap.appendChild(list);
+}
+
 function render() {
   renderTabs();
   const toorder = ACTIVE_TAB === 'toorder';
   const search = ACTIVE_TAB === 'search';
+  const notes = ACTIVE_TAB === 'notes';
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
-  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search) ? 'none' : '';
-  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search) ? 'none' : '';
-  const filt = document.getElementById('filters'); if (filt) filt.style.display = search ? 'none' : '';
+  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes) ? 'none' : '';
+  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes) ? 'none' : '';
+  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes) ? 'none' : '';
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
-  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = search ? 'none' : '';
+  const secNotes = document.getElementById('tab-notes'); if (secNotes) secNotes.hidden = !notes;
+  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes) ? 'none' : '';
+  if (notes) { document.getElementById('empty').hidden = true; renderNotes(); return; }
   if (search) { document.getElementById('empty').hidden = true; return; }
   if (toorder) { renderToOrder(); return; }
   const keepY = window.scrollY;
@@ -696,8 +819,9 @@ async function init() {
   ORDER_SUPPLIER = localStorage.getItem('orderSupplier') || 'all';
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
-  if (qTab === 'toorder' || qTab === 'review' || qTab === 'search') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
+  if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
   if (ACTIVE_TAB === 'toorder') await loadOrders();
+  if (ACTIVE_TAB === 'notes') await loadNotes();
   initSearch();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
