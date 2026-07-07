@@ -373,7 +373,7 @@ function renderOrderRow(o) {
   row.dataset.key = o.key; row.dataset.code = o.itemCode;
   const cb = el('input'); cb.type = 'checkbox'; cb.checked = !!ORDERED[o.key];
   cb.title = 'Označiť ako objednané';
-  cb.onchange = () => { saveOrdered(o.key, cb.checked); row.classList.toggle('done', cb.checked); };
+  cb.onchange = () => { saveOrdered(o.key, cb.checked); row.classList.toggle('done', cb.checked); renderOrderFilters(); };
   row.appendChild(cb);
   if (o.supplierUrl) {
     // reviewed decision link — authoritative, read-only (mení sa v párovacom tabe)
@@ -451,6 +451,7 @@ function renderOrderRow(o) {
     w.textContent = on ? '⏳ Čaká sa' : '⏳ Počkať';
     w.classList.toggle('on', on);
     row.classList.toggle('waiting', on);
+    renderOrderFilters();
   };
   row.appendChild(w);
   // 'skladom' — už máme / naskladnené, a 'nedostupné' — u dodávateľa nedostupné.
@@ -462,6 +463,7 @@ function renderOrderRow(o) {
     saveInstock(o.key, on);
     inStk.classList.toggle('on', on);
     row.classList.toggle('instock', on);
+    renderOrderFilters();
   };
   row.appendChild(inStk);
   const unavailBtn = el('button', 'to-unavail' + (UNAVAIL[o.key] ? ' on' : ''), '✗ Nedostupné');
@@ -471,9 +473,49 @@ function renderOrderRow(o) {
     saveUnavailable(o.key, on);
     unavailBtn.classList.toggle('on', on);
     row.classList.toggle('unavail', on);
+    renderOrderFilters();
   };
   row.appendChild(unavailBtn);
   return row;
+}
+
+// A line is "poriešené" (resolved) once the manager put ANY flag on it — objednané /
+// počkať / skladom / nedostupné. Read from the LIVE flag maps (ORDERED/WAITING/INSTOCK/
+// UNAVAIL), which the toggle handlers update in place — NOT the o.* snapshot, which is
+// frozen at /api/orders fetch time and would leave chips stale until a full reload (#86).
+function isHandled(o) {
+  return !!(ORDERED[o.key] || WAITING[o.key] || INSTOCK[o.key] || UNAVAIL[o.key]);
+}
+
+// Build the supplier filter chips for the Na-objednanie tab, coloured by resolved state:
+// RED (done) = every one of the supplier's lines is flagged (nothing left to deal with),
+// GREEN (todo) = at least one line still un-flagged, ORANGE (active) = the selected chip.
+// Called by renderToOrder AND by every per-line flag toggle so the chips recolour LIVE as
+// the manager works the list (each toggle updates a flag map, then re-renders this bar).
+function renderOrderFilters() {
+  const fbar = document.getElementById('filters');
+  if (!fbar || ACTIVE_TAB !== 'toorder') return;
+  const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
+  const cnt = {}, newest = {}, unhandled = {};
+  for (const o of ORDERS) {
+    const s = effSup(o);
+    cnt[s] = (cnt[s] || 0) + 1;
+    if (!isHandled(o)) unhandled[s] = (unhandled[s] || 0) + 1;
+    newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
+  }
+  const allHandledGlobal = ORDERS.length > 0 && ORDERS.every(isHandled);
+  const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
+  fbar.innerHTML = '';
+  const mk = (key, lbl, done) => {
+    const cls = (ORDER_SUPPLIER === key ? 'active ' : '') + (done ? 'done' : 'todo');
+    const b = el('button', cls, lbl);
+    b.onclick = () => { ORDER_SUPPLIER = key; localStorage.setItem('orderSupplier', key); window.scrollTo(0, 0); render(); };
+    return b;
+  };
+  fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`, allHandledGlobal));
+  // escapeHtml: a supplier name is manually assignable (free text) → never trust it in
+  // the innerHTML-based el() helper. done (RED) = no un-flagged line left; todo (GREEN) = some.
+  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${escapeHtml(s)} (${cnt[s]})`, !unhandled[s]));
 }
 
 function renderToOrder() {
@@ -488,24 +530,14 @@ function renderToOrder() {
   if (!dl) { dl = el('datalist'); dl.id = 'known-suppliers'; document.body.appendChild(dl); }
   dl.innerHTML = '';
   for (const s of known) { const opt = document.createElement('option'); opt.value = s; dl.appendChild(opt); }
-  const cnt = {}, newest = {};
+  const newest = {};
   for (const o of ORDERS) {
     const s = effSup(o);
-    cnt[s] = (cnt[s] || 0) + 1;
     newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
   }
   // dodávateľ s NAJNOVŠOU objednávkou hore; zhoda → abecedne
   const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
-  const fbar = document.getElementById('filters'); fbar.innerHTML = '';
-  const mk = (key, lbl) => {
-    const b = el('button', ORDER_SUPPLIER === key ? 'active' : '', lbl);
-    b.onclick = () => { ORDER_SUPPLIER = key; localStorage.setItem('orderSupplier', key); window.scrollTo(0, 0); render(); };
-    return b;
-  };
-  fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`));
-  // escapeHtml: a supplier name is manually assignable (free text) → never trust it in
-  // the innerHTML-based el() helper (filter label + group header below)
-  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${escapeHtml(s)} (${cnt[s]})`));
+  renderOrderFilters();   // live-coloured supplier chips (recomputed from the flag maps)
   const list = document.getElementById('list'); list.innerHTML = '';
   const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || effSup(o) === ORDER_SUPPLIER);
   document.getElementById('empty').hidden = shown.length > 0;
