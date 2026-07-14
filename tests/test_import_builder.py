@@ -70,6 +70,33 @@ def test_sanitize_drops_unsafe_columns_keeps_restock(tmp_path):
         assert bad not in text
 
 
+def test_sanitize_keeps_availability_out_of_stock(tmp_path):
+    # CEO 2026-07-14: a restock must set BOTH availability fields. Shoptet shows
+    # availabilityOutOfStock once stock sells down to 0, so a restocked product
+    # kept flipping back to the stale "Vypredané" — the column must survive.
+    src = tmp_path / "feed.csv"
+    out = tmp_path / "import.csv"
+    header = ["code", "pairCode", "name", "productVisibility",
+              "availabilityInStock", "availabilityOutOfStock", "stock"]
+    _write(src, header, [["15233/M", "1564", "Vesta", "visible",
+                          "Skladom", "Skladom", "5"]])
+    sanitize_csv(str(src), str(out))
+    with open(out, encoding="utf-8-sig", newline="") as f:
+        rd = csv.DictReader(f, delimiter=";")
+        assert "availabilityOutOfStock" in (rd.fieldnames or [])
+        assert next(rd)["availabilityOutOfStock"] == "Skladom"
+
+
+def test_sanitize_rejects_feed_missing_whitelisted_column(tmp_path):
+    # A present-but-EMPTY column ERASES the field in Shoptet. Padding a missing
+    # input column with "" would therefore wipe live data — reject the feed.
+    src = tmp_path / "feed.csv"
+    out = tmp_path / "import.csv"
+    _write(src, ["code", "pairCode", "stock"], [["A/1", "10", "5"]])
+    with pytest.raises(ValueError, match="availabilityOutOfStock"):
+        sanitize_csv(str(src), str(out))
+
+
 def test_sanitize_writes_bom_utf8(tmp_path):
     src = tmp_path / "feed.csv"
     out = tmp_path / "import.csv"
