@@ -35,7 +35,11 @@ SUPPLIER_HEADER = ["code", "pairCode", "supplier"]
 # An upstream feed (n8n) carries extra info columns (name, prices, supplier, …);
 # Shoptet imports every recognised header, so we must keep ONLY these — otherwise
 # the feed could silently overwrite prices/names on the live eshop.
-RESTOCK_COLS = ["code", "pairCode", "productVisibility", "availabilityInStock", "stock"]
+# availabilityOutOfStock MUSÍ ísť spolu s availabilityInStock: Shoptet zobrazuje
+# availabilityOutOfStock keď stock klesne na 0 — bez neho reštokovaný produkt po
+# vypredaní fiktívnych kusov zobrazil staré "Vypredané" (CEO nález 2026-07-14).
+RESTOCK_COLS = ["code", "pairCode", "productVisibility",
+                "availabilityInStock", "availabilityOutOfStock", "stock"]
 
 # GRUBE per-size externalCode write-back: the ONLY columns this CSV sets. Own file
 # (own header) so a present-but-empty cell can't wipe internalNote/state/prices.
@@ -61,6 +65,11 @@ def sanitize_csv(in_path, out_path, cols=RESTOCK_COLS):
         fields = reader.fieldnames or []
         if "code" not in fields or "pairCode" not in fields:
             raise ValueError(f"vstupné CSV nemá code+pairCode (má: {fields})")
+        missing = [c for c in cols if c not in fields]
+        if missing:
+            # prítomný-ale-prázdny stĺpec Shoptet import ZMAŽE — doplniť chýbajúci
+            # stĺpec prázdnou bunkou by vymazalo živé dáta, preto feed odmietame
+            raise ValueError(f"vstupné CSV nemá povinné stĺpce {missing} (má: {fields})")
         rows = [[(row.get(c) or "").strip() for c in cols]
                 for row in reader if (row.get("code") or "").strip()]
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:

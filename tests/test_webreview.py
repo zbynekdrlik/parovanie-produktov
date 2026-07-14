@@ -431,8 +431,9 @@ def test_supplier_meta_parses_price_and_availability():
 # --- n8n Shoptet import endpoint -------------------------------------------- #
 import csv as _csv  # noqa: E402
 
-_FEED = ("code;pairCode;name;purchasePrice;productVisibility;availabilityInStock;stock\r\n"
-         "15233/M;1564;Vesta;999;visible;Skladom;5\r\n").encode("utf-8")
+_FEED = ("code;pairCode;name;purchasePrice;productVisibility;availabilityInStock;"
+         "availabilityOutOfStock;stock\r\n"
+         "15233/M;1564;Vesta;999;visible;Skladom;Skladom;5\r\n").encode("utf-8")
 
 
 def _arm_token(monkeypatch, tmp_path, token="secret-tok"):
@@ -482,7 +483,8 @@ def test_import_zero_rows_skips_runner(monkeypatch, tmp_path):
     tok = _arm_token(monkeypatch, tmp_path)
     monkeypatch.setattr(webapp, "run_import",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not run")))
-    empty = b"code;pairCode;stock\r\n"
+    empty = ("code;pairCode;productVisibility;availabilityInStock;"
+             "availabilityOutOfStock;stock\r\n").encode("utf-8")
     r = _client().post("/api/n8n/shoptet-import", data=empty,
                        headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 200 and r.get_json()["rows"] == 0
