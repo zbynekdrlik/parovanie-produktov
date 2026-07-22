@@ -254,6 +254,38 @@ vlastného scrapovania — kopíruj ho, nevymýšľaj vlastnú signalizáciu.
   `automations_server`; test nikdy neklika „Spustiť teraz" (to by chcelo skutočný
   export na disku).
 
+### WRITE-JOIN automatizácia (JOIN + zápis do eshopu) — vzor `restock_skladom` (#108)
+
+JOIN-automatizácia ako #107, ale namiesto read-only **PÍŠE do živého eshopu** (napr.
+reštok Vypredané→Skladom). Pure detekcia je v `src/parovanie/restock_skladom.py`
+(`compute_candidates(csv_text, supplier_rows, now, max_pair_age_h)`) — mirror
+`compute_risk`, len opačný smer: náš produkt `vis=='visible'` A **stav 2** (Vypredané)
+cez zdieľaný `export_helpers.state_of` (NIKDY nekopíruj klasifikáciu; `state_of==2`
+chytí AJ `availabilityOutOfStock`-only vypredané, kde `availabilityInStock==''` — presnejšie
+než doslovný n8n `availabilityInStock=='Vypredané'`), A dodávateľ `ok && available is True
+&& checkedAt čerstvé`. **Čerstvosť je NUTNÁ pre prod zápis**: `_is_fresh` prah `MAX_PAIR_AGE_H`
+(48 h — presne n8n per-row check); prázdny/nevalidný/naivný `checkedAt` sa rieši (naivný dedí
+`now.tzinfo`). Idempotencia = stav-2-only detekcia (už-Skladom produkt sa nikdy neflipne znova,
+keď sa export obnoví); netreba osobitný „flipped codes" store.
+
+- **Zápis = REUSE careful importu, NEreimplementuj**: `import_builder.restock_rows(candidates,
+  code2pair)` postaví riadky vo whiteliste `RESTOCK_COLS` (OBE polia dostupnosti → `Skladom`,
+  `visible`, `stock 5` — CEO 2026-07-14, dedup kódov ako `link_rows`). `run_<key>()` zapíše CSV
+  v kánonickom dialekte (`utf-8-sig` BOM, `;`, CRLF, header=`RESTOCK_COLS`) a spustí PRIAMO
+  `run_import` (ten istý ako `/api/n8n/shoptet-import` — záloha + safe-mode + #23 read-back),
+  žiaden self-HTTP/bearer.
+- **Bezpečné zlyhanie (ako `parovania_eshop`)**: `run_<key>()` NEVYHADZUJE výnimku pri zlyhanom
+  importe — degraduje na `status='error'` (z `parse_import_log` read-backu, nie tiché „success");
+  `_import_lock.acquire(blocking=False)` → ak beží iný import, `status='busy'` (preskočí, nie
+  dvojitý import). `TimeoutExpired` z `run_import` → `rc=1`. Kandidáti sa ukladajú VŽDY (aj pri
+  zlyhaní tab ukáže čo sa PROBOVALO naskladniť).
+- **Default DISABLED je tu obzvlášť dôležité** (píše do prod eshopu) — deploy over LEN že tab
+  existuje + Zastavené + tlačidlá; NIKDY neklikaj Štart ani Spustiť teraz (reálny prod zápis).
+  `automations.json` bez kľúča = disabled (over že kľúč tam PO deployi NIE je).
+- Testy: pure JOIN + `restock_rows` (hermetic), Flask wiring incl. **zlyhaný import → status=error**,
+  **busy lock**, no-supplier-data → nič neflipne, both-availability-fields na import riadku,
+  manager-store izolácia; e2e = `automations_server` s pred-vypočítaným `restock_skladom.json`.
+
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
 Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
