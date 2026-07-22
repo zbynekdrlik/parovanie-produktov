@@ -49,6 +49,34 @@ EXTERNALCODE_HEADER = ["code", "pairCode", "externalCode"]
 
 _VYPREDANE = "Vypredané"
 _SKONCIL = "Predaj výrobku skončil"
+_SKLADOM = "Skladom"
+# The fictional positive stock a restock sets so the product is sellable again
+# (Shoptet shows availabilityInStock while stock>0). The live n8n workflow used 5.
+RESTOCK_STOCK = "5"
+
+
+def restock_rows(candidates, code2pair=None):
+    """Restock import rows (Vypredané → Skladom): put temporarily-sold-out products
+    back on sale. One row per unique variant `code` in RESTOCK_COLS order:
+    visible, availabilityInStock + availabilityOutOfStock BOTH 'Skladom', a positive
+    stock. Both availability fields MUST be set together — Shoptet shows
+    availabilityOutOfStock once stock hits 0, so a restock that set only
+    availabilityInStock left the old 'Vypredané' showing after the fictional units
+    sold out (CEO fix 2026-07-14). Each `code` appears ONCE (Shoptet aborts the whole
+    import on a duplicate code — the catalog has duplicate products sharing variant
+    codes; first wins). `candidates` are dicts carrying `code` (+ optional `pairCode`);
+    `code2pair` backfills a missing pairCode. Pure → unit-testable."""
+    code2pair = code2pair or {}
+    rows = []
+    seen = set()
+    for c in candidates:
+        code = (c.get("code") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        pc = (c.get("pairCode") or "").strip() or code2pair.get(code, "")
+        rows.append([code, pc, "visible", _SKLADOM, _SKLADOM, RESTOCK_STOCK])
+    return rows
 
 
 def sanitize_csv(in_path, out_path, cols=RESTOCK_COLS):

@@ -6,6 +6,7 @@ from parovanie.import_builder import (
     EXTERNALCODE_HEADER,
     LINK_HEADER,
     RESTOCK_COLS,
+    RESTOCK_STOCK,
     STATE_HEADER,
     SUPPLIER_HEADER,
     externalcode_rows,
@@ -13,6 +14,7 @@ from parovanie.import_builder import (
     new_pairing_keys,
     new_supplier_keys,
     order_pairing_rows,
+    restock_rows,
     sanitize_csv,
     state_rows,
     supplier_rows,
@@ -323,3 +325,40 @@ def test_link_rows_grube_unparseable_url_falls_back_to_raw():
     rows = link_rows(products, decisions, {"G/1": "7"})
     note = [r for r in rows if r[0] == "G/1"][0][2]
     assert note == "https://www.grube.sk/search/?q=hose"
+
+
+# ── restock_rows (#108: Vypredané → Skladom) ────────────────────────────────────
+def test_restock_rows_sets_both_availability_fields_visible_stock():
+    rows = restock_rows([{"code": "1/M", "pairCode": "P1"}])
+    assert rows == [["1/M", "P1", "visible", "Skladom", "Skladom", RESTOCK_STOCK]]
+    # the row exactly follows the whitelisted RESTOCK_COLS order (6 columns)
+    assert len(rows[0]) == len(RESTOCK_COLS) == 6
+
+
+def test_restock_rows_both_availability_columns_are_skladom():
+    # regression guard for the CEO 2026-07-14 fix: BOTH availabilityInStock AND
+    # availabilityOutOfStock must be 'Skladom' (index 3 and 4 of RESTOCK_COLS)
+    assert RESTOCK_COLS[3] == "availabilityInStock"
+    assert RESTOCK_COLS[4] == "availabilityOutOfStock"
+    r = restock_rows([{"code": "1/M", "pairCode": "P1"}])[0]
+    assert r[3] == "Skladom" and r[4] == "Skladom"
+
+
+def test_restock_rows_dedupes_codes_shoptet_requires_unique():
+    rows = restock_rows([{"code": "1/M", "pairCode": "P1"},
+                         {"code": "1/M", "pairCode": "P1"},
+                         {"code": "2/S", "pairCode": "P2"}])
+    assert [r[0] for r in rows] == ["1/M", "2/S"]
+
+
+def test_restock_rows_backfills_paircode_from_code2pair():
+    rows = restock_rows([{"code": "9/Z"}], code2pair={"9/Z": "777"})
+    assert rows == [["9/Z", "777", "visible", "Skladom", "Skladom", RESTOCK_STOCK]]
+
+
+def test_restock_rows_skips_blank_code():
+    assert restock_rows([{"code": "", "pairCode": "P1"}, {"pairCode": "P2"}]) == []
+
+
+def test_restock_rows_empty_input():
+    assert restock_rows([]) == []
