@@ -1,18 +1,94 @@
 """E2E harness: boot webreview/app.py against a fixture data dir on a free port,
-drive it with a real Chromium via pytest-playwright."""
+drive it with a real Chromium via pytest-playwright.
+
+Auth (#91): the whole app sits behind /login. Every fixture server bootstraps the
+same admin (env ADMIN_EMAIL/ADMIN_PW) with a SHARED SECRET_KEY, and an autouse
+fixture pre-seeds the browser context with a real session cookie — so all the
+pre-auth E2E flows keep running as a logged-in manager. The auth E2E itself opts
+out with @pytest.mark.anonymous."""
 import csv
+import http.cookiejar
 import io
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+E2E_ADMIN = "admin@e2e.test"
+E2E_ADMIN_PW = "e2e-tajne-heslo-123"
+# One shared signing key across the fixture servers: a session cookie minted by
+# any of them validates on all (127.0.0.1 cookies are port-agnostic anyway).
+_AUTH_ENV = {"ADMIN_EMAIL": E2E_ADMIN, "ADMIN_PW": E2E_ADMIN_PW,
+             "SECRET_KEY": "e2e-secret-key"}
+
+_COOKIE_CACHE = {}
+
+
+def _admin_session_cookie(base: str) -> str:
+    """Real form login via urllib (GET /login primes the CSRF token, POST logs in)
+    → the Flask session cookie value. Cached per server (live_server is
+    session-scoped, so one login serves the whole run)."""
+    if base in _COOKIE_CACHE:
+        return _COOKIE_CACHE[base]
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    html = opener.open(base + "/login", timeout=10).read().decode()
+    csrf = re.search(r'name="_csrf" value="([^"]+)"', html).group(1)
+    data = urllib.parse.urlencode({
+        "email": E2E_ADMIN, "password": E2E_ADMIN_PW, "_csrf": csrf}).encode()
+    opener.open(base + "/login", data=data, timeout=10)
+    value = next(c.value for c in jar if c.name == "session")
+    _COOKIE_CACHE[base] = value
+    return value
+
+
+_SERVER_FIXTURES = ("live_server", "matched_server",
+                    "longcontent_matched_server", "search_server")
+
+
+@pytest.fixture(autouse=True)
+def _authenticated_context(request):
+    """Pre-authenticate the browser context against every fixture server the test
+    uses. @pytest.mark.anonymous (the auth E2E itself) starts logged out."""
+    if request.node.get_closest_marker("anonymous"):
+        return
+    bases = [request.getfixturevalue(n) for n in _SERVER_FIXTURES
+             if n in request.fixturenames]
+    if not bases:
+        return
+    context = request.getfixturevalue("context")
+    for base in bases:
+        context.add_cookies([{"name": "session",
+                              "value": _admin_session_cookie(base),
+                              "url": base}])
+
+
+@pytest.fixture(scope="session")
+def admin_creds():
+    return E2E_ADMIN, E2E_ADMIN_PW
+
+
+@pytest.fixture(scope="session")
+def admin_api():
+    """POST a JSON payload to an /api/* endpoint as the bootstrap admin (urllib —
+    no browser). For E2E setup/teardown of extra user accounts."""
+    def call(base, path, payload):
+        req = urllib.request.Request(
+            base + path, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "Cookie": "session=" + _admin_session_cookie(base)})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
+    return call
 
 
 def _fixture_products(base: str) -> list:
@@ -88,6 +164,7 @@ def live_server(tmp_path_factory):
         encoding="utf-8")
     env = {
         **os.environ,
+        **_AUTH_ENV,
         "WEBREVIEW_OUT": str(out),
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
@@ -119,6 +196,7 @@ def matched_server(tmp_path_factory):
         json.dumps(_fixture_products(base), ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
+        **_AUTH_ENV,
         "WEBREVIEW_OUT": str(out),
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
@@ -174,6 +252,7 @@ def longcontent_matched_server(tmp_path_factory):
         json.dumps(_longcontent_fixture_products(base), ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
+        **_AUTH_ENV,
         "WEBREVIEW_OUT": str(out),
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
@@ -257,6 +336,7 @@ def search_server(tmp_path_factory):
     _write_catalog_csv(products_csv)
     env = {
         **os.environ,
+        **_AUTH_ENV,
         "WEBREVIEW_OUT": str(out),
         "WEBREVIEW_PRODUCTS": str(products_csv),
         "WEBREVIEW_PORT": str(port),

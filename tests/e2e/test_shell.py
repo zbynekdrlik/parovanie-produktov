@@ -57,3 +57,20 @@ def test_dark_mode_toggle_persists_across_reload(page, live_server):
     assert page.evaluate("() => localStorage.getItem('theme')") == "light"
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_hidden_tab_sections_are_display_none_on_review(page, live_server):
+    """[hidden] must actually hide: #tab-search/#tab-notes carry display:flex in
+    CSS, and an author display rule OVERRIDES the UA [hidden]{display:none} —
+    so the catalog-search box bled into EVERY tab (review/notes/users). Locks
+    the global [hidden] guard in place."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.get_by_role("button", name="Kontrola párovania").click()
+    for sec in ("tab-search", "tab-notes"):
+        disp = page.evaluate(
+            f"() => getComputedStyle(document.getElementById('{sec}')).display")
+        assert disp == "none", f"#{sec} visible on the review tab (display={disp})"
+    assert not page.locator("#searchBox").is_visible()
+    assert console == [], f"console not clean: {console}"

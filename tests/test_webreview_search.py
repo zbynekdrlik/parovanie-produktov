@@ -17,6 +17,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
+from tests.conftest import authed_client  # noqa: E402 — logged-in session (#91)
+
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
@@ -42,7 +44,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "_CODE2URL", {})
     with open(webapp.DATA, "w", encoding="utf-8") as f:
         json.dump([], f)
-    return webapp.app.test_client()
+    return authed_client()
 
 
 def test_search_endpoint_filters(client):
@@ -165,7 +167,7 @@ def empty_pc_client(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "_CODE2URL", {})
     with open(webapp.DATA, "w", encoding="utf-8") as f:
         json.dump([], f)
-    return webapp.app.test_client()
+    return authed_client()
 
 
 def test_search_returns_empty_paircode_product_keyed_by_code(empty_pc_client):
@@ -248,7 +250,7 @@ def supplier_key_client(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "_CODE2URL", {})
     with open(webapp.DATA, "w", encoding="utf-8") as f:
         json.dump(products, f)
-    return webapp.app.test_client()
+    return authed_client()
 
 
 def test_search_supplier_keyed_product_is_in_review_with_our_url(supplier_key_client):
@@ -330,7 +332,7 @@ def test_promote_current_reflects_hidden_visibility(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "_CODE2URL", {})
     with open(webapp.DATA, "w", encoding="utf-8") as f:
         json.dump([], f)
-    client = webapp.app.test_client()
+    client = authed_client()
 
     r = client.post("/api/search-pair",
                     json={"pairCode": "900", "url": "https://www.grube.de/p/x/154773/"})

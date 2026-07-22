@@ -11,9 +11,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
-
-def _client():
-    return webapp.app.test_client()
+from tests.conftest import authed_client as _client  # noqa: E402 — logged-in session (#91)
 
 
 def test_version_route_returns_vsemver():

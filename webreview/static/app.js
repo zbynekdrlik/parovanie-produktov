@@ -1,3 +1,5 @@
+let ME = null;              // {email, is_admin} — logged-in user (#91)
+let USERS_LIST = [];        // admin 'Užívatelia' tab
 let PRODUCTS = [];
 let DECISIONS = {};         // key -> {status, url}
 let FILTER = 'unreviewed';
@@ -10,6 +12,15 @@ let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'review';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
+
+// Session-expiry guard (#91): ANY api 401 → back to the login page. The server
+// gate protects the data; this just swaps a dead UI for the login form.
+const _origFetch = window.fetch.bind(window);
+window.fetch = async (...args) => {
+  const r = await _origFetch(...args);
+  if (r.status === 401) location.href = '/login';
+  return r;
+};
 
 const imgObserver = new IntersectionObserver((entries) => {
   for (const e of entries) {
@@ -247,20 +258,27 @@ const NAV_ICONS = {
   toorder: '<path d="M9 5h6M9 9h6M9 13h4"/><rect x="4" y="3" width="16" height="18" rx="2"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/>',
   notes: '<path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4"/>',
+  users: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6"/>',
 };
+
+// 'Užívatelia' is an ADMIN-ONLY nav item (the server 403s non-admins anyway).
+function visibleTabs() {
+  return (ME && ME.is_admin) ? TABS.concat([['users', 'Užívatelia']]) : TABS;
+}
 
 // count badge per nav item — review: still-unreviewed, toorder: open lines, notes: count
 function navCount(key) {
   if (key === 'review') return PRODUCTS.filter(p => !statusOf(p)).length;
   if (key === 'toorder') return ORDERS.length;
   if (key === 'notes') return NOTES.length;
+  if (key === 'users') return USERS_LIST.length;
   return 0;
 }
 
 function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
   t.innerHTML = '';
-  for (const [key, lbl] of TABS) {
+  for (const [key, lbl] of visibleTabs()) {
     const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
     const n = navCount(key);
     bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
@@ -274,7 +292,7 @@ function renderTabs() {
 // Top-bar per-page title + a plain-language subtitle (with live counts).
 const PAGE_TITLES = {
   review: 'Kontrola párovania', toorder: 'Na objednanie',
-  search: 'Hľadať / opraviť', notes: 'Poznámky',
+  search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
@@ -289,6 +307,8 @@ function setPageHead() {
     s.textContent = 'Prehľadá všetky polia všetkých produktov';
   } else if (ACTIVE_TAB === 'notes') {
     s.textContent = `${NOTES.length} poznámok`;
+  } else if (ACTIVE_TAB === 'users') {
+    s.textContent = `${USERS_LIST.length} účtov s prístupom`;
   } else { s.textContent = ''; }
 }
 
@@ -319,6 +339,7 @@ async function switchTab(tab) {
   ACTIVE_TAB = tab; localStorage.setItem('tab', tab); window.scrollTo(0, 0);
   if (tab === 'toorder' && !ORDERS.length) await loadOrders();
   if (tab === 'notes' && !NOTES.length) await loadNotes();
+  if (tab === 'users') await loadUsers();   // always fresh — small list
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
@@ -859,19 +880,93 @@ function renderNotes() {
   wrap.appendChild(list);
 }
 
+// ── admin 'Užívatelia' tab (#91) ─────────────────────────────────────────────
+
+async function loadUsers() {
+  try { USERS_LIST = (await (await fetch('/api/users')).json()).users || []; }
+  catch (_) { USERS_LIST = []; }
+}
+
+async function userAction(url, payload) {
+  const r = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) {
+    let msg = '';
+    try { msg = (await r.json()).error || ''; } catch (_) { /* non-JSON error */ }
+    alert('Nepodarilo sa: ' + (msg || ('chyba ' + r.status)));
+  }
+  await loadUsers();
+  render();
+}
+
+function renderUserRow(u) {
+  const row = el('div', 'user-row' + (u.is_admin ? ' admin' : ''));
+  const who = el('div', 'user-who');
+  who.appendChild(el('span', 'user-mail', escapeHtml(u.email)));
+  if (u.is_admin) who.appendChild(el('span', 'user-badge', 'admin'));
+  if (ME && u.email === ME.email) who.appendChild(el('span', 'user-badge me', 'ty'));
+  row.appendChild(who);
+  const acts = el('div', 'user-acts');
+  const admBtn = el('button', 'btn ghost sm', u.is_admin ? 'Odobrať admina' : 'Spraviť adminom');
+  admBtn.onclick = () => userAction('/api/users/admin', { email: u.email, is_admin: !u.is_admin });
+  acts.appendChild(admBtn);
+  const pwBtn = el('button', 'btn ghost sm', 'Nové heslo');
+  pwBtn.onclick = () => {
+    const p = prompt(`Nové heslo pre ${u.email} (min. 8 znakov):`);
+    if (p) userAction('/api/users/password', { email: u.email, password: p });
+  };
+  acts.appendChild(pwBtn);
+  const delBtn = el('button', 'btn warn sm', '✕ Zmazať');
+  delBtn.onclick = () => {
+    if (confirm(`Zmazať účet ${u.email}?`)) userAction('/api/users/delete', { email: u.email });
+  };
+  acts.appendChild(delBtn);
+  row.appendChild(acts);
+  return row;
+}
+
+function renderUsers() {
+  const wrap = document.getElementById('tab-users');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const addBox = el('div', 'user-add');
+  const em = el('input'); em.type = 'email'; em.placeholder = 'email@firma.sk';
+  const pw = el('input'); pw.type = 'password'; pw.placeholder = 'heslo (min. 8 znakov)';
+  const admLbl = el('label', 'user-admchk');
+  const adm = el('input'); adm.type = 'checkbox';
+  admLbl.appendChild(adm); admLbl.appendChild(document.createTextNode(' admin'));
+  const btn = el('button', 'btn good sm', '➕ Pridať používateľa');
+  btn.onclick = () => {
+    const e = em.value.trim(), p = pw.value;
+    if (!e || !p) { alert('Vyplň e-mail aj heslo.'); return; }
+    userAction('/api/users', { email: e, password: p, is_admin: adm.checked });
+  };
+  addBox.appendChild(em); addBox.appendChild(pw);
+  addBox.appendChild(admLbl); addBox.appendChild(btn);
+  wrap.appendChild(addBox);
+  const list = el('div', 'user-list');
+  for (const u of USERS_LIST) list.appendChild(renderUserRow(u));
+  wrap.appendChild(list);
+}
+
 function render() {
   renderTabs();
   setPageHead();
   const toorder = ACTIVE_TAB === 'toorder';
   const search = ACTIVE_TAB === 'search';
   const notes = ACTIVE_TAB === 'notes';
+  const users = ACTIVE_TAB === 'users';
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
-  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes) ? 'none' : '';
-  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes) ? 'none' : '';
-  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes) ? 'none' : '';
+  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes || users) ? 'none' : '';
+  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes || users) ? 'none' : '';
+  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes || users) ? 'none' : '';
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
   const secNotes = document.getElementById('tab-notes'); if (secNotes) secNotes.hidden = !notes;
-  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes) ? 'none' : '';
+  const secUsers = document.getElementById('tab-users'); if (secUsers) secUsers.hidden = !users;
+  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes || users) ? 'none' : '';
+  if (users) { document.getElementById('empty').hidden = true; renderUsers(); return; }
   if (notes) { document.getElementById('empty').hidden = true; renderNotes(); return; }
   if (search) { document.getElementById('empty').hidden = true; return; }
   if (toorder) { renderToOrder(); return; }
@@ -909,6 +1004,25 @@ async function loadVersion() {
 
 async function init() {
   initTheme();
+  // Who am I? (#91) — 401 → the fetch guard above already navigates to /login.
+  try {
+    const meR = await fetch('/api/me');
+    if (meR.status === 401) return;   // navigating to /login
+    ME = await meR.json();
+  } catch (_) { /* network hiccup — the server gate on / already handled auth */ }
+  const ub = document.getElementById('userBox');
+  if (ub && ME) {
+    ub.hidden = false;
+    document.getElementById('userEmail').textContent = ME.email;
+    const lb = document.getElementById('logoutBtn');
+    if (lb) {
+      lb.onclick = async () => {
+        try { await fetch('/logout', { method: 'POST' }); } catch (_) { /* navigating anyway */ }
+        location.href = '/login';
+      };
+    }
+  }
+  if (ACTIVE_TAB === 'users' && !(ME && ME.is_admin)) ACTIVE_TAB = 'review';
   loadVersion();
   const j = await (await fetch('/api/products')).json();
   PRODUCTS = j.products;
@@ -922,6 +1036,7 @@ async function init() {
   if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
   if (ACTIVE_TAB === 'toorder') await loadOrders();
   if (ACTIVE_TAB === 'notes') await loadNotes();
+  if (ACTIVE_TAB === 'users') await loadUsers();
   initSearch();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
