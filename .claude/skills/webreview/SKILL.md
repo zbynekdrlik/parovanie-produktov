@@ -170,6 +170,38 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
 - E2E gotcha: `.pill` má CSS `text-transform:uppercase` → `inner_text()` vráti „ZASTAVENÉ";
   porovnávaj `evaluate("el => el.textContent")` (CSS transform nemení DOM text).
 
+### AI-automatizácia (scraper) — vzor `dodavatelsky_sklad` (#106), podklad pre #105/#107/#108
+
+Automatizácia, ktorá scrapuje externé weby a/alebo volá LLM (OpenAI). Pure jadro do
+`src/parovanie/<key>.py` (bez siete/OpenAI, testovateľné s uloženými HTML fixtúrami + mock LLM JSON):
+
+- **OpenAI kľúč = `data/.ai_env`** (`OPENAI_API_KEY`, gitignored, chmod 600) — načítaj v `app.py`
+  cez `_load_env_file(os.path.join(ROOT, "data", ".ai_env"))` (rovnaký vzor ako `.auth_env`/`.mail_env`;
+  env vyhráva nad súborom). **NIKDY nehardcoduj/necommituj kľúč** — žije v Authorization HLAVIČKE
+  (`requests.post`), nie v URL, takže error-text nenesie tajomstvo (žiadny sanitizer netreba).
+- **OpenAI cez `requests.post`, NIE openai SDK** (žiadna nová závislosť): `POST
+  https://api.openai.com/v1/chat/completions`, `model="gpt-4o-mini"`, `response_format={"type":
+  "json_object"}`, `temperature=0`; parse `choices[0].message.content` cez čistý `parse_llm_json`
+  (tolerantný na ```json fence, `raise ValueError` na nevalidný → error riadok).
+- **STATIC tier PRED LLM** (šetrí ~2/3 platených volaní): JSON-LD Product schema (`offers.availability`
+  schema.org token → bool, `price`/`priceCurrency`) → og/product meta (`og:availability`/`product:
+  price:amount`…) → **text-keyword klasifikácia LEN pre overené domény** (`is_static_text_domain`;
+  4 domény huntingshop.eu/betalov.sk/zubicek.cz/virginiashop.sk — na neoverenej doméne loose text
+  NEklasifikuj, radšej LLM). `need_llm = available is None OR price is None`. LLM sa volá LEN keď
+  `need_llm` a je kľúč; **bez kľúča → `extractedBy="static-only"`, `ok=True` (graceful degrade, NEspadne)**.
+- **Pozn.**: `export_helpers.state_of` klasifikuje NÁŠ 3-stavový eshop (vis+avail), NIE dodávateľovu
+  dostupnosť — preto samostatný `classify_availability` (bool orderable), zdieľa len OUT-keyword slovník.
+- **Náklady/robustnosť**: stale-skip (`is_recently_checked` — refetch len liniek nekontrolovaných >N h,
+  error riadky sa retryujú vždy), per-doménová zdvorilosť (`_politeness_wait` cez `time.monotonic`),
+  per-link try/except → error riadok, beh NIKDY nespadne. Zdroj liniek = export `internalNote` (http +
+  visible) cez `links_from_export` — číta on-disk `SRC` (`data/products.csv`, refreshuje `shoptet_sync`),
+  chýbajúci → 0 liniek. Store `data/out/<key>.json` (`{last_check, rows, stats}`) atomicky 0600.
+- **Testy = mock OBE hrany**: `_fetch_supplier_html` (kanonické HTML) AJ `_llm_extract` (kanonický dict),
+  0 siete. Over: static resolves → LLM sa NEvolá (`llm_calls==0` pre tú linku); no-key → static-only;
+  fetch raise → error riadok nie pád; stale-skip nefetchne; disabled tick nebeží; nedotýka sa manager
+  stores. **Default DISABLED** (scrape+LLM stoja) — pri post-deploy NEklikaj Spustiť teraz, len over
+  tab existuje + Zastavené + tlačidlá.
+
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.
