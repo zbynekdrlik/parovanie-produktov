@@ -157,11 +157,16 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
    výpadku sa preskočí dopredu. „⚡ Spustiť teraz" beží aj vypnutá (explicitná akcia) a
    POSIELA REÁLNE e-maily zákazníkom pri KAŽDOM aktuálne nevyzdvihnutom balíku — pri overovaní
    na živom webe štandardne NEklikaj Spustiť teraz, toggle Štart→Stop stačí.
-   **`parovania_eshop` (#109) PÍŠE do ŽIVÉHO eshopu** (nočný push párovaní/dodávateľov):
-   pri post-deploy overení NEklikaj ani Spustiť teraz ANI Štart — enable by naplánoval
-   reálny push ~1000 nenahraných párovaní o 21:00; over LEN že tab existuje, default
-   Zastavené, tlačidlá prítomné (persistenciu pokrýva e2e). Manažér ho spustí keď sám
-   chce začať nahrávať. **Výnimka (#126,
+   **`parovania_eshop` (#109) PÍŠE do ŽIVÉHO eshopu** (nočný push párovaní/dodávateľov +
+   od #38 aj inline `order_pairings`): pri post-deploy overení NEklikaj ani Spustiť teraz
+   ANI Štart — manuálny beh by naplánoval reálny push tisícok nenahraných párovaní. Over
+   LEN že tab existuje, tlačidlá prítomné (persistenciu pokrýva e2e). **GOTCHA (zistené
+   #38, 2026-07-22): na PRODE je táto automatizácia UŽ `enabled=true` (manažér ju sám
+   zapol) — nepredpokladaj default „Zastavené" pri post-deploy overení, over reálny stav
+   cez `data/out/automations.json` alebo `GET /api/automations` PRED tvrdením o stave.**
+   Pri `enabled=true` beží denne o 21:00 — ak veľká dávka (>~1000 riadkov) prekročí 120s
+   `page.wait_for_url` timeout v `scripts/shoptet_import.py`, beh zlyhá bezpečne (nič sa
+   nezapíše, retry ďalší beh) — viď #156. Manažér ho spustí/zastaví keď sám chce. **Výnimka (#126,
    bezpečné post-deploy overenie funkčnosti):** smieš kliknúť Spustiť teraz LEN keď si PRED tým
    z `data/out/posta_uncollected.json` overil `stats.uncollected==0` A `escalation=={}` (žiadna
    rozbehnutá eskalácia) — vtedy je isté, že beh pošle 0 reálnych mailov, aj keď osloví živé
@@ -375,12 +380,24 @@ Web NEposiela Discord priamo. Nočné workflowy v n8n volajú endpointy a ony po
 
 ## Dve úložiská párov → eshop `internalNote` (KTORÉ kam tečie)
 
+**Od #38 (v0.63.0) ideš OBOMI cestami NOČNE aj RUČNE** — predtým `order_pairings` išli
+na eshop LEN cez ručný zip; teraz `_do_upload_pairings` (zdieľané jadro pre
+`/api/n8n/upload-pairings` AJ pre in-app automatizáciu „Párovania → eshop") pushne OBE
+do JEDNÉHO combined `import_links.csv` v tom istom behu:
+
 | Store | Kľúč | Na eshop cez | review_data nutné? |
 |---|---|---|---|
-| `decisions.json` | review **`key`** = `SUPPLIER\|pairCode` | **nočne** `/api/n8n/upload-pairings` (číta LEN decisions) | **ÁNO** — pri štarte sa decision s kľúčom mimo review_data **TICHO zmaže** (`app.py` prune) |
-| `order_pairings.json` | forestshop **kód** (ľubovoľný) | LEN manuálny `/api/import` zip (`order_pairing_rows`, excl. review-kódy) — **NIE** nočne | nie |
+| `decisions.json` | review **`key`** = `SUPPLIER\|pairCode` | ručný zip (`/api/import`) AJ nočne `/api/n8n/upload-pairings` | **ÁNO** — pri štarte sa decision s kľúčom mimo review_data **TICHO zmaže** (`app.py` prune) |
+| `order_pairings.json` | forestshop **kód** (ľubovoľný) | ručný zip AJ nočne (`_do_upload_pairings` → `order_pairing_rows(..., exclude_codes=<kódy už v decision rows>)`) | nie |
 
-Pre auto-doobjednávanie (nočný upload) musí pár byť v `decisions.json` pod review kľúčom. `order_pairings` je len pre kódy mimo review setu a na eshop ide iba cez zip.
+`order_pairings` kód pokrytý reviewed decisiou v TOM ISTOM behu sa **vynechá** (Shoptet
+padá na duplicitný `code` v jednom importe — decision vyhráva). Dedup nočného stavu pre
+`order_pairings` žije v TOM ISTOM `uploaded_pairings.json` ako decisions, ale pod
+**`order:<code>`** namespace (`import_builder.new_order_pairing_keys`) — nikdy sa nekríži
+s review kľúčmi (`SUPPLIER|pairCode` vždy obsahuje `|`, nikdy nezačína `order:`). Odpoveď
+endpointu/`run_parovania_eshop` má vlastné `order_count`/`order_blocked` polia (oddelené od
+`count`/`blocked`, ktoré ostávajú len pre decisions) — UI tab to zobrazuje ako samostatný
+riadok „📦 Inline páry".
 
 ### Pridanie PRE-napárovaného produktu (mimo review setu) ako napárovaného
 
