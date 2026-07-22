@@ -3095,11 +3095,23 @@ def run_orders_reminder() -> dict:
     Robust: a failing OpenAI or SMTP call for ONE order is logged and skipped (that order is not
     recorded → retried next run), never crashing the scheduler. No key → the AI branch degrades
     gracefully (never e-mails blind). Reads ONLY its own store + the orders export; never touches
-    the manager's decision / to-order stores."""
+    the manager's decision / to-order stores.
+
+    Incremental (#153): an already-terminal order (emailed / manually-contacted) whose date+note
+    fingerprint is unchanged since the last run is NOT re-classified or re-mailed — its previous
+    display row is carried forward as-is (days refreshed). See
+    orders_reminder.partition_incremental for the exact correctness contract (a newly-eligible or
+    not-yet-terminal order is always fully (re)processed)."""
     csv_bytes = _orders_csv_cached()
     orders = orders_reminder.select_orders(csv_bytes)
     with _lock:
-        done = dict(_load_orders_reminder().get("orders") or {})   # code -> {status, ...}
+        state = _load_orders_reminder()
+        done = dict(state.get("orders") or {})   # code -> {status, ...}
+    prev_fp = state.get("fingerprints") or {}
+    prev_orange = {r["code"]: r for r in state.get("orange") or []}
+    prev_skipped = {r["code"]: r for r in state.get("skipped") or []}
+    to_process, already_seen, fingerprints = orders_reminder.partition_incremental(
+        orders, prev_fp, set(done.keys()))
     have_key = bool(os.environ.get("OPENAI_API_KEY"))
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     red, orange, skipped = [], [], []
@@ -3114,7 +3126,19 @@ def run_orders_reminder() -> dict:
             st.setdefault("orders", {})[code] = entry
             _save_orders_reminder(st)
 
-    for o in orders:
+    # unchanged + already-terminal orders: reuse the last computed display row (days refreshed)
+    # — no re-classification, no OpenAI/SMTP call, no CSV-field rebuild (the incremental fast path).
+    for o in already_seen:
+        code = o["code"]
+        status = done.get(code, {}).get("status")
+        prev_row = (prev_orange if status == "emailed" else prev_skipped).get(code)
+        row = dict(prev_row) if prev_row else {k: o[k] for k in
+                                               ("code", "billFullName", "email", "itemName",
+                                                "shopRemark", "days", "admin_link")}
+        row["days"] = o["days"]
+        (orange if status == "emailed" else skipped).append(row)
+
+    for o in to_process:
         code = o["code"]
         if not o["has_note"]:
             red.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
@@ -3178,6 +3202,7 @@ def run_orders_reminder() -> dict:
             "last_check": now_iso,
             "red": red, "orange": orange, "skipped": skipped,
             "stats": stats,
+            "fingerprints": fingerprints,   # #153 — incremental-run cache for the next run
         })
     log.info("orders_reminder: run done %s", stats)
     return stats

@@ -154,6 +154,45 @@ def test_smtp_failure_keeps_order_for_retry(iso, monkeypatch):
     assert "20261001" not in st.get("orders", {})   # not recorded → retried next run
 
 
+# ── incremental processing (#153) ────────────────────────────────────────────────
+def test_second_run_skips_reclassification_of_unchanged_terminal_orders(iso, monkeypatch):
+    webapp.run_orders_reminder()
+    st = _store(iso)
+    # fingerprints cover every currently-eligible code (incl. the red, never-terminal one) —
+    # only DONE codes with a matching fingerprint get the fast path (checked below).
+    assert set(st["fingerprints"]) == {"20261000", "20261001", "20261002"}
+
+    # second run, SAME csv (nothing changed) — the AI classifier must NOT be called again for
+    # the two already-terminal codes; a call would raise, proving the fast path was taken.
+    def boom(note):
+        raise AssertionError(f"re-classified an unchanged terminal order: {note!r}")
+    monkeypatch.setattr(webapp, "_classify_contacted", boom)
+    iso["sent"].clear()
+    stats2 = webapp.run_orders_reminder()
+    assert iso["sent"] == []                        # no re-send either
+    st2 = _store(iso)
+    assert {r["code"] for r in st2["orange"]} == {"20261001"}
+    assert {r["code"] for r in st2["skipped"]} == {"20261002"}
+    assert stats2["orders_4d"] == 3                  # full set still reported (red + 2 terminal)
+
+
+def test_newly_eligible_order_is_still_caught_after_a_prior_run(iso, monkeypatch):
+    # first run with only the base CSV (3 orders) — establishes fingerprints/done state.
+    webapp.run_orders_reminder()
+    # a 4th order, absent from the first run's CSV (simulating one that just aged past 4 days, or
+    # a brand-new order) — has no prior fingerprint, so it must NEVER be treated as 'unchanged'.
+    extra = ("20261099;" + OLD + " 07:00:00;Vybavuje sa;volať zákazníka;e@x.sk;;Nový Zákazník;"
+             "Klobúk;1;20,00")
+    csv2 = ORDERS_CSV.decode("cp1250").rstrip("\r\n") + "\r\n" + extra + "\r\n"
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: csv2.encode("cp1250"))
+    iso["sent"].clear()
+    stats2 = webapp.run_orders_reminder()
+    assert stats2["emailed_now"] == 1
+    assert any(m["to"] == "e@x.sk" for m in iso["sent"])
+    st2 = _store(iso)
+    assert "20261099" in st2["orders"] and st2["orders"]["20261099"]["status"] == "emailed"
+
+
 def test_run_never_touches_manager_stores(iso):
     # seed every manager store in tmp and assert the run writes none of them
     for name in ("decisions.json", "ordered_items.json", "order_pairings.json",

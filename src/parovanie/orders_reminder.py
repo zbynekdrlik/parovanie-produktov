@@ -188,3 +188,35 @@ def parse_classification(content: str) -> bool:
     if kat == CATEGORY_NOT_CONTACTED:
         return False
     raise ValueError(f"klasifikátor nevrátil platnú kategóriu: {content!r}")
+
+
+def order_fingerprint(o: dict) -> str:
+    """Stable per-code fingerprint of the fields that decide the AI/e-mail outcome (#153 —
+    incremental processing) — the order date and the internal note. ``days`` is deliberately
+    excluded: it advances every day even for an order nobody touched, so including it would
+    defeat incrementality (every order would look 'changed' on every single run)."""
+    return f"{o.get('date', '')}|{o.get('shopRemark', '')}"
+
+
+def partition_incremental(orders: list[dict], prev_fingerprints: dict,
+                          done_codes) -> tuple[list[dict], list[dict], dict]:
+    """Split select_orders()'s output into (to_process, unchanged, fingerprints) for the
+    incremental run (#153): today every run re-processes every currently-eligible order even when
+    nothing about it changed since yesterday. An order is ``unchanged`` ONLY when BOTH its
+    fingerprint matches the prior run's AND its code is already terminally resolved
+    (``done_codes`` — emailed or skipped_contacted, from the dedup store). Everything else — a
+    brand-new eligible order (just crossed the 4-day threshold today), a note that changed since
+    last time, or an order not yet terminal (e.g. retried because OPENAI_API_KEY was missing) —
+    goes to ``to_process``, so a newly-eligible order is NEVER skipped and a not-yet-resolved
+    retry is NEVER silently dropped. ``fingerprints`` is the full map to persist for the next run
+    (every currently-eligible code, so a later change is detected against ITS last fingerprint)."""
+    to_process, unchanged, fingerprints = [], [], {}
+    for o in orders:
+        code = o["code"]
+        fp = order_fingerprint(o)
+        fingerprints[code] = fp
+        if code in done_codes and prev_fingerprints.get(code) == fp:
+            unchanged.append(o)
+        else:
+            to_process.append(o)
+    return to_process, unchanged, fingerprints
