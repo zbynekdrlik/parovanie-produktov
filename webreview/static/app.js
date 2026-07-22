@@ -12,7 +12,7 @@ let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
 let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
 let POSTA = null;           // /api/posta-uncollected — last run's display data
 let ORDER_SUPPLIER = 'all';
-let ACTIVE_TAB = localStorage.getItem('tab') || 'review';
+let ACTIVE_TAB = localStorage.getItem('tab') || 'toorder';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
 
 // Session-expiry guard (#91): ANY api 401 → back to the login page. The server
@@ -252,8 +252,11 @@ function renderFilters() {
 // Nav labels carry NO emoji — the outline SVG icon replaces it (moderný sidebar).
 // The accessible name stays the plain label ("Na objednanie", "Hľadať / opraviť"),
 // which the E2E tests match on, so an added count badge doesn't break them.
-const TABS = [['review', 'Kontrola párovania'], ['toorder', 'Na objednanie'],
-  ['search', 'Hľadať / opraviť'], ['notes', 'Poznámky']];
+// Order = usage frequency (#117): 'Kontrola párovania' became the least-used
+// page once the review backlog stabilized, so it sits LAST — before the
+// 'Čoskoro'/automations section, never first.
+const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
+  ['notes', 'Poznámky'], ['review', 'Kontrola párovania']];
 
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
 // sidebar section (#autoTabs) + its own tab section. New automations: add here.
@@ -1207,7 +1210,7 @@ async function init() {
       };
     }
   }
-  if (ACTIVE_TAB === 'users' && !(ME && ME.is_admin)) ACTIVE_TAB = 'review';
+  if (ACTIVE_TAB === 'users' && !(ME && ME.is_admin)) ACTIVE_TAB = 'toorder';
   loadVersion();
   const j = await (await fetch('/api/products')).json();
   PRODUCTS = j.products;
@@ -1219,8 +1222,12 @@ async function init() {
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
   if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes' || qTab === 'posta') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
-  if (ACTIVE_TAB === 'toorder') await loadOrders();
-  if (ACTIVE_TAB === 'notes') await loadNotes();
+  // Prefetch nav badge counts for ALL tabs on first paint (#112) — not just the
+  // active one; the 'Na objednanie'/'Poznámky' counts used to stay empty until
+  // that tab was first opened. loadOrders()/loadNotes() already swallow fetch
+  // failures internally (fall back to empty arrays), so a network hiccup here
+  // can't crash init() or spam the console.
+  await Promise.all([loadOrders(), loadNotes()]);
   if (ACTIVE_TAB === 'users') await loadUsers();
   if (ACTIVE_TAB === 'posta') await loadPosta();
   initSearch();

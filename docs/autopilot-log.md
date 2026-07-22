@@ -27,3 +27,16 @@
 - Bonus (v scope, malý): `_send_mail_html` teraz defaultne BCC-uje `MAIL_BCC` (konvencia „BCC vždy" #105) keď volajúci bcc neuvedie; odstránený natvrdo zapísaný `POSTA_BCC` literál. RED `56cb7b9`→GREEN `8358fc0`: `test_send_mail_html_defaults_bcc_to_mail_bcc_env` (+2 ďalšie). Mimo scope: `_send_mail` (reset hesla) BCC nemá — filed #127.
 - Verzia 0.46.2→0.46.3, PR #128 merge `edee661`, nasadené v0.46.3.
 - Post-deploy: PRED==PO všetkých 11 stores. Živé overenie „Spustiť teraz" (bezpečné — `escalation=={}`+`uncollected==0` pred behom, `emails_sent==0` po behu): `checked` 21→13 (8 DPD vylúčených), `invalid` (nesledovateľné) 8→0, box „⚠️ nesledovateľných" úplne zmizol z UI, žiadne console errory.
+
+## 2026-07-22 — #127 `_send_mail` (reset hesla) doplnené o BCC (worker)
+- Doplnok k #126: `_send_mail_html` (automatizácie) BCC-uje `MAIL_BCC` už z #126; `_send_mail`
+  (reset hesla, `/forgot` flow) BCC nemal — malá medzera (~7 riadkov), rovnaký vzor skopírovaný.
+  Signatúra ostala 3-argumentová (bez `bcc=` parametra — jediný volajúci ho ani nechce vypínať).
+- RED `ff86134` → GREEN `0967e6d`: `tests/test_webreview_auth.py::test_send_mail_bcc_to_mail_bcc_env_when_set`
+  + `test_send_mail_no_bcc_when_mail_bcc_env_unset`. Playbook (webreview SKILL.md „BCC vždy" bullet)
+  aktualizovaný, že teraz platí pre OBE mail cesty — `e63ba0e`.
+- Verzia 0.46.4→0.46.5, PR #129 merge `3c09468`, nasadené v0.46.5.
+- Post-deploy: DOM aj `/api/version` = v0.46.5, PRED==PO všetkých 7 stores (decisions 2831,
+  ordered 146, order_pairings 57, waiting 11, supplier_assignments 1, users 3, reset_tokens 1).
+  Live-overenie zámerne BEZ reálneho odoslania reset-mailu (aby sa nepošlo majiteľovi zbytočné
+  BCC) — funkčnosť pokrytá unit testom; `/forgot` stránka načítaná (200, 0 console errorov).
