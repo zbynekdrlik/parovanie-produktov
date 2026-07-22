@@ -2077,42 +2077,54 @@ def n8n_shoptet_import():
     with os.fdopen(raw_fd, "wb") as w:
         w.write(raw)
     try:
-        rows = import_builder.sanitize_csv(raw_path, out_path)
+        row_count = import_builder.sanitize_csv(raw_path, out_path)
     except (ValueError, UnicodeDecodeError) as e:
         log.warning("n8n import: bad CSV: %s", e)
         _safe_unlink(raw_path, out_path)
         return jsonify({"ok": False, "error": str(e)}), 400
     finally:
         _safe_unlink(raw_path)   # sanitized file is the audit record; raw is transient
-    if rows == 0:
+    if row_count == 0:
         log.info("n8n import: 0 restock rows — nothing to import")
         _safe_unlink(out_path)
         return jsonify({"ok": True, "rows": 0, "message": "no restock rows"}), 200
+
+    # #158: chunk like #156 — a large restock feed can overrun the browser redirect
+    # timeout just like the pairings/suppliers pushes did. out_path is already the
+    # sanitized audit file in canonical RESTOCK_COLS order; read its rows back
+    # instead of re-parsing the raw upload.
+    with open(out_path, encoding="utf-8-sig", newline="") as f:
+        rows_data = list(csv.reader(f, delimiter=";"))[1:]
 
     dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n import: another import already running")
         _safe_unlink(out_path)
         return jsonify({"ok": False, "error": "import already running"}), 409
-    log.info("n8n import: %d rows, dry_run=%s, file=%s", rows, dry, out_path)
+    log.info("n8n import: %d rows (chunks of %d), dry_run=%s, audit=%s",
+             row_count, IMPORT_CHUNK_ROWS, dry, out_path)
     try:
-        rc, out, err = run_import(out_path, dry_run=dry)
-    except subprocess.TimeoutExpired:
-        log.error("n8n import: subprocess timeout — killed import group")
-        return jsonify({"ok": False, "error": "import timeout"}), 504
+        res = _import_rows_chunked(rows_data, import_builder.RESTOCK_COLS, dry,
+                                   prefix=f"n8n_restock_{ts}_chunk_", timeout=900)
     finally:
         _import_lock.release()
 
-    parsed = parse_import_log(out)
-    result = {"ok": rc == 0, "exit_code": rc, "rows": rows, "dry_run": dry,
-              "processed": parsed.get("processed"), "updated": parsed.get("updated"),
-              "failed": parsed.get("failed"), "error_detail": parsed.get("error_detail"),
-              "stdout_tail": (out or "")[-800:]}
-    log.info("n8n import: rc=%s processed=%s updated=%s failed=%s",
-             rc, parsed.get("processed"), parsed.get("updated"), parsed.get("failed"))
-    if rc != 0:
-        log.error("n8n import FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
-    return jsonify(result), (200 if rc == 0 else 502)
+    err_msg = ""
+    if not res["ok"]:
+        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
+                   f"(naimportované {res['rows_ok']} z {row_count} riadkov)")
+    result = {"ok": res["ok"], "exit_code": res["rc"], "rows": row_count, "dry_run": dry,
+              "processed": res["processed"], "updated": res["updated"],
+              "failed": res["failed"], "error_detail": res["error_detail"], "error": err_msg,
+              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
+              "stdout_tail": res["stdout_tail"]}
+    log.info("n8n import: rc=%s chunks=%d/%d processed=%s updated=%s failed=%s",
+             res["rc"], res["chunks_ok"], res["chunks_total"],
+             res["processed"], res["updated"], res["failed"])
+    if not res["ok"]:
+        log.error("n8n import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
+                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
+    return jsonify(result), (200 if res["ok"] else 502)
 
 
 # --------------------------------------------------------------------------- #
@@ -2946,25 +2958,17 @@ def _save_restock(d: dict) -> None:
     os.replace(tmp, RESTOCK_STATE)
 
 
-def _write_restock_csv(path: str, rows: list) -> None:
-    """Write the restock rows in the canonical Shoptet import dialect (utf-8-sig BOM,
-    ';', CRLF), header = import_builder.RESTOCK_COLS — same dialect as the split
-    import files, so the careful run_import script + Shoptet parse it identically."""
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
-        w.writerow(import_builder.RESTOCK_COLS)
-        w.writerows(rows)
-
-
 def run_restock_skladom() -> dict:
     """One restock run (daily ~06:00 or „Spustiť teraz"): join OUR catalog export
     (Vypredané + visible products, state 2) against the „Dodávateľský sklad" scraper's
     LAST result (data/out/supplier_stock.json) and flip back to Skladom every product
     whose supplier now has FRESH confirmed stock — by building the restock import rows
     (both availability fields → Skladom, visible, stock 5 via
-    import_builder.restock_rows) and pushing them through the SAME careful Shoptet
-    import path the n8n endpoint uses (run_import → parse_import_log read-back). WRITES
-    to the live eshop.
+    import_builder.restock_rows) and pushing them through the SAME careful chunked
+    Shoptet import path the n8n endpoints use (_import_rows_chunked → run_import →
+    parse_import_log read-back — #158: a large restock batch has the same 120s
+    browser-redirect-timeout risk #156 fixed for the pairings/suppliers pushes).
+    WRITES to the live eshop.
 
     Safe by construction: no supplier data (scraper never ran) → flips NOTHING and
     surfaces has_supplier_data=False; a candidate needs ok+available+FRESH (checkedAt
@@ -2989,30 +2993,30 @@ def run_restock_skladom() -> dict:
     processed = updated = failed = None
     error_detail = ""
     if rows:
-        os.makedirs(OUT, exist_ok=True)
-        fd, csv_path = tempfile.mkstemp(prefix="restock_", suffix=".csv", dir=OUT)
-        os.close(fd)
-        _write_restock_csv(csv_path, rows)
         if not _import_lock.acquire(blocking=False):
             log.warning("restock_skladom: iný import práve beží — beh preskočený")
             status, error_detail = "busy", "iný import práve beží"
         else:
             try:
-                rc, out, err = run_import(csv_path)
-            except subprocess.TimeoutExpired:
-                rc, out, err = 1, "", "import timeout"
+                # #158: chunked import (like #156) so a large restock batch never
+                # overruns the browser redirect timeout. A chunk that times out is
+                # caught INSIDE _import_rows_chunked (never raises) and treated as
+                # a failed chunk — the lock is always released.
+                res = _import_rows_chunked(rows, import_builder.RESTOCK_COLS, False,
+                                           prefix="restock_", timeout=900)
             finally:
                 _import_lock.release()
-            parsed = parse_import_log(out)
-            processed, updated, failed = (parsed.get("processed"),
-                                          parsed.get("updated"), parsed.get("failed"))
-            if rc == 0:
+            processed, updated, failed = res["processed"], res["updated"], res["failed"]
+            if res["ok"]:
                 status = "ok"
             else:
                 status = "error"
-                error_detail = parsed.get("error_detail") or (err or "")[-300:]
-                log.error("restock_skladom: import FAILED rc=%s stderr=%s",
-                          rc, (err or "")[-400:])
+                detail = res["error_detail"] or (res["err"] or "")[-300:]
+                error_detail = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
+                                f"(naimportované {res['rows_ok']} z {len(rows)} riadkov): {detail}")
+                log.error("restock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
+                          res["rc"], res["chunks_ok"], res["chunks_total"],
+                          (res["err"] or "")[-400:])
 
     # `candidates` are always stored (what WOULD be flipped) so the tab shows them
     # even on a failed import; on success they ARE what was flipped.
