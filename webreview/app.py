@@ -1898,6 +1898,20 @@ def _do_upload_pairings(dry):
         w.writerow(import_builder.LINK_HEADER)
         w.writerows(rows)
 
+    # Not every key in new_keys necessarily landed a row: a product can have zero
+    # variant codes, or ALL its codes can be the "seen"-deduped loser of an earlier
+    # key sharing the same code (link_rows keeps only the first writer per code).
+    # Only keys that actually got at least one code written to the CSV may ever be
+    # marked uploaded — a key with none stays "new" so the next run retries it,
+    # instead of being silently lost forever (#49).
+    written_codes = {r[0] for r in rows}
+    uploaded_keys = [k for k in new_keys
+                     if written_codes & set(by_key.get(k, {}).get("variant_codes") or [])]
+    blocked_keys = [k for k in new_keys if k not in uploaded_keys]
+    if blocked_keys:
+        log.warning("n8n pairings: %d of %d keys generated no row (codes missing/deduped): %s",
+                    len(blocked_keys), len(new_keys), blocked_keys[:10])
+
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n pairings: another import already running")
         _safe_unlink(out_path)
@@ -1909,7 +1923,7 @@ def _do_upload_pairings(dry):
         parsed = parse_import_log(out)
         ok = rc == 0
         if ok and not dry:                   # record only after a real success (inside the lock)
-            for k in new_keys:               # mark with the SAME normalization as the selection
+            for k in uploaded_keys:          # ONLY keys that actually got a row — never blocked_keys
                 uploaded[k] = (dec[k].get("url") or "").strip()
             _save_uploaded(uploaded)
     except subprocess.TimeoutExpired:
@@ -1921,12 +1935,13 @@ def _do_upload_pairings(dry):
 
     if ok:
         _safe_unlink(out_path)               # success → drop the temp CSV (the catalog backup is the audit record)
-    result = {"ok": ok, "exit_code": rc, "count": len(new_keys), "rows": len(rows),
+    result = {"ok": ok, "exit_code": rc, "count": len(uploaded_keys), "rows": len(rows),
               "dry_run": dry, "processed": parsed.get("processed"),
               "updated": parsed.get("updated"), "failed": parsed.get("failed"),
               "products": products, "stdout_tail": (out or "")[-800:],
+              "blocked": len(blocked_keys),
               **_pairing_summary(uploaded)}
-    log.info("n8n pairings: rc=%s processed=%s products=%d", rc, parsed.get("processed"), len(new_keys))
+    log.info("n8n pairings: rc=%s processed=%s products=%d", rc, parsed.get("processed"), len(uploaded_keys))
     if not ok:
         log.error("n8n pairings FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
     return result, (200 if ok else 502)
