@@ -27,8 +27,12 @@ E2E_ADMIN = "admin@e2e.test"
 E2E_ADMIN_PW = "e2e-tajne-heslo-123"
 # One shared signing key across the fixture servers: a session cookie minted by
 # any of them validates on all (127.0.0.1 cookies are port-agnostic anyway).
+# AUTH_COOKIE_SECURE pinned off: fixture servers speak plain http://127.0.0.1, so a
+# Secure session cookie would never round-trip → the login POST loses its CSRF session
+# → 400 (only bites a dev box that HAS a real data/.auth_env with AUTH_COOKIE_SECURE=1;
+# CI has no data/ so it was already off there). Pinning it keeps local E2E deterministic.
 _AUTH_ENV = {"ADMIN_EMAIL": E2E_ADMIN, "ADMIN_PW": E2E_ADMIN_PW,
-             "SECRET_KEY": "e2e-secret-key"}
+             "SECRET_KEY": "e2e-secret-key", "AUTH_COOKIE_SECURE": "0"}
 
 _COOKIE_CACHE = {}
 
