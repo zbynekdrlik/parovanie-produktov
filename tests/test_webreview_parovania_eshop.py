@@ -276,6 +276,9 @@ def test_mid_batch_chunk_failure_records_partial_and_releases_lock(iso, monkeypa
 
     assert result["status"] == "failed"
     assert result["pairings"]["ok"] is False
+    # a clear, tab-surfaced message: WHICH chunk failed + how many rows made it
+    assert "časti 2/" in result["pairings"]["error"]
+    assert "z 650 riadkov" in result["pairings"]["error"]
     assert len(calls) == 2                                  # batch STOPS after the failing chunk
     uploaded = json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())
     # exactly the successful (first) chunk's keys are recorded; the failing chunk's

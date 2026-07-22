@@ -1540,6 +1540,9 @@ function renderParovaniaEshop() {
       + (p.blocked ? ` · ${p.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${p.total_uploaded ?? 0} / ${p.total_products ?? 0} napárovaných`
       + ` · chýba ${p.remaining ?? 0}`));
+    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
+    // successful chunks ARE saved → the next run only retries the rest)
+    if (p.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(p.error)));
     // #38: inline páry pridané priamo na riadku „Na objednanie" (mimo review setu)
     box.appendChild(el('div', '',
       `📦 Inline páry: +${p.order_count ?? 0} nových`
@@ -1549,6 +1552,7 @@ function renderParovaniaEshop() {
       + (s.blocked ? ` · ${s.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${s.total_uploaded ?? 0} / ${s.total_assigned ?? 0} doplnených`
       + ` · chýba ${s.remaining ?? 0}`));
+    if (s.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(s.error)));
     st.appendChild(box);
   } else if (!a.last_run) {
     st.appendChild(el('div', 'muted',

@@ -1951,6 +1951,99 @@ def run_import(csv_path, dry_run=False, timeout=300):
     return p.returncode, out, err
 
 
+# #156: Shoptet's server-side processing of a large import CSV genuinely takes longer
+# than the browser's import-result redirect wait (scripts/shoptet_import.py:296,
+# page.wait_for_url timeout=120000) — the nightly 415-product / 1195-row pairings push
+# overran 120s and failed (Timeout 120000ms). Root-cause fix (not a bigger timeout —
+# no-timeout-band-aids): split a large upload into chunks of <= IMPORT_CHUNK_ROWS rows,
+# import each chunk by its own careful run_import, so every chunk completes well inside
+# the timeout and the whole push is reliable + resumable. 300 leaves ~4x headroom over
+# the ~120s-for-1195-rows point where it failed (a chunk of 300 processes in ~30s).
+IMPORT_CHUNK_ROWS = 300
+
+
+def _write_import_csv(header, rows, prefix, csv_safe=False):
+    """Write ONE import CSV in the canonical Shoptet dialect (utf-8-sig BOM, ';',
+    CRLF) and return its path. csv_safe applies the per-cell formula-injection guard
+    (_csv_safe) used by the supplier write-back sink. Caller owns unlinking."""
+    from parovanie.writer import shoptet_writer
+    os.makedirs(OUT, exist_ok=True)
+    out_fd, out_path = tempfile.mkstemp(prefix=prefix, suffix=".csv", dir=OUT)
+    with os.fdopen(out_fd, "w", encoding="utf-8-sig", newline="") as f:
+        w = shoptet_writer(f)
+        w.writerow(header)
+        if csv_safe:
+            w.writerows([_csv_safe(c) for c in row] for row in rows)
+        else:
+            w.writerows(rows)
+    return out_path
+
+
+def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=900):
+    """Import ``all_rows`` into Shoptet in chunks of <= IMPORT_CHUNK_ROWS rows — one
+    careful ``run_import`` per chunk (#156: a single large import overran the browser
+    redirect timeout). Chunks run SEQUENTIALLY; the FIRST failing chunk STOPS the batch
+    (the remaining rows are left for the next run — the caller's uploaded-state gating
+    on ``success_codes`` keeps the push idempotent + resumable). The caller MUST hold
+    ``_import_lock`` across this call and release it in a ``finally``. Never raises
+    ``TimeoutExpired`` — a chunk timeout is caught and treated as a failed chunk, so the
+    lock is always released and no stuck import-lock is left behind (the 21:03 cascade).
+
+    Returns a dict:
+      ok             True iff EVERY chunk succeeded (dry-run all-ok counts as ok)
+      success_codes  set of r[0] for every row in a SUCCESSFUL chunk (partial progress)
+      chunks_total / chunks_ok / rows_ok
+      processed / updated / failed   summed over successful chunks (None-safe)
+      error_detail   first failing chunk's hard Shoptet error line, if any
+      rc             0 iff ok, else the first failing chunk's rc (1 for a timeout)
+      stdout_tail / err   from the LAST attempted chunk (surfaced upstream)
+    """
+    chunks = [all_rows[i:i + IMPORT_CHUNK_ROWS]
+              for i in range(0, len(all_rows), IMPORT_CHUNK_ROWS)]
+    success_codes = set()
+    agg = {"processed": 0, "updated": 0, "failed": 0}
+    seen = {"processed": False, "updated": False, "failed": False}
+    rc, error_detail, stdout_tail, err_tail = 0, None, "", ""
+    chunks_ok = rows_ok = 0
+    for i, chunk in enumerate(chunks, 1):
+        chunk_path = _write_import_csv(header, chunk, prefix, csv_safe=csv_safe)
+        try:
+            crc, out, err = run_import(chunk_path, dry_run=dry, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            log.error("import %schunk %d/%d timed out — killed import group",
+                      prefix, i, len(chunks))
+            rc, err_tail = 1, "import timeout"
+            error_detail = error_detail or "import timeout"
+            break
+        finally:
+            _safe_unlink(chunk_path)
+        parsed = parse_import_log(out)
+        stdout_tail, err_tail = (out or "")[-800:], (err or "")[-400:]
+        if crc != 0:
+            rc, error_detail = crc, parsed.get("error_detail")
+            log.error("import %schunk %d/%d FAILED rc=%s", prefix, i, len(chunks), crc)
+            break
+        chunks_ok += 1
+        rows_ok += len(chunk)
+        success_codes.update(r[0] for r in chunk)
+        for k in agg:
+            v = parsed.get(k)
+            if v is not None:
+                agg[k] += v
+                seen[k] = True
+        log.info("import %schunk %d/%d OK processed=%s",
+                 prefix, i, len(chunks), parsed.get("processed"))
+    return {
+        "ok": rc == 0, "success_codes": success_codes,
+        "chunks_total": len(chunks), "chunks_ok": chunks_ok, "rows_ok": rows_ok,
+        "processed": agg["processed"] if seen["processed"] else None,
+        "updated": agg["updated"] if seen["updated"] else None,
+        "failed": agg["failed"] if seen["failed"] else None,
+        "error_detail": error_detail, "rc": rc,
+        "stdout_tail": stdout_tail, "err": err_tail,
+    }
+
+
 @app.route("/api/n8n/shoptet-import", methods=["POST"])
 def n8n_shoptet_import():
     """n8n posts a restock CSV (multipart 'file', or raw body); we whitelist it to
@@ -2129,24 +2222,17 @@ def _do_upload_pairings(dry):
         log.warning("n8n pairings: %d codes paired to conflicting URLs (first wins): %s",
                     len(conflicts), conflicts[:10])
 
-    os.makedirs(OUT, exist_ok=True)
-    out_fd, out_path = tempfile.mkstemp(prefix="import_links_", suffix=".csv", dir=OUT)
-    with os.fdopen(out_fd, "w", encoding="utf-8-sig", newline="") as f:
-        from parovanie.writer import shoptet_writer
-        w = shoptet_writer(f)
-        w.writerow(import_builder.LINK_HEADER)
-        w.writerows(all_rows)
-
-    # Not every key in new_keys necessarily landed a row: a product can have zero
+    # Not every key in new_keys necessarily lands a row: a product can have zero
     # variant codes, or ALL its codes can be the "seen"-deduped loser of an earlier
     # key sharing the same code (link_rows keeps only the first writer per code).
-    # Only keys that actually got at least one code written to the CSV may ever be
-    # marked uploaded — a key with none stays "new" so the next run retries it,
-    # instead of being silently lost forever (#49).
+    # `uploadable_keys` = keys that got at least one code written to the CSV; a key
+    # with none is `blocked` (surfaced, not silently dropped #49). Whether an
+    # uploadable key is actually RECORDED uploaded depends on its chunk succeeding
+    # (below).
     written_codes = {r[0] for r in rows}
-    uploaded_keys = [k for k in new_keys
-                     if written_codes & set(by_key.get(k, {}).get("variant_codes") or [])]
-    blocked_keys = [k for k in new_keys if k not in uploaded_keys]
+    uploadable_keys = [k for k in new_keys
+                       if written_codes & set(by_key.get(k, {}).get("variant_codes") or [])]
+    blocked_keys = [k for k in new_keys if k not in uploadable_keys]
     if blocked_keys:
         log.warning("n8n pairings: %d of %d keys generated no row (codes missing/deduped): %s",
                     len(blocked_keys), len(new_keys), blocked_keys[:10])
@@ -2155,51 +2241,64 @@ def _do_upload_pairings(dry):
     # i.e. its code is already covered by a reviewed decision this run. It stays
     # "new" (never marked order:<code>) so it's retried while that stays true.
     order_written_codes = {r[0] for r in order_rows}
-    uploaded_order_codes = [c for c in new_order_codes if c in order_written_codes]
-    blocked_order_codes = [c for c in new_order_codes if c not in uploaded_order_codes]
+    blocked_order_codes = [c for c in new_order_codes if c not in order_written_codes]
     if blocked_order_codes:
         log.warning("n8n pairings: %d order_pairings codes already covered by a reviewed decision: %s",
                     len(blocked_order_codes), blocked_order_codes[:10])
 
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n pairings: another import already running")
-        _safe_unlink(out_path)
         return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n pairings: %d products, %d order codes, %d rows, dry_run=%s",
-             len(new_keys), len(new_order_codes), len(all_rows), dry)
+    log.info("n8n pairings: %d products, %d order codes, %d rows (chunks of %d), dry_run=%s",
+             len(new_keys), len(new_order_codes), len(all_rows), IMPORT_CHUNK_ROWS, dry)
     try:
-        # pairing CSVs can be large (an initial bulk of thousands of rows) → more time
-        rc, out, err = run_import(out_path, dry_run=dry, timeout=900)
-        parsed = parse_import_log(out)
-        ok = rc == 0
-        if ok and not dry:                   # record only after a real success (inside the lock)
-            for k in uploaded_keys:          # ONLY keys that actually got a row — never blocked_keys
+        # #156: import in chunks so no single large import overruns the browser
+        # redirect timeout. The FIRST failing chunk stops the batch; success_codes
+        # holds every row imported by a successful chunk (partial progress).
+        res = _import_rows_chunked(all_rows, import_builder.LINK_HEADER, dry,
+                                   prefix="import_links_", timeout=900)
+        ok = res["ok"]
+        success = res["success_codes"]
+        # A decision key is recorded uploaded only when EVERY one of its written codes
+        # landed in a SUCCESSFUL chunk — a key straddling the failed boundary stays
+        # "new" (re-uploading its done codes next run is idempotent, same URL; marking
+        # it done would lose its un-uploaded codes, the #49 class). On partial failure
+        # this records the successful chunks so the next run only retries the rest
+        # (resumable), never all-or-nothing.
+        uploaded_keys = [
+            k for k in uploadable_keys
+            if (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])) <= success]
+        uploaded_order_codes = [c for c in new_order_codes
+                                if c in order_written_codes and c in success]
+        if not dry and (uploaded_keys or uploaded_order_codes):
+            for k in uploaded_keys:          # ONLY keys whose codes all imported OK
                 uploaded[k] = (dec[k].get("url") or "").strip()
-            for c in uploaded_order_codes:   # ONLY order codes that actually got a row
+            for c in uploaded_order_codes:   # ONLY order codes that imported OK
                 uploaded[f"order:{c}"] = (order_pairings[c] or "").strip()
             _save_uploaded(uploaded)
-    except subprocess.TimeoutExpired:
-        log.error("n8n pairings: subprocess timeout — killed import group")
-        _safe_unlink(out_path)
-        return {"ok": False, "error": "import timeout"}, 504
     finally:
         _import_lock.release()
 
-    if ok:
-        _safe_unlink(out_path)               # success → drop the temp CSV (the catalog backup is the audit record)
-    result = {"ok": ok, "exit_code": rc, "count": len(uploaded_keys), "rows": len(all_rows),
-              "dry_run": dry, "processed": parsed.get("processed"),
-              "updated": parsed.get("updated"), "failed": parsed.get("failed"),
-              "error_detail": parsed.get("error_detail"),
-              "products": products, "stdout_tail": (out or "")[-800:],
+    err_msg = ""
+    if not ok:                               # clear, tab-surfaced message: which chunk + progress
+        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
+                   f"(naimportované {res['rows_ok']} z {len(all_rows)} riadkov)")
+    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_keys),
+              "rows": len(all_rows), "dry_run": dry, "processed": res["processed"],
+              "updated": res["updated"], "failed": res["failed"],
+              "error_detail": res["error_detail"], "error": err_msg,
+              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
+              "products": products, "stdout_tail": res["stdout_tail"],
               "blocked": len(blocked_keys),
               "order_count": len(uploaded_order_codes),
               "order_blocked": len(blocked_order_codes),
               **_pairing_summary(uploaded)}
-    log.info("n8n pairings: rc=%s processed=%s products=%d order_codes=%d",
-             rc, parsed.get("processed"), len(uploaded_keys), len(uploaded_order_codes))
+    log.info("n8n pairings: rc=%s chunks=%d/%d processed=%s products=%d order_codes=%d",
+             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"],
+             len(uploaded_keys), len(uploaded_order_codes))
     if not ok:
-        log.error("n8n pairings FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
+        log.error("n8n pairings FAILED rc=%s chunks_ok=%d/%d stderr=%s",
+                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
     return result, (200 if ok else 502)
 
 
@@ -2278,47 +2377,47 @@ def _do_upload_suppliers(dry):
                 "message": "no import rows", "blocked": len(new_codes),
                 **_supplier_summary(uploaded, assigns)}, 200
 
-    os.makedirs(OUT, exist_ok=True)
-    out_fd, out_path = tempfile.mkstemp(prefix="import_suppliers_", suffix=".csv", dir=OUT)
-    with os.fdopen(out_fd, "w", encoding="utf-8-sig", newline="") as f:
-        from parovanie.writer import shoptet_writer
-        w = shoptet_writer(f)
-        w.writerow(import_builder.SUPPLIER_HEADER)
-        # formula-injection guard at the sink (defense-in-depth alongside the endpoint
-        # reject) — the supplier name is free text written into a CSV cell
-        w.writerows([_csv_safe(c) for c in row] for row in rows)
+    # supplier_rows is 1:1 with codes (no product→variant indirection), so every new
+    # code has exactly one row — written_codes == set(new_codes).
+    written_codes = {r[0] for r in rows}
 
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n suppliers: another import already running")
-        _safe_unlink(out_path)
         return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n suppliers: %d codes, %d rows, dry_run=%s", len(new_codes), len(rows), dry)
+    log.info("n8n suppliers: %d codes, %d rows (chunks of %d), dry_run=%s",
+             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
     try:
-        rc, out, err = run_import(out_path, dry_run=dry, timeout=900)
-        parsed = parse_import_log(out)
-        ok = rc == 0
-        if ok and not dry:                   # record only after a real success (inside the lock)
-            for c in new_codes:
+        # #156: chunked import (formula-injection guard applied per cell — supplier
+        # name is free text). FIRST failing chunk stops the batch; success_codes are
+        # the codes imported by a successful chunk (partial progress → resumable).
+        res = _import_rows_chunked(rows, import_builder.SUPPLIER_HEADER, dry,
+                                   prefix="import_suppliers_", csv_safe=True, timeout=900)
+        ok = res["ok"]
+        success = res["success_codes"]
+        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
+        if not dry and uploaded_codes:       # record only codes that imported OK
+            for c in uploaded_codes:
                 uploaded[c] = (assigns[c] or "").strip()
             _save_uploaded_suppliers(uploaded)
-    except subprocess.TimeoutExpired:
-        log.error("n8n suppliers: subprocess timeout — killed import group")
-        _safe_unlink(out_path)
-        return {"ok": False, "error": "import timeout"}, 504
     finally:
         _import_lock.release()
 
-    if ok:
-        _safe_unlink(out_path)
-    result = {"ok": ok, "exit_code": rc, "count": len(new_codes), "rows": len(rows),
-              "dry_run": dry, "processed": parsed.get("processed"),
-              "updated": parsed.get("updated"), "failed": parsed.get("failed"),
-              "error_detail": parsed.get("error_detail"),
-              "products": products, "stdout_tail": (out or "")[-800:],
-              **_supplier_summary(uploaded, assigns)}
-    log.info("n8n suppliers: rc=%s processed=%s codes=%d", rc, parsed.get("processed"), len(new_codes))
+    err_msg = ""
     if not ok:
-        log.error("n8n suppliers FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
+        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
+                   f"(naimportované {res['rows_ok']} z {len(rows)} riadkov)")
+    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
+              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
+              "updated": res["updated"], "failed": res["failed"],
+              "error_detail": res["error_detail"], "error": err_msg,
+              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
+              "products": products, "stdout_tail": res["stdout_tail"],
+              **_supplier_summary(uploaded, assigns)}
+    log.info("n8n suppliers: rc=%s chunks=%d/%d processed=%s codes=%d",
+             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
+    if not ok:
+        log.error("n8n suppliers FAILED rc=%s chunks_ok=%d/%d stderr=%s",
+                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
     return result, (200 if ok else 502)
 
 
