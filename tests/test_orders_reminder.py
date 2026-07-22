@@ -121,3 +121,48 @@ def test_parse_classification(content, expected):
 def test_parse_classification_rejects_junk(bad):
     with pytest.raises(ValueError):
         ordrem.parse_classification(bad)
+
+
+# ── incremental processing (#153) ────────────────────────────────────────────────
+def _order(code, date="2026-07-10 10:00:00", note="volať zákazníka"):
+    return {"code": code, "date": date, "days": 12, "shopRemark": note, "has_note": bool(note),
+            "email": "a@x.sk", "phone": "", "billFullName": "Ján Vzor", "itemName": "Bunda",
+            "itemAmount": "1", "totalPriceWithVat": "9,90", "admin_link": "https://x/" + code}
+
+
+def test_fingerprint_ignores_days_but_not_note():
+    a = _order("1", date="2026-07-10 10:00:00", note="volať")
+    b = dict(a, days=99)                       # only 'days' differs — days is derived, not stable
+    assert ordrem.order_fingerprint(a) == ordrem.order_fingerprint(b)
+    c = dict(a, shopRemark="iná poznámka")
+    assert ordrem.order_fingerprint(a) != ordrem.order_fingerprint(c)
+
+
+def test_partition_unchanged_only_when_terminal_and_same_fingerprint():
+    o1 = _order("1")   # already terminal, unchanged fingerprint → unchanged
+    o2 = _order("2")   # already terminal, but note CHANGED → to_process (re-evaluate)
+    prev_fp = {"1": ordrem.order_fingerprint(o1), "2": "old-fingerprint-does-not-match"}
+    done_codes = {"1", "2"}
+    to_process, unchanged, fp = ordrem.partition_incremental([o1, o2], prev_fp, done_codes)
+    assert [o["code"] for o in unchanged] == ["1"]
+    assert [o["code"] for o in to_process] == ["2"]
+    assert fp == {"1": ordrem.order_fingerprint(o1), "2": ordrem.order_fingerprint(o2)}
+
+
+def test_partition_never_skips_a_newly_eligible_order():
+    # a code with NO prior fingerprint at all (just crossed the 4-day threshold today) —
+    # even if by coincidence its fingerprint matched something, it isn't in done_codes yet.
+    o = _order("new")
+    to_process, unchanged, fp = ordrem.partition_incremental([o], {}, set())
+    assert [x["code"] for x in to_process] == ["new"]
+    assert unchanged == []
+
+
+def test_partition_retries_not_yet_terminal_even_if_unchanged():
+    # code seen before (fingerprint matches) but NEVER reached done (e.g. OPENAI_API_KEY was
+    # missing last run) — must be retried, not silently treated as 'unchanged'.
+    o = _order("pending")
+    prev_fp = {"pending": ordrem.order_fingerprint(o)}
+    to_process, unchanged, fp = ordrem.partition_incremental([o], prev_fp, set())
+    assert [x["code"] for x in to_process] == ["pending"]
+    assert unchanged == []
