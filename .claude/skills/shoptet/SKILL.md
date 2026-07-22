@@ -60,6 +60,15 @@ Preto sa import **rozdelí podľa polí** — každý súbor/riadok nesie LEN st
 - **Beh:** `PYTHONPATH=src .venv/bin/python scripts/shoptet_import.py --file <CSV> [--dry-run] [--yes] [--headful]`. Importuj OBA súbory zvlášť: `import_links.csv` aj `import_states.csv`. Playwright: `pip install -r requirements-import.txt && playwright install chromium` (NIE v CI).
 - **Poistky (poradie):** pred-letová kontrola CSV (UTF-8, `code`+`pairCode`, rozpis link/nie-skladom/nebude-predávať) → potvrdenie (`--yes` preskočí) → **záloha exportu** do `data/backups/export_<ts>.csv` (bez úspešnej zálohy sa NEimportuje) → login → upload + **nastaví a read-back overí bezpečné parametre** (viď nižšie) → spustí → prečíta skutočný výsledok z **Logu**. Audit (screenshot + log) do `data/out/shoptet_import_<ts>.*`.
 
+### Admin deep-link na objednávku (overené naživo 2026-07-22)
+
+Orders export NEMÁ interné admin `id` objednávky a prehľad objednávok
+(`/admin/prehlad-objednavok/`) NEMÁ GET filter — `?query=`/`?code=` sa TICHO ignorujú
+(filter je POST s `__csrf__`). **Jediný funkčný GET deep-link = globálne vyhľadávanie:**
+`/admin/vyhladavanie/?string=<orderCode>&src=orders` → vráti presne tú objednávku aj
+s linkom na detail (`objednavky-detail/?id=<interné id>`). Používa ho tab
+„Nevyzdvihnuté zásielky"; použi ho pre KAŽDÝ budúci link do adminu podľa kódu objednávky.
+
 ### Reálny Shoptet import formulár (overené naživo)
 
 - **URL:** `/admin/import-produktov/` (POZOR: NIE `produkty-import`). Login: placeholder `E-mail` / `Vaše heslo`, tlačidlo `Prihlásenie`.

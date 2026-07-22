@@ -94,6 +94,33 @@ Vstupy endpointov, čo píšu do CSV (kód/dodávateľ), MUSIA odmietnuť formul
 
 **Zápis do eshopu (write-back):** doplnený dodávateľ → 3. import súbor `import_suppliers.csv` (`code;pairCode;supplier`, vlastný stĺpec) v `/api/import` zipe + nočný `/api/n8n/upload-suppliers` (inkrementálny `uploaded_suppliers.json`, mirror `upload-pairings`). **`supplier` JE importovateľný stĺpec Shoptetu** — overené naživo 2026-06-29 (set `40256/L`=PAROVANIE-TEST → export read-back potvrdil → revert na ''), NIE textProperty-style tichý no-op. Pri akomkoľvek NOVOM zápisovom poli ale ZNOVA over import-settability naživo (export presence ≠ importable).
 
+## In-app AUTOMATIZÁCIE (#93) — generický runner; nová automatizácia = registrácia, NIE nový scheduler
+
+Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry `Automation`
++ background-thread tick; štartuje sa LEN v `__main__`, testy vlákno nespúšťajú). Migrácia
+ďalšieho n8n workflowu (#103/#105–#111) = **registrácia, nič viac**:
+
+1. Pure logika do `src/parovanie/<key>.py` (vzor `posta_uncollected.py` — žiadna sieť/SMTP,
+   všetko `today=`-injektovateľné, fixtures overené proti ŽIVÉMU API).
+2. `run_<key>()` v `app.py` (sieť + `_send_mail_html` + vlastný stav-store 0600 atomicky)
+   + `Automation(key=…, name=…, schedule={"daily_at":"HH:MM","tz":"Europe/Bratislava"},
+   run_fn=…)` do `AUTOMATIONS_REG`. Endpointy `/api/automations*` (status/toggle/run) sú UŽ
+   generické — netreba nové.
+3. Frontend: záložka do `AUTOMATION_TABS` (renderuje sa v sidebar sekcii `#autoTabs`
+   „Automatizácie") + `#tab-<key>` sekcia + `render<Key>()` — vzor `renderPosta`.
+4. **BEZPEČNOSŤ (dohodnuté #93): nová automatizácia štartuje `enabled=false`** — beží až po
+   ▶ Štart; `enabled` prežíva reštart (`data/out/automations.json`); zmeškaný beh počas
+   výpadku sa preskočí dopredu. „⚡ Spustiť teraz" beží aj vypnutá (explicitná akcia) a
+   POSIELA REÁLNE e-maily — pri overovaní na živom webe NIKDY neklikaj Spustiť teraz,
+   toggle Štart→Stop stačí (skonči VYPNUTÉ, zapína manažér).
+- Pošta SK API fakty (live-overené 2026-07-22): `invalid_format` je PER-RESULT status
+  (top-level je stále "ok") — 13-14-miestne numerické štítky ho vracajú vždy (to mesiac
+  potichu rozbíjalo n8n); nevyzdvihnutá = posledný event `notified` + detailCode `ZNP*`.
+  E-mail eskalácia sa bumpuje do stavu HNEĎ po každom sende (pád uprostred behu nesmie
+  zajtra poslať duplicitný mail) a NEbumpuje sa pri zlyhanom SMTP (retry ďalší beh).
+- E2E gotcha: `.pill` má CSS `text-transform:uppercase` → `inner_text()` vráti „ZASTAVENÉ";
+  porovnávaj `evaluate("el => el.textContent")` (CSS transform nemení DOM text).
+
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.
