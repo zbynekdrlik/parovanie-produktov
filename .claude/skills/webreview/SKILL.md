@@ -286,6 +286,42 @@ keď sa export obnoví); netreba osobitný „flipped codes" store.
   **busy lock**, no-supplier-data → nič neflipne, both-availability-fields na import riadku,
   manager-store izolácia; e2e = `automations_server` s pred-vypočítaným `restock_skladom.json`.
 
+### AI-EMAIL automatizácia (klasifikuj + pošli zákazníkovi mail) — vzor `orders_reminder` (#105)
+
+Automatizácia, ktorá číta OBJEDNÁVKY (nie katalóg), LLM-klasifikuje voľný text a podľa výsledku
+POSIELA reálny zákaznícky email. Pure jadro `src/parovanie/orders_reminder.py` (bez siete/OpenAI/SMTP):
+`select_orders(csv, now)` (Vybavuje sa, dedup per code, >Nd), `build_reminder_email` (verbatim
+n8n HTML šablóna, free-text escapnutý), `build_classifier_messages` + `parse_classification`
+(faithful port n8n Text Classifier system promptu). Flask `run_orders_reminder()` drôtuje CSV +
+OpenAI + `_send_mail_html` + store.
+
+- **Zdroj objednávok = REUSE `_orders_csv_cached()`** (SHOPTET_ORDERS_URL CSV, 30-min cache) —
+  NIE XLS `patternId=20` z n8n; žiadna nová závislosť (openpyxl), a rieši to „cachovanie" optim.
+  Orders CSV má `shopRemark` (**interná** poznámka predajne, stĺpec 28) vs `remark` (poznámka
+  ZÁKAZNÍKA) — klasifikuje sa `shopRemark`. Export NEMÁ admin `id` objednávky → admin link cez
+  `posta_uncollected.ADMIN_ORDER_LINK` (globálne vyhľadávanie, reuse, needsIMPORT).
+- **OpenAI = REUSE #106 infra, NErob nové** (`supplier_stock.LLM_MODEL` gpt-4o-mini, `OPENAI_URL`,
+  `OPENAI_TIMEOUT`): `_classify_contacted()` = `requests.post` s `response_format json_object`,
+  kľúč v Authorization HLAVIČKE (nie URL → error nenesie tajomstvo). **Bez kľúča → NEposielaj
+  naslepo** (degraduj: „AI nedostupné", NEzapíš do store → retry ďalší beh); chyba klasifikácie/
+  SMTP per-obj → log+skip, beh nespadne.
+- **Dedup = per-order store `data/out/orders_reminder.json`** (`orders:{code:{status:emailed|
+  skipped_contacted,date,...}}`) — objednávka už v store sa NEklasifikuje/NEposiela znova (max
+  raz/obj, zrkadlí n8n Data Table). **Immediate-persist po každom úspešnom maile** (crash uprostred
+  behu nesmie zajtra poslať duplikát — rovnaký vzor ako `run_posta_uncollected`).
+- **Čistá stavová mašina** (keď issue chce „zjednotiť n8n vetvy"): prázdna poznámka → LEN červený
+  alert (žiaden mail); s poznámkou → AI. n8n často mal duplicitný dvojtok (prázdna šla AJ do
+  alertu AJ do mailu cez „BEZ POZNAMKY"→nekontaktovaný) — v appke to ZJEDNOTÍŠ (dokumentuj odklon).
+- **Default DISABLED** (posiela reálne zákaznícke maily + stojí OpenAI) — deploy over LEN tab +
+  Zastavené + tlačidlá; **NIKDY neklikaj Spustiť teraz** (mailoval by reálnych zákazníkov + minul
+  OpenAI). Testy = mock OBE hrany (`_classify_contacted` AJ `_send_mail_html`, 0 siete/mailu):
+  no-note→red, contacted→skip, not-contacted→mail-raz+dedup(druhý beh neposle), no-key→žiaden mail,
+  classify/SMTP error→retry, BCC na drôte (`_FakeSMTP` cez reálny `_send_mail_html`), manager-store
+  izolácia; e2e = `automations_server` s pred-vypočítaným `orders_reminder.json` (red+orange).
+- **GOTCHA (python literál):** slovenské úvodzovky `„...”` s ASCII `"` ako uzáverom vnútri
+  `"..."` reťazca predčasne UKONČIA reťazec (`SyntaxError: invalid character '„'`). Dlhý SK prompt
+  s ukážkovými `"kľúčovými slovami"` píš ako **triple-quoted** `f"""..."""` (ASCII `"` je tam OK).
+
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
 Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
