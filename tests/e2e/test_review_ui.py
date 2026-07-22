@@ -8,7 +8,9 @@ def test_approve_match_updates_progress_and_console_clean(page, live_server):
     page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
             if m.type in ("error", "warning") else None)
 
-    page.goto(live_server)
+    # 'Na objednanie' is the default landing page since #117 — go straight to
+    # the review tab (this test exercises review-tab behavior specifically).
+    page.goto(live_server + "/?tab=review")
 
     # Version label is rendered (post-deploy verification signal).
     page.wait_for_selector('[data-testid="version"]')

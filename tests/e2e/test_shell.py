@@ -19,15 +19,51 @@ def test_sidebar_hosts_nav_and_pagetitle_updates(page, live_server):
     assert page.locator(".sidebar").count() == 1
     assert page.locator(".sidebar #tabs").count() == 1
 
-    # Top bar carries a per-page title; review is the default page.
+    # Top bar carries a per-page title; 'Na objednanie' is the default page
+    # (#117 — review moved to last-used, so it's no longer the landing tab).
     page.wait_for_selector("#pageTitle")
-    assert page.locator("#pageTitle").inner_text().strip() == "Kontrola párovania"
+    assert page.locator("#pageTitle").inner_text().strip() == "Na objednanie"
 
     # Switching pages via the sidebar nav updates the top-bar title.
-    page.get_by_role("button", name="Na objednanie").click()
+    page.get_by_role("button", name="Kontrola párovania").click()
     page.wait_for_function(
         "() => document.getElementById('pageTitle')"
-        ".textContent.trim() === 'Na objednanie'")
+        ".textContent.trim() === 'Kontrola párovania'")
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_nav_order_has_review_last(page, live_server):
+    """#117 — 'Kontrola párovania' becomes the least-used page, so it moves to
+    the BOTTOM of the sidebar nav (below 'Na objednanie'/'Hľadať / opraviť'/
+    'Poznámky'), not the top."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".sidebar #tabs button")
+
+    # E2E runs as the bootstrap admin, so 'Užívatelia' (admin-only, appended
+    # after TABS regardless) trails everything — 'Kontrola párovania' is last
+    # among the real work tabs, right before it.
+    labels = page.locator(".sidebar #tabs button .tlabel").all_inner_texts()
+    assert labels == ["Na objednanie", "Hľadať / opraviť", "Poznámky",
+                       "Kontrola párovania", "Užívatelia"], labels
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_nav_badges_show_counts_on_initial_load(page, live_server):
+    """#112 — the 'Na objednanie' sidebar count badge must be populated on the
+    VERY FIRST paint, before the tab is ever opened. It used to stay empty
+    (the count read from data that only loaded lazily on first visit)."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    # Do NOT click any tab — the badge must already carry a real count.
+    badge = page.get_by_role("button", name="Na objednanie").locator(".navcount")
+    badge.wait_for(state="visible")
+    assert int(badge.inner_text()) >= 1
 
     assert console == [], f"console not clean: {console}"
 

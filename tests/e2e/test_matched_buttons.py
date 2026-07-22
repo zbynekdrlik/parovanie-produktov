@@ -12,7 +12,9 @@ def test_matched_card_three_direct_buttons(page, matched_server):
     page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
             if m.type in ("error", "warning") else None)
 
-    page.goto(matched_server)
+    # 'Na objednanie' is the default landing page since #117 — go straight to
+    # the review tab (this test exercises the review card's direct buttons).
+    page.goto(matched_server + "/?tab=review")
     page.wait_for_selector('[data-testid="version"]')
     page.wait_for_selector(".card")
 
@@ -84,7 +86,7 @@ def test_urledit_buttons_stay_onscreen_on_narrow_viewport(page, longcontent_matc
             if m.type in ("error", "warning") else None)
 
     page.set_viewport_size({"width": 390, "height": 800})
-    page.goto(longcontent_matched_server)
+    page.goto(longcontent_matched_server + "/?tab=review")
     page.wait_for_selector('[data-testid="version"]')
     page.wait_for_selector(".card")
 
@@ -122,7 +124,7 @@ def test_urledit_buttons_unwrapped_on_desktop(page, longcontent_matched_server):
             if m.type in ("error", "warning") else None)
 
     page.set_viewport_size({"width": 1200, "height": 900})
-    page.goto(longcontent_matched_server)
+    page.goto(longcontent_matched_server + "/?tab=review")
     page.wait_for_selector('[data-testid="version"]')
     page.wait_for_selector(".card")
 
