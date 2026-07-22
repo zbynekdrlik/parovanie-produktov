@@ -221,6 +221,40 @@ Automatizácia, ktorá scrapuje externé weby a/alebo volá LLM (OpenAI). Pure j
   stores. **Default DISABLED** (scrape+LLM stoja) — pri post-deploy NEklikaj Spustiť teraz, len over
   tab existuje + Zastavené + tlačidlá.
 
+## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
+
+Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
+NIE admin-only ako Užívatelia) vypíše GitHub issues repa (open+closed, PR-ka
+odfiltruj cez `pull_request` kľúč). Fixná žiarovka vpravo dole (`#ideaBtn` + modal
+`#ideaModal`) vytvorí issue → objaví sa v zozname.
+
+- **Token = backend-proxy, NIKDY do prehliadača.** `data/.gh_env` (`GITHUB_TOKEN` +
+  `GITHUB_REPO`, gitignored 600) sa načíta cez `_load_env_file` (ako `.auth_env`/
+  `.mail_env`/`.ai_env`). Token žije LEN v server-side `Authorization: Bearer`
+  hlavičke (`_gh_headers`) — nikdy URL/log/JS. Endpointy `/api/dev/issues` (list,
+  bounded `GH_MAX_PAGES`=5 pagination — `/issues?state=all` vracia issues AJ PR-ka
+  premiešané podľa updated, takže jedna 100-stranka by mohla odrezať staršie issues
+  po odfiltrovaní PR) + `/api/dev/idea` (create; title povinný/capnutý, rate-limited
+  per user). **Chýbajúci/neplatný token → graceful `{available:False}`, NIKDY 500** —
+  tab aj žiarovka to zvládnu. `GITHUB_API_BASE` env override = pointne na iný base
+  (e2e stub).
+- **E2E hermeticky** (`tests/e2e/test_dev.py` + `dev_server` fixture): fixture bootne
+  malý `http.server.ThreadingHTTPServer` GitHub-stub (GET `/issues` → canned open+
+  closed+PR, POST → append+echo) a appku spustí s `GITHUB_TOKEN`/`GITHUB_REPO`/
+  `GITHUB_API_BASE`→stub. Pridaj `dev_server` do `_SERVER_FIXTURES` (auth cookie).
+  Backend testy (`tests/test_webreview_dev.py`) mockujú `webapp.requests.get/post`;
+  autouse guard delenv-ne reálny `GITHUB_TOKEN` (dev box ho má z `.gh_env`) + spraví
+  z requests raising stub → žiadne reálne volanie omylom.
+- **GOTCHA — `get_by_role("button", name="Vývoj")` chytí AJ žiarovku** (jej
+  `aria-label="Zapíš nápad na vývoj"` obsahuje „vývoj", substring match) → strict-mode
+  chyba. Nav klikaj scoped: `page.locator("#devNav button")`. `.dev-state` pill má
+  `text-transform:uppercase` (ako `.pill`) → `inner_text()` vráti „OTVORENÉ"; assertuj
+  cez triedu `.dev-state.open`/`.dev-state.done`, nie text.
+- **GOTCHA — po create je GitHub list eventuálne konzistentný**: `loadDevIssues()`
+  hneď po POST create môže vrátiť ešte starý zoznam (nová issue tam ešte nie je);
+  reload (klik nav) o pár s ju už ukáže. Post-deploy: smieš vytvoriť 1 test issue cez
+  živú žiarovku a hneď ju `gh issue close` (overené #149 pri v0.59.0).
+
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.

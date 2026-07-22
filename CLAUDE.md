@@ -7,7 +7,7 @@ Load the matching skill BEFORE working on that area (don't re-derive):
 - shoptet eshop / export / import / polia produktov / textProperty / vypredané/vypnuté → load `.claude/skills/shoptet`
 - dodávatelia / recon webu / pridanie dodávateľa / parsovanie výsledkov → load `.claude/skills/suppliers`
 - deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`
-- webreview web (review tab / Na objednanie / per-riadkové stavy / api endpointy / úložiská párov) → load `.claude/skills/webreview`
+- webreview web (review tab / Na objednanie / per-riadkové stavy / api endpointy / úložiská párov / záložka „Vývoj" = GitHub issues + žiarovka nápad→issue) → load `.claude/skills/webreview`
 - import párov z Discord vlákna cez n8n (forwardnuté notifikácie → páry) → load `.claude/skills/discord-import`
 - GRUBE per-veľkosť kódy / grube.de itemId extrakcia / externalCode zápis → load `.claude/skills/grube`
 
