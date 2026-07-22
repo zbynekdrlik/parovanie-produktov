@@ -29,9 +29,13 @@ from html import escape
 
 TRACKING_API = "https://api.posta.sk/tracking?q={q}&l=sk&p=1"
 TRACKING_LINK = "https://www.posta.sk/sledovanie-zasielok#parcel={q}"
-# Orders export has no internal admin order id (the n8n Sheet had one), so the
-# admin link goes to the orders overview filtered by the order code.
-ADMIN_ORDER_LINK = "https://www.forestshop.sk/admin/prehlad-objednavok/?query={code}"
+# Orders export has no internal admin order id (the n8n Sheet had one). The one
+# GET deep-link the Shoptet admin supports is the global search — verified live
+# 2026-07-22: /admin/vyhladavanie/?string=<code>&src=orders returns exactly that
+# order with its detail link (the overview's filter is POST-only; ?query=/?code=
+# are silently ignored).
+ADMIN_ORDER_LINK = ("https://www.forestshop.sk/admin/vyhladavanie/"
+                    "?string={code}&src=orders")
 SOURCE_WINDOW_DAYS = 30
 MAX_EMAILS = 4
 
