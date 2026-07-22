@@ -312,6 +312,7 @@ def test_override_send_without_email_rejected(iso, monkeypatch):
         "20261000;" + OLD + " 10:00:00;Vybavuje sa;;")
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: csv_noemail.encode("cp1250"))
     c = _seed(iso)
+    iso["sent"].clear()   # drop the seeded run's unrelated 20261001 mail
     r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
     assert r.status_code == 400
     assert iso["sent"] == []
