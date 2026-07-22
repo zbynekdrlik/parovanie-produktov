@@ -360,6 +360,24 @@ def automations_server(tmp_path_factory):
              "checkedAt": "2026-07-22T05:00:03+02:00"},
         ],
     }, ensure_ascii=False), encoding="utf-8")
+    # #108 — pre-existing „Vypredané → Skladom" restock result (one candidate that
+    # WAS flipped) so the tab's status + table + import-outcome render WITHOUT any
+    # network. The E2E never clicks Spustiť teraz (it WRITES to the live eshop) —
+    # same rationale as the parovania_eshop / supplier_stock fixtures.
+    (out / "restock_skladom.json").write_text(json.dumps({
+        "last_check": "2026-07-22T06:00:05+02:00",
+        "has_supplier_data": True,
+        "supplier_last_check": "2026-07-22T05:00:07+02:00",
+        "status": "ok",
+        "candidates": [
+            {"code": "7/L", "pairCode": "P7", "name": "Bunda Restock Test",
+             "supplier": "BETALOV", "ourPrice": "89.90", "supplierPrice": "75.5",
+             "supplierAvailabilityText": "Skladom",
+             "link": "https://www.huntingshop.eu/p/bunda-restock",
+             "checkedAt": "2026-07-22T05:00:03+02:00"},
+        ],
+        "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
+    }, ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
         **_AUTH_ENV,

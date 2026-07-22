@@ -35,7 +35,8 @@ from flask import (Flask, Response, jsonify, redirect, render_template, request,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
-    __version__, config, import_builder, posta_uncollected, riziko_vypadku, supplier_stock)
+    __version__, config, import_builder, posta_uncollected, restock_skladom,
+    riziko_vypadku, supplier_stock)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -2768,6 +2769,124 @@ def run_riziko_vypadku() -> dict:
     return stats
 
 
+# --------------------------------------------------------------------------- #
+# #108 — „Vypredané → Skladom": daily restock (in-app migration of the LIVE n8n
+# workflow „Forestshop — Vypredané → Skladom v2" KN1BE18HLdM8mfTc). WRITES to the
+# live eshop: JOINS our catalog export (Vypredané + visible products, state 2)
+# against #106's ALREADY-SCRAPED supplier_stock.json and, for every product whose
+# supplier now has FRESH confirmed stock, builds the restock rows (both availability
+# fields → Skladom, visible, stock) and pushes them through the SAME careful Shoptet
+# import path the n8n endpoint uses (import_builder.restock_rows → run_import →
+# #23-hardened read-back). Detection logic lives in parovanie.restock_skladom; this
+# wires it to the store + the import + the display endpoint.
+# --------------------------------------------------------------------------- #
+RESTOCK_STATE = os.path.join(OUT, "restock_skladom.json")
+
+
+def _load_restock() -> dict:
+    try:
+        with open(RESTOCK_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_restock(d: dict) -> None:
+    tmp = RESTOCK_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, RESTOCK_STATE)
+
+
+def _write_restock_csv(path: str, rows: list) -> None:
+    """Write the restock rows in the canonical Shoptet import dialect (utf-8-sig BOM,
+    ';', CRLF), header = import_builder.RESTOCK_COLS — same dialect as the split
+    import files, so the careful run_import script + Shoptet parse it identically."""
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+        w.writerow(import_builder.RESTOCK_COLS)
+        w.writerows(rows)
+
+
+def run_restock_skladom() -> dict:
+    """One restock run (daily ~06:00 or „Spustiť teraz"): join OUR catalog export
+    (Vypredané + visible products, state 2) against the „Dodávateľský sklad" scraper's
+    LAST result (data/out/supplier_stock.json) and flip back to Skladom every product
+    whose supplier now has FRESH confirmed stock — by building the restock import rows
+    (both availability fields → Skladom, visible, stock 5 via
+    import_builder.restock_rows) and pushing them through the SAME careful Shoptet
+    import path the n8n endpoint uses (run_import → parse_import_log read-back). WRITES
+    to the live eshop.
+
+    Safe by construction: no supplier data (scraper never ran) → flips NOTHING and
+    surfaces has_supplier_data=False; a candidate needs ok+available+FRESH (checkedAt
+    within 48h), so a stale or negative supplier confirmation never flips a product.
+    Idempotent — only state-2 (Vypredané) products are candidates, so a product already
+    Skladom is never re-flipped once the export refreshes. A failed import is detected
+    via the #23-hardened read-back and recorded status='error', not a silent success
+    (the run itself never raises on an import failure — it degrades to a red row, like
+    parovania_eshop). Reads ONLY its own store + the export + supplier_stock; never
+    touches the manager's decision stores."""
+    with _lock:
+        stock = _load_supplier_stock()
+    supplier_rows = stock.get("rows") or []
+    has_data = bool(supplier_rows)
+    csv_text = _read_export_for_links()          # same cp1250 export reader as #106
+    now = datetime.now(timezone.utc).astimezone()
+    candidates = (restock_skladom.compute_candidates(csv_text, supplier_rows, now)
+                  if has_data else [])
+    rows = import_builder.restock_rows(candidates, CODE2PAIR)
+
+    status = "ok"
+    processed = updated = failed = None
+    error_detail = ""
+    if rows:
+        os.makedirs(OUT, exist_ok=True)
+        fd, csv_path = tempfile.mkstemp(prefix="restock_", suffix=".csv", dir=OUT)
+        os.close(fd)
+        _write_restock_csv(csv_path, rows)
+        if not _import_lock.acquire(blocking=False):
+            log.warning("restock_skladom: iný import práve beží — beh preskočený")
+            status, error_detail = "busy", "iný import práve beží"
+        else:
+            try:
+                rc, out, err = run_import(csv_path)
+            except subprocess.TimeoutExpired:
+                rc, out, err = 1, "", "import timeout"
+            finally:
+                _import_lock.release()
+            parsed = parse_import_log(out)
+            processed, updated, failed = (parsed.get("processed"),
+                                          parsed.get("updated"), parsed.get("failed"))
+            if rc == 0:
+                status = "ok"
+            else:
+                status = "error"
+                error_detail = parsed.get("error_detail") or (err or "")[-300:]
+                log.error("restock_skladom: import FAILED rc=%s stderr=%s",
+                          rc, (err or "")[-400:])
+
+    # `candidates` are always stored (what WOULD be flipped) so the tab shows them
+    # even on a failed import; on success they ARE what was flipped.
+    with _lock:
+        _save_restock({
+            "last_check": now.isoformat(timespec="seconds"),
+            "has_supplier_data": has_data,
+            "supplier_last_check": stock.get("last_check", ""),
+            "status": status,
+            "candidates": candidates,
+            "processed": processed, "updated": updated, "failed": failed,
+            "error_detail": error_detail,
+        })
+    stats = {"candidates": len(candidates), "imported_rows": len(rows),
+             "status": status, "processed": processed, "updated": updated,
+             "failed": failed, "has_supplier_data": has_data}
+    log.info("restock_skladom: run done %s", stats)
+    return stats
+
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
@@ -2807,6 +2926,15 @@ AUTOMATIONS_REG = [
                name="Riziko výpadku",
                schedule={"daily_at": "06:15", "tz": "Europe/Bratislava"},
                run_fn=run_riziko_vypadku),
+    # #108 — daily restock (products WE show as Vypredané but our supplier has stock
+    # again → flip back to Skladom). SAFETY (#93 contract): starts DISABLED — this one
+    # WRITES to the live production eshop, so it runs ONLY after the manager clicks
+    # ▶ Štart; a deploy never auto-restocks on its own. Scheduled after the 05:00
+    # supplier scrape (fresh data) and the 06:15 riziko report brackets it.
+    Automation(key="restock_skladom",
+               name="Vypredané → Skladom",
+               schedule={"daily_at": "06:00", "tz": "Europe/Bratislava"},
+               run_fn=run_restock_skladom),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
@@ -2899,6 +3027,28 @@ def api_riziko_vypadku_csv():
     rows = [[_csv_safe(r.get(k, "")) for k in riziko_vypadku.RISK_FIELDS]
             for r in (st.get("risks") or [])]
     return _csv_response(header, rows, "riziko_vypadku.csv")
+
+
+@app.route("/api/restock-skladom")
+def api_restock_skladom():
+    """Display data for the „Vypredané → Skladom" tab — the last restock run's
+    candidate products (kód, názov, naša cena vs cena dodávateľa, linky), the import
+    outcome (spracované / naskladnené / zlyhania), and whether the '#106 Dodávateľský
+    sklad' scraper has produced data at all (has_supplier_data=False → the tab shows
+    'najprv spusti Dodávateľský sklad', never a misleading empty list)."""
+    with _lock:
+        st = _load_restock()
+    return jsonify({
+        "last_check": st.get("last_check", ""),
+        "has_supplier_data": bool(st.get("has_supplier_data")),
+        "supplier_last_check": st.get("supplier_last_check", ""),
+        "status": st.get("status", ""),
+        "candidates": st.get("candidates") or [],
+        "processed": st.get("processed"),
+        "updated": st.get("updated"),
+        "failed": st.get("failed"),
+        "error_detail": st.get("error_detail", ""),
+    })
 
 
 if __name__ == "__main__":
