@@ -43,6 +43,24 @@ Pri prestavbe shellu/CSS **NEMEŇ** id/`data-testid`/triedy, na ktoré sa viažu
 `data-theme` pred vykreslením obsahu, žiadny biely záblesk pre dark usera). E2E test
 `tests/e2e/test_shell.py` (sidebar + page-title + tmavý-mód persistencia cez reload).
 
+## Paleta — `--accent`/`--accent-hov` sú DVA odtiene, nie jeden (#143, v0.58.1)
+
+Zámerná architektúra, nie duplicita: `--accent` = jemný ťah (TEXT/ikona na svetlom/mäkkom
+podklade — aktívna nav položka na `--accent-soft`, progress bar, focus ring); `--accent-hov`
+= silný ťah (SOLID výplň s BIELYM textom navrchu — brand logo, navcount badge, `.filters
+button.active`, `.downloads a`, `.btn.good`, `.stockfilters .sf.active`). Dôvod: jedna
+farba nevie súčasne vyhovieť „text na bielom/svetlom" (potrebuje TMAVší odtieň, aby mal
+kontrast ≥4.5:1) AJ „biely text na plnej výplni" (potrebuje TIEŽ tmavší odtieň) — takže obe
+použitia v skutočnosti chcú TEN ISTÝ tmavší odtieň, len `--accent` navyše slúži ako text na
+takmer-bielom `--accent-soft` pozadí, kde sa naopak zíde byť o niečo SVETLEJŠÍ v tmavom móde
+(text musí byť čitateľný na TMAVOM `--accent-soft`, teda jasnejšia zelená). Pri ĎALŠEJ zmene
+palety over si kontrast WCAG luminanciou (rýchly python skript, nie odhad od oka) PRED
+zápisom do CSS — pozri commit `63d3963` pre vzor výpočtu. Konkrétne hex boss-om zadaných
+farieb (`#6CAB68`/`#D14D3B`) sa použili DOSLOVA len na miestach, ktoré explicitne pomenoval
+(to-order chip-y, „Skladom"/„Nedostupné"), NIE na `--accent` samotnú (tá je odvodená tmavšia
+verzia v rovnakom odtieni, lebo doslovný boss-ov hex by na bielom pozadí/bielom texte mal
+kontrast len ~2.8:1 — príliš málo).
+
 ## Auth (#91, v0.44.0) — celý web za loginom; KAŽDÝ nový endpoint je chránený automaticky
 
 Default-deny `before_request` gate v `app.py`: nový route NEtreba nijako značiť — chránený je
