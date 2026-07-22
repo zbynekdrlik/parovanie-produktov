@@ -38,7 +38,7 @@ from parovanie import __version__, config, import_builder, posta_uncollected
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
-from parovanie.export_helpers import current_of
+from parovanie.export_helpers import current_of, resync_current
 from parovanie.shoptet_import import parse_import_log
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -992,6 +992,29 @@ def _orders_csv_cached() -> bytes:
         f.write(data)
     os.replace(tmp, ORDERS_CACHE)
     return data
+
+
+def _fetch_export_csv() -> bytes:
+    """Full Shoptet catalog export (pattern 14, cp1250 bytes) — the same URL
+    scripts/shoptet_import.py downloads as an import-time backup, reused here
+    for the hourly read-only refresh (#119)."""
+    url = _cred("SHOPTET_EXPORT_URL")
+    if not url:
+        raise RuntimeError(f"SHOPTET_EXPORT_URL chýba v {CRED_PATH}")
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=120)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        # NEvkladaj `e`/URL do hlášky ani do reťazenej výnimky — obsahuje partner
+        # hash (rovnaký dôvod ako scripts/shoptet_import.py::_backup_export).
+        # `from None` navyše potlačí chained traceback, aby URL neunikla ani cez
+        # log.exception() v automation_runner._execute (last_error v UI je aj
+        # tak už len táto sanitizovaná správa, nie surová `e`).
+        raise RuntimeError(f"stiahnutie katalógového exportu zlyhalo: {type(e).__name__} "
+                           "(URL skrytá — over SHOPTET_EXPORT_URL)") from None
+    if not r.content:
+        raise RuntimeError("stiahnutý export katalógu je prázdny")
+    return r.content
 
 
 @app.route("/")
@@ -2143,11 +2166,79 @@ def run_posta_uncollected() -> dict:
     return stats
 
 
+def run_shoptet_sync() -> dict:
+    """Hourly refresh (#119): re-pulls the forestshop orders export (bypassing the
+    30-min ORDERS_MAXAGE cache window — an hourly GUARANTEED pull, not just
+    "whenever someone opens Na objednanie") AND the full Shoptet catalog export
+    (data/products.csv), then rebuilds the in-memory CODE2PAIR/CATALOG search
+    index and resyncs each review card's price/stock snapshot
+    (export_helpers.resync_current — the same logic scripts/resync_export.py
+    runs manually). Passive READ-ONLY refresh: never touches the manager
+    decision stores (decisions/ordered_items/waiting_items/order_pairings/
+    supplier_assignments — those are the manager's live work, untouched here).
+
+    Fetch-then-swap (temp file + atomic os.replace) throughout: a failed/partial
+    fetch raises BEFORE anything on disk changes, so the runner's existing
+    try/except (automation_runner._execute) records the error and the app keeps
+    serving the previous cache/catalog/review data untouched — degrade, never
+    crash, never a half-written file."""
+    global CODE2PAIR, CATALOG
+
+    orders_bytes = _fetch_orders_csv()
+    tmp = ORDERS_CACHE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(orders_bytes)
+    os.replace(tmp, ORDERS_CACHE)
+
+    export_bytes = _fetch_export_csv()
+    tmp2 = SRC + ".tmp"
+    with open(tmp2, "wb") as f:
+        f.write(export_bytes)
+    os.replace(tmp2, SRC)
+
+    # rebuild the in-memory search index from the fresh export — same single
+    # cp1250-pass helper the app uses at startup, no restart needed.
+    with _lock:
+        review_keys = ({p.get("pairCode") for p in PRODUCTS if p.get("pairCode")}
+                       | {c for p in PRODUCTS for c in (p.get("variant_codes") or [])})
+        CODE2PAIR, CATALOG = _load_catalog(SRC, review_keys)
+
+    rows = []
+    with open(SRC, encoding="cp1250", errors="replace") as f:
+        for row in csv.DictReader(f, delimiter=";"):
+            rows.append(row)
+    with _lock:
+        counts = resync_current(rows, PRODUCTS, set(config.SUPPLIERS))
+        tmp3 = DATA + ".tmp"
+        with open(tmp3, "w", encoding="utf-8") as f:
+            json.dump(PRODUCTS, f, ensure_ascii=False)
+        os.replace(tmp3, DATA)
+
+    result = {
+        "orders_bytes": len(orders_bytes),
+        "catalog_products": len(CATALOG),
+        "catalog_codes": len(CODE2PAIR),
+        "review_synced": counts["synced"],
+        "review_stale": counts["stale"],
+    }
+    log.info("shoptet_sync: run OK %s", result)
+    return result
+
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
                schedule={"daily_at": "09:00", "tz": "Europe/Bratislava"},
                run_fn=run_posta_uncollected),
+    # #119 — hourly guaranteed refresh of the orders export + full catalog export.
+    # SAFETY (#93 contract): starts DISABLED like every automation; the manager
+    # clicks ▶ Štart. Passive/read-only (no e-mails, no customer side-effects),
+    # so it is SAFE to enable immediately once deployed — the deploy itself just
+    # never auto-enables anything on its own.
+    Automation(key="shoptet_sync",
+               name="Sync zo Shoptetu",
+               schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
+               run_fn=run_shoptet_sync),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 

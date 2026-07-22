@@ -38,17 +38,32 @@ class Automation:
 
 
 def schedule_label(schedule: dict) -> str:
-    """Human label for the UI, e.g. 'denne o 09:00'."""
+    """Human label for the UI, e.g. 'denne o 09:00' or 'každú hodinu' (#119 —
+    interval-based schedules, {"interval_minutes": N}, added alongside the
+    original daily_at form; both keys stay supported, never both at once)."""
+    if "interval_minutes" in schedule:
+        mins = int(schedule["interval_minutes"])
+        if mins % 60 == 0:
+            hrs = mins // 60
+            if hrs == 1:
+                return "každú hodinu"
+            if 2 <= hrs <= 4:
+                return f"každé {hrs} hodiny"
+            return f"každých {hrs} hodín"
+        return f"každých {mins} min"
     return f"denne o {schedule.get('daily_at', '?')}"
 
 
 def next_run_at(schedule: dict, now: datetime | None = None) -> datetime:
-    """Next occurrence of the daily HH:MM in the schedule's timezone (tz-aware).
-    A run scheduled while the app was down is SKIPPED (daily checks — the next
-    future slot is good enough), which this encodes by always returning a time
-    strictly in the future."""
+    """Next run time in the schedule's timezone (tz-aware). Two schedule shapes:
+    daily_at "HH:MM" (next occurrence of that clock time — a run missed while the
+    app was down is SKIPPED, the next future slot is good enough) or interval_minutes
+    N (#119 — simple now+N, used for the hourly Shoptet sync; no clock alignment,
+    so re-enabling just restarts the N-minute countdown from that moment)."""
     tz = ZoneInfo(schedule.get("tz", DEFAULT_TZ))
     now = (now or datetime.now(tz)).astimezone(tz)
+    if "interval_minutes" in schedule:
+        return now + timedelta(minutes=int(schedule["interval_minutes"]))
     hh, mm = (int(x) for x in schedule["daily_at"].split(":"))
     candidate = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
     if candidate <= now:

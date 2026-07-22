@@ -2,6 +2,7 @@ from parovanie.export_helpers import (
     IMGCOLS,
     current_of,
     fill_missing_prices,
+    resync_current,
     row_images,
     slug,
     state_of,
@@ -83,3 +84,61 @@ def test_row_images_collects_http_deduped_in_order():
            "image3": "https://x/a.jpg", "image4": "not-a-url", "image": ""}
     assert row_images(row) == ["https://x/a.jpg", "https://x/b.jpg"]
     assert IMGCOLS[0] == "defaultImage"
+
+
+# ── resync_current (#119 — shared by scripts/resync_export.py AND the new hourly
+#    in-app "Sync zo Shoptetu" automation; extracted so the two never drift) ────
+def _row(supplier, name, code="", vis="visible", ais="Skladom", aos="",
+         price="", std="", stock="", img=""):
+    return {"supplier": supplier, "name": name, "code": code,
+            "productVisibility": vis, "availabilityInStock": ais,
+            "availabilityOutOfStock": aos, "price": price, "standardPrice": std,
+            "stock": stock, "defaultImage": img}
+
+
+def test_resync_current_updates_matched_product_by_supplier_and_name():
+    rows = [_row("BETALOV", "Bunda ALFA", code="1/M", price="99,00",
+                 std="109,00", stock="3", img="https://x/a.jpg"),
+            _row("BETALOV", "Bunda ALFA", code="1/L")]
+    rd = [{"supplier": "BETALOV", "name": "Bunda ALFA", "current": {}}]
+    counts = resync_current(rows, rd, {"BETALOV"})
+    assert counts == {"synced": 1, "stale": 0, "off": 0}
+    assert rd[0]["variant_codes"] == ["1/M", "1/L"]
+    assert rd[0]["our_images"] == ["https://x/a.jpg"]
+    assert rd[0]["current"]["price"] == "99,00"
+    assert rd[0]["current"]["state"] == 1
+
+
+def test_resync_current_first_row_wins_price_and_vis():
+    # first-non-empty semantics: the SECOND row's vis/price never overwrite the first
+    rows = [_row("BETALOV", "X", code="A", price="10,00"),
+            _row("BETALOV", "X", code="B", price="999,00", vis="hidden")]
+    rd = [{"supplier": "BETALOV", "name": "X", "current": {}}]
+    resync_current(rows, rd, {"BETALOV"})
+    assert rd[0]["current"]["price"] == "10,00"
+    assert rd[0]["current"]["vis"] == "visible"
+
+
+def test_resync_current_not_found_by_name_flags_stale_keeps_old_vis():
+    rd = [{"supplier": "BETALOV", "name": "Zmiznutý produkt",
+           "current": {"vis": "visible", "price": "50,00"}}]
+    counts = resync_current([], rd, {"BETALOV"})
+    assert counts == {"synced": 0, "stale": 1, "off": 0}
+    assert rd[0]["current"]["stale"] is True
+    assert rd[0]["current"]["vis"] == "visible"           # old value preserved
+    assert rd[0]["current"]["price"] == "50,00"            # untouched, not wiped
+
+
+def test_resync_current_ignores_rows_from_uncovered_supplier():
+    rows = [_row("UNKNOWN_SUPPLIER", "Y", code="Z")]
+    rd = [{"supplier": "BETALOV", "name": "Y", "current": {}}]
+    counts = resync_current(rows, rd, {"BETALOV"})
+    assert counts["synced"] == 0 and counts["stale"] == 1
+
+
+def test_resync_current_counts_off_products():
+    rows = [_row("BETALOV", "Off product", code="C", vis="hidden", ais="", aos="")]
+    rd = [{"supplier": "BETALOV", "name": "Off product", "current": {}}]
+    counts = resync_current(rows, rd, {"BETALOV"})
+    assert counts["off"] == 1
+    assert rd[0]["current"]["state"] == 3

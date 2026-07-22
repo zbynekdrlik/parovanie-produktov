@@ -19,6 +19,7 @@ from parovanie.automation_runner import (
 
 TZ = ZoneInfo("Europe/Bratislava")
 SCHED = {"daily_at": "09:00", "tz": "Europe/Bratislava"}
+HOURLY = {"interval_minutes": 60, "tz": "Europe/Bratislava"}
 
 
 def _runner(tmp_path, run_fn=None, tick=30.0):
@@ -47,6 +48,32 @@ def test_next_run_exactly_at_time_is_tomorrow():
 
 def test_schedule_label():
     assert schedule_label(SCHED) == "denne o 09:00"
+
+
+# ── interval-based scheduling (#119 — hourly Shoptet sync) ───────────────────
+def test_next_run_interval_minutes_is_now_plus_interval():
+    now = datetime(2026, 7, 22, 8, 17, tzinfo=TZ)
+    assert next_run_at(HOURLY, now) == datetime(2026, 7, 22, 9, 17, tzinfo=TZ)
+
+
+def test_next_run_interval_minutes_respects_tz_arg_default():
+    # no explicit `now` -> uses "now" in the schedule's own tz, still +interval
+    before = datetime.now(TZ)
+    got = next_run_at(HOURLY)
+    assert got - before >= timedelta(minutes=59, seconds=55)
+    assert got - before <= timedelta(minutes=60, seconds=5)
+
+
+def test_schedule_label_interval_hourly():
+    assert schedule_label(HOURLY) == "každú hodinu"
+
+
+def test_schedule_label_interval_minutes_non_hour():
+    assert schedule_label({"interval_minutes": 15}) == "každých 15 min"
+
+
+def test_schedule_label_interval_multiple_hours():
+    assert schedule_label({"interval_minutes": 120}) == "každé 2 hodiny"
 
 
 # ── safety: default DISABLED ──────────────────────────────────────────────────

@@ -260,7 +260,7 @@ const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
 
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
 // sidebar section (#autoTabs) + its own tab section. New automations: add here.
-const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky']];
+const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['shoptet_sync', 'Sync zo Shoptetu']];
 
 const NAV_ICONS = {
   review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
@@ -269,6 +269,8 @@ const NAV_ICONS = {
   notes: '<path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4"/>',
   users: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6"/>',
   posta: '<path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><path d="M3 8l9 5 9-5"/><path d="M12 13v8"/>',
+  shoptet_sync: '<path d="M21 12a9 9 0 01-15.3 6.4M3 12a9 9 0 0115.3-6.4"/>'
+    + '<path d="M21 3v6h-6M3 21v-6h6"/>',
 };
 
 // 'Užívatelia' is an ADMIN-ONLY nav item (the server 403s non-admins anyway).
@@ -318,7 +320,7 @@ function renderTabs() {
 const PAGE_TITLES = {
   review: 'Kontrola párovania', toorder: 'Na objednanie',
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
-  posta: 'Nevyzdvihnuté zásielky',
+  posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
@@ -338,6 +340,8 @@ function setPageHead() {
   } else if (ACTIVE_TAB === 'posta') {
     const n = POSTA ? (POSTA.uncollected || []).length : 0;
     s.textContent = `${n} zásielok čaká na pošte · automatická kontrola + upozornenia zákazníkom`;
+  } else if (ACTIVE_TAB === 'shoptet_sync') {
+    s.textContent = 'Hodinové obnovenie objednávok a katalógu zo Shoptetu';
   } else { s.textContent = ''; }
 }
 
@@ -391,6 +395,7 @@ async function switchTab(tab) {
   if (tab === 'notes' && !NOTES.length) await loadNotes();
   if (tab === 'users') await loadUsers();   // always fresh — small list
   if (tab === 'posta') await loadPosta();   // always fresh — status can change
+  if (tab === 'shoptet_sync') await loadAutomations();   // always fresh — status can change
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
@@ -1003,15 +1008,16 @@ function renderUsers() {
 }
 
 // ---- Automatizácie (#93): tab „Nevyzdvihnuté zásielky" -------------------- //
+// ---- + „Sync zo Shoptetu" (#119, plain status-only tab, no per-item table) - //
+async function loadAutomations() {
+  try { AUTOMATIONS = (await (await fetch('/api/automations')).json()).automations || []; }
+  catch (_) { AUTOMATIONS = []; }
+}
+
 async function loadPosta() {
-  try {
-    const [a, p] = await Promise.all([
-      fetch('/api/automations').then(r => r.json()),
-      fetch('/api/posta-uncollected').then(r => r.json()),
-    ]);
-    AUTOMATIONS = a.automations || [];
-    POSTA = p;
-  } catch (_) { AUTOMATIONS = []; POSTA = null; }
+  await loadAutomations();
+  try { POSTA = await (await fetch('/api/posta-uncollected')).json(); }
+  catch (_) { POSTA = null; }
 }
 
 function autoByKey(key) { return AUTOMATIONS.find(x => x.key === key); }
@@ -1021,16 +1027,20 @@ async function toggleAutomation(key, enabled) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled }),
   });
+  // loadPosta() also refreshes AUTOMATIONS (needed by every tab) — the extra
+  // /api/posta-uncollected fetch is harmless on a non-posta tab, unused there.
   await loadPosta(); render();
 }
 
 let _postaPoll = null;
-async function runAutomation(key) {
+// `tab` = which sidebar tab must stay open for polling to continue (default
+// 'posta' keeps the original single-caller behavior unchanged).
+async function runAutomation(key, tab = 'posta') {
   await fetch(`/api/automations/${key}/run`, { method: 'POST' });
   await loadPosta(); render();
   clearInterval(_postaPoll);
   _postaPoll = setInterval(async () => {           // refresh until the run ends
-    if (ACTIVE_TAB !== 'posta') { clearInterval(_postaPoll); _postaPoll = null; return; }
+    if (ACTIVE_TAB !== tab) { clearInterval(_postaPoll); _postaPoll = null; return; }
     await loadPosta(); render();
     const a = autoByKey(key);
     if (!a || !a.running) { clearInterval(_postaPoll); _postaPoll = null; }
@@ -1164,6 +1174,59 @@ function renderPosta() {
   }
 }
 
+// ---- Automatizácie (#119): tab „Sync zo Shoptetu" -------------------------- //
+// Plain status-only tab (no per-item table like posta — a sync run has nothing
+// to list, just counts) — status/controls come straight from AUTOMATIONS
+// (last_result), no dedicated display endpoint needed.
+function renderShoptetSync() {
+  const wrap = document.getElementById('tab-shoptet_sync');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('shoptet_sync');
+  if (!a) {
+    wrap.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    return;
+  }
+  const st = el('div', 'autostatus');
+  const head = el('div', 'autohead');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'shoptet-sync-status';
+  head.appendChild(pill);
+  if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha synchronizácia…'));
+  const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+    a.enabled ? '⏹ Stop' : '▶ Štart');
+  btn.dataset.testid = 'shoptet-sync-toggle';
+  btn.onclick = () => toggleAutomation('shoptet_sync', !a.enabled);
+  head.appendChild(btn);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'shoptet-sync-run';
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation('shoptet_sync', 'shoptet_sync');
+  head.appendChild(run);
+  st.appendChild(head);
+
+  const meta = el('div', 'autometa');
+  const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+  bits.push('Posledný beh: ' + (a.last_run
+    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+    : 'zatiaľ nikdy'));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+  st.appendChild(meta);
+  if (a.last_status === 'error' && a.last_error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+  }
+  const lr = a.last_result || {};
+  if (a.last_run && a.last_status === 'ok') {
+    st.appendChild(el('div', 'muted',
+      `Objednávky: ${(lr.orders_bytes || 0).toLocaleString('sk-SK')} B stiahnuté`
+      + ` · katalóg: ${lr.catalog_products ?? 0} produktov (${lr.catalog_codes ?? 0} kódov)`
+      + ` · zosynchronizované review karty: ${lr.review_synced ?? 0}`
+      + (lr.review_stale ? ` (nenájdených v exporte: ${lr.review_stale})` : '')));
+  }
+  wrap.appendChild(st);
+}
+
 function render() {
   renderTabs();
   setPageHead();
@@ -1172,15 +1235,18 @@ function render() {
   const notes = ACTIVE_TAB === 'notes';
   const users = ACTIVE_TAB === 'users';
   const posta = ACTIVE_TAB === 'posta';
+  const shoptetSync = ACTIVE_TAB === 'shoptet_sync';
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
-  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes || users || posta) ? 'none' : '';
-  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes || users || posta) ? 'none' : '';
-  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes || users || posta) ? 'none' : '';
+  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes || users || posta || shoptetSync) ? 'none' : '';
+  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes || users || posta || shoptetSync) ? 'none' : '';
+  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes || users || posta || shoptetSync) ? 'none' : '';
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
   const secNotes = document.getElementById('tab-notes'); if (secNotes) secNotes.hidden = !notes;
   const secUsers = document.getElementById('tab-users'); if (secUsers) secUsers.hidden = !users;
   const secPosta = document.getElementById('tab-posta'); if (secPosta) secPosta.hidden = !posta;
-  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes || users || posta) ? 'none' : '';
+  const secShoptetSync = document.getElementById('tab-shoptet_sync'); if (secShoptetSync) secShoptetSync.hidden = !shoptetSync;
+  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes || users || posta || shoptetSync) ? 'none' : '';
+  if (shoptetSync) { document.getElementById('empty').hidden = true; renderShoptetSync(); return; }
   if (posta) { document.getElementById('empty').hidden = true; renderPosta(); return; }
   if (users) { document.getElementById('empty').hidden = true; renderUsers(); return; }
   if (notes) { document.getElementById('empty').hidden = true; renderNotes(); return; }
@@ -1250,7 +1316,8 @@ async function init() {
   ORDER_SUPPLIER = localStorage.getItem('orderSupplier') || 'all';
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
-  if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes' || qTab === 'posta') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
+  if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes'
+      || qTab === 'posta' || qTab === 'shoptet_sync') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
   // Prefetch nav badge counts for ALL tabs on first paint (#112) — not just the
   // active one; the 'Na objednanie'/'Poznámky' counts used to stay empty until
   // that tab was first opened. loadOrders()/loadNotes() already swallow fetch
@@ -1259,6 +1326,7 @@ async function init() {
   await Promise.all([loadOrders(), loadNotes()]);
   if (ACTIVE_TAB === 'users') await loadUsers();
   if (ACTIVE_TAB === 'posta') await loadPosta();
+  if (ACTIVE_TAB === 'shoptet_sync') await loadAutomations();
   initSearch();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
