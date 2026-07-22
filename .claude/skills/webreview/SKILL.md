@@ -28,8 +28,9 @@ Pri prestavbe shellu/CSS **NEMEŇ** id/`data-testid`/triedy, na ktoré sa viažu
 - IDs: `tabs filters progressText progressBar empty searchBox searchResults list tab-search
   tab-notes dlImport known-suppliers version pageTitle themeBtn`; `data-testid="version"`.
 - **Order-supplier chip farby MUSIA ostať presné** — `body.toorder-wide .filters button.todo`
-  `#16a34a` / `.done` `#dc2626` / `.active` `#f59e0b` (E2E asserty na computed rgb 22,163,74 /
-  220,38,38 / 245,158,11). Review-filter `.active` je oddelený (accent green).
+  `#6CAB68` / `.done` `#D14D3B` / `.active` `#DDA43C` (E2E asserty na computed rgb 108,171,104 /
+  209,77,59 / 221,164,60 — zjemnené #143 2026-07-22, presné hex od šéfa pre todo/done). Review-filter
+  `.active` je oddelený (accent green, `--accent-hov`).
 - Nav-button accessible NAME = holý label ("Na objednanie", "Hľadať / opraviť") — SVG ikona
   nedáva text, `.navcount` len appenduje, takže `get_by_role(name=...)` substring stále sedí.
   `render()` viditeľnosť cieli `.progress`/`.downloads`/`#filters`/`#list`/`#tab-*`/`body.toorder-wide`.
