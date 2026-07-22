@@ -154,6 +154,45 @@ def test_smtp_failure_keeps_order_for_retry(iso, monkeypatch):
     assert "20261001" not in st.get("orders", {})   # not recorded → retried next run
 
 
+# ── incremental processing (#153) ────────────────────────────────────────────────
+def test_second_run_skips_reclassification_of_unchanged_terminal_orders(iso, monkeypatch):
+    webapp.run_orders_reminder()
+    st = _store(iso)
+    # fingerprints cover every currently-eligible code (incl. the red, never-terminal one) —
+    # only DONE codes with a matching fingerprint get the fast path (checked below).
+    assert set(st["fingerprints"]) == {"20261000", "20261001", "20261002"}
+
+    # second run, SAME csv (nothing changed) — the AI classifier must NOT be called again for
+    # the two already-terminal codes; a call would raise, proving the fast path was taken.
+    def boom(note):
+        raise AssertionError(f"re-classified an unchanged terminal order: {note!r}")
+    monkeypatch.setattr(webapp, "_classify_contacted", boom)
+    iso["sent"].clear()
+    stats2 = webapp.run_orders_reminder()
+    assert iso["sent"] == []                        # no re-send either
+    st2 = _store(iso)
+    assert {r["code"] for r in st2["orange"]} == {"20261001"}
+    assert {r["code"] for r in st2["skipped"]} == {"20261002"}
+    assert stats2["orders_4d"] == 3                  # full set still reported (red + 2 terminal)
+
+
+def test_newly_eligible_order_is_still_caught_after_a_prior_run(iso, monkeypatch):
+    # first run with only the base CSV (3 orders) — establishes fingerprints/done state.
+    webapp.run_orders_reminder()
+    # a 4th order, absent from the first run's CSV (simulating one that just aged past 4 days, or
+    # a brand-new order) — has no prior fingerprint, so it must NEVER be treated as 'unchanged'.
+    extra = ("20261099;" + OLD + " 07:00:00;Vybavuje sa;volať zákazníka;e@x.sk;;Nový Zákazník;"
+             "Klobúk;1;20,00")
+    csv2 = ORDERS_CSV.decode("cp1250").rstrip("\r\n") + "\r\n" + extra + "\r\n"
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: csv2.encode("cp1250"))
+    iso["sent"].clear()
+    stats2 = webapp.run_orders_reminder()
+    assert stats2["emailed_now"] == 1
+    assert any(m["to"] == "e@x.sk" for m in iso["sent"])
+    st2 = _store(iso)
+    assert "20261099" in st2["orders"] and st2["orders"]["20261099"]["status"] == "emailed"
+
+
 def test_run_never_touches_manager_stores(iso):
     # seed every manager store in tmp and assert the run writes none of them
     for name in ("decisions.json", "ordered_items.json", "order_pairings.json",
@@ -184,6 +223,136 @@ class _FakeSMTP:
 
     def quit(self):
         pass
+
+
+# ── manual per-row override (#153) ───────────────────────────────────────────────
+def _seed(iso):
+    """Run once so the state has one RED (no note), one ORANGE (emailed) and one SKIPPED
+    (AI said contacted) row — the three cases the override endpoint acts on."""
+    webapp.run_orders_reminder()
+    return authed_client()
+
+
+def test_override_requires_login(iso):
+    anon = webapp.app.test_client()
+    r = anon.post("/api/orders-reminder/override", json={"code": "20261000", "action": "contact"})
+    assert r.status_code == 401
+
+
+def test_override_rejects_bad_payload(iso):
+    c = _seed(iso)
+    assert c.post("/api/orders-reminder/override", json={"code": "", "action": "contact"}
+                  ).status_code == 400
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "delete"}).status_code == 400
+
+
+def test_override_unknown_code_404(iso):
+    c = _seed(iso)
+    r = c.post("/api/orders-reminder/override", json={"code": "nope", "action": "contact"})
+    assert r.status_code == 404
+
+
+def test_override_contact_marks_red_order_contacted_no_email(iso):
+    c = _seed(iso)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "contact"})
+    assert r.status_code == 200 and r.get_json() == {"ok": True, "status": "skipped_contacted"}
+    st = _store(iso)
+    assert st["orders"]["20261000"]["status"] == "skipped_contacted"
+    assert st["orders"]["20261000"]["manual"] is True
+    assert {r2["code"] for r2 in st["red"]} == set()          # moved out of red
+    assert "20261000" in {r2["code"] for r2 in st["skipped"]}  # into skipped
+    assert all(m["to"] != "a@x.sk" for m in iso["sent"])       # never e-mailed
+
+
+def test_override_contact_rejects_already_resolved_order(iso):
+    c = _seed(iso)
+    # 20261001 is already 'emailed' (terminal) from the seeded run
+    r = c.post("/api/orders-reminder/override", json={"code": "20261001", "action": "contact"})
+    assert r.status_code == 409
+
+
+def test_override_send_now_from_red_row(iso):
+    c = _seed(iso)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200 and r.get_json() == {"ok": True, "status": "emailed"}
+    (mail,) = [m for m in iso["sent"] if m["to"] == "a@x.sk"]
+    assert "20261000" in mail["body"] and "Ján Bez" in mail["body"]
+    st = _store(iso)
+    assert st["orders"]["20261000"]["status"] == "emailed"
+    assert st["orders"]["20261000"]["manual"] is True
+    assert {r2["code"] for r2 in st["red"]} == set()
+    assert "20261000" in {r2["code"] for r2 in st["orange"]}
+
+
+def test_override_send_now_overrides_wrong_ai_skip(iso):
+    # 20261002 was AI-classified 'kontaktovany' (skipped, no mail) — the manager knows better.
+    c = _seed(iso)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261002", "action": "send"})
+    assert r.status_code == 200 and r.get_json() == {"ok": True, "status": "emailed"}
+    assert any(m["to"] == "c@x.sk" for m in iso["sent"])
+    st = _store(iso)
+    assert st["orders"]["20261002"]["status"] == "emailed"
+    assert {r2["code"] for r2 in st["skipped"]} == set()
+    assert "20261002" in {r2["code"] for r2 in st["orange"]}
+
+
+def test_override_send_rejects_already_emailed(iso):
+    c = _seed(iso)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261001", "action": "send"})
+    assert r.status_code == 409
+    # unchanged — no duplicate send
+    assert len([m for m in iso["sent"] if m["to"] == "b@x.sk"]) == 1
+
+
+def test_override_send_without_email_rejected(iso, monkeypatch):
+    # a red row whose customer has no e-mail on file
+    csv_noemail = ORDERS_CSV.decode("cp1250").replace(
+        "20261000;" + OLD + " 10:00:00;Vybavuje sa;;a@x.sk",
+        "20261000;" + OLD + " 10:00:00;Vybavuje sa;;")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: csv_noemail.encode("cp1250"))
+    c = _seed(iso)
+    iso["sent"].clear()   # drop the seeded run's unrelated 20261001 mail
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 400
+    assert iso["sent"] == []
+
+
+def test_override_send_does_not_hold_the_store_lock_during_smtp(iso, monkeypatch):
+    # The SMTP call must run OUTSIDE `_lock` (the app's single global lock guards every store) —
+    # simulate a concurrent request resolving the SAME code WHILE our _send_mail_html call is
+    # "in flight" (its mocked body mutates the store directly, exactly what another thread could
+    # do if the lock were free during the network call). The endpoint's post-send re-check must
+    # notice the race and NOT append a second orange row / overwrite the concurrent result.
+    c = _seed(iso)
+
+    def concurrent_send(to, subject, body, bcc=None):
+        st = _store(iso)
+        st["orders"]["20261000"] = {"status": "emailed", "email": to, "manual": True,
+                                     "date": "concurrent"}
+        st["red"] = [r for r in st["red"] if r["code"] != "20261000"]
+        st.setdefault("orange", []).append({"code": "20261000", "billFullName": "Ján Bez",
+                                            "email": to, "sent_date": "concurrent"})
+        webapp._save_orders_reminder(st)
+        return True
+
+    monkeypatch.setattr(webapp, "_send_mail_html", concurrent_send)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200 and r.get_json() == {"ok": True, "status": "emailed"}
+    st = _store(iso)
+    # exactly ONE orange row for 20261000 — the endpoint did not append a duplicate
+    assert len([o for o in st["orange"] if o["code"] == "20261000"]) == 1
+    assert st["orders"]["20261000"]["date"] == "concurrent"   # the concurrent write won, untouched
+
+
+def test_override_send_smtp_failure_reports_error_and_keeps_row(iso, monkeypatch):
+    c = _seed(iso)
+    monkeypatch.setattr(webapp, "_send_mail_html", lambda *a, **kw: False)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 502
+    st = _store(iso)
+    assert "20261000" not in st["orders"]                      # not recorded — can retry
+    assert "20261000" in {r2["code"] for r2 in st["red"]}       # still shown as red
 
 
 def test_reminder_mail_bccs_mail_bcc_on_the_wire(iso, monkeypatch):

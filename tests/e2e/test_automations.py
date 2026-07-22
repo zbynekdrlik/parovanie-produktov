@@ -83,6 +83,23 @@ def test_start_stop_toggle_persists_across_reload(page, automations_server):
     assert console == [], f"console not clean: {console}"
 
 
+# ── visible failure indicator (#153) ─────────────────────────────────────────────
+def test_failed_automation_shows_nav_warning_badge_without_opening_its_tab(page, automations_server):
+    """The fixture seeds orders_reminder's LAST run as failed. The manager must see that from
+    ANY page — this test deliberately opens 'Nevyzdvihnuté zásielky' (a DIFFERENT, healthy
+    automation), never the orders_reminder tab itself, and still expects the ⚠ badge in the
+    sidebar. This is exactly the #156-class silent failure #153 exists to surface."""
+    console = _console(page)
+    _open_tab(page, automations_server)   # 'Nevyzdvihnuté zásielky' — healthy, no ⚠ expected
+
+    ord_btn = page.get_by_role("button", name="Pripomienky objednávok")
+    assert ord_btn.locator(".navwarn").count() == 1
+    posta_btn = page.get_by_role("button", name="Nevyzdvihnuté zásielky")
+    assert posta_btn.locator(".navwarn").count() == 0
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_run_now_executes_and_reports_result(page, automations_server):
     console = _console(page)
     _open_tab(page, automations_server)

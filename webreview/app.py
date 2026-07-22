@@ -3095,11 +3095,23 @@ def run_orders_reminder() -> dict:
     Robust: a failing OpenAI or SMTP call for ONE order is logged and skipped (that order is not
     recorded → retried next run), never crashing the scheduler. No key → the AI branch degrades
     gracefully (never e-mails blind). Reads ONLY its own store + the orders export; never touches
-    the manager's decision / to-order stores."""
+    the manager's decision / to-order stores.
+
+    Incremental (#153): an already-terminal order (emailed / manually-contacted) whose date+note
+    fingerprint is unchanged since the last run is NOT re-classified or re-mailed — its previous
+    display row is carried forward as-is (days refreshed). See
+    orders_reminder.partition_incremental for the exact correctness contract (a newly-eligible or
+    not-yet-terminal order is always fully (re)processed)."""
     csv_bytes = _orders_csv_cached()
     orders = orders_reminder.select_orders(csv_bytes)
     with _lock:
-        done = dict(_load_orders_reminder().get("orders") or {})   # code -> {status, ...}
+        state = _load_orders_reminder()
+        done = dict(state.get("orders") or {})   # code -> {status, ...}
+    prev_fp = state.get("fingerprints") or {}
+    prev_orange = {r["code"]: r for r in state.get("orange") or []}
+    prev_skipped = {r["code"]: r for r in state.get("skipped") or []}
+    to_process, already_seen, fingerprints = orders_reminder.partition_incremental(
+        orders, prev_fp, set(done.keys()))
     have_key = bool(os.environ.get("OPENAI_API_KEY"))
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     red, orange, skipped = [], [], []
@@ -3114,7 +3126,19 @@ def run_orders_reminder() -> dict:
             st.setdefault("orders", {})[code] = entry
             _save_orders_reminder(st)
 
-    for o in orders:
+    # unchanged + already-terminal orders: reuse the last computed display row (days refreshed)
+    # — no re-classification, no OpenAI/SMTP call, no CSV-field rebuild (the incremental fast path).
+    for o in already_seen:
+        code = o["code"]
+        status = done.get(code, {}).get("status")
+        prev_row = (prev_orange if status == "emailed" else prev_skipped).get(code)
+        row = dict(prev_row) if prev_row else {k: o[k] for k in
+                                               ("code", "billFullName", "email", "itemName",
+                                                "shopRemark", "days", "admin_link")}
+        row["days"] = o["days"]
+        (orange if status == "emailed" else skipped).append(row)
+
+    for o in to_process:
         code = o["code"]
         if not o["has_note"]:
             red.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
@@ -3178,6 +3202,7 @@ def run_orders_reminder() -> dict:
             "last_check": now_iso,
             "red": red, "orange": orange, "skipped": skipped,
             "stats": stats,
+            "fingerprints": fingerprints,   # #153 — incremental-run cache for the next run
         })
     log.info("orders_reminder: run done %s", stats)
     return stats
@@ -3287,6 +3312,103 @@ def api_posta_uncollected():
         "errors": st.get("errors") or [],
         "stats": st.get("stats") or {},
     })
+
+
+def _find_current_row(st: dict, code: str) -> dict | None:
+    """Look up `code`'s row in the CURRENT red/orange/skipped snapshot (#153 manual override) —
+    the display data already carries every field the override needs (billFullName, email,
+    itemName, shopRemark), so it never has to re-read the CSV export."""
+    for section in ("red", "orange", "skipped"):
+        for r in st.get(section) or []:
+            if r.get("code") == code:
+                return r
+    return None
+
+
+def _pop_row(st: dict, section: str, code: str) -> None:
+    st[section] = [r for r in st.get(section) or [] if r.get("code") != code]
+
+
+@app.route("/api/orders-reminder/override", methods=["POST"])
+def api_orders_reminder_override():
+    """Manual per-row override (#153): the manager corrects the automation directly from the tab
+    — either the note is empty (no AI classification ever ran, a RED row) or the AI verdict was
+    wrong (a SKIPPED row it marked 'already contacted'). action='contact' records the order as
+    manually-contacted — the same terminal dedup as the AI 'already contacted' path, no e-mail,
+    never shown again. action='send' sends the ONE reminder e-mail right now — allowed on a red OR
+    skipped row (overriding a wrong 'already contacted' verdict), but NEVER on an already-emailed
+    one (the same dedup as the automated run — no double-send).
+
+    The SMTP call happens OUTSIDE the store lock — mirroring run_orders_reminder, which also
+    classifies/e-mails unlocked and only holds `_lock` for the file read/write. `_lock` is the
+    app's single GLOBAL lock (guards every store), so holding it for the duration of a network
+    call would stall every other admin action on the site for the SMTP timeout. The final write
+    re-checks `prev_status` to stay correct if a concurrent request resolved the same code
+    meanwhile (a double-click on 'send' during a slow SMTP call must never double-e-mail)."""
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    action = str(body.get("action") or "").strip()
+    if not code or action not in ("contact", "send"):
+        return jsonify({"ok": False, "error": "neplatná požiadavka"}), 400
+
+    with _lock:
+        st = _load_orders_reminder()
+        row = _find_current_row(st, code)
+        if row is None:
+            return jsonify({"ok": False, "error": "objednávka sa v aktuálnom zozname nenašla"}), 404
+        prev_status = st.get("orders", {}).get(code, {}).get("status")
+        if action == "contact" and prev_status:
+            return jsonify({"ok": False, "error": "objednávka je už vybavená",
+                            "status": prev_status}), 409
+        if action == "send" and prev_status == "emailed":
+            return jsonify({"ok": False, "error": "pripomienka už bola odoslaná"}), 409
+
+    now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    base = {"name": row.get("billFullName", ""), "email": row.get("email", ""),
+            "itemName": row.get("itemName", ""), "note": row.get("shopRemark", ""),
+            "date": now_iso, "manual": True}
+
+    if action == "contact":
+        with _lock:
+            st = _load_orders_reminder()
+            done = st.setdefault("orders", {})
+            if done.get(code, {}).get("status"):   # lost the race meanwhile — stay correct
+                return jsonify({"ok": False, "error": "objednávka je už vybavená",
+                                "status": done[code]["status"]}), 409
+            done[code] = {**base, "status": "skipped_contacted"}
+            _pop_row(st, "red", code)
+            _pop_row(st, "skipped", code)
+            st.setdefault("skipped", []).append({**row, "sent_date": now_iso})
+            _save_orders_reminder(st)
+        log.info("orders_reminder: manual override %s -> kontaktované (user %s)",
+                 code, session.get("user"))
+        return jsonify({"ok": True, "status": "skipped_contacted"})
+
+    # action == "send" — allowed from red or skipped (override), never from already-emailed.
+    # No lock held here: the SMTP round-trip (up to ~20s, see _send_mail_html) must never block
+    # every other manager's request on the shared global lock.
+    email = row.get("email") or ""
+    if not email:
+        return jsonify({"ok": False, "error": "objednávka nemá e-mail"}), 400
+    subject, html = orders_reminder.build_reminder_email(row.get("billFullName", ""), code)
+    if not _send_mail_html(email, subject, html):
+        return jsonify({"ok": False, "error": "odoslanie e-mailu zlyhalo"}), 502
+
+    with _lock:
+        st = _load_orders_reminder()
+        done = st.setdefault("orders", {})
+        if done.get(code, {}).get("status") == "emailed":
+            # a concurrent request already recorded this send while we were talking to SMTP —
+            # the e-mail landed (this one too, unlikely double-click race), state is correct either way.
+            return jsonify({"ok": True, "status": "emailed"})
+        done[code] = {**base, "status": "emailed"}
+        _pop_row(st, "red", code)
+        _pop_row(st, "skipped", code)
+        _pop_row(st, "orange", code)
+        st.setdefault("orange", []).append({**row, "sent_date": now_iso})
+        _save_orders_reminder(st)
+    log.info("orders_reminder: manual send %s -> %s (user %s)", code, email, session.get("user"))
+    return jsonify({"ok": True, "status": "emailed"})
 
 
 @app.route("/api/orders-reminder")

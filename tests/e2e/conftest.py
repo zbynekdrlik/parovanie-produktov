@@ -288,11 +288,14 @@ def automations_server(tmp_path_factory):
 
     Seeded so the tab has content WITHOUT any network: a pre-existing
     posta_uncollected.json (one uncollected shipment + one invalid-format
-    package from an earlier 'run'), NO automations.json (→ the runner must
-    default to DISABLED = Zastavené), and a FRESH orders_cache.csv whose only
-    row has NO packageNumber → a manual 'Spustiť teraz' run finds 0 shipments,
-    calls no Pošta API and sends no mail (hermetic green run). Shoptet creds
-    are pointed at a nonexistent file so no code path can reach the live shop."""
+    package from an earlier 'run'), an automations.json that carries ONLY a
+    failed-run record for orders_reminder (#153 — no `enabled` key on ANY
+    automation, so every tab still defaults to DISABLED = Zastavené, exactly
+    like the old no-file state; only orders_reminder's nav item should show the
+    ⚠ failed-run badge), and a FRESH orders_cache.csv whose only row has NO
+    packageNumber → a manual 'Spustiť teraz' run finds 0 shipments, calls no
+    Pošta API and sends no mail (hermetic green run). Shoptet creds are pointed
+    at a nonexistent file so no code path can reach the live shop."""
     out = tmp_path_factory.mktemp("wr_auto_out")
     port = _free_port()
     base = f"http://127.0.0.1:{port}"
@@ -322,6 +325,16 @@ def automations_server(tmp_path_factory):
         "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
         "2026200;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
         encoding="cp1250")
+    # #153 — orders_reminder's LAST run failed (e.g. the #156 export-timeout class of failure) —
+    # no `enabled` key on ANY automation here, so every tab still defaults to Zastavené (#93
+    # contract unchanged); this ONLY seeds the failed-run record the new nav ⚠ badge reads.
+    (out / "automations.json").write_text(json.dumps({
+        "orders_reminder": {
+            "last_run": "2026-07-22T08:00:05+02:00",
+            "last_status": "error",
+            "last_error": "TimeoutExpired: shoptet_import.py neodpovedal do 120s",
+        },
+    }, ensure_ascii=False), encoding="utf-8")
     # #106 — pre-existing „Dodávateľský sklad" rows (one OK, one error) so the tab's
     # table + filters render WITHOUT any network. No products.csv → a manual run
     # would find 0 links, but the E2E never clicks Spustiť teraz (it would scrape +
@@ -385,7 +398,10 @@ def automations_server(tmp_path_factory):
         "last_check": "2026-07-22T08:00:05+02:00",
         "orders": {"20261001": {"status": "emailed", "date": "2026-07-22T08:00:03+02:00",
                                 "name": "Eva Nová", "email": "eva@example.com",
-                                "itemName": "Nohavice", "note": "volať zákazníka"}},
+                                "itemName": "Nohavice", "note": "volať zákazníka"},
+                   "20261002": {"status": "skipped_contacted", "date": "2026-07-22T08:00:04+02:00",
+                                "name": "Iva Stará", "email": "iva@example.com",
+                                "itemName": "Čiapka", "note": "volané so zákazníkom"}},
         "red": [{"code": "20261000", "billFullName": "Ján Bez", "phone": "+421900111222",
                  "email": "jan@example.com", "itemName": "Bunda Test Red", "days": 9,
                  "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261000&src=orders"}],
@@ -393,8 +409,11 @@ def automations_server(tmp_path_factory):
                     "itemName": "Nohavice Test Orange", "shopRemark": "volať zákazníka", "days": 8,
                     "sent_date": "2026-07-22T08:00:03+02:00",
                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261001&src=orders"}],
-        "skipped": [],
-        "stats": {"orders_4d": 2, "no_note": 1, "with_note": 1, "emailed_now": 0,
+        # AI marked 20261002 already-contacted — the row an override can 'poslať teraz' anyway.
+        "skipped": [{"code": "20261002", "billFullName": "Iva Stará", "email": "iva@example.com",
+                    "itemName": "Čiapka Test Skipped", "shopRemark": "volané so zákazníkom", "days": 7,
+                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261002&src=orders"}],
+        "stats": {"orders_4d": 3, "no_note": 1, "with_note": 2, "emailed_now": 0,
                   "emailed_total": 1, "skipped_now": 0, "ai_unavailable": 0, "errors": 0},
     }, ensure_ascii=False), encoding="utf-8")
     env = {
@@ -404,6 +423,13 @@ def automations_server(tmp_path_factory):
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
         "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+        # #153 — the manual override 'send' button can reach the REAL _send_mail_html path.
+        # _load_env_file() reads data/.mail_env by REPO PATH (independent of WEBREVIEW_OUT), so
+        # on a dev box that has real SMTP creds checked out, an unguarded e2e click would attempt
+        # a genuine send with real credentials. os.environ.setdefault() never overrides an
+        # ALREADY-SET key, so pinning MAIL_HOST="" here forces the deterministic
+        # not-configured/no-network branch on every machine, CI included.
+        "MAIL_HOST": "",
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)

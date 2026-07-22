@@ -6,6 +6,7 @@ Verifies the tab renders default-Zastavené with Štart/Stop + Spustiť teraz, b
 sections render, and the toggle persists across a reload. It NEVER clicks „Spustiť teraz" — that
 SENDS real customer e-mails + costs OpenAI (needs the live orders export + a real key).
 """
+import re
 
 
 def _console(page):
@@ -13,6 +14,15 @@ def _console(page):
     page.on("console", lambda m: msgs.append(f"[{m.type}] {m.text}")
             if m.type in ("error", "warning") else None)
     return msgs
+
+
+# Chrome logs every non-2xx resource load as a console error (mirrors test_auth.py's own
+# helper) — the #153 override 'send' failure test deliberately provokes a 502.
+_PROVOKED = re.compile(r"Failed to load resource: .*\b502\b")
+
+
+def _unexpected(console):
+    return [m for m in console if not _PROVOKED.search(m)]
 
 
 def _open_tab(page, base):
@@ -78,3 +88,49 @@ def test_start_stop_toggle_persists_across_reload(page, automations_server):
         "&& document.querySelector('[data-testid=ordrem-status]').textContent === 'Zastavené'")
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── manual per-row override (#153) ───────────────────────────────────────────────
+def test_mark_red_order_as_contacted_moves_it_to_skipped(page, automations_server):
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    row = page.locator('tr[data-code="20261000"]')
+    assert row.is_visible()
+    with page.expect_response("**/api/orders-reminder/override"):
+        row.locator(".ordrem-act-contact").click()
+    # moved: no longer in the red table (the SKIPPED table already exists in this fixture from
+    # a DIFFERENT seeded code, so wait precisely for THIS code to leave the red table, not just
+    # for a skipped table to exist somewhere).
+    page.wait_for_function(
+        "() => document.querySelectorAll('[data-testid=ordrem-red]"
+        " tr[data-code=\"20261000\"]').length === 0")
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 0
+    skipped = page.locator('[data-testid="ordrem-skipped"]')
+    assert skipped.is_visible()
+    assert "20261000" in skipped.inner_text()
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_send_now_button_posts_and_surfaces_smtp_failure(page, automations_server):
+    # The 'send' override reaches the REAL _send_mail_html path — automations_server pins
+    # MAIL_HOST="" (see conftest) so this is a deterministic, hermetic no-network failure on
+    # every machine (never a genuine send, even on a dev box with real SMTP creds checked out).
+    # This proves the button → endpoint → error-surfacing wiring; the HAPPY path (row moves
+    # red → orange on a successful send) is covered by the backend unit tests with a mocked SMTP.
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    row = page.locator('tr[data-code="20261000"]')
+    with page.expect_response("**/api/orders-reminder/override") as resp_info, \
+         page.expect_event("dialog") as dialog_info:
+        row.locator(".ordrem-act-send").click()
+    assert resp_info.value.status == 502
+    dialog = dialog_info.value
+    assert "Nepodarilo sa" in dialog.message
+    dialog.accept()
+    # nothing was persisted on failure — the row stays exactly where it was
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 1
+
+    assert _unexpected(console) == [], f"console not clean: {console}"
