@@ -125,3 +125,58 @@ def test_search_row_commerce_line_and_in_review_full_card(page, search_server):
     assert card.get_by_role("button", name="✓ Dobré").count() == 1  # decision button
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_search_duplicate_paircode_two_rows_each_independently_repairable(page, search_dup_server):
+    """#64 regression: a pairCode reviewed under TWO suppliers (TSA|DUP425 and
+    TSB|DUP425 — the same forestshop product matched against candidates from more than
+    one supplier) must render as TWO distinct search rows sharing the catalog key
+    'DUP425', each opening its OWN full review card; repairing the SECOND row must
+    persist under ITS OWN key without touching the first (before the fix only the
+    first PRODUCTS match was ever shown/reachable — the second was invisible)."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    _open_search(page, search_dup_server)
+    page.fill("#searchBox", "duplicitny")
+
+    row_sel = "#searchResults .search-row[data-key='DUP425']"
+    page.wait_for_selector(row_sel)
+    assert page.locator(row_sel).count() == 2, "one row per duplicated review product"
+
+    row_a = page.locator(f"{row_sel}[data-review-key='TSA|DUP425']")
+    row_b = page.locator(f"{row_sel}[data-review-key='TSB|DUP425']")
+    assert row_a.count() == 1 and row_b.count() == 1
+
+    # each row shows its OWN review supplier (not the shared catalog one) so the
+    # manager can tell the duplicates apart at a glance
+    assert "TSA" in row_a.locator(".srch-meta").inner_text()
+    assert "TSB" in row_b.locator(".srch-meta").inner_text()
+
+    # opening row B must open PRODUCT B's own card (its candidate 'U dodávateľa B'),
+    # never the FIRST duplicate's card (the previously-reported bug)
+    row_b.locator(".srch-head").click()
+    page.wait_for_selector(f"{row_sel}[data-review-key='TSB|DUP425'] .srch-panel .card")
+    panel_b = row_b.locator(".srch-panel .card")
+    assert "U dodávateľa B" in panel_b.inner_text()
+    assert "U dodávateľa A" not in panel_b.inner_text()
+
+    # repair (approve) row B's own match via the card's '✓ Dobré' button
+    with page.expect_response(
+            lambda r: "/api/decision" in r.url and r.request.method == "POST"):
+        panel_b.get_by_role("button", name="✓ Dobré").click()
+
+    # reload + re-search: row B now carries the saved decision as a '🔗 dodávateľ' link;
+    # row A (the first duplicate) must stay completely untouched by B's repair
+    page.reload()
+    page.wait_for_selector('[data-testid="version"]')
+    page.get_by_role("button", name="Hľadať / opraviť").click()
+    page.fill("#searchBox", "duplicitny")
+    page.wait_for_selector(row_sel)
+    row_a = page.locator(f"{row_sel}[data-review-key='TSA|DUP425']")
+    row_b = page.locator(f"{row_sel}[data-review-key='TSB|DUP425']")
+    assert row_b.locator(".srch-link a").count() == 1, "B now carries the saved link"
+    assert row_a.locator(".srch-link a").count() == 0, "A untouched by B's repair"
+
+    assert console == [], f"console not clean: {console}"

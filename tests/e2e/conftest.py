@@ -58,7 +58,7 @@ def _admin_session_cookie(base: str) -> str:
 
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
-                    "longcontent_matched_server", "search_server",
+                    "longcontent_matched_server", "search_server", "search_dup_server",
                     "automations_server", "imgfail_server", "imgflood_server")
 
 
@@ -402,6 +402,80 @@ def search_server(tmp_path_factory):
     }], ensure_ascii=False), encoding="utf-8")
     products_csv = out / "products.csv"
     _write_catalog_csv(products_csv)
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(products_csv),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _write_dup_catalog_csv(path):
+    """cp1250 Shoptet-export fixture with ONE catalog product whose pairCode ('DUP425')
+    is reviewed under TWO different suppliers (#64) — mirrors _write_catalog_csv."""
+    header = ["code", "pairCode", "name", "supplier", "productVisibility",
+              "availabilityInStock", "availabilityOutOfStock", "price",
+              "standardPrice", "stock", "defaultImage"]
+    rows = [
+        ["DUP9001", "DUP425", "Duplicitný Test Produkt", "TESTSUP", "visible",
+         "Skladom", "Vypredané", "77,00", "99,00", "5", _PNG_1x1],
+    ]
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    w.writerow(header)
+    w.writerows(rows)
+    with open(path, "w", encoding="cp1250", newline="") as f:
+        f.write(buf.getvalue())
+
+
+@pytest.fixture(scope="function")
+def search_dup_server(tmp_path_factory):
+    """#64 regression: an isolated webreview instance whose catalog has ONE product
+    (pairCode 'DUP425') reviewed under TWO DIFFERENT suppliers — 'TSA|DUP425' and
+    'TSB|DUP425' (mirrors a real GRUBE|425 + WETLAND|425 duplication). /api/search must
+    return TWO rows for it, each independently openable/repairable — before the fix,
+    search collapsed both into one row and only the first product was ever reachable.
+    Own tmp out-dir (search-pair mutates review_data.json/decisions.json), isolated from
+    every other fixture server."""
+    out = tmp_path_factory.mktemp("wr_search_dup_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    img_url = f"{base}/favicon.ico"
+    (out / "review_data.json").write_text(json.dumps([
+        {
+            "idx": 0, "supplier": "TSA", "name": "Duplicitný Test Produkt",
+            "pairCode": "DUP425", "variant_codes": ["DUP9001"], "our_images": [],
+            "ai_status": "matched", "ai_chosen_url": img_url, "ai_reason": "kód sedí",
+            "candidates": [{"name": "U dodávateľa A", "url": img_url}],
+            "our_url": "", "key": "TSA|DUP425",
+            "current": {"state": 1, "off": False, "vis": "visible", "avail": "Skladom",
+                        "price": "77,00", "std": "99,00", "stock": "5"},
+        },
+        {
+            "idx": 1, "supplier": "TSB", "name": "Duplicitný Test Produkt",
+            "pairCode": "DUP425", "variant_codes": ["DUP9001"], "our_images": [],
+            "ai_status": "matched", "ai_chosen_url": img_url, "ai_reason": "kód sedí",
+            "candidates": [{"name": "U dodávateľa B", "url": img_url}],
+            "our_url": "", "key": "TSB|DUP425",
+            "current": {"state": 1, "off": False, "vis": "visible", "avail": "Skladom",
+                        "price": "77,00", "std": "99,00", "stock": "5"},
+        },
+    ], ensure_ascii=False), encoding="utf-8")
+    products_csv = out / "products.csv"
+    _write_dup_catalog_csv(products_csv)
     env = {
         **os.environ,
         **_AUTH_ENV,
