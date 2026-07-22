@@ -2,9 +2,9 @@
 
 Load BEFORE vystavovaním lokálneho webu na verejnú doménu (newlevel.media).
 
-## Hotové: DVE verejné adresy → tá istá appka (`:8801`)
+## Hotové: TRI verejné adresy → tá istá appka (`:8801`)
 
-- **`forestaci.newlevel.media`** (názov appky „Forestaci", #94) **aj** pôvodná **`parovanie-forestshop.newlevel.media`** (manažér ju používa denne) — OBE cez ten istý tunel na `http://localhost:8801`. Nová sa pridala ADITÍVNE (viď „Pridanie ďalšieho hostname" nižšie); stará ostáva.
+- **`forestshop.newlevel.media`** (nová PRIMÁRNA, názov appky „Forestshop", #120) **aj** **`parovanie-forestshop.newlevel.media`** (manažér ju používa denne — MUSÍ ostať) **aj** **`forestaci.newlevel.media`** (starý názov #94, ponechaná, neškodí) — VŠETKY TRI cez ten istý tunel `a3df5493` na `http://localhost:8801`. Každá nová sa pridala ADITÍVNE (viď „Pridanie ďalšieho hostname" nižšie); staré ostávajú. História brandu: „Forestshop" → „Forestaci" (#94) → späť „Forestshop" (#120).
 - Flask web na dev1 `:8801` → vystavený cez `cloudflared` tunel (žiadny otvorený port navonok).
 - Dve `systemd --user` služby (Restart=always, `loginctl enable-linger newlevel`):
   - `parovanie-web.service` — Flask app (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`)
