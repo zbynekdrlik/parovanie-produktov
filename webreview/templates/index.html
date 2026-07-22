@@ -4,27 +4,54 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrola párovania — Forestshop</title>
-  <link rel="stylesheet" href="/static/style.css?v=32">
+  <link rel="stylesheet" href="/static/style.css?v=33">
 </head>
 <body>
-  <header>
-    <div class="title">Kontrola párovania produktov</div>
-    <div class="tabs" id="tabs"></div>
-    <div class="progress"><span id="progressText">…</span><div class="bar"><div id="progressBar"></div></div></div>
-    <div class="filters" id="filters"></div>
-    <div class="downloads">
-      <a id="dlImport" href="/api/import" download>⬇ Stiahnuť import</a>
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="logo"><svg viewBox="0 0 24 24"><path d="M12 2L3 7v6c0 5 3.5 8 9 9 5.5-1 9-4 9-9V7z"/></svg></span>
+      <span class="brandtxt">Forestshop<small>Párovač &amp; dashboard</small></span>
     </div>
-  </header>
-  <main id="list"></main>
-  <div id="empty" class="empty" hidden>Žiadne produkty v tomto filtri.</div>
-  <section id="tab-search" hidden>
-    <input id="searchBox" type="search" autocomplete="off"
-           placeholder="Hľadať produkt podľa názvu, dodávateľa alebo kódu…">
-    <div id="searchResults"></div>
-  </section>
-  <section id="tab-notes" hidden></section>
-  <footer class="appfoot"><span id="version" data-testid="version">…</span></footer>
-  <script src="/static/app.js?v=32"></script>
+    <nav class="side-nav">
+      <div class="tabs" id="tabs"></div>
+      <div class="nav-sec">Čoskoro — rozšírime</div>
+      <div class="soon-nav">
+        <span class="soon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span class="tlabel">Prehľad eshopu</span><span class="soonpill">soon</span></span>
+        <span class="soon"><svg viewBox="0 0 24 24"><path d="M12 3v12M8 11l4 4 4-4"/><path d="M5 21h14"/></svg><span class="tlabel">Import do eshopu</span><span class="soonpill">soon</span></span>
+        <span class="soon"><svg viewBox="0 0 24 24"><rect x="1" y="6" width="14" height="10" rx="1"/><path d="M15 9h4l3 3v4h-7z"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/></svg><span class="tlabel">Dodávatelia</span><span class="soonpill">soon</span></span>
+        <span class="soon"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span class="tlabel">Štatistiky</span><span class="soonpill">soon</span></span>
+      </div>
+    </nav>
+    <div class="sidefoot">
+      <button class="themebtn" id="themeBtn" type="button">
+        <svg viewBox="0 0 24 24" id="themeIcon"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg>
+        <span id="themeLbl">Tmavý mód</span>
+      </button>
+      <div class="ver">verzia <span id="version" data-testid="version">…</span></div>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="topbar-head">
+        <h1 id="pageTitle">Kontrola párovania</h1>
+        <div class="sub" id="pageSub"></div>
+      </div>
+      <div class="topacts">
+        <div class="downloads"><a id="dlImport" href="/api/import" download>⬇ Stiahnuť import</a></div>
+      </div>
+      <div class="progress"><span id="progressText">…</span><div class="bar"><div id="progressBar"></div></div></div>
+      <div class="filters" id="filters"></div>
+    </header>
+    <main id="list"></main>
+    <div id="empty" class="empty" hidden>Žiadne produkty v tomto filtri.</div>
+    <section id="tab-search" hidden>
+      <input id="searchBox" type="search" autocomplete="off"
+             placeholder="Hľadať produkt podľa názvu, dodávateľa alebo kódu…">
+      <div id="searchResults"></div>
+    </section>
+    <section id="tab-notes" hidden></section>
+  </div>
+  <script src="/static/app.js?v=33"></script>
 </body>
 </html>

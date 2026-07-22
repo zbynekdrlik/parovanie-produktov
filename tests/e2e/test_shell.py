@@ -1,0 +1,59 @@
+"""E2E of the new sidebar-dashboard shell (redesign): left sidebar hosts the nav,
+the top bar shows a per-page title, and the dark-mode toggle persists across reloads.
+These assert the NEW shell behavior — written RED before the redesign existed."""
+
+
+def _console(page):
+    msgs = []
+    page.on("console", lambda m: msgs.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+    return msgs
+
+
+def test_sidebar_hosts_nav_and_pagetitle_updates(page, live_server):
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    # Nav lives INSIDE the left sidebar now (not a top tab bar).
+    assert page.locator(".sidebar").count() == 1
+    assert page.locator(".sidebar #tabs").count() == 1
+
+    # Top bar carries a per-page title; review is the default page.
+    page.wait_for_selector("#pageTitle")
+    assert page.locator("#pageTitle").inner_text().strip() == "Kontrola párovania"
+
+    # Switching pages via the sidebar nav updates the top-bar title.
+    page.get_by_role("button", name="Na objednanie").click()
+    page.wait_for_function(
+        "() => document.getElementById('pageTitle')"
+        ".textContent.trim() === 'Na objednanie'")
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_dark_mode_toggle_persists_across_reload(page, live_server):
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector("#themeBtn")
+
+    # Default = light: no dark marker on <body>.
+    assert page.locator('body[data-theme="dark"]').count() == 0
+
+    # Toggle → dark, persisted to localStorage.
+    page.locator("#themeBtn").click()
+    page.wait_for_selector('body[data-theme="dark"]')
+    assert page.evaluate("() => localStorage.getItem('theme')") == "dark"
+
+    # Survives a full reload (the store, not just the in-page toggle).
+    page.reload()
+    page.wait_for_selector('body[data-theme="dark"]')
+
+    # Toggle back → light again, persisted.
+    page.locator("#themeBtn").click()
+    page.wait_for_function(
+        "() => !document.body.hasAttribute('data-theme') "
+        "|| document.body.getAttribute('data-theme') !== 'dark'")
+    assert page.evaluate("() => localStorage.getItem('theme')") == "light"
+
+    assert console == [], f"console not clean: {console}"

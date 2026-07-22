@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forestshop — návrh vizuálu (maketa)</title>
+<style>
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --side:#ffffff; --border:#e8eaed;
+  --text:#1f2430; --muted:#6b7280; --soft:#9aa1ac;
+  --accent:#15803d; --accent-hov:#116330; --accent-soft:#dcfce7;
+  --done:#16a34a; --done-bg:#dcfce7; --done-tx:#065f46;
+  --bad:#dc2626; --bad-bg:#fee2e2; --bad-tx:#991b1b;
+  --manual:#2563eb; --manual-bg:#dbeafe; --manual-tx:#1e40af;
+  --wait:#d97706; --wait-bg:#fef3c7; --wait-tx:#92400e;
+  --grey:#6b7280; --grey-bg:#f1f3f5;
+  --radius:12px; --shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
+}
+[data-theme=dark]{
+  --bg:#0f1420; --panel:#161c28; --side:#141a26; --border:#26303f;
+  --text:#e6e9ef; --muted:#98a2b3; --soft:#6b7686;
+  --accent:#22c55e; --accent-hov:#16a34a; --accent-soft:#0f2a1c;
+  --done-bg:#0f2a1c; --done-tx:#4ade80;
+  --bad-bg:#331416; --bad-tx:#fca5a5;
+  --manual-bg:#12213f; --manual-tx:#93c5fd;
+  --wait-bg:#2a1f08; --wait-tx:#fcd34d;
+  --grey-bg:#1c2434;
+  --shadow:0 1px 3px rgba(0,0,0,.4);
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Inter,sans-serif;
+  background:var(--bg);color:var(--text);display:flex;min-height:100vh;
+  -webkit-font-smoothing:antialiased}
+svg{width:19px;height:19px;flex:0 0 19px;stroke:currentColor;fill:none;
+  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---------- SIDEBAR ---------- */
+.sidebar{width:242px;flex:0 0 242px;background:var(--side);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;
+  position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:10px;padding:16px 18px 14px;
+  font-weight:800;font-size:17px;letter-spacing:-.01em}
+.brand .logo{width:30px;height:30px;border-radius:9px;background:var(--accent);
+  color:#fff;display:flex;align-items:center;justify-content:center;flex:0 0 30px}
+.brand .logo svg{stroke:#fff;width:18px;height:18px}
+.brand small{display:block;font-weight:500;font-size:11px;color:var(--muted);margin-top:1px}
+.nav{padding:6px 10px;overflow-y:auto;flex:1}
+.nav .sec{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--soft);padding:14px 10px 6px}
+.nav a{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;
+  color:var(--muted);text-decoration:none;font-size:14px;font-weight:500;cursor:pointer;
+  margin:1px 0;transition:background .12s,color .12s}
+.nav a:hover{background:var(--bg);color:var(--text)}
+.nav a.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.nav a.active svg{stroke:var(--accent)}
+.nav a.soon{opacity:.5;cursor:default}
+.nav a.soon:hover{background:transparent;color:var(--muted)}
+.nav a .badge{margin-left:auto;background:var(--accent);color:#fff;font-size:11px;
+  font-weight:700;border-radius:20px;padding:1px 8px;min-width:20px;text-align:center}
+.nav a .soonpill{margin-left:auto;font-size:9.5px;font-weight:700;color:var(--soft);
+  border:1px solid var(--border);border-radius:6px;padding:1px 6px}
+.sidefoot{border-top:1px solid var(--border);padding:10px 12px;display:flex;
+  flex-direction:column;gap:2px}
+.themebtn{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:9px;
+  color:var(--muted);font-size:14px;font-weight:500;cursor:pointer;background:none;border:0;
+  width:100%;text-align:left}
+.themebtn:hover{background:var(--bg);color:var(--text)}
+.ver{font-size:11px;color:var(--soft);padding:6px 11px 2px}
+
+/* ---------- MAIN ---------- */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{position:sticky;top:0;z-index:5;background:var(--bg);
+  border-bottom:1px solid var(--border);padding:20px 30px 16px;display:flex;
+  align-items:flex-start;gap:16px;flex-wrap:wrap}
+.topbar h1{margin:0;font-size:23px;font-weight:800;letter-spacing:-.02em}
+.topbar .sub{font-size:13px;color:var(--muted);margin-top:3px}
+.topacts{margin-left:auto;display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+.btn{border:1px solid var(--border);background:var(--panel);color:var(--text);
+  border-radius:9px;padding:9px 15px;font-size:13.5px;font-weight:600;cursor:pointer;
+  display:inline-flex;align-items:center;gap:7px;transition:.12s;white-space:nowrap}
+.btn:hover{border-color:var(--soft)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent-hov);border-color:var(--accent-hov)}
+.btn svg{width:16px;height:16px}
+.content{padding:20px 30px 60px}
+
+/* filter pills */
+.pills{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+.pill{border:1px solid var(--border);background:var(--panel);border-radius:20px;
+  padding:6px 13px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;
+  display:inline-flex;align-items:center;gap:7px;transition:.12s}
+.pill:hover{border-color:var(--soft)}
+.pill.on{background:var(--text);border-color:var(--text);color:var(--panel)}
+.pill .n{font-size:11.5px;font-weight:700;background:var(--grey-bg);color:var(--muted);
+  border-radius:20px;padding:0 7px;min-width:18px;text-align:center}
+.pill.on .n{background:rgba(255,255,255,.22);color:#fff}
+
+/* review card */
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  box-shadow:var(--shadow);margin-bottom:14px;overflow:hidden}
+.card .head{display:flex;align-items:center;gap:12px;padding:13px 16px;
+  border-bottom:1px solid var(--border)}
+.card .head .idx{font-size:12px;font-weight:700;color:var(--soft)}
+.card .head .htitle{font-weight:700;font-size:15px;flex:1;min-width:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tag{font-size:11.5px;font-weight:700;border-radius:7px;padding:3px 9px;white-space:nowrap}
+.tag.done{background:var(--done-bg);color:var(--done-tx)}
+.tag.bad{background:var(--bad-bg);color:var(--bad-tx)}
+.tag.manual{background:var(--manual-bg);color:var(--manual-tx)}
+.tag.wait{background:var(--wait-bg);color:var(--wait-tx)}
+.tag.grey{background:var(--grey-bg);color:var(--grey)}
+.cols{display:grid;grid-template-columns:1fr 1fr}
+.col{padding:15px 16px;min-width:0}
+.col.l{border-right:1px solid var(--border)}
+.label{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--soft);
+  font-weight:700;margin-bottom:7px}
+.pname{font-weight:600;font-size:14.5px;line-height:1.3;margin-bottom:5px}
+.meta{font-size:12.5px;color:var(--muted);line-height:1.7}
+.meta b{color:var(--text);font-weight:600}
+.imrow{display:flex;gap:8px;margin:10px 0 4px}
+.im{width:66px;height:66px;border-radius:8px;background:var(--grey-bg);
+  border:1px solid var(--border);display:flex;align-items:center;justify-content:center;
+  color:var(--soft);font-size:22px}
+.candrow{display:flex;gap:11px;align-items:center;margin-top:4px}
+.supurl{color:var(--manual);font-size:12px;text-decoration:none;display:block;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}
+.reason{font-size:12px;color:var(--wait-tx);background:var(--wait-bg);
+  border-radius:8px;padding:6px 10px;margin-top:10px}
+.acts{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--border);
+  flex-wrap:wrap;background:var(--bg)}
+.abtn{border:1px solid var(--border);background:var(--panel);border-radius:8px;
+  padding:8px 14px;font-size:13px;font-weight:600;cursor:pointer;color:var(--text);
+  display:inline-flex;align-items:center;gap:6px}
+.abtn.good{background:var(--done);border-color:var(--done);color:#fff}
+.abtn.no{background:var(--panel);border-color:var(--bad);color:var(--bad)}
+
+/* to-order */
+.supchips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.sc{border:0;border-radius:9px;padding:8px 14px;font-size:13.5px;font-weight:700;
+  cursor:pointer;color:#fff}
+.sc.todo{background:var(--done)} .sc.done{background:var(--bad)}
+.sc.sel{background:var(--wait);box-shadow:0 0 0 3px var(--wait-bg)}
+.orow{background:var(--panel);border:1px solid var(--border);border-radius:11px;
+  box-shadow:var(--shadow);padding:13px 16px;margin-bottom:10px;display:flex;
+  align-items:center;gap:14px;flex-wrap:wrap}
+.orow .oim{width:46px;height:46px;flex:0 0 46px;border-radius:8px;background:var(--grey-bg);
+  border:1px solid var(--border);display:flex;align-items:center;justify-content:center;
+  color:var(--soft);font-size:18px}
+.orow .oinfo{flex:1;min-width:180px}
+.orow .on{font-weight:600;font-size:14px;margin-bottom:2px}
+.orow .om{font-size:12px;color:var(--muted)}
+.orow .ourl{color:var(--manual);font-size:12px;text-decoration:none}
+.toggles{display:flex;gap:7px;flex-wrap:wrap}
+.tg{border:1px solid var(--border);background:var(--panel);border-radius:8px;
+  padding:6px 11px;font-size:12.5px;font-weight:600;cursor:pointer;color:var(--muted);
+  display:inline-flex;align-items:center;gap:5px}
+.tg.on-order{background:var(--manual-bg);border-color:var(--manual);color:var(--manual-tx)}
+.tg.on-wait{background:var(--wait-bg);border-color:var(--wait);color:var(--wait-tx)}
+.tg.on-stock{background:var(--done-bg);border-color:var(--done);color:var(--done-tx)}
+.tg.on-un{background:var(--bad-bg);border-color:var(--bad);color:var(--bad-tx)}
+
+.placeholder{background:var(--panel);border:1px dashed var(--border);border-radius:var(--radius);
+  padding:48px;text-align:center;color:var(--muted)}
+.placeholder .pi{font-size:40px;margin-bottom:12px;opacity:.5}
+.hide{display:none}
+@media(max-width:820px){
+  .sidebar{display:none}
+  .cols{grid-template-columns:1fr}.col.l{border-right:0;border-bottom:1px solid var(--border)}
+  .content,.topbar{padding-left:16px;padding-right:16px}
+}
+</style>
+</head>
+<body>
+<aside class="sidebar">
+  <div class="brand">
+    <span class="logo"><svg viewBox="0 0 24 24"><path d="M12 2L3 7v6c0 5 3.5 8 9 9 5.5-1 9-4 9-9V7z"/></svg></span>
+    <span>Forestshop<small>Párovač &amp; dashboard</small></span>
+  </div>
+  <nav class="nav">
+    <a class="active" data-page="review"><svg viewBox="0 0 24 24"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>Kontrola párovania<span class="badge">312</span></a>
+    <a data-page="toorder"><svg viewBox="0 0 24 24"><path d="M9 5h6M9 9h6M9 13h4"/><rect x="4" y="3" width="16" height="18" rx="2"/></svg>Na objednanie<span class="badge">24</span></a>
+    <a data-page="search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>Hľadať / opraviť</a>
+    <a data-page="notes"><svg viewBox="0 0 24 24"><path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4"/></svg>Poznámky<span class="badge">3</span></a>
+    <div class="sec">Čoskoro — rozšírime</div>
+    <a class="soon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Prehľad eshopu<span class="soonpill">soon</span></a>
+    <a class="soon"><svg viewBox="0 0 24 24"><path d="M12 3v12M8 11l4 4 4-4"/><path d="M5 21h14"/></svg>Import do eshopu<span class="soonpill">soon</span></a>
+    <a class="soon"><svg viewBox="0 0 24 24"><rect x="1" y="6" width="14" height="10" rx="1"/><path d="M15 9h4l3 3v4h-7z"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/></svg>Dodávatelia<span class="soonpill">soon</span></a>
+    <a class="soon"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>Štatistiky<span class="soonpill">soon</span></a>
+  </nav>
+  <div class="sidefoot">
+    <button class="themebtn" onclick="tgTheme()"><svg viewBox="0 0 24 24" id="themeicon"><path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/></svg><span id="themelbl">Tmavý mód</span></button>
+    <div class="ver">verzia v0.40.1 · maketa</div>
+  </div>
+</aside>
+
+<div class="main">
+  <div class="topbar">
+    <div>
+      <h1 id="pgTitle">Kontrola párovania</h1>
+      <div class="sub" id="pgSub">4 371 produktov · 312 čaká na potvrdenie</div>
+    </div>
+    <div class="topacts" id="pgActs"></div>
+  </div>
+  <div class="content" id="content"></div>
+</div>
+
+<script>
+const ACTS={
+  review:'<button class="btn primary"><svg viewBox="0 0 24 24"><path d="M12 3v12M8 11l4 4 4-4M5 21h14"/></svg>Stiahnuť import</button><button class="btn"><svg viewBox="0 0 24 24"><path d="M4 4v6h6M20 20v-6h-6"/><path d="M20 9A8 8 0 006 5M4 15a8 8 0 0014 4"/></svg>Obnoviť</button>',
+  toorder:'<button class="btn primary"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Ručné doobjednanie</button>',
+  search:'', notes:'<button class="btn primary"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Nová poznámka</button>'
+};
+const TITLES={review:['Kontrola párovania','4 371 produktov · 312 čaká na potvrdenie'],
+  toorder:['Na objednanie','24 otvorených položiek u dodávateľov'],
+  search:['Hľadať / opraviť','Prehľadá všetky polia všetkých produktov'],
+  notes:['Poznámky','Náhrada Discordu — rýchle poznámky k práci']};
+
+function reviewPage(){
+  const pills=[['Všetko',4371,true],['Dobré',3820,false],['Manuál',186,false],['Zlé',53,false],['Nedostupné',312,false]];
+  let h='<div class="pills">'+pills.map(p=>`<span class="pill ${p[2]?'on':''}">${p[0]}<span class="n">${p[1]}</span></span>`).join('')+'</div>';
+  const cards=[
+    {i:'#1842',t:'Alpenheat AH5 — vyhrievané vložky do topánok',tag:['done','Dobré'],
+     our:{n:'Alpenheat AH5 vyhrievané vložky',sup:'ODIMON',code:'60648',price:'119,00 €',state:'Predajný'},
+     cand:{n:'AH5 Trend — vyhrievané stielky (odimon.sk)',url:'https://odimon.sk/produkt/alpenheat-ah5-trend',
+       reason:'Kód AH5 sedí, model aj značka Alpenheat totožné.'}},
+    {i:'#2091',t:'Deerhunter Moor Padded — vesta',tag:['manual','Ručne overené'],
+     our:{n:'Deerhunter Moor Padded Waistcoat 393',sup:'BETALOV',code:'15233',price:'89,90 €',state:'detailOnly'},
+     cand:{n:'Deerhunter Moor Padded Waistcoat (huntingshop.eu)',url:'https://huntingshop.eu/moor-padded-waistcoat',
+       reason:'Ručne priradené — číslo 393 vs 367 rozlíšené podľa obrázka.'}},
+    {i:'#3377',t:'Härkila Pro Hunter GTX — obuv',tag:['grey','Nedostupné'],
+     our:{n:'Härkila Pro Hunter GTX 42',sup:'WETLAND',code:'88120',price:'—',state:'Vypredané'},
+     cand:null},
+  ];
+  h+=cards.map(c=>`
+    <div class="card">
+      <div class="head"><span class="idx">${c.i}</span>
+        <span class="htitle">${c.t}</span>
+        <span class="tag ${c.tag[0]}">${c.tag[1]}</span></div>
+      <div class="cols">
+        <div class="col l">
+          <div class="label">Náš produkt (forestshop)</div>
+          <div class="pname">${c.our.n}</div>
+          <div class="meta">Dodávateľ <b>${c.our.sup}</b> · kód <b>${c.our.code}</b><br>Cena <b>${c.our.price}</b> · stav <b>${c.our.state}</b></div>
+          <div class="imrow"><div class="im">📦</div><div class="im">🖼️</div></div>
+        </div>
+        <div class="col">
+          <div class="label">Nájdený u dodávateľa</div>
+          ${c.cand?`<div class="candrow"><div class="im">🔗</div><div style="min-width:0"><div class="pname">${c.cand.n}</div><a class="supurl">${c.cand.url}</a></div></div><div class="reason">${c.cand.reason}</div>`
+            :`<div class="meta" style="padding:14px 0;color:var(--soft)">Žiadny vhodný kandidát — produkt je vypredaný, ostáva v poole na re-kontrolu.</div>`}
+        </div>
+      </div>
+      <div class="acts">
+        <button class="abtn good"><svg viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg>Potvrdiť</button>
+        <button class="abtn no"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>Zlé</button>
+        <button class="abtn"><svg viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 013 3L7 19l-4 1 1-4z"/></svg>Ručne opraviť URL</button>
+      </div>
+    </div>`).join('');
+  return h;
+}
+function toorderPage(){
+  const chips=[['Všetci',24,'sel'],['GRUBE',9,'todo'],['BETALOV',7,'todo'],['ODIMON',5,'done'],['WETLAND',3,'todo']];
+  let h='<div class="supchips">'+chips.map(c=>`<button class="sc ${c[2]}">${c[0]} (${c[1]})</button>`).join('')+'</div>';
+  const rows=[
+    {n:'Alpenheat AH5 vyhrievané vložky',m:'Objednávka 20260712 · ODIMON · kód 60648',url:'odimon.sk/produkt/ah5-trend',tg:'stock',tgl:'Skladom ✓'},
+    {n:'Deerhunter Moor Padded Waistcoat',m:'Objednávka 20260712 · BETALOV · kód 15233',url:'huntingshop.eu/moor-padded',tg:'order',tgl:'Objednané'},
+    {n:'Härkila Pro Hunter GTX 42',m:'Objednávka 20260711 · WETLAND · kód 88120',url:'wetland.sk/pro-hunter-gtx',tg:'wait',tgl:'Čaká sa'},
+    {n:'Blaser lovecký nôž R8',m:'Objednávka 20260711 · GRUBE · kód R8-KNF',url:'grube.sk/p/blaser-r8-noz/44210',tg:'un',tgl:'Nedostupné ✗'},
+  ];
+  h+=rows.map(r=>`
+    <div class="orow"><div class="oim">📦</div>
+      <div class="oinfo"><div class="on">${r.n}</div><div class="om">${r.m}</div>
+        <a class="ourl">🔗 ${r.url}</a></div>
+      <div class="toggles">
+        <button class="tg ${r.tg=='order'?'on-order':''}">Objednané</button>
+        <button class="tg ${r.tg=='wait'?'on-wait':''}">Počkať</button>
+        <button class="tg ${r.tg=='stock'?'on-stock':''}">Skladom ✓</button>
+        <button class="tg ${r.tg=='un'?'on-un':''}">Nedostupné ✗</button>
+      </div></div>`).join('');
+  return h;
+}
+function searchPage(){
+  return `<input style="width:100%;padding:13px 16px;font-size:15px;border:1px solid var(--border);
+    border-radius:11px;background:var(--panel);color:var(--text);margin-bottom:16px"
+    placeholder="Hľadať produkt — názov, dodávateľ, kód, EAN, popis…" value="alpenheat">
+    <div class="orow"><div class="oim">📦</div><div class="oinfo"><div class="on">Alpenheat AH5 vyhrievané vložky</div>
+      <div class="om">ODIMON · kód 60648 · EAN 9008392… · 119,00 € · Predajný</div></div>
+      <button class="abtn">Otvoriť / opraviť</button></div>
+    <div class="orow"><div class="oim">📦</div><div class="oinfo"><div class="on">Alpenheat Fire-Glove vyhrievané rukavice</div>
+      <div class="om">ODIMON · kód 60712 · 189,00 € · Predajný</div></div>
+      <button class="abtn">Otvoriť / opraviť</button></div>`;
+}
+function notesPage(){
+  const ns=[['Skontrolovať GRUBE veľkosti — každá iná URL','dnes 09:12',false],
+    ['Doobjednať Härkila obuv keď naskladnia','včera 16:40',false],
+    ['StepanDK: pridať filter podľa kina — hotové','12.07. 11:03',true]];
+  return ns.map(n=>`<div class="orow" style="align-items:flex-start"><div class="oim">📝</div>
+    <div class="oinfo"><div class="on" style="${n[2]?'opacity:.5;text-decoration:line-through':''}">${n[0]}</div>
+    <div class="om">${n[1]}</div></div>
+    <button class="tg ${n[2]?'on-stock':''}">${n[2]?'Hotové ✓':'Označiť hotové'}</button></div>`).join('');
+}
+const PAGES={review:reviewPage,toorder:toorderPage,search:searchPage,notes:notesPage};
+function go(p){
+  document.querySelectorAll('.nav a[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===p));
+  document.getElementById('pgTitle').textContent=TITLES[p][0];
+  document.getElementById('pgSub').textContent=TITLES[p][1];
+  document.getElementById('pgActs').innerHTML=ACTS[p];
+  document.getElementById('content').innerHTML=PAGES[p]();
+  window.scrollTo(0,0);
+}
+document.querySelectorAll('.nav a[data-page]').forEach(a=>a.onclick=()=>go(a.dataset.page));
+function tgTheme(){
+  const d=document.body.dataset.theme==='dark';
+  document.body.dataset.theme=d?'':'dark';
+  document.getElementById('themelbl').textContent=d?'Tmavý mód':'Svetlý mód';
+  document.getElementById('themeicon').innerHTML=d?'<path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/>':'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>';
+}
+go('review');
+</script>
+</body>
+</html>
