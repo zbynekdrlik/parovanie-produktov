@@ -182,7 +182,7 @@ def test_evaluate_first_notification():
     assert r["new_state_value"] == "1|2026-07-22"
     assert r["email_subject"].startswith("Vaša zásielka čaká")
     assert r["call_needed"] is False
-    assert r["admin_link"].endswith("query=2026100")
+    assert r["admin_link"].endswith("vyhladavanie/?string=2026100&src=orders")
     assert r["days_at_post"] == 6
 
 

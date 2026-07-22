@@ -39,7 +39,7 @@ def test_tab_renders_seeded_data_default_stopped(page, automations_server):
     assert "2/4" in row.inner_text()                 # escalation progress
     # tracking + admin links point where they should
     assert row.locator('a[href*="posta.sk/sledovanie-zasielok"]').count() == 1
-    assert row.locator('a[href*="prehlad-objednavok"]').count() == 1
+    assert row.locator('a[href*="vyhladavanie"]').count() == 1
 
     # the invalid-format package (the class that broke n8n) is flagged, not hidden
     inv = page.locator('[data-testid="posta-invalid"]')
