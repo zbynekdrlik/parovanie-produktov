@@ -15,6 +15,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
+from tests.conftest import authed_client  # noqa: E402 — logged-in session (#91)
+
 _SK = "https://www.grube.sk/p/slug/619850/"
 _DE = "https://www.grube.de/p/x/619850/"
 _WET = "https://www.wetland.sk/p/thing/"
@@ -42,7 +44,7 @@ def test_api_products_normalizes_grube_urls_to_de_display_only(monkeypatch, tmp_
     monkeypatch.setattr(webapp, "PRODUCTS", [grube, wetland])
     monkeypatch.setattr(webapp, "DECISIONS", str(dec_path))
 
-    j = webapp.app.test_client().get("/api/products").get_json()
+    j = authed_client().get("/api/products").get_json()
     prods = {p["key"]: p for p in j["products"]}
     served = j["decisions"]
 
@@ -78,7 +80,7 @@ def test_api_products_grube_candidate_without_url_untouched(monkeypatch, tmp_pat
     monkeypatch.setattr(webapp, "PRODUCTS", [grube])
     monkeypatch.setattr(webapp, "DECISIONS", str(dec_path))
 
-    j = webapp.app.test_client().get("/api/products").get_json()
+    j = authed_client().get("/api/products").get_json()
     cands = j["products"][0]["candidates"]
     assert "url" not in cands[0]                    # url-less candidate intact
     assert cands[1]["url"] == _DE                   # linked candidate normalized

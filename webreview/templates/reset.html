@@ -1,0 +1,22 @@
+{% extends "auth.html" %}
+{% block title %}Nové heslo{% endblock %}
+{% block card %}
+<h1>Nastavenie nového hesla</h1>
+{% if not valid %}
+  <p class="err">Tento odkaz na obnovu hesla je neplatný, už použitý alebo
+  vypršal.</p>
+  <div class="links"><a href="/forgot">Vyžiadať nový odkaz</a></div>
+{% else %}
+  <form method="post" action="/reset/{{ token }}">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label for="password">Nové heslo (min. 8 znakov)</label>
+    <input id="password" name="password" type="password"
+           autocomplete="new-password" minlength="8" required autofocus>
+    <label for="password2">Nové heslo znova</label>
+    <input id="password2" name="password2" type="password"
+           autocomplete="new-password" minlength="8" required>
+    {% if error %}<p class="err">{{ error }}</p>{% endif %}
+    <button type="submit">Nastaviť heslo</button>
+  </form>
+{% endif %}
+{% endblock %}

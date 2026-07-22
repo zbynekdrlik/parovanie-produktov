@@ -13,7 +13,9 @@ import logging
 import os
 import re
 import hashlib
+import secrets
 import signal
+import smtplib
 import subprocess
 import sys
 import tempfile
@@ -21,11 +23,15 @@ import threading
 import time
 import uuid
 import zipfile
-from urllib.parse import urljoin
+from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from urllib.parse import quote, urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, request, send_from_directory, Response
+from flask import (Flask, Response, jsonify, redirect, render_template, request,
+                   send_from_directory, session)
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import __version__, config, import_builder
 from parovanie.catalog_index import (
@@ -111,6 +117,478 @@ def _save_decisions(d: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DECISIONS)
+
+
+# --------------------------------------------------------------------------- #
+# Auth (#91): email+password login (Flask session), user store, reset tokens.
+# The WHOLE app + every /api/* endpoint sits behind the login gate; the only
+# public surface is /login, /forgot, /reset/<token>, static assets, /favicon,
+# /api/version (login-page footer) and the /api/n8n/* machine endpoints (those
+# carry their OWN bearer auth — n8n has no session).
+# --------------------------------------------------------------------------- #
+
+
+def _load_env_file(path):
+    """KEY=VALUE lines from a gitignored creds file → os.environ DEFAULTS (a real
+    env var always wins). Lets the systemd service keep auth/mail config in
+    data/.auth_env + data/.mail_env (chmod 600) instead of unit files."""
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_env_file(os.path.join(ROOT, "data", ".auth_env"))
+_load_env_file(os.path.join(ROOT, "data", ".mail_env"))
+
+
+def _secret_key():
+    """Stable session-signing key: SECRET_KEY env (data/.auth_env) wins; else a
+    generated key persisted in OUT/.auth_secret (0600), so sessions survive
+    restarts even with zero config (a fresh key each boot would log everyone
+    out on every deploy)."""
+    env = os.environ.get("SECRET_KEY")
+    if env:
+        return env
+    path = os.path.join(OUT, ".auth_secret")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            key = f.read().strip()
+        if key:
+            return key
+    key = secrets.token_hex(32)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(key)
+    log.info("auth: generated new session secret at %s", path)
+    return key
+
+
+app.secret_key = _secret_key()
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    # The public site is https (Cloudflare tunnel) → AUTH_COOKIE_SECURE=1 lives
+    # in data/.auth_env there; plain-http dev/E2E boots leave it off.
+    SESSION_COOKIE_SECURE=os.environ.get("AUTH_COOKIE_SECURE") == "1",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+)
+
+USERS = os.path.join(OUT, "users.json")          # email -> {pw_hash,is_admin,created_at}
+RESET_TOKENS = os.path.join(OUT, "reset_tokens.json")   # sha256(token) -> {email,exp}
+RESET_TTL = 2 * 3600                             # reset link validity: 2 hours
+PW_MIN_LEN = 8
+LOGIN_MAX_FAILS = 5                              # failed logins per IP…
+LOGIN_WINDOW = 15 * 60                           # …within 15 minutes → 429
+_login_fails: dict = {}                          # ip -> [fail timestamps]
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _load_users() -> dict:
+    if os.path.exists(USERS):
+        with open(USERS, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_json_0600(path, d) -> None:
+    """Atomic write with 0600 perms — users.json holds password hashes and
+    reset_tokens.json holds live reset-token hashes."""
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def _save_users(d: dict) -> None:
+    _save_json_0600(USERS, d)
+
+
+def _load_reset_tokens() -> dict:
+    if os.path.exists(RESET_TOKENS):
+        with open(RESET_TOKENS, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_reset_tokens(d: dict) -> None:
+    _save_json_0600(RESET_TOKENS, d)
+
+
+def _norm_email(e) -> str:
+    return (e or "").strip().lower()
+
+
+def _bootstrap_admin() -> None:
+    """First-run admin from ADMIN_EMAIL/ADMIN_PW (data/.auth_env), so the manager
+    is never locked out after a deploy. Creates the account only when missing —
+    a password changed later in the UI is NEVER overwritten by a restart."""
+    email = _norm_email(os.environ.get("ADMIN_EMAIL"))
+    pw = os.environ.get("ADMIN_PW") or ""
+    if not email or not pw:
+        return
+    with _lock:
+        users = _load_users()
+        if email in users:
+            return
+        users[email] = {
+            "pw_hash": generate_password_hash(pw), "is_admin": True,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        _save_users(users)
+    log.info("auth: bootstrapped admin %s from env", email)
+
+
+_bootstrap_admin()
+
+
+def _current_user():
+    """Session → live user record. Re-checks the store on EVERY request, so a
+    deleted user (or a stale cookie) loses access immediately."""
+    email = session.get("user")
+    if not email:
+        return None
+    u = _load_users().get(email)
+    if not u:
+        return None
+    return {"email": email, "is_admin": bool(u.get("is_admin"))}
+
+
+_PUBLIC_ENDPOINTS = {"login", "forgot_password", "reset_password", "favicon",
+                     "api_version", "static", "static_files"}
+
+
+@app.before_request
+def _require_login():
+    """Default-deny login gate: every endpoint (present and future) is protected
+    unless explicitly public. /api/n8n/* keep their own bearer auth."""
+    if request.endpoint in _PUBLIC_ENDPOINTS or request.path.startswith("/api/n8n/"):
+        return None
+    if _current_user():
+        return None
+    log.info("auth: unauthenticated %s %s from %s", request.method, request.path,
+             _client_ip())
+    if request.path.startswith("/api/"):
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    nxt = request.full_path if request.query_string else request.path
+    return redirect("/login?next=" + quote(nxt))
+
+
+def _csrf_token() -> str:
+    tok = session.get("_csrf")
+    if not tok:
+        tok = secrets.token_hex(16)
+        session["_csrf"] = tok
+    return tok
+
+
+def _csrf_ok() -> bool:
+    tok = session.get("_csrf") or ""
+    sent = request.form.get("_csrf") or ""
+    return bool(tok) and hmac.compare_digest(tok, sent)
+
+
+def _rate_limited(ip) -> bool:
+    now = time.time()
+    fails = [t for t in _login_fails.get(ip, []) if now - t < LOGIN_WINDOW]
+    _login_fails[ip] = fails
+    return len(fails) >= LOGIN_MAX_FAILS
+
+
+def _note_fail(ip) -> None:
+    _login_fails.setdefault(ip, []).append(time.time())
+
+
+def _safe_next(nxt) -> str:
+    """Post-login redirect target: same-site paths only (no open redirect)."""
+    if nxt and nxt.startswith("/") and not nxt.startswith("//"):
+        return nxt
+    return "/"
+
+
+def _login_page(error=None, status=200):
+    return render_template(
+        "login.html", csrf=_csrf_token(), version=__version__, error=error,
+        nxt=request.values.get("next", ""),
+        reset_done=request.args.get("reset") == "1"), status
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "GET":
+        if _current_user():
+            return redirect("/")
+        return _login_page()
+    ip = _client_ip()
+    if not _csrf_ok():
+        log.warning("auth: login with bad/missing CSRF from %s", ip)
+        return _login_page("Neplatná relácia — skús to znova.", 400)
+    if _rate_limited(ip):
+        log.warning("auth: login rate-limited ip=%s", ip)
+        return _login_page("Priveľa pokusov — počkaj 15 minút a skús znova.", 429)
+    email = _norm_email(request.form.get("email"))
+    pw = request.form.get("password") or ""
+    u = _load_users().get(email)
+    if not u or not check_password_hash(u.get("pw_hash", ""), pw):
+        _note_fail(ip)
+        log.warning("auth: failed login email=%s ip=%s", email, ip)
+        return _login_page("Nesprávny e-mail alebo heslo.", 401)
+    session.clear()
+    session["user"] = email
+    session["_csrf"] = secrets.token_hex(16)   # fresh token for the fresh session
+    session.permanent = True
+    log.info("auth: login ok %s ip=%s", email, ip)
+    return redirect(_safe_next(request.form.get("next")))
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    email = session.get("user")
+    session.clear()
+    log.info("auth: logout %s", email)
+    return redirect("/login")
+
+
+@app.route("/api/me")
+def api_me():
+    return jsonify(_current_user())   # the login gate guarantees a user here
+
+
+def _send_mail(to, subject, body) -> bool:
+    """Plain-text mail via SMTP from data/.mail_env (MAIL_HOST/PORT/USER/PASS/FROM).
+    Unconfigured or failing SMTP is LOGGED and reported False — the forgot page
+    never 500s and never leaks whether a mail actually left."""
+    host = os.environ.get("MAIL_HOST")
+    if not host:
+        log.error("auth: SMTP not configured (data/.mail_env) — mail to %s NOT sent", to)
+        return False
+    port = int(os.environ.get("MAIL_PORT", "587"))
+    user = os.environ.get("MAIL_USER", "")
+    pw = os.environ.get("MAIL_PASS", "")
+    sender = os.environ.get("MAIL_FROM") or user
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = to
+    try:
+        if port == 465:
+            smtp = smtplib.SMTP_SSL(host, port, timeout=20)
+        else:
+            smtp = smtplib.SMTP(host, port, timeout=20)
+            smtp.starttls()
+        if user:
+            smtp.login(user, pw)
+        smtp.sendmail(sender, [to], msg.as_string())
+        smtp.quit()
+        log.info("auth: reset mail sent to %s via %s:%s", to, host, port)
+        return True
+    except Exception as e:  # noqa: BLE001 — log full context + degrade, never 500
+        log.error("auth: SMTP send to %s via %s:%s failed: %r", to, host, port, e)
+        return False
+
+
+def _base_url() -> str:
+    """Absolute base for reset links: APP_BASE_URL (data/.auth_env — the public
+    tunnel URL) wins; request.url_root is the dev/test fallback."""
+    return (os.environ.get("APP_BASE_URL") or request.url_root).rstrip("/")
+
+
+def _forgot_page(sent, error=None, status=200):
+    return render_template("forgot.html", csrf=_csrf_token(), version=__version__,
+                           sent=sent, error=error), status
+
+
+@app.route("/forgot", methods=["GET", "POST"])
+def forgot_password():
+    if request.method == "GET":
+        return _forgot_page(sent=False)
+    ip = _client_ip()
+    if not _csrf_ok():
+        log.warning("auth: forgot with bad/missing CSRF from %s", ip)
+        return _forgot_page(sent=False, error="Neplatná relácia — skús to znova.",
+                            status=400)
+    if _rate_limited(ip):   # shares the login fail budget — brakes mail-bombing too
+        log.warning("auth: forgot rate-limited ip=%s", ip)
+        return _forgot_page(sent=False,
+                            error="Priveľa pokusov — počkaj 15 minút.", status=429)
+    email = _norm_email(request.form.get("email"))
+    if email in _load_users():
+        token = secrets.token_urlsafe(32)
+        th = hashlib.sha256(token.encode()).hexdigest()
+        now = time.time()
+        with _lock:
+            toks = {k: v for k, v in _load_reset_tokens().items()
+                    if v.get("exp", 0) > now}        # purge expired on the way
+            toks[th] = {"email": email, "exp": now + RESET_TTL}
+            _save_reset_tokens(toks)
+        link = _base_url() + "/reset/" + token
+        sent_ok = _send_mail(
+            email, "Obnova hesla — Párovanie Forestshop",
+            "Na nastavenie nového hesla klikni na tento odkaz (platí 2 hodiny a "
+            f"funguje iba raz):\n\n{link}\n\nAk si o obnovu hesla nežiadal, tento "
+            "e-mail ignoruj — heslo sa nemení.")
+        log.info("auth: reset token issued for %s ip=%s mail_sent=%s",
+                 email, ip, sent_ok)
+    else:
+        _note_fail(ip)   # unknown-email probing eats the same budget
+        log.info("auth: forgot for unknown email=%s ip=%s", email, ip)
+    # identical answer whether the account exists or not (no enumeration)
+    return _forgot_page(sent=True)
+
+
+def _reset_page(valid, token, error=None, status=200):
+    return render_template("reset.html", valid=valid, token=token,
+                           csrf=_csrf_token(), version=__version__,
+                           error=error), status
+
+
+@app.route("/reset/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    th = hashlib.sha256(token.encode()).hexdigest()
+    rec = _load_reset_tokens().get(th)
+    if not rec or rec.get("exp", 0) < time.time():
+        log.info("auth: reset with invalid/expired token from %s", _client_ip())
+        return _reset_page(valid=False, token="", status=410)
+    if request.method == "GET":
+        return _reset_page(valid=True, token=token)
+    if not _csrf_ok():
+        return _reset_page(valid=True, token=token,
+                           error="Neplatná relácia — skús to znova.", status=400)
+    pw = request.form.get("password") or ""
+    pw2 = request.form.get("password2") or ""
+    if len(pw) < PW_MIN_LEN:
+        return _reset_page(valid=True, token=token,
+                           error=f"Heslo musí mať aspoň {PW_MIN_LEN} znakov.",
+                           status=400)
+    if pw != pw2:
+        return _reset_page(valid=True, token=token,
+                           error="Heslá sa nezhodujú.", status=400)
+    with _lock:
+        toks = _load_reset_tokens()
+        rec = toks.pop(th, None)                     # single-use: consume NOW
+        if not rec or rec.get("exp", 0) < time.time():
+            return _reset_page(valid=False, token="", status=410)
+        _save_reset_tokens(toks)
+        users = _load_users()
+        u = users.get(rec["email"])
+        if u:
+            u["pw_hash"] = generate_password_hash(pw)
+            _save_users(users)
+    log.info("auth: password reset completed for %s from %s",
+             rec["email"], _client_ip())
+    return redirect("/login?reset=1")
+
+
+# ── admin user management (sekcia „Užívatelia") ──────────────────────────────
+
+
+def _admin_or_none():
+    u = _current_user()
+    return u if (u and u["is_admin"]) else None
+
+
+def _forbidden():
+    log.warning("auth: non-admin %s denied on %s", session.get("user"), request.path)
+    return jsonify({"ok": False, "error": "forbidden"}), 403
+
+
+@app.route("/api/users", methods=["GET", "POST"])
+def api_users():
+    me = _admin_or_none()
+    if not me:
+        return _forbidden()
+    if request.method == "GET":
+        return jsonify({"users": [
+            {"email": e, "is_admin": bool(r.get("is_admin")),
+             "created_at": r.get("created_at", "")}
+            for e, r in sorted(_load_users().items())]})
+    d = request.get_json(silent=True) or {}
+    email = _norm_email(d.get("email"))
+    pw = d.get("password") or ""
+    if not _EMAIL_RE.match(email):
+        return jsonify({"ok": False, "error": "neplatný e-mail"}), 400
+    if len(pw) < PW_MIN_LEN:
+        return jsonify({"ok": False,
+                        "error": f"heslo musí mať aspoň {PW_MIN_LEN} znakov"}), 400
+    with _lock:
+        users = _load_users()
+        if email in users:
+            return jsonify({"ok": False, "error": "používateľ už existuje"}), 409
+        users[email] = {
+            "pw_hash": generate_password_hash(pw),
+            "is_admin": bool(d.get("is_admin")),
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        _save_users(users)
+    log.info("auth: %s created user %s (admin=%s)",
+             me["email"], email, bool(d.get("is_admin")))
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/delete", methods=["POST"])
+def api_users_delete():
+    me = _admin_or_none()
+    if not me:
+        return _forbidden()
+    email = _norm_email((request.get_json(silent=True) or {}).get("email"))
+    if email == me["email"]:
+        # also guarantees ≥1 admin always remains (you can't remove yourself)
+        return jsonify({"ok": False, "error": "nemôžeš zmazať vlastný účet"}), 400
+    with _lock:
+        users = _load_users()
+        if email not in users:
+            return jsonify({"ok": False, "error": "používateľ neexistuje"}), 404
+        del users[email]
+        _save_users(users)
+    log.info("auth: %s deleted user %s", me["email"], email)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/admin", methods=["POST"])
+def api_users_admin():
+    me = _admin_or_none()
+    if not me:
+        return _forbidden()
+    d = request.get_json(silent=True) or {}
+    email = _norm_email(d.get("email"))
+    is_admin = bool(d.get("is_admin"))
+    if email == me["email"] and not is_admin:
+        # self-demotion off → the last admin can never disappear
+        return jsonify({"ok": False,
+                        "error": "nemôžeš odobrať admina sám sebe"}), 400
+    with _lock:
+        users = _load_users()
+        if email not in users:
+            return jsonify({"ok": False, "error": "používateľ neexistuje"}), 404
+        users[email]["is_admin"] = is_admin
+        _save_users(users)
+    log.info("auth: %s set admin=%s for %s", me["email"], is_admin, email)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/password", methods=["POST"])
+def api_users_password():
+    me = _admin_or_none()
+    if not me:
+        return _forbidden()
+    d = request.get_json(silent=True) or {}
+    email = _norm_email(d.get("email"))
+    pw = d.get("password") or ""
+    if len(pw) < PW_MIN_LEN:
+        return jsonify({"ok": False,
+                        "error": f"heslo musí mať aspoň {PW_MIN_LEN} znakov"}), 400
+    with _lock:
+        users = _load_users()
+        if email not in users:
+            return jsonify({"ok": False, "error": "používateľ neexistuje"}), 404
+        users[email]["pw_hash"] = generate_password_hash(pw)
+        _save_users(users)
+    log.info("auth: %s set new password for %s", me["email"], email)
+    return jsonify({"ok": True})
 
 
 # Per-line "objednané" state for the Na-objednanie tab (key = '<orderCode>|<itemCode>').

@@ -1,0 +1,17 @@
+{% extends "auth.html" %}
+{% block title %}Prihlásenie{% endblock %}
+{% block card %}
+<h1>Prihlásenie</h1>
+{% if reset_done %}<p class="ok">Heslo je zmenené — prihlás sa novým heslom.</p>{% endif %}
+<form method="post" action="/login">
+  <input type="hidden" name="_csrf" value="{{ csrf }}">
+  <input type="hidden" name="next" value="{{ nxt }}">
+  <label for="email">E-mail</label>
+  <input id="email" name="email" type="email" autocomplete="username" required autofocus>
+  <label for="password">Heslo</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" required>
+  {% if error %}<p class="err">{{ error }}</p>{% endif %}
+  <button type="submit">Prihlásiť sa</button>
+</form>
+<div class="links"><a href="/forgot">Zabudol som heslo</a></div>
+{% endblock %}

@@ -1,0 +1,19 @@
+{% extends "auth.html" %}
+{% block title %}Zabudnuté heslo{% endblock %}
+{% block card %}
+<h1>Zabudnuté heslo</h1>
+{% if sent %}
+  <p class="ok">Ak účet s týmto e-mailom existuje, poslali sme naň odkaz na
+  obnovu hesla. Odkaz platí 2 hodiny a funguje iba raz.</p>
+  <div class="links"><a href="/login">Späť na prihlásenie</a></div>
+{% else %}
+  <form method="post" action="/forgot">
+    <input type="hidden" name="_csrf" value="{{ csrf }}">
+    <label for="email">E-mail účtu</label>
+    <input id="email" name="email" type="email" autocomplete="username" required autofocus>
+    {% if error %}<p class="err">{{ error }}</p>{% endif %}
+    <button type="submit">Poslať odkaz na obnovu</button>
+  </form>
+  <div class="links"><a href="/login">Späť na prihlásenie</a></div>
+{% endif %}
+{% endblock %}
