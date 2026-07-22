@@ -1001,8 +1001,17 @@ def _fetch_export_csv() -> bytes:
     url = _cred("SHOPTET_EXPORT_URL")
     if not url:
         raise RuntimeError(f"SHOPTET_EXPORT_URL chýba v {CRED_PATH}")
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=120)
-    r.raise_for_status()
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=120)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        # NEvkladaj `e`/URL do hlášky ani do reťazenej výnimky — obsahuje partner
+        # hash (rovnaký dôvod ako scripts/shoptet_import.py::_backup_export).
+        # `from None` navyše potlačí chained traceback, aby URL neunikla ani cez
+        # log.exception() v automation_runner._execute (last_error v UI je aj
+        # tak už len táto sanitizovaná správa, nie surová `e`).
+        raise RuntimeError(f"stiahnutie katalógového exportu zlyhalo: {type(e).__name__} "
+                           "(URL skrytá — over SHOPTET_EXPORT_URL)") from None
     if not r.content:
         raise RuntimeError("stiahnutý export katalógu je prázdny")
     return r.content

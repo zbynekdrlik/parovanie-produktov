@@ -13,6 +13,7 @@ import os
 import sys
 
 import pytest
+import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
@@ -71,6 +72,29 @@ def iso(tmp_path, monkeypatch):
         sentinel_paths[name] = p
     return {"tmp": tmp_path, "src": src, "data": data, "orders_cache": orders_cache,
             "manager_stores": sentinel_paths}
+
+
+# ── secret hygiene: a network failure must never leak the partner-hash URL ────
+# (the same rule scripts/shoptet_import.py::_backup_export already follows for
+# this exact credential — "NEvkladaj `e` do hlášky, obsahuje URL s tajným hashom")
+def test_fetch_export_csv_sanitizes_secret_url_on_network_failure(monkeypatch):
+    secret_url = "https://www.forestshop.sk/export/products.csv?hash=TOTALLY-SECRET-HASH"
+    monkeypatch.setattr(webapp, "_cred",
+                        lambda key: secret_url if key == "SHOPTET_EXPORT_URL" else None)
+
+    def boom(*a, **kw):
+        raise requests.ConnectionError(f"Failed to connect to {secret_url}")
+    monkeypatch.setattr(webapp.requests, "get", boom)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        webapp._fetch_export_csv()
+
+    msg = str(exc_info.value)
+    assert "TOTALLY-SECRET-HASH" not in msg
+    assert "ConnectionError" in msg
+    # the chain is suppressed too (`from None`) — never leaks via a traceback/log.exception
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
 
 
 # ── registration + status ─────────────────────────────────────────────────────
