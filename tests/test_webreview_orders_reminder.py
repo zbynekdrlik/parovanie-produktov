@@ -318,6 +318,33 @@ def test_override_send_without_email_rejected(iso, monkeypatch):
     assert iso["sent"] == []
 
 
+def test_override_send_does_not_hold_the_store_lock_during_smtp(iso, monkeypatch):
+    # The SMTP call must run OUTSIDE `_lock` (the app's single global lock guards every store) —
+    # simulate a concurrent request resolving the SAME code WHILE our _send_mail_html call is
+    # "in flight" (its mocked body mutates the store directly, exactly what another thread could
+    # do if the lock were free during the network call). The endpoint's post-send re-check must
+    # notice the race and NOT append a second orange row / overwrite the concurrent result.
+    c = _seed(iso)
+
+    def concurrent_send(to, subject, body, bcc=None):
+        st = _store(iso)
+        st["orders"]["20261000"] = {"status": "emailed", "email": to, "manual": True,
+                                     "date": "concurrent"}
+        st["red"] = [r for r in st["red"] if r["code"] != "20261000"]
+        st.setdefault("orange", []).append({"code": "20261000", "billFullName": "Ján Bez",
+                                            "email": to, "sent_date": "concurrent"})
+        webapp._save_orders_reminder(st)
+        return True
+
+    monkeypatch.setattr(webapp, "_send_mail_html", concurrent_send)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200 and r.get_json() == {"ok": True, "status": "emailed"}
+    st = _store(iso)
+    # exactly ONE orange row for 20261000 — the endpoint did not append a duplicate
+    assert len([o for o in st["orange"] if o["code"] == "20261000"]) == 1
+    assert st["orders"]["20261000"]["date"] == "concurrent"   # the concurrent write won, untouched
+
+
 def test_override_send_smtp_failure_reports_error_and_keeps_row(iso, monkeypatch):
     c = _seed(iso)
     monkeypatch.setattr(webapp, "_send_mail_html", lambda *a, **kw: False)
