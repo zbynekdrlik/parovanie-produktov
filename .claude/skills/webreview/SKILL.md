@@ -2,9 +2,24 @@
 
 Load BEFORE prácou na `webreview/` (Flask `app.py` + vanilla-JS SPA `static/app.js`,
 `style.css`, `templates/index.html`). Layout = **ľavý sidebar-dashboard** (redesign v0.42.0):
-sidebar (nav = naše funkcie s outline SVG ikonami + `.navcount` počítadlami, sekcia „Čoskoro"
-na budúce stránky, dole tmavý-mód prepínač + verzia) + top bar (`#pageTitle`/`#pageSub` +
-`.topacts`). Nav (`#tabs`) žije v sidebar-e; `.filters`/`.progress`/`.downloads` v top bar-e.
+sidebar (nav = naše funkcie s outline SVG ikonami + `.navcount` počítadlami, zoskupené v
+rozbaľovacom priečinku „Eshop" #118; admin „Užívatelia" je SAMOSTATNE úplne dole; dole tmavý-mód
+prepínač + verzia) + top bar (`#pageTitle`/`#pageSub` + `.topacts`). Nav (`#tabs`) žije v
+sidebar-e; `.filters`/`.progress`/`.downloads` v top bar-e.
+
+## Sidebar strom — priečinok „Eshop" (#118) + „Užívatelia" štandalón
+
+- **Priečinok „Eshop"** (rozbaľovací, default rozbalený, stav `localStorage('folder:eshop')`)
+  obaľuje `#tabs` (pracovné taby) + pod-sekciu „Automatizácie" (`#autoTabs`). `initFolder(id, key)`
+  drôtuje ďalší priečinok. `#tabs` OSTÁVA vnútri `.sidebar` (selektorový kontrakt).
+- **`renderTabs()` vykresľuje TRI kontajnery**: `#tabs` (z `TABS`), `#autoTabs` (z
+  `AUTOMATION_TABS`), a `#usersNav` (len admin, `isAdmin()` — NIE cez starý `visibleTabs()`).
+  „Užívatelia" je MIMO priečinka: samostatný `#usersNav` (priamy potomok `.sidebar` medzi
+  `.side-nav` a `.sidefoot`), skryje sa keď prázdny (`.users-nav:empty{display:none}` → non-admin
+  nevidí prázdny separátor). Presun/skrytie „Užívatelia" NEmení `switchTab('users')`/`loadUsers`/
+  `renderUsers`/`#tab-users` — tie ostávajú; mení sa len KDE žije nav-button.
+- Sekcia „Čoskoro — rozšírime" + `.soon`/`.soonpill`/`.soon-nav` boli ODSTRÁNENÉ (#118, Marek
+  2026-07-22) — nevracaj ich.
 
 ## UI redesign / shell zmeny — zachovaj SELEKTOROVÝ KONTRAKT (E2E ho merajú)
 
@@ -190,6 +205,19 @@ In-app verzia manuálneho promote vyššie — manažér nájde a napáruje prod
 ## e2e gotcha — `saveDecision` render je SYNC pred `await fetch` → serializuj POSTy
 
 `saveDecision(p,status,url)` synchronne updatne `DECISIONS` + `render()` a AŽ POTOM `await fetch('/api/decision')` → POST odletí ONESKORENE. V e2e kde klikáš viac tlačidiel za sebou (napr. 📦 → ↩ Vrátiť → 🚫), sa POST z predošlej akcie (`undo`) stihne vypustiť **do `expect_response` okna ĎALŠEJ akcie** → zachytíš zlý request (`assert 'undo' == 'discontinued'`). Lokálne (rýchle) prejde, na CI (pomalšie) padne = flaky. **Fix: KAŽDÝ `/api/decision` POST konzumuj vo VLASTNOM `with page.expect_response("**/api/decision")` — vrátane každého `↩ Vrátiť` (undo)** — pred ďalšou akciou; medzi akciami `wait_for_selector` na cieľový stav (nie `sleep`/`wait_for_timeout`).
+
+## e2e gotcha — `[data-testid=version]` NIE je „init hotový" wait (flaky title race)
+
+Shell E2E, čo overuje stav PO `init()` (napr. default `#pageTitle`), NESMIE gate-ovať len na
+`page.wait_for_selector('[data-testid="version"]')` — verziový `<span>` je v DOM od prvého
+vykreslenia (zobrazuje `…` kým nedobehne fetch), takže ten wait prejde OKAMŽITE, ešte pred
+`init()`. `index.html` navyše dodáva STATICKÝ `<h1 id="pageTitle">Kontrola párovania</h1>`, ktorý
+`init()→render()→setPageHead()` async prepíše na default „Na objednanie" — na pomalom CI teda
+assert prečíta ten statický titulok a padne (green na `push` behu, red na `pull_request` behu TOHO
+istého commitu = klasický race). **Fix: čakaj na vykreslený nav `page.wait_for_selector(".sidebar
+#tabs button")`** (renderTabs beží v tom istom `render()` ako setPageHead) a/alebo
+`wait_for_function` na cieľový text titulku — až potom assertni. Platí pre KAŽDÝ shell test
+čítajúci post-init stav.
 
 ## Živé Playwright overenie bez znečistenia dát
 
