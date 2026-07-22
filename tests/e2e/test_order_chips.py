@@ -6,7 +6,11 @@ still un-flagged, and ORANGE (class `active`) when it is the selected filter. Th
 fixture has ORBIS with a single line (77/X) and BETALOV with two (1/M, 2/M); flagging
 ORBIS's only line as in-stock makes ORBIS fully resolved → red, while BETALOV stays
 green. Colours are asserted via getComputedStyle so the scoped CSS is really applied,
-not just the class. The seeded flag is removed at the end (session-scoped fixture)."""
+not just the class. The seeded flag is removed at the end (session-scoped fixture).
+
+Colours softened for #143 (2026-07-22, exact hex from the boss):
+green #6CAB68 = rgb(108,171,104), red #D14D3B = rgb(209,77,59),
+orange (kept distinct, gently muted) #DDA43C = rgb(221,164,60)."""
 
 ORBIS_KEY = "20260700|77/X"   # <orderCode>|<itemCode> of ORBIS's single fixture line
 
@@ -35,8 +39,8 @@ def test_order_supplier_chips_colour_by_resolved_state(page, live_server):
 
         red = orbis.evaluate("e => getComputedStyle(e).backgroundColor")
         green = betalov.evaluate("e => getComputedStyle(e).backgroundColor")
-        assert red == "rgb(220, 38, 38)", f"ORBIS chip not red: {red}"
-        assert green == "rgb(22, 163, 74)", f"BETALOV chip not green: {green}"
+        assert red == "rgb(209, 77, 59)", f"ORBIS chip not red: {red}"
+        assert green == "rgb(108, 171, 104)", f"BETALOV chip not green: {green}"
 
         # Clicking a chip makes it the active (orange) filter.
         betalov.click()
@@ -44,7 +48,7 @@ def test_order_supplier_chips_colour_by_resolved_state(page, live_server):
         betalov = _chip(page, "BETALOV")
         assert "active" in (betalov.get_attribute("class") or "")
         orange = betalov.evaluate("e => getComputedStyle(e).backgroundColor")
-        assert orange == "rgb(245, 158, 11)", f"active chip not orange: {orange}"
+        assert orange == "rgb(221, 164, 60)", f"active chip not orange: {orange}"
 
         assert console == [], f"console not clean: {console}"
     finally:

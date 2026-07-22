@@ -1,12 +1,17 @@
 /* Forestshop párovač — moderný sidebar-dashboard (redesign 2026-07-22).
    Spec: docs/superpowers/specs/2026-07-22-webreview-modern-dashboard-redesign.md
-   Mení sa LAYOUT + vzhľad; všetky triedy/id/data-testid + chip-farby ostávajú
-   (E2E ich merajú: order chip todo=#16a34a done=#dc2626 active=#f59e0b). */
+   Mení sa LAYOUT + vzhľad; všetky triedy/id/data-testid ostávajú.
+   Paleta zjemnená #143 (2026-07-22, presné farby od šéfa):
+   order chip todo=#6CAB68 done=#D14D3B active=#DDA43C — E2E merajú presné rgb, NEMEŇ
+   bez úpravy tests/e2e/test_order_chips.py. --accent* je odvodená tlmená zelená
+   v ROVNAKOM odtieni ako #6CAB68 (~116° hue), len tmavšia kvôli kontrastu bieleho
+   textu na plných tlačidlách — --accent-hov je "silný" ťah (biely text), --accent
+   je "jemný" ťah (text/ikona na svetlom/mäkkom podklade). */
 
 :root{
   --bg:#f6f7f9; --panel:#ffffff; --side:#ffffff; --border:#e8eaed; --border2:#eef0f3;
   --text:#1f2430; --muted:#6b7280; --soft:#9aa1ac;
-  --accent:#15803d; --accent-hov:#116330; --accent-soft:#dcfce7;
+  --accent:#3F7F3B; --accent-hov:#356B32; --accent-soft:#E4EEE3;
   --input-bg:#ffffff; --chip-off-bg:#e5e7eb; --chip-off-tx:#6b7280;
   --row-done:#f0fdf4; --row-wait:#fffbeb; --row-instock:#f0fdf4; --row-unavail:#fef2f2;
   --radius:12px; --shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
@@ -14,7 +19,7 @@
 body[data-theme=dark]{
   --bg:#0f1420; --panel:#161c28; --side:#141a26; --border:#26303f; --border2:#222c3a;
   --text:#e6e9ef; --muted:#98a2b3; --soft:#6b7686;
-  --accent:#22c55e; --accent-hov:#16a34a; --accent-soft:#123122;
+  --accent:#7CB878; --accent-hov:#4A8546; --accent-soft:#182619;
   --input-bg:#0f1724; --chip-off-bg:#26303f; --chip-off-tx:#98a2b3;
   --row-done:#0f2318; --row-wait:#241c07; --row-instock:#0f2318; --row-unavail:#2a1315;
   --shadow:0 1px 3px rgba(0,0,0,.45);
@@ -33,7 +38,7 @@ a{color:inherit}
   display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
 .brand{display:flex;align-items:center;gap:10px;padding:16px 18px 14px;font-weight:800;
   font-size:17px;letter-spacing:-.01em}
-.brand .logo{width:30px;height:30px;flex:0 0 30px;border-radius:9px;background:var(--accent);
+.brand .logo{width:30px;height:30px;flex:0 0 30px;border-radius:9px;background:var(--accent-hov);
   display:flex;align-items:center;justify-content:center}
 .brand .logo svg{width:18px;height:18px;stroke:#fff;fill:none;stroke-width:1.7}
 .brand .brandtxt small{display:block;font-weight:500;font-size:11px;color:var(--muted);margin-top:1px}
@@ -50,7 +55,7 @@ a{color:inherit}
 .tabs .tab:hover{background:var(--bg);color:var(--text)}
 .tabs .tab.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
 .tabs .tab.active svg{stroke:var(--accent)}
-.tabs .tab .navcount{background:var(--accent);color:#fff;font-size:11px;font-weight:700;
+.tabs .tab .navcount{background:var(--accent-hov);color:#fff;font-size:11px;font-weight:700;
   border-radius:20px;padding:1px 8px;min-width:20px;text-align:center}
 /* Admin 'Užívatelia' — standalone nav at the sidebar bottom, OUTSIDE the folder
    (#118 refinement). Separated from the folder above; collapses when empty
@@ -95,16 +100,17 @@ a{color:inherit}
 .filters button{background:var(--panel);color:var(--muted);border:1px solid var(--border);
   padding:6px 12px;border-radius:20px;cursor:pointer;font-size:13px;font-weight:600;transition:.12s}
 .filters button:hover{border-color:var(--soft)}
-.filters button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.filters button.active{background:var(--accent-hov);border-color:var(--accent-hov);color:#fff}
 /* „Na objednanie" supplier chips (scoped by body.toorder-wide): GREEN=treba riešiť,
-   RED=všetko poriešené, ORANGE=vybraná. E2E merajú presné rgb — NEMEŇ. */
-body.toorder-wide .filters button.todo{background:#16a34a;border-color:#16a34a;color:#eafff2}
-body.toorder-wide .filters button.done{background:#dc2626;border-color:#dc2626;color:#fee2e2}
-body.toorder-wide .filters button.active{background:#f59e0b;border-color:#f59e0b;color:#3b1d00;font-weight:700}
+   RED=všetko poriešené, ORANGE=vybraná. Presné farby od šéfa (#143) — E2E merajú
+   presné rgb (tests/e2e/test_order_chips.py) — NEMEŇ bez úpravy testov. */
+body.toorder-wide .filters button.todo{background:#6CAB68;border-color:#6CAB68;color:#173617}
+body.toorder-wide .filters button.done{background:#D14D3B;border-color:#D14D3B;color:#fff}
+body.toorder-wide .filters button.active{background:#DDA43C;border-color:#DDA43C;color:#3b1d00;font-weight:700}
 .downloads{display:flex;gap:8px}
-.downloads a{background:var(--accent);color:#fff;text-decoration:none;font-size:13.5px;
+.downloads a{background:var(--accent-hov);color:#fff;text-decoration:none;font-size:13.5px;
   font-weight:600;padding:9px 15px;border-radius:9px}
-.downloads a:hover{background:var(--accent-hov)}
+.downloads a:hover{filter:brightness(.88)}
 
 /* content area */
 main#list{padding:20px 28px 60px;display:flex;flex-direction:column;gap:12px;
@@ -115,10 +121,10 @@ body.toorder-wide main#list{max-width:none}
 /* ---------------- REVIEW CARD ---------------- */
 .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
   box-shadow:var(--shadow);display:grid;grid-template-columns:1fr 1fr;overflow:hidden}
-.card.good{border-color:#16a34a}
+.card.good{border-color:var(--accent)}
 .card.manual{border-color:#3b82f6} .card.unavailable{border-color:#9ca3af}
 .card.discontinued{border-color:#9ca3af}
-.card.curoff{box-shadow:var(--shadow),inset 4px 0 0 #f59e0b}
+.card.curoff{box-shadow:var(--shadow),inset 4px 0 0 #DDA43C}
 .side{padding:14px 16px;min-width:0}
 .side.left{border-right:1px solid var(--border2)}
 @media(max-width:760px){.card{grid-template-columns:1fr}.side.left{border-right:0;border-bottom:1px solid var(--border2)}}
@@ -151,7 +157,7 @@ body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f3
 .actions{display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}
 .btn{border:1px solid transparent;border-radius:8px;padding:8px 14px;font-size:14px;
   cursor:pointer;font-weight:600;font-family:inherit}
-.btn.good{background:#16a34a;color:#fff} .btn.good:hover{background:#15803d}
+.btn.good{background:var(--accent-hov);color:#fff} .btn.good:hover{filter:brightness(.88)}
 .btn.ghost{background:var(--chip-off-bg);color:var(--text)}
 .btn.warn{background:#fca5a5;color:#7f1d1d}
 .btn.sm{padding:5px 10px;font-size:12px}
@@ -175,16 +181,16 @@ body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f3
 .toorder-row{display:flex;gap:12px;align-items:center;padding:10px 12px;background:var(--panel);
   border:1px solid var(--border);border-radius:10px;margin-bottom:8px;box-shadow:var(--shadow)}
 .toorder-row.done{opacity:.55;background:var(--row-done)}
-.toorder-row.waiting{background:var(--row-wait);box-shadow:inset 4px 0 0 #f59e0b}
-.toorder-row.instock{background:var(--row-instock);box-shadow:inset 4px 0 0 #16a34a}
-.toorder-row.unavail{background:var(--row-unavail);box-shadow:inset 4px 0 0 #dc2626}
+.toorder-row.waiting{background:var(--row-wait);box-shadow:inset 4px 0 0 #DDA43C}
+.toorder-row.instock{background:var(--row-instock);box-shadow:inset 4px 0 0 #6CAB68}
+.toorder-row.unavail{background:var(--row-unavail);box-shadow:inset 4px 0 0 #D14D3B}
 .toorder-row input[type=checkbox]{width:20px;height:20px;cursor:pointer;flex:0 0 auto}
 .toorder-row .to-wait,.toorder-row .to-instock,.toorder-row .to-unavail{flex:0 0 auto;
   background:var(--chip-off-bg);color:var(--chip-off-tx);border:0;border-radius:7px;
   padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
-.toorder-row .to-wait.on{background:#f59e0b;color:#422006}
-.toorder-row .to-instock.on{background:#16a34a;color:#fff}
-.toorder-row .to-unavail.on{background:#dc2626;color:#fff}
+.toorder-row .to-wait.on{background:#DDA43C;color:#422006}
+.toorder-row .to-instock.on{background:#6CAB68;color:#173617}
+.toorder-row .to-unavail.on{background:#D14D3B;color:#fff}
 .toorder-row .to-link{color:#2563eb;text-decoration:none;font-weight:600;font-size:13px;flex:0 0 auto;min-width:110px}
 .toorder-row .to-link:hover{text-decoration:underline}
 body[data-theme=dark] .toorder-row .to-link{color:#60a5fa}
@@ -192,18 +198,18 @@ body[data-theme=dark] .toorder-row .to-link{color:#60a5fa}
 .toorder-row .to-pcode{color:var(--soft);font-size:12px;flex:0 0 auto}
 .toorder-row .to-pairurl{flex:1 1 auto;min-width:110px;padding:6px 8px;border:1px solid var(--border);
   border-radius:7px;font-size:12px;background:var(--input-bg);color:var(--text)}
-.toorder-row .to-pairsave{flex:0 0 auto;background:#6d28d9;color:#fff;border:0;border-radius:7px;
+.toorder-row .to-pairsave{flex:0 0 auto;background:#713AC7;color:#fff;border:0;border-radius:7px;
   padding:6px 11px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
-.toorder-row .to-pairsave:hover{background:#5b21b6}
+.toorder-row .to-pairsave:hover{background:#6234AB}
 .toorder-row .to-pairedit,.toorder-row .to-supedit{background:transparent;border:0;cursor:pointer;
   font-size:13px;padding:2px 4px;flex:0 0 auto;opacity:.55}
 .toorder-row .to-pairedit:hover,.toorder-row .to-supedit:hover{opacity:1}
 .toorder-row .to-supplier{display:flex;align-items:center;gap:6px;flex:0 0 auto}
 .toorder-row .to-supinput{width:140px;padding:6px 8px;border:1px solid var(--border);
   border-radius:7px;font-size:12px;background:var(--input-bg);color:var(--text)}
-.toorder-row .to-supsave{background:#0d9488;color:#fff;border:0;border-radius:7px;padding:6px 11px;
+.toorder-row .to-supsave{background:#1F7A72;color:#fff;border:0;border-radius:7px;padding:6px 11px;
   font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
-.toorder-row .to-supsave:hover{background:#0f766e}
+.toorder-row .to-supsave:hover{background:#186059}
 .toorder-row .to-suptag{background:#ccfbf1;color:#0f5132;font-size:12px;font-weight:600;
   padding:3px 8px;border-radius:10px;flex:0 0 auto;white-space:nowrap}
 .toorder-row .to-grube{background:#eef;border:1px solid #99c;color:#1e1e6b;border-radius:5px;
@@ -215,7 +221,7 @@ body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
 .toorder-row .to-name{color:var(--muted);font-size:13px;flex:1;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .toorder-row .to-date{color:var(--soft);font-size:12px;flex:0 0 auto;white-space:nowrap}
-.toorder-row .to-order{color:#6d28d9;text-decoration:none;font-weight:600;font-size:12px;flex:0 0 auto;
+.toorder-row .to-order{color:#713AC7;text-decoration:none;font-weight:600;font-size:12px;flex:0 0 auto;
   background:#ede9fe;padding:3px 8px;border-radius:6px;white-space:nowrap}
 .toorder-row .to-order:hover{background:#ddd6fe;text-decoration:underline}
 @media(max-width:760px){
@@ -366,10 +372,10 @@ body[data-theme=dark] .posta-table .sub2.err{color:#fca5a5}
 .stockfilters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:16px}
 .stockfilters .sf{font-size:12.5px;font-weight:600;border:1px solid var(--border);background:var(--panel);
   color:var(--text);border-radius:8px;padding:5px 11px;cursor:pointer}
-.stockfilters .sf.active{border-color:var(--accent);background:var(--accent);color:#fff}
+.stockfilters .sf.active{border-color:var(--accent-hov);background:var(--accent-hov);color:#fff}
 .stockfilters .sfsel{font-size:12.5px;border:1px solid var(--border);background:var(--panel);
   color:var(--text);border-radius:8px;padding:5px 9px;margin-left:auto}
-.warnbox{margin-top:16px;background:var(--panel);border:1px solid #f59e0b;border-radius:var(--radius);
+.warnbox{margin-top:16px;background:var(--panel);border:1px solid #DDA43C;border-radius:var(--radius);
   padding:12px 16px;box-shadow:var(--shadow)}
 .warnbox .warnhead{font-weight:700;font-size:14px;margin-bottom:4px}
 .warnbox ul{margin:8px 0 0 18px;padding:0;font-size:13px}
