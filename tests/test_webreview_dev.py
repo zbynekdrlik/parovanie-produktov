@@ -95,6 +95,36 @@ def test_dev_issues_lists_open_and_closed_filtering_prs(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer test-token"
 
 
+def test_dev_issues_paginates_until_short_page(monkeypatch):
+    """/issues returns issues AND PRs interleaved — a single page can push older
+    issues off after filtering, so the endpoint pages through (bounded)."""
+    _configure(monkeypatch)
+    full = [{"number": n, "title": f"i{n}", "state": "open", "labels": [],
+             "updated_at": "2026-07-20T10:00:00Z",
+             "html_url": f"https://github.com/owner/repo/issues/{n}", "comments": 0}
+            for n in range(webapp.GH_LIST_PER_PAGE)]      # exactly one full page
+    tail = [{"number": 999, "title": "posledna", "state": "closed", "labels": [],
+             "updated_at": "2026-07-01T10:00:00Z",
+             "html_url": "https://github.com/owner/repo/issues/999", "comments": 0}]
+    seen_pages = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        page = params["page"]
+        seen_pages.append(page)
+        if page == 1:
+            return _Resp(200, full)          # full → the loop must fetch page 2
+        if page == 2:
+            return _Resp(200, tail)          # short → stop
+        raise AssertionError(f"paged too far: {page}")
+
+    monkeypatch.setattr(webapp.requests, "get", fake_get)
+    r = _client().get("/api/dev/issues")
+    j = r.get_json()
+    assert seen_pages == [1, 2]
+    assert len(j["issues"]) == webapp.GH_LIST_PER_PAGE + 1
+    assert j["issues"][-1]["number"] == 999
+
+
 def test_dev_issues_token_missing_degrades_gracefully(monkeypatch):
     # no GITHUB_TOKEN configured (the autouse guard already delenv'd it)
     r = _client().get("/api/dev/issues")

@@ -1644,7 +1644,11 @@ def api_note():
 # --------------------------------------------------------------------------- #
 GITHUB_API = (os.environ.get("GITHUB_API_BASE") or "https://api.github.com").rstrip("/")
 GH_TIMEOUT = 15                 # s per GitHub API call
-GH_LIST_PER_PAGE = 100          # most-recent-updated page (no deep pagination needed)
+GH_LIST_PER_PAGE = 100          # GitHub max page size
+GH_MAX_PAGES = 5                # bounded pagination (≤500 items): /issues returns
+#                                 issues AND PRs, so a single page could push older
+#                                 issues off after PR-filtering — page through so the
+#                                 boss sees every issue (incl. all the closed/done ones).
 IDEA_TITLE_MAX = 200
 IDEA_BODY_MAX = 5000
 IDEA_RATE_MAX = 20              # ideas per user per window (anti-spam / runaway guard)
@@ -1694,20 +1698,26 @@ def _do_dev_issues():
         return {"ok": False, "available": False, "issues": [],
                 "error": "GitHub nedostupný — token nie je nastavený"}, 200
     try:
-        r = requests.get(
-            f"{GITHUB_API}/repos/{repo}/issues",
-            params={"state": "all", "per_page": GH_LIST_PER_PAGE,
-                    "sort": "updated", "direction": "desc"},
-            headers=_gh_headers(token), timeout=GH_TIMEOUT)
-        if r.status_code != 200:
-            log.warning("gh issues: HTTP %s for %s", r.status_code, repo)
-            return {"ok": False, "available": False, "issues": [],
-                    "error": f"GitHub API vrátil {r.status_code}"}, 200
-        raw = r.json()
-        if not isinstance(raw, list):
-            raw = []
-        issues = [_slim_issue(it) for it in raw
-                  if isinstance(it, dict) and "pull_request" not in it]
+        issues = []
+        for page in range(1, GH_MAX_PAGES + 1):
+            r = requests.get(
+                f"{GITHUB_API}/repos/{repo}/issues",
+                params={"state": "all", "per_page": GH_LIST_PER_PAGE,
+                        "sort": "updated", "direction": "desc", "page": page},
+                headers=_gh_headers(token), timeout=GH_TIMEOUT)
+            if r.status_code != 200:
+                log.warning("gh issues: HTTP %s for %s (page %d)", r.status_code, repo, page)
+                if page == 1:
+                    return {"ok": False, "available": False, "issues": [],
+                            "error": f"GitHub API vrátil {r.status_code}"}, 200
+                break                            # keep the pages already collected
+            batch = r.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            issues.extend(_slim_issue(it) for it in batch
+                          if isinstance(it, dict) and "pull_request" not in it)
+            if len(batch) < GH_LIST_PER_PAGE:    # last page reached
+                break
         return {"ok": True, "available": True, "issues": issues}, 200
     except Exception as e:  # noqa: BLE001 — the tab must never crash on GitHub trouble
         log.warning("gh issues fetch failed: %r", e)
