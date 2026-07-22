@@ -55,6 +55,42 @@ def build_index(slugs):
     return set(slugs), {s: _tokens(s) for s in slugs}
 
 
+def disambiguate(candidate_slugs, name_slug, image_urls):
+    """Given 2+ candidate slugs that all match a product on name/token grounds
+    alone, use the product's OWN image filename(s) to pick the one it's really
+    for — or None if the image signal doesn't settle it to a single winner (a
+    wrong link is worse than no link). `name_slug` is the product's own slug
+    (used for the "fewest unexplained extra tokens" tiebreak).
+
+    Shared by `resolve()` (candidates = sitemap slugs) and
+    `scripts.resolve_urls` (candidates = HTTP-confirmed slug guesses) so BOTH
+    paths honor the exact same disambiguation rule — never reimplemented."""
+    slug_tokens = {s: _tokens(s) for s in candidate_slugs}
+
+    # Test each image independently so a stray brand-logo image can't
+    # disqualify the real one.
+    img_token_sets = [t for t in (_tokens(image_slug(u)) for u in (image_urls or [])[:4]) if t]
+    if not img_token_sets:
+        return None
+
+    supported = [s for s in candidate_slugs
+                 if any(it <= slug_tokens[s] for it in img_token_sets)]
+    if not supported:
+        return None
+    if len(supported) == 1:
+        return supported[0]
+
+    # Several image-supported candidates (e.g. plain / youth / lady waistcoat):
+    # prefer the slug that introduces the FEWEST tokens not already explained by
+    # the product's own name + images. Require a unique winner, else don't guess.
+    nt = _tokens(name_slug)
+    explained = nt | set().union(*img_token_sets)
+    ranked = sorted(supported, key=lambda s: len(slug_tokens[s] - explained))
+    if len(slug_tokens[ranked[0]] - explained) < len(slug_tokens[ranked[1]] - explained):
+        return ranked[0]
+    return None
+
+
 def resolve(name, image_urls, slugset, slug_tokens):
     """Best forestshop URL for ONE product.
 
@@ -76,36 +112,24 @@ def resolve(name, image_urls, slugset, slug_tokens):
     if len(candidates) == 1:
         return BASE + candidates[0] + "/", _SINGLE, sn
 
-    # Ambiguous on name alone — disambiguate with the image filename(s). Test each
-    # image independently so a stray brand-logo image can't disqualify the real one.
-    img_token_sets = [t for t in (_tokens(image_slug(u)) for u in (image_urls or [])[:4]) if t]
-    if not img_token_sets:
+    winner = disambiguate(candidates, sn, image_urls)
+    if winner is None:
         return None, _NONE, sn
-
-    supported = [s for s in candidates
-                 if any(it <= slug_tokens[s] for it in img_token_sets)]
-    if not supported:
-        return None, _NONE, sn
-    if len(supported) == 1:
-        return BASE + supported[0] + "/", _IMAGE, sn
-
-    # Several image-supported candidates (e.g. plain / youth / lady waistcoat):
-    # prefer the slug that introduces the FEWEST tokens not already explained by
-    # the product's own name + images. Require a unique winner, else don't guess.
-    explained = nt | set().union(*img_token_sets)
-    ranked = sorted(supported, key=lambda s: len(slug_tokens[s] - explained))
-    if len(slug_tokens[ranked[0]] - explained) < len(slug_tokens[ranked[1]] - explained):
-        return BASE + ranked[0] + "/", _IMAGE, sn
-    return None, _NONE, sn
+    return BASE + winner + "/", _IMAGE, sn
 
 
-def assign_urls(products, slugs,
-                name_of=lambda p: p.get("name", ""),
-                images_of=lambda p: p.get("our_images") or []):
-    """Resolve every product, then enforce that two DIFFERENT products never share
-    a URL. Returns {index_in_products: url_or_None}; mutates nothing."""
-    slugset, slug_tokens = build_index(slugs)
-    resolved = [resolve(name_of(p), images_of(p), slugset, slug_tokens) for p in products]
+def dedup(resolved):
+    """Enforce that two DIFFERENT products never share a resolved URL: keep the
+    strongest match, None the rest; a tie among different products drops all (a
+    wrong link is worse than no link). Two entries with the SAME name_slug are a
+    genuine catalog duplicate and both legitimately keep the URL.
+
+    `resolved` = list of (url_or_None, strength, name_slug) — higher strength
+    wins. Returns {index: url_or_None}; mutates nothing.
+
+    Shared by `assign_urls()` (sitemap matches) and `scripts.resolve_urls`
+    (HTTP-probed guesses, mixed with already-assigned URLs at a sentinel
+    strength so an existing link is never displaced) — never reimplemented."""
     out = {i: r[0] for i, r in enumerate(resolved)}
 
     by_url: dict[str, list[int]] = {}
@@ -130,3 +154,13 @@ def assign_urls(products, slugs,
             if i not in keep:
                 out[i] = None
     return out
+
+
+def assign_urls(products, slugs,
+                name_of=lambda p: p.get("name", ""),
+                images_of=lambda p: p.get("our_images") or []):
+    """Resolve every product, then enforce that two DIFFERENT products never share
+    a URL. Returns {index_in_products: url_or_None}; mutates nothing."""
+    slugset, slug_tokens = build_index(slugs)
+    resolved = [resolve(name_of(p), images_of(p), slugset, slug_tokens) for p in products]
+    return dedup(resolved)
