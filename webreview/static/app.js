@@ -263,7 +263,7 @@ function renderTabs() {
   for (const [key, lbl] of TABS) {
     const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
     const n = navCount(key);
-    bt.innerHTML = `<svg viewBox="0 0 24 24">${NAV_ICONS[key]}</svg>`
+    bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
       + `<span class="tlabel">${escapeHtml(lbl)}</span>`
       + (n > 0 ? `<span class="navcount">${n}</span>` : '');
     bt.onclick = () => switchTab(key);
@@ -296,6 +296,8 @@ function setPageHead() {
 function applyTheme(theme) {
   if (theme === 'dark') document.body.setAttribute('data-theme', 'dark');
   else document.body.removeAttribute('data-theme');
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.setAttribute('aria-pressed', theme === 'dark' ? 'true' : 'false');
   const lbl = document.getElementById('themeLbl');
   if (lbl) lbl.textContent = theme === 'dark' ? 'Svetlý mód' : 'Tmavý mód';
   const ic = document.getElementById('themeIcon');

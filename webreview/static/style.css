@@ -96,7 +96,7 @@ body.toorder-wide main#list{max-width:none}
 /* ---------------- REVIEW CARD ---------------- */
 .card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
   box-shadow:var(--shadow);display:grid;grid-template-columns:1fr 1fr;overflow:hidden}
-.card.good{border-color:#16a34a} .card.bad{border-color:#ef4444}
+.card.good{border-color:#16a34a}
 .card.manual{border-color:#3b82f6} .card.unavailable{border-color:#9ca3af}
 .card.discontinued{border-color:#9ca3af}
 .card.curoff{box-shadow:var(--shadow),inset 4px 0 0 #f59e0b}
@@ -122,19 +122,17 @@ body[data-theme=dark] a.supurl{color:#60a5fa}
   border-radius:8px;padding:6px 9px;margin:6px 0}
 body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f320c}
 .curbadge{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;margin:2px 0 6px}
-.curbadge.off{background:#fee2e2;color:#991b1b} .curbadge.on{background:#d1fae5;color:#065f46}
 .curbadge.st1{background:#d1fae5;color:#065f46} .curbadge.st2{background:#fef3c7;color:#92400e}
 .curbadge.st3{background:#f3f4f6;color:#4b5563}
 .staterow{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
 .badge{font-size:12px;font-weight:700;padding:2px 8px;border-radius:10px}
-.badge.good{background:#d1fae5;color:#065f46} .badge.bad{background:#fee2e2;color:#991b1b}
+.badge.good{background:#d1fae5;color:#065f46}
 .badge.manual{background:#dbeafe;color:#1e40af} .badge.unavailable{background:#e5e7eb;color:#374151}
 .badge.discontinued{background:#f3f4f6;color:#4b5563}
 .actions{display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}
 .btn{border:1px solid transparent;border-radius:8px;padding:8px 14px;font-size:14px;
   cursor:pointer;font-weight:600;font-family:inherit}
 .btn.good{background:#16a34a;color:#fff} .btn.good:hover{background:#15803d}
-.btn.bad{background:#ef4444;color:#fff} .btn.bad:hover{background:#dc2626}
 .btn.ghost{background:var(--chip-off-bg);color:var(--text)}
 .btn.warn{background:#fca5a5;color:#7f1d1d}
 .btn.sm{padding:5px 10px;font-size:12px}
