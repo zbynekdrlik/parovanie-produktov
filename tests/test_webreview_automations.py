@@ -104,12 +104,14 @@ def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
     stats = webapp.run_posta_uncollected()
     assert stats == {"checked": 3, "uncollected": 1, "invalid": 1, "errors": 0,
                      "emails_sent": 1, "emails_failed": 0}
-    # exactly ONE customer mail, template #1, bcc to Marek
+    # exactly ONE customer mail, template #1. run_posta_uncollected no longer
+    # passes an explicit bcc — _send_mail_html itself defaults it to MAIL_BCC
+    # (tested directly below); here it's stubbed, so bcc arrives as None.
     (m,) = iso["sent"]
     assert m["to"] == "jan@example.com"
     assert m["subject"] == "Vaša zásielka čaká na vyzdvihnutie | EF000000002SK"
     assert "Skalica 1" in m["body"]
-    assert m["bcc"] == webapp.POSTA_BCC
+    assert m["bcc"] is None
     # state file: escalation bumped for the mailed order only
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert st["escalation"] == {"2026100": f"1|{TODAY.isoformat()}"}
@@ -198,3 +200,48 @@ def test_run_now_endpoint_executes_in_background(iso):
     assert a["last_result"]["checked"] == 3
     assert a["enabled"] is False                     # run-now must not enable the schedule
     assert len(iso["sent"]) == 1
+
+
+# ── "BCC vždy" convention (#126, decided on #105): every automation e-mail is
+# BCC'd to MAIL_BCC (data/.mail_env) unless the caller explicitly overrides it.
+class _FakeSMTP:
+    """Captures the sendmail() recipient list; no real network."""
+    def __init__(self, *a, **kw):
+        pass
+
+    def starttls(self):
+        pass
+
+    def login(self, user, pw):
+        pass
+
+    def sendmail(self, frm, rcpt, msg):
+        _FakeSMTP.last_rcpt = rcpt
+
+    def quit(self):
+        pass
+
+
+def test_send_mail_html_defaults_bcc_to_mail_bcc_env(monkeypatch):
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.setenv("MAIL_BCC", "owner@example.com")
+    monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTP)
+    ok = webapp._send_mail_html("zak@example.com", "predmet", "<p>telo</p>")
+    assert ok is True
+    assert _FakeSMTP.last_rcpt == ["zak@example.com", "owner@example.com"]
+
+
+def test_send_mail_html_explicit_bcc_overrides_mail_bcc_env(monkeypatch):
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.setenv("MAIL_BCC", "owner@example.com")
+    monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTP)
+    webapp._send_mail_html("zak@example.com", "predmet", "<p>telo</p>", bcc="iny@example.com")
+    assert _FakeSMTP.last_rcpt == ["zak@example.com", "iny@example.com"]
+
+
+def test_send_mail_html_no_mail_bcc_env_sends_without_bcc(monkeypatch):
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTP)
+    webapp._send_mail_html("zak@example.com", "predmet", "<p>telo</p>")
+    assert _FakeSMTP.last_rcpt == ["zak@example.com"]
