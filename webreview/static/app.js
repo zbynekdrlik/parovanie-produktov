@@ -30,15 +30,48 @@ const imgObserver = new IntersectionObserver((entries) => {
   }
 }, { rootMargin: '300px' });
 
+// A fast scroll through a large filter (e.g. ~1800+ 'Napárované' cards) makes MANY
+// gallery boxes cross the 300px rootMargin within the same tick — each firing its own
+// /api/images fetch. Without a cap, dozens of concurrent scrapes (our backend does a
+// synchronous per-request supplier-page GET) pile up on the Flask worker pool and the
+// slow ones all hang until Cloudflare's edge timeout — surfacing as a burst of
+// "Failed to load resource: 524" console errors (#74). Cap concurrency; the rest queue
+// and drain as slots free up — same eventual result, no backend/CDN pile-up.
+const IMG_FETCH_CONCURRENCY = 4;
+let _imgActive = 0;
+const _imgQueue = [];
+function _pumpImgQueue() {
+  while (_imgActive < IMG_FETCH_CONCURRENCY && _imgQueue.length) {
+    const task = _imgQueue.shift();
+    _imgActive++;
+    task().finally(() => { _imgActive--; _pumpImgQueue(); });
+  }
+}
+
 async function loadInfo(box) {
   const url = box.dataset.url;
   if (!url) { box.classList.remove('loading'); return; }
+  return new Promise((resolve) => {
+    _imgQueue.push(async () => { await _loadInfoNow(box, url); resolve(); });
+    _pumpImgQueue();
+  });
+}
+
+async function _loadInfoNow(box, url) {
   try {
     const j = await (await fetch('/api/images?url=' + encodeURIComponent(url))).json();
     box.classList.remove('loading');
     box.innerHTML = '';
     if (!j.images || !j.images.length) { box.innerHTML = '<span class="noimg">bez obrázkov</span>'; }
-    else for (const u of j.images) { const im = document.createElement('img'); im.src = u; im.loading = 'lazy'; box.appendChild(im); }
+    else for (const u of j.images) {
+      const im = document.createElement('img'); im.src = u; im.loading = 'lazy';
+      // broken supplier-CDN image → degrade to the placeholder instead of leaving a
+      // broken-image icon on the card (the browser's own network-failure console log
+      // for a genuinely 404/reset resource can't be suppressed from JS — see #50/#74
+      // playbook note — this only fixes the VISUAL fallback).
+      im.onerror = () => im.replaceWith(el('span', 'noimg', 'bez obrázka'));
+      box.appendChild(im);
+    }
     if (box.dataset.titleId && j.title) {
       const t = document.getElementById(box.dataset.titleId); if (t) t.textContent = j.title;
     }
@@ -184,7 +217,13 @@ function renderCard(p) {
     if (parts.length) left.appendChild(el('div', 'priceline', parts.join(' · ')));
   }
   const oimgs = el('div', 'imgs');
-  if (p.our_images.length) for (const u of p.our_images) { const im = el('img'); im.src = u; im.loading = 'lazy'; oimgs.appendChild(im); }
+  if (p.our_images.length) for (const u of p.our_images) {
+    const im = el('img'); im.src = u; im.loading = 'lazy';
+    // our own forestshop-CDN image can go stale (renamed/removed product photo) →
+    // degrade to a clean placeholder instead of a broken-image icon (#50).
+    im.onerror = () => im.replaceWith(el('span', 'noimg', 'bez obrázka'));
+    oimgs.appendChild(im);
+  }
   else oimgs.innerHTML = '<span class="noimg">bez obrázkov</span>';
   left.appendChild(oimgs);
   card.appendChild(left);
