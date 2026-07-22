@@ -106,3 +106,10 @@
   parovanie-forestshop.newlevel.media (Playwright, sidebar + Na objednanie + Kontrola
   párovania, svetlý aj tmavý mód): menu accent už nie je krikľavý, chip-y/tlačidlá
   jemnejšie a čitateľné v oboch módoch, 0 console errorov.
+
+## #115 — „Vývoj" tab (GitHub issues) + idea lightbulb (2026-07-22, v0.59.0)
+- Commits: 68dddb2 (bump 0.59.0), ad070fe (feat), cde7f74 (paginate). PR #148 → main af08674.
+- New standalone „Vývoj" nav (bottom, all logged-in users) lists repo GitHub issues (open+closed, PRs filtered); fixed bottom-right lightbulb (#ideaBtn) creates an issue → appears in list.
+- Backend proxies ALL GitHub calls: token from data/.gh_env (GITHUB_TOKEN+GITHUB_REPO via _load_env_file), Authorization header ONLY — never to browser/URL/log. Endpoints /api/dev/issues (bounded 5-page pagination) + /api/dev/idea (title required/capped, rate-limited). Missing token → graceful „GitHub nedostupný", never 500. GITHUB_API_BASE env override enables hermetic e2e stub.
+- Tests: tests/test_webreview_dev.py (11 backend, GitHub mocked); tests/e2e/test_dev.py + dev_server GitHub stub in e2e conftest (3 e2e). All existing tests green (535 backend + e2e).
+- Live verify: forestshop.newlevel.media v0.59.0 DOM, tab lists 26 open + 28 closed real issues, lightbulb created #149 (closed after), 0 console errors. Manager stores PRED==PO (decisions 2831 / ordered 146 / order_pairings 57 / waiting 11 / supplier_assignments 1).
