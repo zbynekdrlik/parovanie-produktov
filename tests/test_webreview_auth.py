@@ -346,3 +346,42 @@ def test_send_mail_bad_port_degrades_not_500(monkeypatch):
     monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
     monkeypatch.setenv("MAIL_PORT", "nie-cislo")
     assert webapp._send_mail("x@test.sk", "predmet", "telo") is False
+
+
+# ── "BCC vždy" convention (#127, follow-up to #105/#126): the reset-password
+# mail path (_send_mail) must ALSO BCC MAIL_BCC — _send_mail_html already does
+# this (#126); _send_mail was the one path left out.
+class _FakeSMTPForReset:
+    """Captures the sendmail() recipient list; no real network."""
+    def __init__(self, *a, **kw):
+        pass
+
+    def starttls(self):
+        pass
+
+    def login(self, user, pw):
+        pass
+
+    def sendmail(self, frm, rcpt, msg):
+        _FakeSMTPForReset.last_rcpt = rcpt
+
+    def quit(self):
+        pass
+
+
+def test_send_mail_bcc_to_mail_bcc_env_when_set(monkeypatch):
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.setenv("MAIL_BCC", "owner@example.com")
+    monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTPForReset)
+    ok = webapp._send_mail("zak@example.com", "predmet", "telo")
+    assert ok is True
+    assert _FakeSMTPForReset.last_rcpt == ["zak@example.com", "owner@example.com"]
+
+
+def test_send_mail_no_bcc_when_mail_bcc_env_unset(monkeypatch):
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTPForReset)
+    ok = webapp._send_mail("zak@example.com", "predmet", "telo")
+    assert ok is True
+    assert _FakeSMTPForReset.last_rcpt == ["zak@example.com"]
