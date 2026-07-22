@@ -187,6 +187,9 @@ LOGIN_MAX_FAILS = 5                              # failed logins per IP…
 LOGIN_WINDOW = 15 * 60                           # …within 15 minutes → 429
 _login_fails: dict = {}                          # ip -> [fail timestamps]
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Burned on login attempts for UNKNOWN emails so they cost the same as a wrong
+# password (no account enumeration via response latency).
+_DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
 
 
 def _load_users() -> dict:
@@ -334,7 +337,9 @@ def login():
     email = _norm_email(request.form.get("email"))
     pw = request.form.get("password") or ""
     u = _load_users().get(email)
-    if not u or not check_password_hash(u.get("pw_hash", ""), pw):
+    # unknown email verifies against a dummy hash → same cost as a wrong
+    # password (no enumeration via timing); malformed stored hash → False
+    if not check_password_hash((u or {}).get("pw_hash") or _DUMMY_HASH, pw) or not u:
         _note_fail(ip)
         log.warning("auth: failed login email=%s ip=%s", email, ip)
         return _login_page("Nesprávny e-mail alebo heslo.", 401)
