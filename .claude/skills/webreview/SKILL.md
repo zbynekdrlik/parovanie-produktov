@@ -27,7 +27,33 @@ Pri prestavbe shellu/CSS **NEMEŇ** id/`data-testid`/triedy, na ktoré sa viažu
 `data-theme` pred vykreslením obsahu, žiadny biely záblesk pre dark usera). E2E test
 `tests/e2e/test_shell.py` (sidebar + page-title + tmavý-mód persistencia cez reload).
 
+## Auth (#91, v0.44.0) — celý web za loginom; KAŽDÝ nový endpoint je chránený automaticky
+
+Default-deny `before_request` gate v `app.py`: nový route NEtreba nijako značiť — chránený je
+sám od seba. Verejné výnimky = množina `_PUBLIC_ENDPOINTS` (login/forgot/reset/static/favicon/
+api_version) + path-prefix `/api/n8n/*` (vlastný bearer, n8n nemá session). Anonym: `/api/*` →
+401 JSON, stránky → redirect `/login?next=…`. Session sa overuje proti store pri KAŽDOM requeste.
+
+- **Stores (0600, data-safety počty pri deployi počítaj AJ tieto)**: `data/out/users.json`
+  (email → pw_hash/is_admin/created_at), `data/out/reset_tokens.json` (sha256(token) → email/exp).
+- **Creds súbory (gitignored, chmod 600, NIKDY do gitu)**: `data/.auth_env` (SECRET_KEY,
+  ADMIN_EMAIL, ADMIN_PW, AUTH_COOKIE_SECURE=1, APP_BASE_URL) a `data/.mail_env` (MAIL_HOST/PORT/
+  USER/PASS/FROM — SMTP pre reset-maily, viď #113). Bootstrap admin sa vytvorí pri štarte
+  create-if-missing — reštart NIKDY neprepíše zmenené heslo.
+- **Testy sú auto-prihlásené**: backend cez `authed_client()` z `tests/conftest.py` (autouse
+  fixture seedne user store), E2E cez autouse session-cookie fixture v `tests/e2e/conftest.py`
+  (fixture servery dostávajú `**_AUTH_ENV`). Test, ktorý MUSÍ začať odhlásený →
+  `@pytest.mark.anonymous`. Nový fixture server v e2e conftest → pridaj ho do `_SERVER_FIXTURES`
+  + `**_AUTH_ENV` do env.
+- **`[hidden]` guard**: `[hidden]{display:none!important}` v style.css je NUTNÝ — sekcia
+  s author `display:flex` (`#tab-search`/`#tab-notes`) inak prebije hidden atribút a presakuje
+  do všetkých tabov (bug opravený v #104). Neodstraňuj; nové `#tab-*` sekcie ho dedia zadarmo.
+
 ## Screenshot OSTREJ appky bez reštartu živej služby (:8801)
+
+**Od v0.44.0 vyžaduje login.** Throwaway inštancia si pri štarte načíta `data/.auth_env` →
+bootstrapne reálneho admina do svojho tmp store — prihlás sa jeho údajmi, alebo daj do env
+vlastné `ADMIN_EMAIL`/`ADMIN_PW` (env vyhráva nad súborom).
 
 Náhľad reálneho vzhľadu (reálne dáta, nie fixture): bootni ODHODENÚ inštanciu na inom porte
 `WEBREVIEW_PORT=8811 PYTHONPATH=src nohup .venv/bin/python webreview/app.py &`, Playwright
