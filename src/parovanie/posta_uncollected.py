@@ -20,12 +20,31 @@ numbers (a different carrier label) → the API answers per-result
 status:'invalid_format' with no events; continueOnFail hid that as success.
 Here those are surfaced explicitly (invalid=True) so the tab can show them.
 
+Carrier filter (#126): the automation covers Pošta SK only — DPD (and other
+non-Pošta couriers) are excluded from the shipment source entirely, not shown
+as "nesledovateľné". Live export check (2026-07-22, 523 orders): the SHIPPING
+pseudo-item's itemName is NEVER literally "Slovenská pošta" — Pošta SK home
+delivery is labelled "Kuriér" (~98% of volume, EF...SK tracking numbers), so
+the filter is a BLOCKLIST of recognised non-Pošta carrier names (DPD + common
+SK couriers), not an allowlist matching "pošta" (that would have excluded
+almost every real Pošta shipment). An order with no SHIPPING row at all
+(older/partial export) fails OPEN (kept) — never silently drops a shipment.
+
 The Flask app (webreview/app.py) wires this to the network, SMTP and stores.
 """
 import csv
 import io
 from datetime import date, timedelta
 from html import escape
+
+# Non-Pošta courier names recognised in the SHIPPING pseudo-item's itemName
+# (case-insensitive substring match). DPD is the one confirmed live (#126);
+# the rest are common SK couriers kept out defensively per the issue's "DPD +
+# other couriers" wording.
+NON_POSTA_CARRIER_KEYWORDS = (
+    "dpd", "gls", "packeta", "zásielkov", "zasielkov",
+    "in time", "intime", "wedo", "spservis",
+)
 
 TRACKING_API = "https://api.posta.sk/tracking?q={q}&l=sk&p=1"
 TRACKING_LINK = "https://www.posta.sk/sledovanie-zasielok#parcel={q}"
@@ -48,6 +67,27 @@ def _parse_date(s) -> date | None:
         return None
 
 
+def _order_carriers(rows: list[dict]) -> dict[str, str]:
+    """order code -> SHIPPING pseudo-item name (itemCode starting 'SHIPPING'),
+    scanning ALL rows of the export — the SHIPPING line need not be the first
+    row per order. An order with no such row is simply absent (caller treats
+    that as 'unknown carrier' -> fail-open, kept)."""
+    out: dict[str, str] = {}
+    for r in rows:
+        code = (r.get("code") or "").strip()
+        item_code = (r.get("itemCode") or "").strip()
+        if code and item_code.upper().startswith("SHIPPING"):
+            out[code] = (r.get("itemName") or "").strip()
+    return out
+
+
+def _is_non_posta_carrier(name: str) -> bool:
+    """True when the SHIPPING itemName names a recognised non-Pošta courier
+    (see NON_POSTA_CARRIER_KEYWORDS). Empty/unknown name -> False (fail-open)."""
+    n = (name or "").lower()
+    return any(k in n for k in NON_POSTA_CARRIER_KEYWORDS)
+
+
 def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dict]:
     """Shoptet orders.csv (cp1250 bytes or str) → one shipment per ORDER.
 
@@ -55,13 +95,18 @@ def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dic
     non-empty AND order date within the last 30 days, first row per order code
     wins (the export repeats order fields on every item line). One deliberate
     deviation from n8n: a cancelled order (Stornovaná) is skipped — nagging a
-    customer who cancelled would be wrong (documented on #93)."""
+    customer who cancelled would be wrong (documented on #93). Second
+    deviation (#126): orders shipped via a non-Pošta courier (DPD etc., see
+    _is_non_posta_carrier) are excluded entirely — this automation is Pošta
+    SK only."""
     text = (orders_csv.decode("cp1250", errors="replace")
             if isinstance(orders_csv, bytes) else orders_csv)
     today = today or date.today()
     cutoff = today - timedelta(days=SOURCE_WINDOW_DAYS)
+    rows = list(csv.DictReader(io.StringIO(text), delimiter=";"))
+    carriers = _order_carriers(rows)
     out, seen = [], set()
-    for r in csv.DictReader(io.StringIO(text), delimiter=";"):
+    for r in rows:
         code = (r.get("code") or "").strip()
         if not code or code in seen:
             continue
@@ -70,6 +115,8 @@ def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dic
         if not pkg:
             continue
         if (r.get("statusName") or "").strip().lower() == "stornovaná":
+            continue
+        if _is_non_posta_carrier(carriers.get(code, "")):
             continue
         od = _parse_date(r.get("date"))
         if od is None or od < cutoff:

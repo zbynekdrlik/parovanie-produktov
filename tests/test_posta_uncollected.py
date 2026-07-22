@@ -59,6 +59,45 @@ def test_shipments_bad_date_skipped():
     assert pu.shipments_from_orders_csv(csv_txt, today=TODAY) == []
 
 
+# ── carrier filter (#126): only Pošta SK, DPD/other couriers excluded ──────────
+# Real live export (2026-07-22, data/out/orders_cache.csv, 523 orders): the
+# SHIPPING pseudo-item's itemName is NEVER literally "Slovenská pošta" — Pošta
+# SK home delivery is labelled "Kuriér" (SHIPPING11, ~98% of volume, carries
+# EF...SK tracking numbers); "DPD doručenie na adresu" (SHIPPING23) and "DPD
+# kuriér" (SHIPPING26) carry 14-digit numeric DPD labels. So the filter is a
+# BLOCKLIST (exclude recognised non-Pošta couriers), not an allowlist matching
+# "pošta" — an allowlist would have excluded 223/228 real Pošta shipments.
+CARRIER_CSV = (
+    "code;date;statusName;email;phone;billFullName;packageNumber;itemCode;itemName\r\n"
+    # Pošta SK home delivery, labelled "Kuriér" in the export — INCLUDED
+    "3001;2026-07-10 10:00:00;Vybavená;posta@example.com;;Pošta Zákazník;"
+    "EF000000009SK;SHIPPING11;Kuriér\r\n"
+    "3001;2026-07-10 10:00:00;Vybavená;posta@example.com;;Pošta Zákazník;"
+    "EF000000009SK;1/M;Obuv\r\n"
+    # DPD home delivery — EXCLUDED even though it has a non-empty packageNumber
+    "3002;2026-07-11 10:00:00;Vybavená;dpd@example.com;;Dpd Zákazník;"
+    "06565700398918;2/M;Obuv\r\n"
+    "3002;2026-07-11 10:00:00;Vybavená;dpd@example.com;;Dpd Zákazník;"
+    "06565700398918;SHIPPING23;DPD doručenie na adresu\r\n"
+    # second DPD shipping method label, lower-case check — EXCLUDED
+    "3003;2026-07-12 10:00:00;Vybavená;dpd2@example.com;;Dpd2 Zákazník;"
+    "06565700398920;SHIPPING26;dpd kuriér\r\n"
+    # no SHIPPING row present at all (older/partial export) — fail-open, INCLUDED
+    "3004;2026-07-13 10:00:00;Vybavená;nokur@example.com;;Bez Info;"
+    "EF000000010SK;9/L;Obuv\r\n"
+)
+
+
+def test_shipments_dpd_carrier_excluded_posta_carrier_included():
+    s = pu.shipments_from_orders_csv(CARRIER_CSV, today=TODAY)
+    codes = [x["code"] for x in s]
+    assert "3001" in codes                       # "Kuriér" == Pošta SK -> included
+    assert "3002" not in codes                    # DPD doručenie na adresu -> excluded
+    assert "3003" not in codes                    # DPD kuriér (any case) -> excluded
+    assert "3004" in codes                        # no SHIPPING row -> fail-open, included
+    assert len(s) == 2
+
+
 # ── classify_tracking ──────────────────────────────────────────────────────────
 def test_classify_notified_znp_is_uncollected():
     c = pu.classify_tracking(_fix("tracking_notified_znp.json"), today=TODAY)
