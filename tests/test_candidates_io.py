@@ -140,9 +140,9 @@ def test_join_verdicts_survives_a_filtered_candidates_list():
     re-gather filtered it out) must not shift every later verdict onto the wrong
     neighbour — each surviving product still gets ITS OWN verdict, by key."""
     rec_a = _rec("SUP|A", "Product A")
-    rec_b = _rec("SUP|B", "Product B")
     rec_c = _rec("SUP|C", "Product C")
-    # verdicts were produced when candidates.json was [A, B, C] (idx 0,1,2)
+    # verdicts were produced when candidates.json was [A, B, C] (idx 0,1,2) — B is
+    # intentionally NOT built into a rec here: it is the product later filtered out.
     verdicts = [
         {"idx": 0, "pair_key": "SUP|A", "chosen_i": 0, "reason": "for A"},
         {"idx": 1, "pair_key": "SUP|B", "chosen_i": 0, "reason": "for B"},
