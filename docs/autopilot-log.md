@@ -106,3 +106,18 @@
   parovanie-forestshop.newlevel.media (Playwright, sidebar + Na objednanie + Kontrola
   párovania, svetlý aj tmavý mód): menu accent už nie je krikľavý, chip-y/tlačidlá
   jemnejšie a čitateľné v oboch módoch, 0 console errorov.
+
+## #115 — „Vývoj" tab (GitHub issues) + idea lightbulb (2026-07-22, v0.59.0)
+- Commits: 68dddb2 (bump 0.59.0), ad070fe (feat), cde7f74 (paginate). PR #148 → main af08674.
+- New standalone „Vývoj" nav (bottom, all logged-in users) lists repo GitHub issues (open+closed, PRs filtered); fixed bottom-right lightbulb (#ideaBtn) creates an issue → appears in list.
+- Backend proxies ALL GitHub calls: token from data/.gh_env (GITHUB_TOKEN+GITHUB_REPO via _load_env_file), Authorization header ONLY — never to browser/URL/log. Endpoints /api/dev/issues (bounded 5-page pagination) + /api/dev/idea (title required/capped, rate-limited). Missing token → graceful „GitHub nedostupný", never 500. GITHUB_API_BASE env override enables hermetic e2e stub.
+- Tests: tests/test_webreview_dev.py (11 backend, GitHub mocked); tests/e2e/test_dev.py + dev_server GitHub stub in e2e conftest (3 e2e). All existing tests green (535 backend + e2e).
+- Live verify: forestshop.newlevel.media v0.59.0 DOM, tab lists 26 open + 28 closed real issues, lightbulb created #149 (closed after), 0 console errors. Manager stores PRED==PO (decisions 2831 / ordered 146 / order_pairings 57 / waiting 11 / supplier_assignments 1).
+
+## #107 — „Riziko výpadku" JOIN-automatizácia (migrácia n8n 7ujLZ4WDNphSgsuj) (2026-07-22, v0.60.0, worker)
+- Migrácia denného n8n workflowu (06:15, porovnanie nášho katalógu s dodávateľským skladom → Discord) do appky ako čisto READ-ONLY/advisory automatizácia — nikdy nezapisuje do eshopu. Verzia 0.59.0→0.60.0. Commits: `028a8e1` (bump), `196f7f5` (backend), `8ebd1ee` (frontend).
+- **REUSE, nie re-scrape**: žiadna vlastná sieť/LLM — `run_riziko_vypadku()` len JOINuje on-disk export s UŽ napísaným `data/out/supplier_stock.json` (#106 automatizácia), cez rovnaký `internalNote` link kľúč. Pure jadro `src/parovanie/riziko_vypadku.compute_risk(csv_text, supplier_rows)`: risk = náš `export_helpers.state_of==1` (Skladom+visible/detailOnly) AND supplier row `ok=True, available=False`. Absencia dát (nikdy nescrapované, chyba, `available=None`) sa NIKDY nevykazuje ako risk.
+- **`has_supplier_data` kontrakt**: keď #106 ešte nikdy nebežal (`rows==[]`), store nesie `has_supplier_data=False` a tab zobrazí „najprv spusti Dodávateľský sklad" namiesto zavádzajúceho prázdneho „0 rizík". Nový sub-vzor pre budúce JOIN-automatizácie zdokumentovaný v `.claude/skills/webreview/SKILL.md`.
+- Registrovaná `Automation(key="riziko_vypadku", daily_at="06:15")`, **default DISABLED** (konzistencia s ostatnými, hoci je read-only). `GET /api/riziko-vypadku` (display) + `GET /api/riziko-vypadku/csv` (voliteľný download, `_csv_response`+`_csv_safe`). Tab „Riziko výpadku" (vzor renderDodavatelskySklad/renderPosta) — žiadne nové CSS.
+- Testy: 12 pure-logic (`tests/test_riziko_vypadku.py`) + 10 Flask wiring (`tests/test_webreview_riziko_vypadku.py`, incl. manager-store isolation) + 3 e2e (`tests/e2e/test_riziko_vypadku.py`, `automations_server` fixture rozšírená o pred-vypočítaný `riziko_vypadku.json`). 557 backend + 50 e2e zelené, ruff clean.
+- PR #150 (Closes #107), CI (test/e2e/version-check) zelené na push AJ pull_request evente, mergeable=clean.

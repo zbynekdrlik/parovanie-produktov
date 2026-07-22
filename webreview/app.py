@@ -35,7 +35,7 @@ from flask import (Flask, Response, jsonify, redirect, render_template, request,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
-    __version__, config, import_builder, posta_uncollected, supplier_stock)
+    __version__, config, import_builder, posta_uncollected, riziko_vypadku, supplier_stock)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -2713,6 +2713,61 @@ def run_supplier_stock() -> dict:
     return stats
 
 
+# --------------------------------------------------------------------------- #
+# #107 — „Riziko výpadku": daily supply-risk report (in-app migration of the
+# n8n workflow „Forestshop — Riziko výpadku" 7ujLZ4WDNphSgsuj). READ-ONLY /
+# advisory — writes NOTHING to the eshop, ever. JOINS our catalog export
+# against #106's ALREADY-SCRAPED data/out/supplier_stock.json (same
+# internalNote link both automations share) — this automation does not scrape
+# anything itself. Pure logic lives in parovanie.riziko_vypadku; this wires it
+# to the store + the display/CSV endpoints.
+# --------------------------------------------------------------------------- #
+RIZIKO_STATE = os.path.join(OUT, "riziko_vypadku.json")
+
+
+def _load_riziko() -> dict:
+    try:
+        with open(RIZIKO_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_riziko(d: dict) -> None:
+    tmp = RIZIKO_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, RIZIKO_STATE)
+
+
+def run_riziko_vypadku() -> dict:
+    """One check run (daily ~06:15 or „Spustiť teraz"): join OUR catalog export
+    (same on-disk data/products.csv #106 reads) against the „Dodávateľský sklad"
+    scraper's LAST result (data/out/supplier_stock.json) — no network calls of
+    its own. When the scraper has never run yet (no rows persisted), this
+    surfaces has_supplier_data=False instead of silently flagging nothing as
+    'no risk' (which would look like a false all-clear)."""
+    with _lock:
+        stock = _load_supplier_stock()
+    supplier_rows = stock.get("rows") or []
+    has_data = bool(supplier_rows)
+    csv_text = _read_export_for_links()          # same cp1250 export reader as #106
+    risks = riziko_vypadku.compute_risk(csv_text, supplier_rows) if has_data else []
+    now = datetime.now(timezone.utc).astimezone()
+    with _lock:
+        _save_riziko({
+            "last_check": now.isoformat(timespec="seconds"),
+            "has_supplier_data": has_data,
+            "supplier_last_check": stock.get("last_check", ""),
+            "risks": risks,
+        })
+    stats = {"risks": len(risks), "has_supplier_data": has_data}
+    log.info("riziko_vypadku: run done %s", stats)
+    return stats
+
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
@@ -2743,6 +2798,15 @@ AUTOMATIONS_REG = [
                name="Dodávateľský sklad",
                schedule={"daily_at": "05:00", "tz": "Europe/Bratislava"},
                run_fn=run_supplier_stock),
+    # #107 — daily supply-risk report (products we still show as Skladom but our
+    # supplier has sold out). SAFETY (#93 contract): starts DISABLED like every
+    # other automation, for consistency — even though it is purely READ-ONLY /
+    # advisory (no e-mail, no eshop write, no cost) it runs ONLY after the manager
+    # clicks ▶ Štart, same as shoptet_sync; a deploy never auto-enables anything.
+    Automation(key="riziko_vypadku",
+               name="Riziko výpadku",
+               schedule={"daily_at": "06:15", "tz": "Europe/Bratislava"},
+               run_fn=run_riziko_vypadku),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
@@ -2804,6 +2868,37 @@ def api_supplier_stock():
         "rows": st.get("rows") or [],
         "stats": st.get("stats") or {},
     })
+
+
+@app.route("/api/riziko-vypadku")
+def api_riziko_vypadku():
+    """Display data for the „Riziko výpadku" tab — the last join's risk rows +
+    whether the '#106 Dodávateľský sklad' scraper has ever produced data at all
+    (has_supplier_data=False -> the tab shows 'spusti Dodávateľský sklad first',
+    never a misleading empty 'no risk' list)."""
+    with _lock:
+        st = _load_riziko()
+    return jsonify({
+        "last_check": st.get("last_check", ""),
+        "has_supplier_data": bool(st.get("has_supplier_data")),
+        "supplier_last_check": st.get("supplier_last_check", ""),
+        "risks": st.get("risks") or [],
+    })
+
+
+@app.route("/api/riziko-vypadku/csv")
+def api_riziko_vypadku_csv():
+    """Optional CSV download of the last run's risk rows (per the digest — ready
+    to eyeball or hand to someone deciding which to flip to 'Vypredané'). Never
+    imported back automatically by this app, but formula-injection-guarded like
+    every other CSV sink here (_csv_safe)."""
+    with _lock:
+        st = _load_riziko()
+    header = ["kod", "parovaci_kod", "nazov", "dodavatel", "nasa_cena", "nas_sklad",
+              "dostupnost_u_dodavatela", "link", "kontrolovane"]
+    rows = [[_csv_safe(r.get(k, "")) for k in riziko_vypadku.RISK_FIELDS]
+            for r in (st.get("risks") or [])]
+    return _csv_response(header, rows, "riziko_vypadku.csv")
 
 
 if __name__ == "__main__":

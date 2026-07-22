@@ -13,6 +13,7 @@ let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
 let POSTA = null;           // /api/posta-uncollected — last run's display data
 let SUPPLIER_STOCK = null;  // /api/supplier-stock — last scraper run's rows (#106)
 let STOCK_FILTER = 'all';   // dodávateľský sklad filter: all | errors | llm | <supplier>
+let RIZIKO = null;          // /api/riziko-vypadku — last risk-report run (#107)
 let DEV = null;             // /api/dev/issues — {available, issues:[...]} or null (#115)
 let DEV_FILTER = 'open';    // 'Vývoj' tab filter: open | closed | all
 let ORDER_SUPPLIER = 'all';
@@ -304,7 +305,8 @@ const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
 // sidebar section (#autoTabs) + its own tab section. New automations: add here.
 const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['shoptet_sync', 'Sync zo Shoptetu'],
-  ['parovania_eshop', 'Párovania → eshop'], ['dodavatelsky_sklad', 'Dodávateľský sklad']];
+  ['parovania_eshop', 'Párovania → eshop'], ['dodavatelsky_sklad', 'Dodávateľský sklad'],
+  ['riziko_vypadku', 'Riziko výpadku']];
 
 const NAV_ICONS = {
   review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
@@ -319,6 +321,7 @@ const NAV_ICONS = {
     + '<path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
   dodavatelsky_sklad: '<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M3 7l9 4 9-4"/>'
     + '<path d="M12 11v10"/>',
+  riziko_vypadku: '<path d="M12 3L2 20h20L12 3z"/><path d="M12 9.5v4"/><path d="M12 17v.01"/>',
   dev: '<path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 5l-2 14"/>',
 };
 
@@ -335,6 +338,7 @@ function navCount(key) {
   if (key === 'users') return USERS_LIST.length;
   if (key === 'posta') return POSTA ? (POSTA.uncollected || []).length : 0;
   if (key === 'dodavatelsky_sklad') return SUPPLIER_STOCK ? (SUPPLIER_STOCK.stats || {}).errors || 0 : 0;
+  if (key === 'riziko_vypadku') return RIZIKO ? (RIZIKO.risks || []).length : 0;
   if (key === 'dev') return DEV ? (DEV.issues || []).filter(i => i.state === 'open').length : 0;
   return 0;
 }
@@ -379,7 +383,7 @@ const PAGE_TITLES = {
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
   parovania_eshop: 'Párovania → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
-  dev: 'Vývoj',
+  riziko_vypadku: 'Riziko výpadku', dev: 'Vývoj',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
@@ -406,6 +410,9 @@ function setPageHead() {
   } else if (ACTIVE_TAB === 'dodavatelsky_sklad') {
     const n = SUPPLIER_STOCK ? (SUPPLIER_STOCK.rows || []).length : 0;
     s.textContent = `${n} dodávateľských liniek · denná kontrola dostupnosti a cien`;
+  } else if (ACTIVE_TAB === 'riziko_vypadku') {
+    const n = RIZIKO ? (RIZIKO.risks || []).length : 0;
+    s.textContent = `${n} produktov v riziku výpadku · máme skladom, dodávateľ už nemá`;
   } else if (ACTIVE_TAB === 'dev') {
     if (DEV && DEV.available) {
       const iss = DEV.issues || [];
@@ -470,6 +477,7 @@ async function switchTab(tab) {
   if (tab === 'shoptet_sync') await loadAutomations();   // always fresh — status can change
   if (tab === 'parovania_eshop') await loadAutomations();   // always fresh — status can change
   if (tab === 'dodavatelsky_sklad') await loadSupplierStock();   // always fresh — status can change
+  if (tab === 'riziko_vypadku') await loadRiziko();   // always fresh — status can change
   if (tab === 'dev') await loadDevIssues();   // always fresh — issues change on GitHub
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
@@ -1229,10 +1237,17 @@ async function loadSupplierStock() {
   catch (_) { SUPPLIER_STOCK = null; }
 }
 
+async function loadRiziko() {
+  await loadAutomations();
+  try { RIZIKO = await (await fetch('/api/riziko-vypadku')).json(); }
+  catch (_) { RIZIKO = null; }
+}
+
 // Reload AUTOMATIONS + the active tab's display data (used by toggle + run poll,
 // so a live run refreshes whichever automation tab is open).
 async function _reloadAuto(tab) {
   if (tab === 'dodavatelsky_sklad') { await loadSupplierStock(); return; }
+  if (tab === 'riziko_vypadku') { await loadRiziko(); return; }
   await loadPosta();   // loads AUTOMATIONS too; POSTA fetch is harmless elsewhere
 }
 
@@ -1647,6 +1662,93 @@ function renderDodavatelskySklad() {
   wrap.appendChild(tbl);
 }
 
+// ---- Automatizácie (#107): tab „Riziko výpadku" ---------------------------- //
+// Per-item table tab (like posta / dodavatelsky_sklad): READ-ONLY join of OUR
+// catalog (Skladom + viditeľné) against #106's already-scraped supplier stock —
+// products we still show as available but our supplier has, in the meantime,
+// sold out. No write action here (advisory only, per the digest).
+function renderRizikoVypadku() {
+  const wrap = document.getElementById('tab-riziko_vypadku');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('riziko_vypadku');
+  if (!a) {
+    wrap.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    return;
+  }
+  const st = el('div', 'autostatus');
+  const head = el('div', 'autohead');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'riziko-status';
+  head.appendChild(pill);
+  if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha kontrola…'));
+  const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+    a.enabled ? '⏹ Stop' : '▶ Štart');
+  btn.dataset.testid = 'riziko-toggle';
+  btn.onclick = () => toggleAutomation('riziko_vypadku', !a.enabled);
+  head.appendChild(btn);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'riziko-run';
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation('riziko_vypadku', 'riziko_vypadku');
+  head.appendChild(run);
+  st.appendChild(head);
+
+  const meta = el('div', 'autometa');
+  const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+  bits.push('Posledný beh: ' + (a.last_run
+    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+    : 'zatiaľ nikdy'));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+  st.appendChild(meta);
+  if (a.last_status === 'error' && a.last_error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+  }
+  wrap.appendChild(st);
+
+  const r = RIZIKO || {};
+  if (!r.has_supplier_data) {
+    wrap.appendChild(el('div', 'empty2',
+      'Žiadne dáta o dodávateľskom sklade — najprv spusti automatizáciu „Dodávateľský sklad".'));
+    return;
+  }
+  const risks = r.risks || [];
+  if (risks.length) {
+    const dl = el('div', 'downloads');
+    const da = el('a', '', '⬇ Stiahnuť CSV');
+    da.href = '/api/riziko-vypadku/csv'; da.setAttribute('download', '');
+    da.dataset.testid = 'riziko-csv';
+    dl.appendChild(da);
+    wrap.appendChild(dl);
+  }
+  if (!risks.length) {
+    wrap.appendChild(el('div', 'empty2',
+      r.last_check ? `Žiadne riziko výpadku (kontrola ${fmtDt(r.last_check)}).`
+                   : 'Zatiaľ neprebehla žiadna kontrola — spusti automatizáciu (▶ Štart) alebo klikni ⚡ Spustiť teraz.'));
+    return;
+  }
+  const tbl = el('table', 'posta-table');
+  tbl.dataset.testid = 'riziko-table';
+  tbl.innerHTML = '<thead><tr><th>Produkt</th><th>Dodávateľ</th><th>Naša cena / sklad</th>'
+    + '<th>Dostupnosť u dodávateľa</th><th>Kontrolované</th></tr></thead>';
+  const tb = el('tbody');
+  for (const x of risks) {
+    const tr = el('tr', 'callneeded');
+    tr.innerHTML =
+      `<td><code>${escapeHtml(x.code || '')}</code><div class="sub2">${escapeHtml(x.name || '')}</div></td>`
+      + `<td>${escapeHtml(x.supplier || '—')}`
+      + (x.link ? `<div class="sub2"><a href="${escapeHtml(x.link)}" target="_blank" rel="noopener">produkt u dodávateľa</a></div>` : '')
+      + '</td>'
+      + `<td>${escapeHtml(x.ourPrice || '—')} € · ${escapeHtml(x.ourStock || '0')} ks</td>`
+      + `<td>${_availChip(false)}<div class="sub2">${escapeHtml(x.supplierAvailabilityText || '')}</div></td>`
+      + `<td>${fmtDt(x.checkedAt)}</td>`;
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb);
+  wrap.appendChild(tbl);
+}
+
 function render() {
   renderTabs();
   setPageHead();
@@ -1658,8 +1760,9 @@ function render() {
   const shoptetSync = ACTIVE_TAB === 'shoptet_sync';
   const parovaniaEshop = ACTIVE_TAB === 'parovania_eshop';
   const dodavatelskySklad = ACTIVE_TAB === 'dodavatelsky_sklad';
+  const rizikoVypadku = ACTIVE_TAB === 'riziko_vypadku';
   const dev = ACTIVE_TAB === 'dev';
-  const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad;  // any automation tab
+  const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad || rizikoVypadku;  // any automation tab
   const plain = search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
@@ -1672,9 +1775,11 @@ function render() {
   const secShoptetSync = document.getElementById('tab-shoptet_sync'); if (secShoptetSync) secShoptetSync.hidden = !shoptetSync;
   const secParovania = document.getElementById('tab-parovania_eshop'); if (secParovania) secParovania.hidden = !parovaniaEshop;
   const secSklad = document.getElementById('tab-dodavatelsky_sklad'); if (secSklad) secSklad.hidden = !dodavatelskySklad;
+  const secRiziko = document.getElementById('tab-riziko_vypadku'); if (secRiziko) secRiziko.hidden = !rizikoVypadku;
   const secDev = document.getElementById('tab-dev'); if (secDev) secDev.hidden = !dev;
   const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = plain ? 'none' : '';
   if (dev) { document.getElementById('empty').hidden = true; renderDev(); return; }
+  if (rizikoVypadku) { document.getElementById('empty').hidden = true; renderRizikoVypadku(); return; }
   if (dodavatelskySklad) { document.getElementById('empty').hidden = true; renderDodavatelskySklad(); return; }
   if (parovaniaEshop) { document.getElementById('empty').hidden = true; renderParovaniaEshop(); return; }
   if (shoptetSync) { document.getElementById('empty').hidden = true; renderShoptetSync(); return; }

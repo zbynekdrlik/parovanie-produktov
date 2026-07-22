@@ -221,6 +221,73 @@ Automatizácia, ktorá scrapuje externé weby a/alebo volá LLM (OpenAI). Pure j
   stores. **Default DISABLED** (scrape+LLM stoja) — pri post-deploy NEklikaj Spustiť teraz, len over
   tab existuje + Zastavené + tlačidlá.
 
+### JOIN-automatizácia (žiadne škrabanie) — vzor `riziko_vypadku` (#107)
+
+Automatizácia, ktorá NEROBÍ žiadnu sieť ani LLM — len SPOJÍ náš katalóg export s
+`data/out/<inej-automatizácie>.json`, ktorý UŽ napísal INÝ automation run (napr.
+`dodavatelsky_sklad` #106). Pure jadro je jedna funkcia `compute_risk(csv_text,
+other_rows)` — číta export cez ten istý `_read_export_for_links()`/`internalNote`
+join-kľúč ako scraper, mapuje `{link: row}` z `other_rows` (`by_link` dict),
+a filtruje cez `export_helpers.state_of` (NIKDY nekopíruj 3-stavovú klasifikáciu
+nanovo). **Absencia dát ≠ risk**: chýbajúci link v `by_link`, `ok=False` (chyba pri
+scrapovaní), alebo `available is None` (nevie sa) sa VŽDY preskočí — nikdy sa
+netvári ako "nie je skladom".
+
+**Kontrakt pre tab, keď závislá automatizácia ešte nebežala**: `run_fn` vráti
+(a store nesie) explicitný `has_<x>_data: bool` flag (`bool(other_rows)` — prázdne
+`rows`/chýbajúci store = `False`), NIE len prázdny `risks: []`. Frontend potom
+zobrazí „najprv spusti <závislá automatizácia>" namiesto zavádzajúceho „0 rizík"
+(ktoré vyzerá ako čisté hlásenie, keď v skutočnosti nikto ešte nemeral). Tento
+kontrakt je NUTNÝ pre KAŽDÚ automatizáciu, čo číta iný `data/out/*.json` store bez
+vlastného scrapovania — kopíruj ho, nevymýšľaj vlastnú signalizáciu.
+
+- **Registrácia**: rovnaký `Automation(...)` do `AUTOMATIONS_REG`, **default DISABLED**
+  ako VŠETKY ostatné — aj keď je čisto READ-ONLY (žiadny e-mail, žiadny zápis, žiadna
+  cena) sa drží konzistencie s `shoptet_sync` (tiež read-only, tiež default Stop);
+  deploy nikdy nič sám nezapne.
+- **Tab**: per-item tabuľka (vzor `renderPosta`/`renderDodavatelskySklad`) — žiadne
+  nové CSS triedy netreba (`.autostatus`/`.posta-table`/`.avail`/`.downloads` sa
+  recyklujú). Voliteľné „Stiahnuť CSV" = `_csv_response` + `_csv_safe` (rovnaký
+  formula-injection guard ako `/api/import`).
+- **E2E**: fixture server nasadí PRE-vypočítaný `data/out/<key>.json` priamo (žiadny
+  reálny `products.csv`, žiadna sieť) — presne ako `supplier_stock.json` fixture v
+  `automations_server`; test nikdy neklika „Spustiť teraz" (to by chcelo skutočný
+  export na disku).
+
+## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
+
+Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
+NIE admin-only ako Užívatelia) vypíše GitHub issues repa (open+closed, PR-ka
+odfiltruj cez `pull_request` kľúč). Fixná žiarovka vpravo dole (`#ideaBtn` + modal
+`#ideaModal`) vytvorí issue → objaví sa v zozname.
+
+- **Token = backend-proxy, NIKDY do prehliadača.** `data/.gh_env` (`GITHUB_TOKEN` +
+  `GITHUB_REPO`, gitignored 600) sa načíta cez `_load_env_file` (ako `.auth_env`/
+  `.mail_env`/`.ai_env`). Token žije LEN v server-side `Authorization: Bearer`
+  hlavičke (`_gh_headers`) — nikdy URL/log/JS. Endpointy `/api/dev/issues` (list,
+  bounded `GH_MAX_PAGES`=5 pagination — `/issues?state=all` vracia issues AJ PR-ka
+  premiešané podľa updated, takže jedna 100-stranka by mohla odrezať staršie issues
+  po odfiltrovaní PR) + `/api/dev/idea` (create; title povinný/capnutý, rate-limited
+  per user). **Chýbajúci/neplatný token → graceful `{available:False}`, NIKDY 500** —
+  tab aj žiarovka to zvládnu. `GITHUB_API_BASE` env override = pointne na iný base
+  (e2e stub).
+- **E2E hermeticky** (`tests/e2e/test_dev.py` + `dev_server` fixture): fixture bootne
+  malý `http.server.ThreadingHTTPServer` GitHub-stub (GET `/issues` → canned open+
+  closed+PR, POST → append+echo) a appku spustí s `GITHUB_TOKEN`/`GITHUB_REPO`/
+  `GITHUB_API_BASE`→stub. Pridaj `dev_server` do `_SERVER_FIXTURES` (auth cookie).
+  Backend testy (`tests/test_webreview_dev.py`) mockujú `webapp.requests.get/post`;
+  autouse guard delenv-ne reálny `GITHUB_TOKEN` (dev box ho má z `.gh_env`) + spraví
+  z requests raising stub → žiadne reálne volanie omylom.
+- **GOTCHA — `get_by_role("button", name="Vývoj")` chytí AJ žiarovku** (jej
+  `aria-label="Zapíš nápad na vývoj"` obsahuje „vývoj", substring match) → strict-mode
+  chyba. Nav klikaj scoped: `page.locator("#devNav button")`. `.dev-state` pill má
+  `text-transform:uppercase` (ako `.pill`) → `inner_text()` vráti „OTVORENÉ"; assertuj
+  cez triedu `.dev-state.open`/`.dev-state.done`, nie text.
+- **GOTCHA — po create je GitHub list eventuálne konzistentný**: `loadDevIssues()`
+  hneď po POST create môže vrátiť ešte starý zoznam (nová issue tam ešte nie je);
+  reload (klik nav) o pár s ju už ukáže. Post-deploy: smieš vytvoriť 1 test issue cez
+  živú žiarovku a hneď ju `gh issue close` (overené #149 pri v0.59.0).
+
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.

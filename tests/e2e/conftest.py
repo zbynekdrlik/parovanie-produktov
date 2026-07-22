@@ -344,6 +344,22 @@ def automations_server(tmp_path_factory):
                   "available": 1, "unavailable": 0, "unknown": 0, "errors": 1,
                   "llm_calls": 0},
     }, ensure_ascii=False), encoding="utf-8")
+    # #107 — pre-existing „Riziko výpadku" join result (one risky product) so the
+    # tab's status + table render WITHOUT any network AND without needing a real
+    # products.csv (the E2E never clicks Spustiť teraz — same rationale as the
+    # supplier_stock rows above).
+    (out / "riziko_vypadku.json").write_text(json.dumps({
+        "last_check": "2026-07-22T06:15:04+02:00",
+        "has_supplier_data": True,
+        "supplier_last_check": "2026-07-22T05:00:07+02:00",
+        "risks": [
+            {"code": "1/M", "pairCode": "P1", "name": "Bunda Risk Test",
+             "supplier": "BETALOV", "ourPrice": "99.90", "ourStock": "5",
+             "supplierAvailabilityText": "Vypredané",
+             "link": "https://www.huntingshop.eu/p/bunda-risk",
+             "checkedAt": "2026-07-22T05:00:03+02:00"},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
         **_AUTH_ENV,
