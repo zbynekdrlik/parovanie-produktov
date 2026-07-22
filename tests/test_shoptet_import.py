@@ -9,6 +9,7 @@ from parovanie.shoptet_import import (
     classify_row,
     load_credentials,
     parse_import_log,
+    pick_result_row,
     preflight_csv,
     result_exit_code,
 )
@@ -173,3 +174,81 @@ def test_preflight_counts_externalcode(tmp_path):
     assert plan["total"] == 1
     assert plan["externalcode"] == 1
     assert plan["other"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# #23 — result read-back must never grab a STALE row / mask a hard error
+# --------------------------------------------------------------------------- #
+def test_parse_import_log_hard_error_row_no_summary():
+    # Shoptet ABORTED the whole import (duplicate 'code' column) — the log page
+    # carries ONLY this hard error line, no Spracované/Zlyhanie summary at all.
+    # processed must stay None (=> never reported as success) and the raw error
+    # text must be surfaced explicitly (not just silently swallowed).
+    txt = "Chyba | Číslo riadku: 42 - Data in column code are not unique"
+    r = parse_import_log(txt)
+    assert r["processed"] is None
+    assert r["failed"] is None
+    assert r["error_detail"] == txt
+    assert result_exit_code(r) == 2   # never a silent success
+
+
+def test_parse_import_log_clean_result_has_no_error_detail():
+    txt = "Spracované: 100. Upravené: 50. Zlyhanie variantov: 0."
+    r = parse_import_log(txt)
+    assert r["error_detail"] is None
+    assert result_exit_code(r) == 0
+
+
+def test_parse_import_log_chybou_prose_not_mistaken_for_hard_error():
+    # 'chybou' (declined prose, "skončil s chybou") must NOT trip error_detail —
+    # only relevant when there's genuinely no processed count at all.
+    txt = "Import skončil s chybou. Spracované: 50. Zlyhanie variantov: 3."
+    r = parse_import_log(txt)
+    assert r["error_detail"] is None
+    assert r["processed"] == 50 and r["failed"] == 3
+
+
+def test_pick_result_row_picks_hard_error_over_older_stale_success():
+    # THE issue #23 regression: a failed 690-row import wrote ONLY a hard
+    # 'Chyba | Číslo riadku' entry (no Spracované/Zlyhanie line) at the TOP of
+    # the log table (Shoptet renders newest-first). The OLD keyword-only
+    # picker (spracov|zpracov|upraven|zlyhan) didn't match that row, fell
+    # through to an OLDER completed run further down, and reported ITS
+    # 'spracované=19' as if it were this run's result. The picker must return
+    # the TOP error row, never skip past it.
+    rows = [
+        "Chyba | Číslo riadku: 42 - Data in column code are not unique",
+        "12.7.2026 10:00  Spracované: 19. Upravené: 19. Zlyhanie variantov: 0.",
+    ]
+    row = pick_result_row(rows)
+    assert row == rows[0]
+    assert "chyba" in row.lower()
+    # and parsing that row never looks like success
+    assert result_exit_code(parse_import_log(row)) == 2
+
+
+def test_pick_result_row_skips_header_row():
+    rows = ["Dátum Výsledok", "Spracované: 5. Upravené: 5."]
+    assert pick_result_row(rows) == rows[1]
+
+
+def test_pick_result_row_returns_none_when_table_empty_or_only_header():
+    assert pick_result_row([]) is None
+    assert pick_result_row(["Dátum Výsledok"]) is None
+
+
+def test_pick_result_row_returns_none_when_unchanged_from_baseline():
+    # a large/async import: right after submitting, the log page may not have
+    # written THIS run's row yet — the topmost entry is still the run BEFORE
+    # this one (the pre-submit baseline). Must return None ("not ready yet"),
+    # never report the baseline row as today's result.
+    baseline = "12.7.2026 10:00  Spracované: 19. Upravené: 19."
+    rows = [baseline]
+    assert pick_result_row(rows, baseline=baseline) is None
+
+
+def test_pick_result_row_returns_new_row_once_it_differs_from_baseline():
+    baseline = "12.7.2026 10:00  Spracované: 19. Upravené: 19."
+    rows = ["12.7.2026 10:05  Spracované: 3776. Upravené: 784.", baseline]
+    row = pick_result_row(rows, baseline=baseline)
+    assert row == rows[0]
