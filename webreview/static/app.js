@@ -272,9 +272,9 @@ const NAV_ICONS = {
 };
 
 // 'Užívatelia' is an ADMIN-ONLY nav item (the server 403s non-admins anyway).
-function visibleTabs() {
-  return (ME && ME.is_admin) ? TABS.concat([['users', 'Užívatelia']]) : TABS;
-}
+// It is rendered STANDALONE at the sidebar bottom (#usersNav), OUTSIDE the
+// 'Eshop' folder (#118 refinement, Marek 2026-07-22) — see renderTabs().
+function isAdmin() { return !!(ME && ME.is_admin); }
 
 // count badge per nav item — review: still-unreviewed, toorder: open lines, notes: count
 function navCount(key) {
@@ -299,11 +299,18 @@ function _navButton(key, lbl) {
 function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
   t.innerHTML = '';
-  for (const [key, lbl] of visibleTabs()) t.appendChild(_navButton(key, lbl));
+  for (const [key, lbl] of TABS) t.appendChild(_navButton(key, lbl));
   const at = document.getElementById('autoTabs');
   if (at) {
     at.innerHTML = '';
     for (const [key, lbl] of AUTOMATION_TABS) at.appendChild(_navButton(key, lbl));
+  }
+  // 'Užívatelia' (admin-only) — standalone at the sidebar bottom, OUTSIDE the
+  // 'Eshop' folder (#118 refinement). Non-admins: container stays empty.
+  const un = document.getElementById('usersNav');
+  if (un) {
+    un.innerHTML = '';
+    if (isAdmin()) un.appendChild(_navButton('users', 'Užívatelia'));
   }
 }
 
