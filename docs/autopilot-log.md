@@ -3,3 +3,8 @@
 - Bonus bug (pre-existing v0.42): [hidden] vs display:flex — search box presakoval do všetkých tabov; RED 76271be → GREEN bb3354f.
 - Rozhodnutia: /api/n8n/* mimo session gate (vlastný bearer); reset-token store hashovaný sha256; bootstrap create-if-missing; legacy testy = reálna session (authed_client + store seed), e2e autouse cookie + @pytest.mark.anonymous.
 - Otvorené: #113 SMTP údaje pre reset-mail (needs-answer — čaká na Mareka).
+
+## 2026-07-22 — #94 rebrand „Forestaci" + nová URL (worker)
+- Prebrandované z „Forestshop" na „Forestaci": sidebar `.brandtxt` + `<title>` v index.html AJ auth shell (auth.html; login/forgot/reset ho dedia). Eshop odkazy forestshop.sk NEDOTKNUTÉ; email subject „Párovanie Forestshop" ponechaný (ambiguous eshop-ref → default keep). Verzia 0.44.1→0.45.0. Commit 621e8fa, PR #116, merge e896040, nasadené v0.45.0.
+- Brand-lock test tests/test_branding.py (index authed + login shell anonymous; pozit. + negat. assert). E2E fixture: pinnutý AUTH_COOKIE_SECURE=0 do _AUTH_ENV — lokálne e2e padali CSRF/400 na dev boxe s reálnym data/.auth_env (AUTH_COOKIE_SECURE=1 → Secure cookie sa cez http://127.0.0.1 nevráti); CI to nemal (žiadne data/). Deterministické lokálne e2e.
+- Cloudflare (aditívne, API token data/.cf_token): ingress tunela a3df5493… + DNS CNAME forestaci.newlevel.media → tunel (proxied). parovanie-forestshop.newlevel.media OSTÁVA (obe → localhost:8801). Post-deploy: obe URL anon `/`→302 /login, /login 200, /api/version v0.45.0; DOM brand „Forestaci", [data-testid=version]=v0.45.0; post-login index sidebar brandtxt=Forestaci. Data-safety PRED==PO (decisions 2831, ordered 146, order_pairings 51, waiting 11, suppliers 1, instock 10, users 2).
