@@ -78,3 +78,41 @@ def test_start_stop_toggle_persists_across_reload(page, automations_server):
         "&& document.querySelector('[data-testid=ordrem-status]').textContent === 'Zastavené'")
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── manual per-row override (#153) ───────────────────────────────────────────────
+def test_mark_red_order_as_contacted_moves_it_to_skipped(page, automations_server):
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    row = page.locator('tr[data-code="20261000"]')
+    assert row.is_visible()
+    with page.expect_response("**/api/orders-reminder/override"):
+        row.locator(".ordrem-act-contact").click()
+    # moved: no longer in the red table, now shows in the skipped table
+    page.wait_for_function(
+        "() => !document.querySelector('tr[data-code=\"20261000\"]')"
+        " || document.querySelector('[data-testid=ordrem-skipped]')")
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 0
+    skipped = page.locator('[data-testid="ordrem-skipped"]')
+    assert skipped.is_visible()
+    assert "20261000" in skipped.inner_text()
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_send_now_from_red_row_moves_it_to_orange(page, automations_server):
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    row = page.locator('tr[data-code="20261000"]')
+    with page.expect_response("**/api/orders-reminder/override"):
+        row.locator(".ordrem-act-send").click()
+    page.wait_for_function(
+        "() => !document.querySelector('tr[data-code=\"20261000\"]')"
+        " || document.querySelector('[data-testid=ordrem-orange]')")
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 0
+    orange = page.locator('[data-testid="ordrem-orange"]')
+    assert "20261000" in orange.inner_text()
+
+    assert console == [], f"console not clean: {console}"

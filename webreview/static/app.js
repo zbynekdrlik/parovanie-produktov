@@ -351,11 +351,22 @@ function navCount(key) {
   return 0;
 }
 
+// #153 — visible failure indicator: TRUE when this automation's LAST run ended in error. Read
+// straight from AUTOMATIONS (prefetched at init(), see below) so the badge shows on ANY page —
+// the manager must not have to open the failing automation's own tab to find out (that silence
+// is exactly why the #156 timeout went unnoticed until a human spotted it by chance).
+function navError(key) {
+  const a = autoByKey(key);
+  return !!(a && a.last_status === 'error');
+}
+
 function _navButton(key, lbl) {
   const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
   const n = navCount(key);
+  const err = navError(key);
   bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
     + `<span class="tlabel">${escapeHtml(lbl)}</span>`
+    + (err ? '<span class="navwarn" title="posledný beh zlyhal">⚠</span>' : '')
     + (n > 0 ? `<span class="navcount">${n}</span>` : '');
   bt.onclick = () => switchTab(key);
   return bt;
@@ -1935,11 +1946,19 @@ function renderOrdersReminder() {
   const d = ORDERS_REMINDER || {};
   const red = d.red || [];
   const orange = d.orange || [];
-  if (!red.length && !orange.length) {
+  const skipped = d.skipped || [];
+  if (!red.length && !orange.length && !skipped.length) {
     wrap.appendChild(el('div', 'empty2',
       d.last_check ? `Žiadne objednávky na pripomenutie (kontrola ${fmtDt(d.last_check)}).`
                    : 'Zatiaľ neprebehla žiadna kontrola — spusti automatizáciu (▶ Štart) alebo klikni ⚡ Spustiť teraz.'));
     return;
+  }
+
+  // manual per-row override (#153) — "send" (▶ pripomienka teraz) works on red AND skipped rows
+  // (overriding a wrong AI 'už kontaktovaný' verdict); "contact" (✓ kontaktované) only on red
+  // rows (no note ever ran through the AI, so it can't already be resolved).
+  function _ordremAction(btn, code, action) {
+    btn.onclick = () => overrideOrdersReminder(code, action);
   }
 
   // RED — >4d orders with NO internal note (nobody has touched them yet)
@@ -1948,23 +1967,30 @@ function renderOrdersReminder() {
     const tbl = el('table', 'posta-table');
     tbl.dataset.testid = 'ordrem-red';
     tbl.innerHTML = '<thead><tr><th>Objednávka</th><th>Zákazník</th><th>Položka</th>'
-      + '<th>Bez pohybu</th></tr></thead>';
+      + '<th>Bez pohybu</th><th>Akcia</th></tr></thead>';
     const tb = el('tbody');
     for (const o of red) {
-      const tr = el('tr', 'callneeded');
+      const tr = el('tr', 'callneeded'); tr.dataset.code = o.code;
       tr.innerHTML =
         `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
         + `<td>${escapeHtml(o.billFullName || '')}`
         + `<div class="sub2">${escapeHtml(o.phone || '')} · ${escapeHtml(o.email || '')}</div></td>`
         + `<td>${escapeHtml(o.itemName || '')}</td>`
         + `<td>${o.days || 0} ${dniLabel(o.days || 0)}</td>`;
+      const actTd = el('td', 'ordrem-actions');
+      const sendBtn = el('button', 'btn sm ghost ordrem-act-send', '▶ Poslať pripomienku');
+      _ordremAction(sendBtn, o.code, 'send');
+      const contactBtn = el('button', 'btn sm ghost ordrem-act-contact', '✓ Kontaktované');
+      _ordremAction(contactBtn, o.code, 'contact');
+      actTd.appendChild(sendBtn); actTd.appendChild(contactBtn);
+      tr.appendChild(actTd);
       tb.appendChild(tr);
     }
     tbl.appendChild(tb);
     wrap.appendChild(tbl);
   }
 
-  // ORANGE — reminder e-mail sent to the customer
+  // ORANGE — reminder e-mail sent to the customer (terminal — no override action)
   if (orange.length) {
     wrap.appendChild(el('div', 'warnhead', `🟠 ${orange.length} — pripomienka odoslaná zákazníkovi`));
     const tbl = el('table', 'posta-table');
@@ -1973,7 +1999,7 @@ function renderOrdersReminder() {
       + '<th>Interná poznámka</th><th>Odoslané</th></tr></thead>';
     const tb = el('tbody');
     for (const o of orange) {
-      const tr = el('tr', '');
+      const tr = el('tr', ''); tr.dataset.code = o.code;
       tr.innerHTML =
         `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
         + `<td>${escapeHtml(o.billFullName || '')}<div class="sub2">${escapeHtml(o.email || '')}</div></td>`
@@ -1985,6 +2011,49 @@ function renderOrdersReminder() {
     tbl.appendChild(tb);
     wrap.appendChild(tbl);
   }
+
+  // SKIPPED — AI classified the note as 'already contacted', so no e-mail went out. Shown so the
+  // manager can correct a wrong AI read (#153) — the only override here is 'send anyway'.
+  if (skipped.length) {
+    wrap.appendChild(el('div', 'warnhead',
+      `⚪ ${skipped.length} — AI usúdilo, že zákazník je už kontaktovaný`));
+    const tbl = el('table', 'posta-table');
+    tbl.dataset.testid = 'ordrem-skipped';
+    tbl.innerHTML = '<thead><tr><th>Objednávka</th><th>Zákazník</th><th>Položka</th>'
+      + '<th>Interná poznámka</th><th>Akcia</th></tr></thead>';
+    const tb = el('tbody');
+    for (const o of skipped) {
+      const tr = el('tr', ''); tr.dataset.code = o.code;
+      tr.innerHTML =
+        `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
+        + `<td>${escapeHtml(o.billFullName || '')}<div class="sub2">${escapeHtml(o.email || '')}</div></td>`
+        + `<td>${escapeHtml(o.itemName || '')}<div class="sub2">${o.days || 0} ${dniLabel(o.days || 0)} v stave</div></td>`
+        + `<td class="sub2">${escapeHtml(o.shopRemark || '—')}</td>`;
+      const actTd = el('td', 'ordrem-actions');
+      const sendBtn = el('button', 'btn sm ghost ordrem-act-send', '▶ Poslať pripomienku');
+      _ordremAction(sendBtn, o.code, 'send');
+      actTd.appendChild(sendBtn);
+      tr.appendChild(actTd);
+      tb.appendChild(tr);
+    }
+    tbl.appendChild(tb);
+    wrap.appendChild(tbl);
+  }
+}
+
+// manual per-row override (#153) — POST + reload the tab data + re-render.
+async function overrideOrdersReminder(code, action) {
+  const r = await fetch('/api/orders-reminder/override', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, action })
+  });
+  if (!r.ok) {
+    let msg = '';
+    try { msg = (await r.json()).error || ''; } catch (_) { /* non-JSON error */ }
+    alert('Nepodarilo sa: ' + (msg || ('chyba ' + r.status)));
+  }
+  await loadOrdersReminder();
+  render();
 }
 
 function render() {
@@ -2106,12 +2175,12 @@ async function init() {
   // active one; the 'Na objednanie'/'Poznámky' counts used to stay empty until
   // that tab was first opened. loadOrders()/loadNotes() already swallow fetch
   // failures internally (fall back to empty arrays), so a network hiccup here
-  // can't crash init() or spam the console.
-  await Promise.all([loadOrders(), loadNotes()]);
+  // can't crash init() or spam the console. loadAutomations() (#153) is prefetched
+  // the SAME way — the ⚠ failed-run nav badge must show from ANY page, not only
+  // after the manager happens to open that specific automation's tab.
+  await Promise.all([loadOrders(), loadNotes(), loadAutomations()]);
   if (ACTIVE_TAB === 'users') await loadUsers();
   if (ACTIVE_TAB === 'posta') await loadPosta();
-  if (ACTIVE_TAB === 'shoptet_sync') await loadAutomations();
-  if (ACTIVE_TAB === 'parovania_eshop') await loadAutomations();
   if (ACTIVE_TAB === 'dev') await loadDevIssues();
   initSearch();
   render();
