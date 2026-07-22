@@ -2106,9 +2106,13 @@ def _do_upload_pairings(dry):
     if not all_rows:
         log.warning("n8n pairings: %d new keys + %d new order codes but 0 import rows",
                     len(new_keys), len(new_order_codes))
-        # paired but un-uploadable (variant codes missing / all order codes already
-        # covered by a decision) — surface so the notifier warns instead of staying
-        # silent (count:0 alone would send nothing)
+        # paired but un-uploadable — every decision key has 0 variant codes (blocked
+        # below the fold). order_pairings can never contribute to this branch on its
+        # own: order_pairing_rows only excludes a code via THIS run's decision rows
+        # (`rows`), and `rows` is empty here (exclude_codes=set()), so any non-empty
+        # new_order_codes would always have produced order_rows. order_blocked is
+        # therefore always 0 here — kept explicit (not hardcoded) so this stays
+        # correct if that invariant ever changes.
         return {"ok": True, "count": 0, "products": products,
                 "order_count": 0, "order_blocked": len(new_order_codes),
                 "message": "no import rows", "blocked": len(new_keys),
@@ -2545,6 +2549,10 @@ def run_parovania_eshop() -> dict:
         status = "blocked"         # paired but un-uploadable (missing codes) → orange row
     else:
         status = "ok"
+    # NOTE: pairings["order_blocked"] deliberately does NOT feed this status — an
+    # inline order_pairing code excluded because a reviewed decision already covers
+    # it (#38) is expected/benign (the decision wins), not a data problem worth an
+    # orange row. It's still surfaced in the tab's own "Inline páry" counters.
 
     result = {
         "status": status,
