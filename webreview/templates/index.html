@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrola párovania — Forestshop</title>
-  <link rel="stylesheet" href="/static/style.css?v=40">
+  <link rel="stylesheet" href="/static/style.css?v=41">
 </head>
 <body>
   <script>try{if(localStorage.getItem('theme')==='dark')document.body.setAttribute('data-theme','dark');}catch(e){}</script>
@@ -30,6 +30,9 @@
     <!-- Admin 'Užívatelia' — standalone at the sidebar bottom, OUTSIDE the
          'Eshop' folder (#118 refinement); populated admin-only by renderTabs(). -->
     <nav class="tabs users-nav" id="usersNav" aria-label="Správa užívateľov"></nav>
+    <!-- 'Vývoj' (#115) — standalone at the very bottom, visible to every logged-in
+         user; lists this repo's GitHub issues. Populated by renderTabs(). -->
+    <nav class="tabs dev-nav" id="devNav" aria-label="Vývoj"></nav>
     <div class="sidefoot">
       <div class="userbox" id="userBox" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6"/></svg>
@@ -69,7 +72,33 @@
     <section id="tab-shoptet_sync" hidden></section>
     <section id="tab-parovania_eshop" hidden></section>
     <section id="tab-dodavatelsky_sklad" hidden></section>
+    <section id="tab-dev" hidden></section>
   </div>
-  <script src="/static/app.js?v=41"></script>
+
+  <!-- Idea lightbulb (#115): any logged-in user writes an idea → it becomes a
+       GitHub issue in the 'Vývoj' list. Fixed bottom-right, present on every tab. -->
+  <button id="ideaBtn" class="idea-fab" type="button"
+          title="Zapíš nápad na vývoj" aria-label="Zapíš nápad na vývoj">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M9 18h6M10 21h4M12 3a6 6 0 00-4 10.5c.7.7 1 1.3 1 2.5h6c0-1.2.3-1.8 1-2.5A6 6 0 0012 3z"/>
+    </svg>
+  </button>
+  <div id="ideaModal" class="idea-modal" hidden>
+    <div class="idea-backdrop" id="ideaBackdrop"></div>
+    <div class="idea-dialog" role="dialog" aria-modal="true" aria-labelledby="ideaHead">
+      <h2 id="ideaHead">💡 Nový nápad na vývoj</h2>
+      <p class="idea-hint">Zapíš nápad — vytvorí sa úloha v zozname „Vývoj".</p>
+      <input id="ideaTitleInput" type="text" maxlength="200"
+             placeholder="Nápad v skratke (názov)…" autocomplete="off">
+      <textarea id="ideaDescInput" rows="4" maxlength="5000"
+                placeholder="Podrobnosti (voliteľné)…"></textarea>
+      <div id="ideaMsg" class="idea-msg" hidden></div>
+      <div class="idea-acts">
+        <button id="ideaCancel" class="btn ghost" type="button">Zrušiť</button>
+        <button id="ideaSubmit" class="btn good" type="button">➕ Vytvoriť úlohu</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/app.js?v=42"></script>
 </body>
 </html>

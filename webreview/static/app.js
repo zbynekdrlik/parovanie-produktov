@@ -13,6 +13,8 @@ let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
 let POSTA = null;           // /api/posta-uncollected — last run's display data
 let SUPPLIER_STOCK = null;  // /api/supplier-stock — last scraper run's rows (#106)
 let STOCK_FILTER = 'all';   // dodávateľský sklad filter: all | errors | llm | <supplier>
+let DEV = null;             // /api/dev/issues — {available, issues:[...]} or null (#115)
+let DEV_FILTER = 'open';    // 'Vývoj' tab filter: open | closed | all
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'toorder';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
@@ -317,6 +319,7 @@ const NAV_ICONS = {
     + '<path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
   dodavatelsky_sklad: '<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M3 7l9 4 9-4"/>'
     + '<path d="M12 11v10"/>',
+  dev: '<path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 5l-2 14"/>',
 };
 
 // 'Užívatelia' is an ADMIN-ONLY nav item (the server 403s non-admins anyway).
@@ -332,6 +335,7 @@ function navCount(key) {
   if (key === 'users') return USERS_LIST.length;
   if (key === 'posta') return POSTA ? (POSTA.uncollected || []).length : 0;
   if (key === 'dodavatelsky_sklad') return SUPPLIER_STOCK ? (SUPPLIER_STOCK.stats || {}).errors || 0 : 0;
+  if (key === 'dev') return DEV ? (DEV.issues || []).filter(i => i.state === 'open').length : 0;
   return 0;
 }
 
@@ -361,6 +365,12 @@ function renderTabs() {
     un.innerHTML = '';
     if (isAdmin()) un.appendChild(_navButton('users', 'Užívatelia'));
   }
+  // 'Vývoj' (#115) — standalone at the very bottom, for EVERY logged-in user.
+  const dn = document.getElementById('devNav');
+  if (dn) {
+    dn.innerHTML = '';
+    dn.appendChild(_navButton('dev', 'Vývoj'));
+  }
 }
 
 // Top-bar per-page title + a plain-language subtitle (with live counts).
@@ -369,6 +379,7 @@ const PAGE_TITLES = {
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
   parovania_eshop: 'Párovania → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
+  dev: 'Vývoj',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
@@ -395,6 +406,14 @@ function setPageHead() {
   } else if (ACTIVE_TAB === 'dodavatelsky_sklad') {
     const n = SUPPLIER_STOCK ? (SUPPLIER_STOCK.rows || []).length : 0;
     s.textContent = `${n} dodávateľských liniek · denná kontrola dostupnosti a cien`;
+  } else if (ACTIVE_TAB === 'dev') {
+    if (DEV && DEV.available) {
+      const iss = DEV.issues || [];
+      const open = iss.filter(i => i.state === 'open').length;
+      s.textContent = `${open} otvorených · ${iss.length - open} hotových úloh`;
+    } else {
+      s.textContent = 'Zoznam vývojových úloh (GitHub) + nápady zo žiarovky';
+    }
   } else { s.textContent = ''; }
 }
 
@@ -451,6 +470,7 @@ async function switchTab(tab) {
   if (tab === 'shoptet_sync') await loadAutomations();   // always fresh — status can change
   if (tab === 'parovania_eshop') await loadAutomations();   // always fresh — status can change
   if (tab === 'dodavatelsky_sklad') await loadSupplierStock();   // always fresh — status can change
+  if (tab === 'dev') await loadDevIssues();   // always fresh — issues change on GitHub
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
@@ -1073,6 +1093,123 @@ function renderUsers() {
   wrap.appendChild(list);
 }
 
+// ---- Vývoj (#115): GitHub issues list + idea lightbulb -------------------- //
+async function loadDevIssues() {
+  try { DEV = await (await fetch('/api/dev/issues')).json(); }
+  catch (_) { DEV = { available: false, issues: [] }; }
+}
+
+const DEV_FILTERS = [['open', 'Otvorené'], ['closed', 'Hotové'], ['all', 'Všetky']];
+
+function _devDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return isNaN(d) ? '' : d.toLocaleDateString('sk-SK', { day: 'numeric', month: 'numeric', year: 'numeric' });
+}
+
+function renderDev() {
+  const wrap = document.getElementById('tab-dev');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (!DEV || !DEV.available) {
+    wrap.appendChild(el('div', 'empty2',
+      '⚠️ GitHub nedostupný — zoznam úloh sa teraz nedá načítať.<br>'
+      + escapeHtml((DEV && DEV.error) || 'Skontroluj nastavenie (data/.gh_env).')));
+    return;
+  }
+  const issues = DEV.issues || [];
+  const openN = issues.filter(i => i.state === 'open').length;
+  const closedN = issues.length - openN;
+  const fbar = el('div', 'dev-filters');
+  for (const [key, lbl] of DEV_FILTERS) {
+    const n = key === 'open' ? openN : key === 'closed' ? closedN : issues.length;
+    const b = el('button', DEV_FILTER === key ? 'active' : '', `${escapeHtml(lbl)} (${n})`);
+    b.onclick = () => { DEV_FILTER = key; renderDev(); };
+    fbar.appendChild(b);
+  }
+  wrap.appendChild(fbar);
+  const shown = issues.filter(i => DEV_FILTER === 'all' ? true : i.state === DEV_FILTER);
+  if (!shown.length) {
+    wrap.appendChild(el('div', 'srch-empty', 'Žiadne úlohy v tomto filtri.'));
+    return;
+  }
+  const list = el('div', 'dev-list');
+  for (const it of shown) list.appendChild(renderDevRow(it));
+  wrap.appendChild(list);
+}
+
+function renderDevRow(it) {
+  const row = el('div', 'dev-row' + (it.state === 'closed' ? ' closed' : ''));
+  const head = el('div', 'dev-head');
+  head.appendChild(el('span', 'dev-num', '#' + it.number));
+  const title = el('a', 'dev-title', escapeHtml(it.title || '(bez názvu)'));
+  if (it.html_url) { title.href = it.html_url; title.target = '_blank'; title.rel = 'noopener'; }
+  head.appendChild(title);
+  head.appendChild(el('span', 'dev-state ' + (it.state === 'closed' ? 'done' : 'open'),
+    it.state === 'closed' ? 'Hotové' : 'Otvorené'));
+  row.appendChild(head);
+  const meta = el('div', 'dev-meta');
+  for (const lbl of (it.labels || [])) meta.appendChild(el('span', 'dev-label', escapeHtml(lbl)));
+  const upd = _devDate(it.updated_at);
+  if (upd) meta.appendChild(el('span', 'dev-upd', 'upravené ' + upd));
+  if ((it.labels || []).length || upd) row.appendChild(meta);
+  return row;
+}
+
+// Idea lightbulb — any logged-in user writes an idea → POST /api/dev/idea creates a
+// GitHub issue that then appears in the Vývoj list. The token stays server-side.
+function _ideaMsg(text, cls) {
+  const msg = document.getElementById('ideaMsg');
+  if (!msg) return;
+  if (!text) { msg.hidden = true; msg.textContent = ''; return; }
+  msg.hidden = false; msg.className = 'idea-msg' + (cls ? ' ' + cls : ''); msg.textContent = text;
+}
+function _ideaOpen() {
+  const m = document.getElementById('ideaModal'); if (!m) return;
+  document.getElementById('ideaTitleInput').value = '';
+  document.getElementById('ideaDescInput').value = '';
+  _ideaMsg('');
+  m.hidden = false;
+  document.getElementById('ideaTitleInput').focus();
+}
+function _ideaClose() {
+  const m = document.getElementById('ideaModal'); if (m) m.hidden = true;
+}
+async function _ideaSubmit() {
+  const ti = document.getElementById('ideaTitleInput');
+  const de = document.getElementById('ideaDescInput');
+  const btn = document.getElementById('ideaSubmit');
+  const title = ti.value.trim();
+  if (!title) { _ideaMsg('Napíš aspoň názov nápadu.', 'err'); ti.focus(); return; }
+  btn.disabled = true;
+  let ok = false, err = '';
+  try {
+    const r = await fetch('/api/dev/idea', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, description: de.value.trim() }),
+    });
+    const j = await r.json().catch(() => ({}));
+    ok = r.ok && j.ok;
+    if (!ok) err = j.error || ('chyba ' + r.status);
+  } catch (_) { err = 'sieťová chyba'; }
+  btn.disabled = false;
+  if (!ok) { _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
+  _ideaClose();
+  await loadDevIssues();                       // new issue appears + nav badge updates
+  if (ACTIVE_TAB === 'dev') render(); else renderTabs();
+}
+function initIdea() {
+  const btn = document.getElementById('ideaBtn'); if (btn) btn.onclick = _ideaOpen;
+  const cancel = document.getElementById('ideaCancel'); if (cancel) cancel.onclick = _ideaClose;
+  const back = document.getElementById('ideaBackdrop'); if (back) back.onclick = _ideaClose;
+  const submit = document.getElementById('ideaSubmit'); if (submit) submit.onclick = _ideaSubmit;
+  const ti = document.getElementById('ideaTitleInput');
+  if (ti) ti.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); _ideaSubmit(); }
+    else if (e.key === 'Escape') _ideaClose();
+  });
+}
+
 // ---- Automatizácie (#93): tab „Nevyzdvihnuté zásielky" -------------------- //
 // ---- + „Sync zo Shoptetu" (#119, plain status-only tab, no per-item table) - //
 async function loadAutomations() {
@@ -1521,11 +1658,13 @@ function render() {
   const shoptetSync = ACTIVE_TAB === 'shoptet_sync';
   const parovaniaEshop = ACTIVE_TAB === 'parovania_eshop';
   const dodavatelskySklad = ACTIVE_TAB === 'dodavatelsky_sklad';
+  const dev = ACTIVE_TAB === 'dev';
   const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad;  // any automation tab
+  const plain = search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
-  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes || users || auto) ? 'none' : '';
-  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes || users || auto) ? 'none' : '';
-  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes || users || auto) ? 'none' : '';
+  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
+  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || plain) ? 'none' : '';
+  const filt = document.getElementById('filters'); if (filt) filt.style.display = plain ? 'none' : '';
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
   const secNotes = document.getElementById('tab-notes'); if (secNotes) secNotes.hidden = !notes;
   const secUsers = document.getElementById('tab-users'); if (secUsers) secUsers.hidden = !users;
@@ -1533,7 +1672,9 @@ function render() {
   const secShoptetSync = document.getElementById('tab-shoptet_sync'); if (secShoptetSync) secShoptetSync.hidden = !shoptetSync;
   const secParovania = document.getElementById('tab-parovania_eshop'); if (secParovania) secParovania.hidden = !parovaniaEshop;
   const secSklad = document.getElementById('tab-dodavatelsky_sklad'); if (secSklad) secSklad.hidden = !dodavatelskySklad;
-  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes || users || auto) ? 'none' : '';
+  const secDev = document.getElementById('tab-dev'); if (secDev) secDev.hidden = !dev;
+  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = plain ? 'none' : '';
+  if (dev) { document.getElementById('empty').hidden = true; renderDev(); return; }
   if (dodavatelskySklad) { document.getElementById('empty').hidden = true; renderDodavatelskySklad(); return; }
   if (parovaniaEshop) { document.getElementById('empty').hidden = true; renderParovaniaEshop(); return; }
   if (shoptetSync) { document.getElementById('empty').hidden = true; renderShoptetSync(); return; }
@@ -1577,6 +1718,7 @@ async function loadVersion() {
 async function init() {
   initTheme();
   initFolders();
+  initIdea();
   // Who am I? (#91) — 401 → the fetch guard above already navigates to /login.
   try {
     const meR = await fetch('/api/me');
@@ -1607,7 +1749,8 @@ async function init() {
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
   if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes'
-      || qTab === 'posta' || qTab === 'shoptet_sync' || qTab === 'parovania_eshop') {
+      || qTab === 'posta' || qTab === 'shoptet_sync' || qTab === 'parovania_eshop'
+      || qTab === 'dev') {
     ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab);
   }
   // Prefetch nav badge counts for ALL tabs on first paint (#112) — not just the
@@ -1620,6 +1763,7 @@ async function init() {
   if (ACTIVE_TAB === 'posta') await loadPosta();
   if (ACTIVE_TAB === 'shoptet_sync') await loadAutomations();
   if (ACTIVE_TAB === 'parovania_eshop') await loadAutomations();
+  if (ACTIVE_TAB === 'dev') await loadDevIssues();
   initSearch();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
