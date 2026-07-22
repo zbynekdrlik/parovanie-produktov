@@ -21,7 +21,15 @@ def test_sidebar_hosts_nav_and_pagetitle_updates(page, live_server):
 
     # Top bar carries a per-page title; 'Na objednanie' is the default page
     # (#117 — review moved to last-used, so it's no longer the landing tab).
-    page.wait_for_selector("#pageTitle")
+    # #pageTitle ships a static 'Kontrola párovania' in the HTML that init()
+    # async-overwrites with the default page; the version span is present from
+    # first paint so it does NOT gate init completion. Wait for the rendered nav
+    # (renderTabs runs inside the same render() as setPageHead) so the title
+    # assertion can't race the static markup (flaky before this fix).
+    page.wait_for_selector(".sidebar #tabs button")
+    page.wait_for_function(
+        "() => document.getElementById('pageTitle')"
+        ".textContent.trim() === 'Na objednanie'")
     assert page.locator("#pageTitle").inner_text().strip() == "Na objednanie"
 
     # Switching pages via the sidebar nav updates the top-bar title.
@@ -42,12 +50,12 @@ def test_nav_order_has_review_last(page, live_server):
     page.wait_for_selector('[data-testid="version"]')
     page.wait_for_selector(".sidebar #tabs button")
 
-    # E2E runs as the bootstrap admin, so 'Užívatelia' (admin-only, appended
-    # after TABS regardless) trails everything — 'Kontrola párovania' is last
-    # among the real work tabs, right before it.
+    # The 'Eshop' folder (#tabs) holds ONLY the work tabs now — 'Užívatelia'
+    # was moved OUT to a standalone item at the bottom (#118 refinement), so
+    # 'Kontrola párovania' is the LAST item inside the folder.
     labels = page.locator(".sidebar #tabs button .tlabel").all_inner_texts()
     assert labels == ["Na objednanie", "Hľadať / opraviť", "Poznámky",
-                       "Kontrola párovania", "Užívatelia"], labels
+                       "Kontrola párovania"], labels
 
     assert console == [], f"console not clean: {console}"
 
@@ -91,6 +99,96 @@ def test_dark_mode_toggle_persists_across_reload(page, live_server):
         "() => !document.body.hasAttribute('data-theme') "
         "|| document.body.getAttribute('data-theme') !== 'dark'")
     assert page.evaluate("() => localStorage.getItem('theme')") == "light"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_eshop_folder_groups_nav_and_collapses(page, live_server):
+    """#118 — the sidebar nav is grouped under a collapsible 'Eshop' folder:
+    the folder header exists, the work-tab nav lives NESTED under its body, and
+    clicking the header collapses/expands the items with the state persisted in
+    localStorage across a full reload (default = expanded)."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".sidebar #tabs button")
+
+    # The 'Eshop' folder header exists in the sidebar.
+    head = page.locator(".folder-head", has_text="Eshop")
+    assert head.count() == 1
+
+    # The work-tab nav (#tabs) is NESTED under the Eshop folder body.
+    assert page.locator(".nav-folder #folder-eshop-body #tabs").count() == 1
+    naobj = page.locator("#tabs button").filter(has_text="Na objednanie")
+    body_disp = ("() => getComputedStyle(document.getElementById("
+                 "'folder-eshop-body')).display")
+
+    # Default = expanded: the folder body and its items are visible.
+    assert page.evaluate(body_disp) != "none"
+    assert naobj.first.is_visible()
+
+    # Collapse: click the folder header → body hidden, state persisted.
+    head.click()
+    page.wait_for_function(f"{body_disp} === 'none'")
+    assert not naobj.first.is_visible()
+    assert page.evaluate("() => localStorage.getItem('folder:eshop')") == "collapsed"
+
+    # Persists across a full reload (the store, not just the in-page toggle).
+    # #tabs buttons are collapsed (display:none) now, so wait for them ATTACHED.
+    page.reload()
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".sidebar #tabs button", state="attached")
+    assert page.evaluate(body_disp) == "none"
+    assert not page.locator("#tabs button").filter(
+        has_text="Na objednanie").first.is_visible()
+
+    # Expand again → items visible + 'open' persisted.
+    page.locator(".folder-head", has_text="Eshop").click()
+    page.wait_for_function(f"{body_disp} !== 'none'")
+    assert page.locator("#tabs button").filter(
+        has_text="Na objednanie").first.is_visible()
+    assert page.evaluate("() => localStorage.getItem('folder:eshop')") == "open"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_users_standalone_at_bottom_and_no_soon_section(page, live_server):
+    """#118 refinement (Marek 2026-07-22):
+      1. 'Užívatelia' (admin-only) is OUT of the 'Eshop' folder — a standalone
+         nav item at the very bottom of the sidebar, above the theme/version
+         footer (E2E runs as bootstrap admin, so it is present).
+      2. The whole 'Čoskoro — rozšírime' section (heading + the four 'soon'
+         placeholders) is GONE."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".sidebar #tabs button")
+
+    # 'Užívatelia' exists (admin) but is NOT nested under the Eshop folder — it
+    # lives in the dedicated standalone container at the sidebar bottom.
+    assert page.get_by_role("button", name="Užívatelia").count() == 1
+    assert page.locator("#usersNav button", has_text="Užívatelia").count() == 1
+    assert page.locator(
+        "#folder-eshop-body button", has_text="Užívatelia").count() == 0
+
+    # The standalone users nav sits AFTER the folder and ABOVE the theme/version
+    # footer (bottom of the sidebar).
+    order_ok = page.evaluate(
+        "() => {"
+        " const sb = document.querySelector('.sidebar');"
+        " const kids = [...sb.children];"
+        " const folder = document.getElementById('folder-eshop');"
+        " const un = document.getElementById('usersNav');"
+        " const foot = document.querySelector('.sidefoot');"
+        " const pos = n => kids.indexOf(n.closest('.sidebar > *')) ;"
+        " return sb.contains(un) && pos(un) > pos(folder) && pos(un) < pos(foot);"
+        "}")
+    assert order_ok, "usersNav must be after the folder and before the footer"
+
+    # No 'Čoskoro' heading and no 'soon' placeholder items remain anywhere.
+    assert page.locator(".sidebar", has_text="Čoskoro").count() == 0
+    assert page.locator(".soon").count() == 0
+    assert page.locator(".soon-nav").count() == 0
 
     assert console == [], f"console not clean: {console}"
 

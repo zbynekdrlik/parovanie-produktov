@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrola párovania — Forestshop</title>
-  <link rel="stylesheet" href="/static/style.css?v=35">
+  <link rel="stylesheet" href="/static/style.css?v=37">
 </head>
 <body>
   <script>try{if(localStorage.getItem('theme')==='dark')document.body.setAttribute('data-theme','dark');}catch(e){}</script>
@@ -14,17 +14,22 @@
       <span class="brandtxt">Forestshop<small>Párovač &amp; dashboard</small></span>
     </div>
     <nav class="side-nav">
-      <div class="tabs" id="tabs"></div>
-      <div class="nav-sec">Automatizácie</div>
-      <div class="tabs" id="autoTabs"></div>
-      <div class="nav-sec">Čoskoro — rozšírime</div>
-      <div class="soon-nav">
-        <span class="soon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span class="tlabel">Prehľad eshopu</span><span class="soonpill">soon</span></span>
-        <span class="soon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12M8 11l4 4 4-4"/><path d="M5 21h14"/></svg><span class="tlabel">Import do eshopu</span><span class="soonpill">soon</span></span>
-        <span class="soon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1" y="6" width="14" height="10" rx="1"/><path d="M15 9h4l3 3v4h-7z"/><circle cx="6" cy="18" r="2"/><circle cx="18" cy="18" r="2"/></svg><span class="tlabel">Dodávatelia</span><span class="soonpill">soon</span></span>
-        <span class="soon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span class="tlabel">Štatistiky</span><span class="soonpill">soon</span></span>
+      <div class="nav-folder" id="folder-eshop">
+        <button class="folder-head" id="folderEshopHead" type="button" aria-expanded="true" aria-controls="folder-eshop-body">
+          <svg class="folder-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+          <span class="ftitle">Eshop</span>
+          <svg class="folder-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="folder-body" id="folder-eshop-body">
+          <div class="tabs" id="tabs"></div>
+          <div class="nav-sec">Automatizácie</div>
+          <div class="tabs" id="autoTabs"></div>
+        </div>
       </div>
     </nav>
+    <!-- Admin 'Užívatelia' — standalone at the sidebar bottom, OUTSIDE the
+         'Eshop' folder (#118 refinement); populated admin-only by renderTabs(). -->
+    <nav class="tabs users-nav" id="usersNav" aria-label="Správa užívateľov"></nav>
     <div class="sidefoot">
       <div class="userbox" id="userBox" hidden>
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6"/></svg>
@@ -62,6 +67,6 @@
     <section id="tab-users" hidden></section>
     <section id="tab-posta" hidden></section>
   </div>
-  <script src="/static/app.js?v=35"></script>
+  <script src="/static/app.js?v=37"></script>
 </body>
 </html>

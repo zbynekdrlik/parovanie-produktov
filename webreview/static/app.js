@@ -253,8 +253,8 @@ function renderFilters() {
 // The accessible name stays the plain label ("Na objednanie", "Hľadať / opraviť"),
 // which the E2E tests match on, so an added count badge doesn't break them.
 // Order = usage frequency (#117): 'Kontrola párovania' became the least-used
-// page once the review backlog stabilized, so it sits LAST — before the
-// 'Čoskoro'/automations section, never first.
+// page once the review backlog stabilized, so it sits LAST inside the 'Eshop'
+// folder — before the 'Automatizácie' section, never first.
 const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
   ['notes', 'Poznámky'], ['review', 'Kontrola párovania']];
 
@@ -272,9 +272,9 @@ const NAV_ICONS = {
 };
 
 // 'Užívatelia' is an ADMIN-ONLY nav item (the server 403s non-admins anyway).
-function visibleTabs() {
-  return (ME && ME.is_admin) ? TABS.concat([['users', 'Užívatelia']]) : TABS;
-}
+// It is rendered STANDALONE at the sidebar bottom (#usersNav), OUTSIDE the
+// 'Eshop' folder (#118 refinement, Marek 2026-07-22) — see renderTabs().
+function isAdmin() { return !!(ME && ME.is_admin); }
 
 // count badge per nav item — review: still-unreviewed, toorder: open lines, notes: count
 function navCount(key) {
@@ -299,11 +299,18 @@ function _navButton(key, lbl) {
 function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
   t.innerHTML = '';
-  for (const [key, lbl] of visibleTabs()) t.appendChild(_navButton(key, lbl));
+  for (const [key, lbl] of TABS) t.appendChild(_navButton(key, lbl));
   const at = document.getElementById('autoTabs');
   if (at) {
     at.innerHTML = '';
     for (const [key, lbl] of AUTOMATION_TABS) at.appendChild(_navButton(key, lbl));
+  }
+  // 'Užívatelia' (admin-only) — standalone at the sidebar bottom, OUTSIDE the
+  // 'Eshop' folder (#118 refinement). Non-admins: container stays empty.
+  const un = document.getElementById('usersNav');
+  if (un) {
+    un.innerHTML = '';
+    if (isAdmin()) un.appendChild(_navButton('users', 'Užívatelia'));
   }
 }
 
@@ -355,6 +362,27 @@ function initTheme() {
     localStorage.setItem('theme', next);
     applyTheme(next);
   };
+}
+
+// Sidebar folders (#118): collapsible nav groups, system-like tree. Each folder's
+// expanded/collapsed state persists per-key in localStorage (default = expanded).
+// Designed for extensibility — register more folders by calling initFolder().
+function initFolder(id, key) {
+  const folder = document.getElementById(id);
+  const head = folder && folder.querySelector('.folder-head');
+  if (!folder || !head) return;
+  const collapsed = localStorage.getItem(key) === 'collapsed';
+  folder.classList.toggle('collapsed', collapsed);
+  head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  head.onclick = () => {
+    const nowCollapsed = !folder.classList.contains('collapsed');
+    folder.classList.toggle('collapsed', nowCollapsed);
+    head.setAttribute('aria-expanded', nowCollapsed ? 'false' : 'true');
+    localStorage.setItem(key, nowCollapsed ? 'collapsed' : 'open');
+  };
+}
+function initFolders() {
+  initFolder('folder-eshop', 'folder:eshop');
 }
 
 async function switchTab(tab) {
@@ -1192,6 +1220,7 @@ async function loadVersion() {
 
 async function init() {
   initTheme();
+  initFolders();
   // Who am I? (#91) — 401 → the fetch guard above already navigates to /login.
   try {
     const meR = await fetch('/api/me');
