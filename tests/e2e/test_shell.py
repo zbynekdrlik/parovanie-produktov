@@ -21,7 +21,15 @@ def test_sidebar_hosts_nav_and_pagetitle_updates(page, live_server):
 
     # Top bar carries a per-page title; 'Na objednanie' is the default page
     # (#117 — review moved to last-used, so it's no longer the landing tab).
-    page.wait_for_selector("#pageTitle")
+    # #pageTitle ships a static 'Kontrola párovania' in the HTML that init()
+    # async-overwrites with the default page; the version span is present from
+    # first paint so it does NOT gate init completion. Wait for the rendered nav
+    # (renderTabs runs inside the same render() as setPageHead) so the title
+    # assertion can't race the static markup (flaky before this fix).
+    page.wait_for_selector(".sidebar #tabs button")
+    page.wait_for_function(
+        "() => document.getElementById('pageTitle')"
+        ".textContent.trim() === 'Na objednanie'")
     assert page.locator("#pageTitle").inner_text().strip() == "Na objednanie"
 
     # Switching pages via the sidebar nav updates the top-bar title.
