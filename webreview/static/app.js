@@ -9,6 +9,8 @@ let WAITING = {};           // key -> true (čaká sa — deferred active line)
 let INSTOCK = {};           // key -> true (skladom — máme/naskladnené)
 let UNAVAIL = {};           // key -> true (nedostupné — u dodávateľa)
 let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
+let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
+let POSTA = null;           // /api/posta-uncollected — last run's display data
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'review';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
@@ -253,12 +255,17 @@ function renderFilters() {
 const TABS = [['review', 'Kontrola párovania'], ['toorder', 'Na objednanie'],
   ['search', 'Hľadať / opraviť'], ['notes', 'Poznámky']];
 
+// In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
+// sidebar section (#autoTabs) + its own tab section. New automations: add here.
+const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky']];
+
 const NAV_ICONS = {
   review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
   toorder: '<path d="M9 5h6M9 9h6M9 13h4"/><rect x="4" y="3" width="16" height="18" rx="2"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/>',
   notes: '<path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4"/>',
   users: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6"/>',
+  posta: '<path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><path d="M3 8l9 5 9-5"/><path d="M12 13v8"/>',
 };
 
 // 'Užívatelia' is an ADMIN-ONLY nav item (the server 403s non-admins anyway).
@@ -272,20 +279,28 @@ function navCount(key) {
   if (key === 'toorder') return ORDERS.length;
   if (key === 'notes') return NOTES.length;
   if (key === 'users') return USERS_LIST.length;
+  if (key === 'posta') return POSTA ? (POSTA.uncollected || []).length : 0;
   return 0;
+}
+
+function _navButton(key, lbl) {
+  const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
+  const n = navCount(key);
+  bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
+    + `<span class="tlabel">${escapeHtml(lbl)}</span>`
+    + (n > 0 ? `<span class="navcount">${n}</span>` : '');
+  bt.onclick = () => switchTab(key);
+  return bt;
 }
 
 function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
   t.innerHTML = '';
-  for (const [key, lbl] of visibleTabs()) {
-    const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
-    const n = navCount(key);
-    bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
-      + `<span class="tlabel">${escapeHtml(lbl)}</span>`
-      + (n > 0 ? `<span class="navcount">${n}</span>` : '');
-    bt.onclick = () => switchTab(key);
-    t.appendChild(bt);
+  for (const [key, lbl] of visibleTabs()) t.appendChild(_navButton(key, lbl));
+  const at = document.getElementById('autoTabs');
+  if (at) {
+    at.innerHTML = '';
+    for (const [key, lbl] of AUTOMATION_TABS) at.appendChild(_navButton(key, lbl));
   }
 }
 
@@ -293,6 +308,7 @@ function renderTabs() {
 const PAGE_TITLES = {
   review: 'Kontrola párovania', toorder: 'Na objednanie',
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
+  posta: 'Nevyzdvihnuté zásielky',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
@@ -309,6 +325,9 @@ function setPageHead() {
     s.textContent = `${NOTES.length} poznámok`;
   } else if (ACTIVE_TAB === 'users') {
     s.textContent = `${USERS_LIST.length} účtov s prístupom`;
+  } else if (ACTIVE_TAB === 'posta') {
+    const n = POSTA ? (POSTA.uncollected || []).length : 0;
+    s.textContent = `${n} zásielok čaká na pošte · automatická kontrola + upozornenia zákazníkom`;
   } else { s.textContent = ''; }
 }
 
@@ -340,6 +359,7 @@ async function switchTab(tab) {
   if (tab === 'toorder' && !ORDERS.length) await loadOrders();
   if (tab === 'notes' && !NOTES.length) await loadNotes();
   if (tab === 'users') await loadUsers();   // always fresh — small list
+  if (tab === 'posta') await loadPosta();   // always fresh — status can change
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
@@ -951,6 +971,168 @@ function renderUsers() {
   wrap.appendChild(list);
 }
 
+// ---- Automatizácie (#93): tab „Nevyzdvihnuté zásielky" -------------------- //
+async function loadPosta() {
+  try {
+    const [a, p] = await Promise.all([
+      fetch('/api/automations').then(r => r.json()),
+      fetch('/api/posta-uncollected').then(r => r.json()),
+    ]);
+    AUTOMATIONS = a.automations || [];
+    POSTA = p;
+  } catch (_) { AUTOMATIONS = []; POSTA = null; }
+}
+
+function autoByKey(key) { return AUTOMATIONS.find(x => x.key === key); }
+
+async function toggleAutomation(key, enabled) {
+  await fetch(`/api/automations/${key}/toggle`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  await loadPosta(); render();
+}
+
+let _postaPoll = null;
+async function runAutomation(key) {
+  await fetch(`/api/automations/${key}/run`, { method: 'POST' });
+  await loadPosta(); render();
+  clearInterval(_postaPoll);
+  _postaPoll = setInterval(async () => {           // refresh until the run ends
+    if (ACTIVE_TAB !== 'posta') { clearInterval(_postaPoll); _postaPoll = null; return; }
+    await loadPosta(); render();
+    const a = autoByKey(key);
+    if (!a || !a.running) { clearInterval(_postaPoll); _postaPoll = null; }
+  }, 2000);
+}
+
+function fmtDt(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleDateString('sk-SK') + ' '
+    + d.toLocaleTimeString('sk-SK', { hour: '2-digit', minute: '2-digit' });
+}
+
+function dniLabel(n) { return n === 1 ? 'deň' : (n >= 2 && n <= 4 ? 'dni' : 'dní'); }
+
+function renderPosta() {
+  const wrap = document.getElementById('tab-posta');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('posta_uncollected');
+
+  // status + controls (Štart/Stop persists; Spustiť teraz = manual run)
+  const st = el('div', 'autostatus');
+  if (!a) {
+    st.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+  } else {
+    const head = el('div', 'autohead');
+    const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+    pill.dataset.testid = 'posta-status';
+    head.appendChild(pill);
+    if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha kontrola…'));
+    const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+      a.enabled ? '⏹ Stop' : '▶ Štart');
+    btn.dataset.testid = 'posta-toggle';
+    btn.onclick = () => toggleAutomation('posta_uncollected', !a.enabled);
+    head.appendChild(btn);
+    const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+    run.dataset.testid = 'posta-run';
+    run.disabled = !!a.running;
+    run.onclick = () => runAutomation('posta_uncollected');
+    head.appendChild(run);
+    st.appendChild(head);
+
+    const meta = el('div', 'autometa');
+    const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+    bits.push('Posledný beh: ' + (a.last_run
+      ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+      : 'zatiaľ nikdy'));
+    if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+    meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+    st.appendChild(meta);
+    if (a.last_status === 'error' && a.last_error) {
+      st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+    }
+    const lr = a.last_result || {};
+    if (a.last_run && a.last_status === 'ok') {
+      st.appendChild(el('div', 'muted',
+        `Skontrolovaných zásielok: ${lr.checked ?? 0} · nevyzdvihnuté: ${lr.uncollected ?? 0}`
+        + ` · odoslané e-maily: ${lr.emails_sent ?? 0}`
+        + (lr.invalid ? ` · nesledovateľné: ${lr.invalid}` : '')
+        + (lr.errors ? ` · chyby pri kontrole: ${lr.errors}` : '')));
+    }
+  }
+  wrap.appendChild(st);
+
+  const p = POSTA || {};
+  // uncollected shipments table
+  const unc = p.uncollected || [];
+  if (!unc.length) {
+    wrap.appendChild(el('div', 'empty2',
+      p.last_check ? `Žiadne nevyzdvihnuté zásielky (kontrola ${fmtDt(p.last_check)}).`
+                   : 'Zatiaľ neprebehla žiadna kontrola — spusti automatizáciu (▶ Štart) alebo klikni ⚡ Spustiť teraz.'));
+  } else {
+    const tbl = el('table', 'posta-table');
+    tbl.dataset.testid = 'posta-table';
+    tbl.innerHTML = '<thead><tr><th>Zásielka</th><th>Objednávka</th><th>Zákazník</th>'
+      + '<th>Na pošte</th><th>Vyzdvihnúť do</th><th>E-maily</th></tr></thead>';
+    const tb = el('tbody');
+    for (const u of unc) {
+      const tr = el('tr', u.call_needed ? 'callneeded' : '');
+      tr.innerHTML =
+        `<td><a href="${escapeHtml(u.tracking_link)}" target="_blank" rel="noopener">${escapeHtml(u.packageNumber)}</a>`
+        + `<div class="sub2">${escapeHtml(u.office_name || '')}</div></td>`
+        + `<td><a href="${escapeHtml(u.admin_link)}" target="_blank" rel="noopener">${escapeHtml(u.orderCode)}</a></td>`
+        + `<td>${escapeHtml(u.name || '')}<div class="sub2">${escapeHtml(u.phone || '')}</div></td>`
+        + `<td>${u.days_at_post || 1} ${dniLabel(u.days_at_post || 1)}`
+        + (u.notified_since ? `<div class="sub2">od ${escapeHtml(u.notified_since)}</div>` : '') + '</td>'
+        + `<td>${escapeHtml(u.retained_till || '—')}</td>`
+        + `<td>${u.count || 0}/4`
+        + (u.last_sent ? `<div class="sub2">naposledy ${escapeHtml(u.last_sent)}</div>` : '')
+        + (u.call_needed ? '<div class="callbadge">⚠️ TREBA ZAVOLAŤ</div>' : '') + '</td>';
+      tb.appendChild(tr);
+    }
+    tbl.appendChild(tb);
+    wrap.appendChild(tbl);
+  }
+
+  // invalid_format packages — the class that silently broke the n8n workflow
+  const inv = p.invalid || [];
+  if (inv.length) {
+    const box = el('div', 'warnbox');
+    box.dataset.testid = 'posta-invalid';
+    box.appendChild(el('div', 'warnhead', `⚠️ ${inv.length} zásielok s nesledovateľným číslom`));
+    box.appendChild(el('div', 'muted',
+      'Pošta SK tieto čísla nepozná (invalid_format — pravdepodobne iný prepravca '
+      + 'alebo nový typ štítku). Treba ich preveriť ručne.'));
+    const ul = el('ul');
+    for (const i of inv) {
+      ul.appendChild(el('li', '',
+        `<code>${escapeHtml(i.packageNumber)}</code> — obj. `
+        + `<a href="${escapeHtml(i.admin_link)}" target="_blank" rel="noopener">${escapeHtml(i.orderCode)}</a>`
+        + ` ${escapeHtml(i.name || '')}`));
+    }
+    box.appendChild(ul);
+    wrap.appendChild(box);
+  }
+
+  // per-shipment tracking errors (API down / timeouts after retries)
+  const errs = p.errors || [];
+  if (errs.length) {
+    const box = el('div', 'warnbox');
+    box.appendChild(el('div', 'warnhead', `❌ ${errs.length} zásielok sa nepodarilo skontrolovať`));
+    const ul = el('ul');
+    for (const i of errs) {
+      ul.appendChild(el('li', '',
+        `<code>${escapeHtml(i.packageNumber)}</code> (obj. ${escapeHtml(i.orderCode)}) — ${escapeHtml(i.error || '')}`));
+    }
+    box.appendChild(ul);
+    wrap.appendChild(box);
+  }
+}
+
 function render() {
   renderTabs();
   setPageHead();
@@ -958,14 +1140,17 @@ function render() {
   const search = ACTIVE_TAB === 'search';
   const notes = ACTIVE_TAB === 'notes';
   const users = ACTIVE_TAB === 'users';
+  const posta = ACTIVE_TAB === 'posta';
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
-  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes || users) ? 'none' : '';
-  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes || users) ? 'none' : '';
-  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes || users) ? 'none' : '';
+  const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes || users || posta) ? 'none' : '';
+  const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes || users || posta) ? 'none' : '';
+  const filt = document.getElementById('filters'); if (filt) filt.style.display = (search || notes || users || posta) ? 'none' : '';
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
   const secNotes = document.getElementById('tab-notes'); if (secNotes) secNotes.hidden = !notes;
   const secUsers = document.getElementById('tab-users'); if (secUsers) secUsers.hidden = !users;
-  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes || users) ? 'none' : '';
+  const secPosta = document.getElementById('tab-posta'); if (secPosta) secPosta.hidden = !posta;
+  const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes || users || posta) ? 'none' : '';
+  if (posta) { document.getElementById('empty').hidden = true; renderPosta(); return; }
   if (users) { document.getElementById('empty').hidden = true; renderUsers(); return; }
   if (notes) { document.getElementById('empty').hidden = true; renderNotes(); return; }
   if (search) { document.getElementById('empty').hidden = true; return; }
@@ -1033,10 +1218,11 @@ async function init() {
   ORDER_SUPPLIER = localStorage.getItem('orderSupplier') || 'all';
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
-  if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
+  if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes' || qTab === 'posta') { ACTIVE_TAB = qTab; localStorage.setItem('tab', qTab); }
   if (ACTIVE_TAB === 'toorder') await loadOrders();
   if (ACTIVE_TAB === 'notes') await loadNotes();
   if (ACTIVE_TAB === 'users') await loadUsers();
+  if (ACTIVE_TAB === 'posta') await loadPosta();
   initSearch();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);

@@ -292,3 +292,41 @@ body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
   padding:2px 7px;border-radius:99px;background:var(--accent-soft);color:var(--accent)}
 .user-badge.me{background:var(--chip-off-bg);color:var(--chip-off-tx)}
 .user-acts{display:flex;gap:6px;flex-wrap:wrap}
+
+/* ---- Automatizácie (#93): tab „Nevyzdvihnuté zásielky" ------------------- */
+#tab-posta{max-width:1060px;margin:18px auto;padding:0 16px}
+.autostatus{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  padding:14px 16px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:8px}
+.autohead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.pill{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  padding:3px 12px;border-radius:99px}
+.pill.on{background:#d1fae5;color:#065f46}
+.pill.off{background:var(--chip-off-bg);color:var(--chip-off-tx)}
+body[data-theme=dark] .pill.on{background:#064e3b;color:#6ee7b7}
+.runningdot{font-size:13px;color:var(--muted)}
+.autometa{font-size:13px;color:var(--muted);display:flex;gap:6px;flex-wrap:wrap}
+.autoerr{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
+  border-radius:8px;padding:8px 10px;word-break:break-word}
+body[data-theme=dark] .autoerr{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
+.muted{font-size:13px;color:var(--muted)}
+.empty2{margin-top:16px;text-align:center;color:var(--muted);font-size:14px;padding:26px 10px;
+  background:var(--panel);border:1px dashed var(--border);border-radius:var(--radius)}
+.posta-table{width:100%;margin-top:16px;border-collapse:separate;border-spacing:0;
+  background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  overflow:hidden;box-shadow:var(--shadow);font-size:13.5px}
+.posta-table th{background:var(--bg);text-align:left;font-size:11.5px;letter-spacing:.05em;
+  text-transform:uppercase;color:var(--muted);padding:9px 12px;border-bottom:1px solid var(--border)}
+.posta-table td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+.posta-table tr:last-child td{border-bottom:none}
+.posta-table tr.callneeded td{background:#fef2f2}
+body[data-theme=dark] .posta-table tr.callneeded td{background:#2a0f0f}
+.posta-table .sub2{font-size:11.5px;color:var(--muted);margin-top:2px}
+.callbadge{display:inline-block;margin-top:3px;font-size:11px;font-weight:800;color:#b91c1c;
+  background:#fee2e2;border-radius:6px;padding:2px 7px}
+body[data-theme=dark] .callbadge{background:#450a0a;color:#fca5a5}
+.warnbox{margin-top:16px;background:var(--panel);border:1px solid #f59e0b;border-radius:var(--radius);
+  padding:12px 16px;box-shadow:var(--shadow)}
+.warnbox .warnhead{font-weight:700;font-size:14px;margin-bottom:4px}
+.warnbox ul{margin:8px 0 0 18px;padding:0;font-size:13px}
+.warnbox li{margin:3px 0}
+.warnbox code{background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:1px 5px}

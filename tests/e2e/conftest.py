@@ -56,7 +56,8 @@ def _admin_session_cookie(base: str) -> str:
 
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
-                    "longcontent_matched_server", "search_server")
+                    "longcontent_matched_server", "search_server",
+                    "automations_server")
 
 
 @pytest.fixture(autouse=True)
@@ -172,6 +173,67 @@ def live_server(tmp_path_factory):
         "WEBREVIEW_OUT": str(out),
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def automations_server(tmp_path_factory):
+    """Isolated webreview instance for the automations tab E2E (#93).
+
+    Seeded so the tab has content WITHOUT any network: a pre-existing
+    posta_uncollected.json (one uncollected shipment + one invalid-format
+    package from an earlier 'run'), NO automations.json (→ the runner must
+    default to DISABLED = Zastavené), and a FRESH orders_cache.csv whose only
+    row has NO packageNumber → a manual 'Spustiť teraz' run finds 0 shipments,
+    calls no Pošta API and sends no mail (hermetic green run). SHOTPET creds
+    are pointed at a nonexistent file so no code path can reach the live shop."""
+    out = tmp_path_factory.mktemp("wr_auto_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "posta_uncollected.json").write_text(json.dumps({
+        "escalation": {"2026100": "2|2026-07-18"},
+        "last_check": "2026-07-21T09:00:05+02:00",
+        "uncollected": [{
+            "orderCode": "2026100", "packageNumber": "EF000000002SK",
+            "name": "Ján Vzor", "phone": "+421900111222", "email": "jan@example.com",
+            "office_name": "Skalica 1", "office_addr": "Potočná 24, 90901 Skalica",
+            "retained_till": "2026-08-03", "notified_since": "2026-07-16",
+            "days_at_post": 5, "count": 2, "last_sent": "2026-07-18",
+            "call_needed": False,
+            "tracking_link": "https://www.posta.sk/sledovanie-zasielok#parcel=EF000000002SK",
+            "admin_link": "https://www.forestshop.sk/admin/prehlad-objednavok/?query=2026100",
+        }],
+        "invalid": [{
+            "orderCode": "2026101", "packageNumber": "06565700348274",
+            "name": "Eva Testová",
+            "admin_link": "https://www.forestshop.sk/admin/prehlad-objednavok/?query=2026101",
+        }],
+        "errors": [],
+        "stats": {"checked": 2, "uncollected": 1, "invalid": 1, "errors": 0,
+                  "emails_sent": 0, "emails_failed": 0},
+    }, ensure_ascii=False), encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+        "2026200;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
