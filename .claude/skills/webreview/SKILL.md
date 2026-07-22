@@ -111,13 +111,29 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
 4. **BEZPEČNOSŤ (dohodnuté #93): nová automatizácia štartuje `enabled=false`** — beží až po
    ▶ Štart; `enabled` prežíva reštart (`data/out/automations.json`); zmeškaný beh počas
    výpadku sa preskočí dopredu. „⚡ Spustiť teraz" beží aj vypnutá (explicitná akcia) a
-   POSIELA REÁLNE e-maily — pri overovaní na živom webe NIKDY neklikaj Spustiť teraz,
-   toggle Štart→Stop stačí (skonči VYPNUTÉ, zapína manažér).
+   POSIELA REÁLNE e-maily zákazníkom pri KAŽDOM aktuálne nevyzdvihnutom balíku — pri overovaní
+   na živom webe štandardne NEklikaj Spustiť teraz, toggle Štart→Stop stačí. **Výnimka (#126,
+   bezpečné post-deploy overenie funkčnosti):** smieš kliknúť Spustiť teraz LEN keď si PRED tým
+   z `data/out/posta_uncollected.json` overil `stats.uncollected==0` A `escalation=={}` (žiadna
+   rozbehnutá eskalácia) — vtedy je isté, že beh pošle 0 reálnych mailov, aj keď osloví živé
+   Pošta SK API. Po behu over `stats.emails_sent==0` v tom istom súbore (nie len UI).
 - Pošta SK API fakty (live-overené 2026-07-22): `invalid_format` je PER-RESULT status
   (top-level je stále "ok") — 13-14-miestne numerické štítky ho vracajú vždy (to mesiac
   potichu rozbíjalo n8n); nevyzdvihnutá = posledný event `notified` + detailCode `ZNP*`.
   E-mail eskalácia sa bumpuje do stavu HNEĎ po každom sende (pád uprostred behu nesmie
   zajtra poslať duplicitný mail) a NEbumpuje sa pri zlyhanom SMTP (retry ďalší beh).
+- **Carrier filter (#126) — dopravcu odvoď z BLOCKLISTU, nie z allowlistu.** Zásielkový
+  export NIKDY doslovne nepíše „Slovenská pošta" — SHIPPING pseudo-položka (`itemCode` na
+  `SHIPPING*`, `itemName`=názov dopravy) pre Pošta SK domové doručenie sa v reálnom exporte
+  volá **„Kuriér"** (overené na živých dátach 2026-07-22: 223/228 takých objednávok má
+  trackovacie číslo v Pošta SK formáte `EF…SK`). Allowlist podľa „pošt"/„Balík" by preto
+  vyradil takmer VŠETKY reálne Pošta zásielky. Pri filtrovaní dopravcu z exportu vždy over
+  reálne `itemName` hodnoty na živom `data/out/orders_cache.csv` PRED písaním filtra — text v
+  zadaní/issue môže byť len predpoklad, nie skutočný string z exportu.
+- **„BCC vždy" (#105/#126) je teraz vynútené v kóde, nie len konvenciou v docs**:
+  `_send_mail_html(...)` (webreview/app.py) automaticky doplní `bcc=` z `MAIL_BCC`
+  (`data/.mail_env`), keď volajúci `bcc` neuvedie explicitne (`bcc=""` explicitne vypne).
+  Nová automatizácia s vlastným e-mailom → stačí NEuvádzať `bcc=` a konvencia platí sama.
 - E2E gotcha: `.pill` má CSS `text-transform:uppercase` → `inner_text()` vráti „ZASTAVENÉ";
   porovnávaj `evaluate("el => el.textContent")` (CSS transform nemení DOM text).
 
