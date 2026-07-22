@@ -1797,7 +1797,8 @@ def n8n_shoptet_import():
     parsed = parse_import_log(out)
     result = {"ok": rc == 0, "exit_code": rc, "rows": rows, "dry_run": dry,
               "processed": parsed.get("processed"), "updated": parsed.get("updated"),
-              "failed": parsed.get("failed"), "stdout_tail": (out or "")[-800:]}
+              "failed": parsed.get("failed"), "error_detail": parsed.get("error_detail"),
+              "stdout_tail": (out or "")[-800:]}
     log.info("n8n import: rc=%s processed=%s updated=%s failed=%s",
              rc, parsed.get("processed"), parsed.get("updated"), parsed.get("failed"))
     if rc != 0:
@@ -1938,6 +1939,7 @@ def _do_upload_pairings(dry):
     result = {"ok": ok, "exit_code": rc, "count": len(uploaded_keys), "rows": len(rows),
               "dry_run": dry, "processed": parsed.get("processed"),
               "updated": parsed.get("updated"), "failed": parsed.get("failed"),
+              "error_detail": parsed.get("error_detail"),
               "products": products, "stdout_tail": (out or "")[-800:],
               "blocked": len(blocked_keys),
               **_pairing_summary(uploaded)}
@@ -2057,6 +2059,7 @@ def _do_upload_suppliers(dry):
     result = {"ok": ok, "exit_code": rc, "count": len(new_codes), "rows": len(rows),
               "dry_run": dry, "processed": parsed.get("processed"),
               "updated": parsed.get("updated"), "failed": parsed.get("failed"),
+              "error_detail": parsed.get("error_detail"),
               "products": products, "stdout_tail": (out or "")[-800:],
               **_supplier_summary(uploaded, assigns)}
     log.info("n8n suppliers: rc=%s processed=%s codes=%d", rc, parsed.get("processed"), len(new_codes))
