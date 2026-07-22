@@ -621,6 +621,42 @@ def test_pairings_blocked_when_codes_missing(monkeypatch, tmp_path):
     assert j["count"] == 0 and j["blocked"] == 1 and j["total_products"] == 1
 
 
+def test_pairings_partial_batch_only_marks_keys_with_rows_uploaded(monkeypatch, tmp_path):
+    # #49: a batch with ONE coded (uploadable) key and ONE code-less (blocked) key
+    # must mark ONLY the coded key as uploaded — the code-less key must stay "new"
+    # so a later run retries it, instead of being silently lost forever.
+    cred = tmp_path / ".shoptet_admin"
+    cred.write_text("N8N_IMPORT_TOKEN=secret-tok\n", encoding="utf-8")
+    monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded.json"))
+    monkeypatch.setattr(webapp, "PRODUCTS", [
+        {"key": "k1", "name": "X1", "our_url": "u1", "variant_codes": ["A/1"]},
+        {"key": "k2", "name": "X2", "our_url": "u2", "variant_codes": []},
+    ])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"A/1": "100"})
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {
+        "k1": {"status": "good", "url": "https://supplier/x1"},
+        "k2": {"status": "good", "url": "https://supplier/x2"},
+    })
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""))
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": "Bearer secret-tok"}).get_json()
+    assert j["ok"] is True
+    assert j["count"] == 1                # only k1 genuinely got a row uploaded
+    assert j["blocked"] == 1               # k2 surfaced as blocked, not silently dropped
+    uploaded = json.loads((tmp_path / "uploaded.json").read_text())
+    assert uploaded == {"k1": "https://supplier/x1"}   # k2 must NOT be recorded
+
+    # k2 must still be retried on the next run — it was never marked uploaded
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("k1 must not re-import")))
+    j2 = _client().post("/api/n8n/upload-pairings",
+                        headers={"Authorization": "Bearer secret-tok"}).get_json()
+    assert j2["count"] == 0 and j2["blocked"] == 1     # k2 retried, still blocked (no codes)
+
+
 def test_pairings_rejects_wrong_token(monkeypatch, tmp_path):
     _arm_pairings(monkeypatch, tmp_path, {})
     r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": "Bearer nope"})
