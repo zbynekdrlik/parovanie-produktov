@@ -399,3 +399,91 @@ def test_load_catalog_in_review_keyed_by_paircode_at_real_call_site(tmp_path, mo
         monkeypatch.setenv("WEBREVIEW_OUT", str(tmp_path / "empty_out"))
         monkeypatch.setenv("WEBREVIEW_PRODUCTS", str(tmp_path / "no_export.csv"))
         importlib.reload(webapp)
+
+
+# --------------------------------------------------------------------------- #
+# #64: a pairCode duplicated across TWO review entries under DIFFERENT
+# suppliers (e.g. GRUBE|425 AND WETLAND|425 — the same forestshop product was
+# matched against candidates from more than one supplier). The catalog index
+# groups by the bare pairCode (ONE forestshop product = one catalog entry, by
+# design), but /api/search must still surface EVERY matching review product as
+# its OWN row (own idx/our_url/paired_url/review_key) so the manager can find
+# and repair the SECOND one too — before the fix only the first PRODUCTS match
+# was ever returned/repairable (the second was invisible via search).
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def dup_supplier_client(tmp_path, monkeypatch):
+    """Two review products share pairCode '425' under different suppliers."""
+    products = [
+        {
+            "idx": 3, "key": "GRUBE|425", "pairCode": "425", "supplier": "GRUBE",
+            "name": "Bunda Tradition", "variant_codes": ["60611/L"], "our_images": [],
+            "our_url": "https://www.forestshop.sk/bunda-tradition/",
+            "ai_status": "manual", "ai_chosen_url": "", "ai_reason": "",
+            "candidates": [], "current": {},
+        },
+        {
+            "idx": 9, "key": "WETLAND|425", "pairCode": "425", "supplier": "WETLAND",
+            "name": "Bunda Tradition", "variant_codes": ["60611/L"], "our_images": [],
+            "our_url": "https://www.forestshop.sk/bunda-tradition/",
+            "ai_status": "manual", "ai_chosen_url": "", "ai_reason": "",
+            "candidates": [], "current": {},
+        },
+    ]
+    catalog = _build_catalog_with_review([
+        {"code": "60611/L", "pairCode": "425", "name": "Bunda Tradition",
+         "supplier": "GRUBE", "defaultImage": "i.jpg"},
+    ], products)
+    monkeypatch.setattr(webapp, "CATALOG", catalog)
+    monkeypatch.setattr(webapp, "PRODUCTS", products)
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"60611/L": "425"})
+    monkeypatch.setattr(webapp, "DECISIONS", str(tmp_path / "decisions.json"))
+    monkeypatch.setattr(webapp, "DATA", str(tmp_path / "review_data.json"))
+    monkeypatch.setattr(webapp, "SRC", str(tmp_path / "no_export.csv"))
+    monkeypatch.setattr(webapp, "_CODE2URL", {})
+    with open(webapp.DATA, "w", encoding="utf-8") as f:
+        json.dump(products, f)
+    return authed_client()
+
+
+def test_search_returns_a_row_per_supplier_for_a_duplicated_paircode(dup_supplier_client):
+    """#64 core: a pairCode reviewed under TWO suppliers must yield TWO search rows —
+    one per review product, each carrying its OWN review_key/idx — not just the first
+    match collapsed into a single row (the previously-reported bug)."""
+    res = dup_supplier_client.get("/api/search?q=tradition").get_json()["results"]
+    assert len(res) == 2
+    review_keys = {r["review_key"] for r in res}
+    assert review_keys == {"GRUBE|425", "WETLAND|425"}
+    idx_by_key = {r["review_key"]: r["idx"] for r in res}
+    assert idx_by_key == {"GRUBE|425": 3, "WETLAND|425": 9}
+    # both rows still report the shared catalog identity (pairCode/name/codes)
+    for r in res:
+        assert r["pairCode"] == "425" and r["in_review"] is True
+
+
+def test_search_second_duplicate_is_independently_repairable(dup_supplier_client):
+    """#64 core: repairing the SECOND duplicate (WETLAND|425) via search-pair with its
+    own review_key must write the decision under WETLAND|425 — not silently touch the
+    first (GRUBE|425), and not promote a spurious THIRD entry."""
+    r = dup_supplier_client.post(
+        "/api/search-pair",
+        json={"key": "425", "review_key": "WETLAND|425", "url": "https://wetland.example/new/"})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["promoted"] is False
+    assert body["key"] == "WETLAND|425"
+    dec = json.load(open(webapp.DECISIONS))
+    assert dec["WETLAND|425"]["url"] == "https://wetland.example/new/"
+    assert "GRUBE|425" not in dec                    # the first duplicate untouched
+    assert sum(1 for p in webapp.PRODUCTS if p.get("pairCode") == "425") == 2  # no dup created
+
+
+def test_search_pair_unknown_review_key_404(dup_supplier_client):
+    """An explicit review_key that doesn't match any existing PRODUCTS entry must 404
+    (never silently fall back to repairing the wrong duplicate)."""
+    r = dup_supplier_client.post(
+        "/api/search-pair",
+        json={"key": "425", "review_key": "BOGUS|425", "url": "https://x.example/"})
+    assert r.status_code == 404
+    dec_path = webapp.DECISIONS
+    assert not os.path.exists(dec_path) or "BOGUS|425" not in json.load(open(dec_path))
