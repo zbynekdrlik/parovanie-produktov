@@ -293,13 +293,18 @@ def _csrf_token() -> str:
 def _csrf_ok() -> bool:
     tok = session.get("_csrf") or ""
     sent = request.form.get("_csrf") or ""
-    return bool(tok) and hmac.compare_digest(tok, sent)
+    # compare BYTES — compare_digest raises TypeError on non-ASCII str, and the
+    # form value is attacker-controlled (must yield 400, never a 500)
+    return bool(tok) and hmac.compare_digest(tok.encode(), sent.encode())
 
 
 def _rate_limited(ip) -> bool:
     now = time.time()
     fails = [t for t in _login_fails.get(ip, []) if now - t < LOGIN_WINDOW]
-    _login_fails[ip] = fails
+    if fails:
+        _login_fails[ip] = fails
+    else:
+        _login_fails.pop(ip, None)   # no lingering entry per visitor IP
     return len(fails) >= LOGIN_MAX_FAILS
 
 
@@ -372,15 +377,17 @@ def _send_mail(to, subject, body) -> bool:
     if not host:
         log.error("auth: SMTP not configured (data/.mail_env) — mail to %s NOT sent", to)
         return False
-    port = int(os.environ.get("MAIL_PORT", "587"))
-    user = os.environ.get("MAIL_USER", "")
-    pw = os.environ.get("MAIL_PASS", "")
-    sender = os.environ.get("MAIL_FROM") or user
-    msg = MIMEText(body, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = sender
-    msg["To"] = to
     try:
+        # config parsing INSIDE the try: a malformed MAIL_PORT in .mail_env must
+        # log-and-degrade like any other send failure, never 500 the forgot page
+        port = int(os.environ.get("MAIL_PORT", "587"))
+        user = os.environ.get("MAIL_USER", "")
+        pw = os.environ.get("MAIL_PASS", "")
+        sender = os.environ.get("MAIL_FROM") or user
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = sender
+        msg["To"] = to
         if port == 465:
             smtp = smtplib.SMTP_SSL(host, port, timeout=20)
         else:
@@ -393,7 +400,8 @@ def _send_mail(to, subject, body) -> bool:
         log.info("auth: reset mail sent to %s via %s:%s", to, host, port)
         return True
     except Exception as e:  # noqa: BLE001 — log full context + degrade, never 500
-        log.error("auth: SMTP send to %s via %s:%s failed: %r", to, host, port, e)
+        log.error("auth: SMTP send to %s via %s:%s failed: %r",
+                  to, host, os.environ.get("MAIL_PORT", "587"), e)
         return False
 
 

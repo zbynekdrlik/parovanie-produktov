@@ -327,3 +327,22 @@ def test_bootstrap_admin_from_env(tmp_path, monkeypatch):
     webapp._bootstrap_admin()
     users = json.load(open(tmp_path / "users.json", encoding="utf-8"))
     assert users["boss@test.sk"]["pw_hash"] == first_hash
+
+
+# ── robustness (deep-review findings on PR #104) ──────────────────────────────
+
+def test_login_nonascii_csrf_is_400_not_500(aclient):
+    """compare_digest raises TypeError on non-ASCII str — the attacker-controlled
+    form value must yield a clean 400, never a 500."""
+    aclient.get("/login")
+    r = aclient.post("/login", data={"email": ADMIN, "password": ADMIN_PW,
+                                     "_csrf": "č-nie-ascii"})
+    assert r.status_code == 400
+
+
+def test_send_mail_bad_port_degrades_not_500(monkeypatch):
+    """A malformed MAIL_PORT in data/.mail_env must log-and-return-False like any
+    other SMTP failure — never crash the forgot page."""
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.setenv("MAIL_PORT", "nie-cislo")
+    assert webapp._send_mail("x@test.sk", "predmet", "telo") is False
