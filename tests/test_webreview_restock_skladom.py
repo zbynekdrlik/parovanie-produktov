@@ -252,3 +252,101 @@ def test_run_never_touches_manager_stores(iso, monkeypatch):
     webapp.run_restock_skladom()
     for _name, path in iso["manager_stores"].items():
         assert path.read_text(encoding="utf-8") == '{"sentinel": true}'
+
+
+# ── #158: the restock batch has the SAME 120s browser-redirect-timeout risk #156
+#    fixed for the pairings/suppliers pushes — must route through the SAME chunked
+#    import helper (_import_rows_chunked). Hermetic: run_import stubbed. ──────────
+def _large_restock_fixture(n):
+    """n Vypredané+visible products, each with a fresh+available supplier link —
+    every one is a restock candidate. Returns (export_csv_bytes, supplier_stock_rows)."""
+    header = ("code;pairCode;name;supplier;productVisibility;availabilityInStock;"
+              "availabilityOutOfStock;price;stock;internalNote\r\n")
+    lines = []
+    stock_rows = []
+    fresh = "2026-07-22T05:00:00+02:00"
+    for i in range(n):
+        code = f"{i}/M"
+        link = f"https://supplier.test/p/{i}"
+        lines.append(f"{code};P{i};Bunda {i};TESTSUP;visible;Vypredané;Vypredané;"
+                     f"9.90;0;{link}\r\n")
+        stock_rows.append({"link": link, "ok": True, "available": True,
+                           "price": 9.0, "availabilityText": "Skladom",
+                           "supplier": "TESTSUP", "checkedAt": fresh})
+    return (header + "".join(lines)).encode("cp1250"), stock_rows
+
+
+def _recording_import(fail_on_call=None):
+    """run_import stub recording each chunk CSV's rows; optionally FAIL the Nth call
+    (1-based) to simulate a mid-batch chunk failure (mirrors
+    test_webreview_parovania_eshop.py's #156 pattern)."""
+    calls = []
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rd = list(_csv.reader(f, delimiter=";"))
+        rows = rd[1:]
+        calls.append({"header": rd[0], "rows": rows, "dry_run": dry_run})
+        if fail_on_call is not None and len(calls) == fail_on_call:
+            return 2, "POZOR: Shoptet hlási zlyhania", "boom"
+        return 0, f"VÝSLEDOK: spracované={len(rows)} upravené={len(rows)} zlyhania=0", ""
+    return fake_run, calls
+
+
+def test_large_restock_batch_split_into_chunks(iso, monkeypatch):
+    # 650 candidates -> must be imported in >=2 chunks, each <= IMPORT_CHUNK_ROWS.
+    # RED before the fix: a single 650-row import call.
+    n = 650
+    export_csv, stock_rows = _large_restock_fixture(n)
+    src = iso["tmp"] / "products.csv"
+    src.write_bytes(export_csv)
+    monkeypatch.setattr(webapp, "SRC", str(src))
+    webapp._save_supplier_stock({"last_check": "now", "rows": stock_rows, "stats": {}})
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    stats = webapp.run_restock_skladom()
+
+    assert len(calls) >= 2                                   # split, not one giant import
+    assert max(len(c["rows"]) for c in calls) <= webapp.IMPORT_CHUNK_ROWS
+    imported = [r[0] for c in calls for r in c["rows"]]
+    assert sorted(imported) == sorted(f"{i}/M" for i in range(n))
+    assert all(c["dry_run"] is False for c in calls)          # never a dry run
+    assert stats["status"] == "ok"
+    assert stats["candidates"] == n and stats["imported_rows"] == n
+
+
+def test_restock_mid_batch_chunk_failure_records_error_and_releases_lock(iso, monkeypatch):
+    # a chunk failing mid-batch must -> status='error' with a clear tab-surfaced
+    # message, STOP after the failing chunk, and release the import lock (no stuck
+    # lock -> no cascade failure on the next scheduled run).
+    n = 650
+    export_csv, stock_rows = _large_restock_fixture(n)
+    src = iso["tmp"] / "products.csv"
+    src.write_bytes(export_csv)
+    monkeypatch.setattr(webapp, "SRC", str(src))
+    webapp._save_supplier_stock({"last_check": "now", "rows": stock_rows, "stats": {}})
+    fake_run, calls = _recording_import(fail_on_call=2)      # 1st chunk ok, 2nd fails
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    stats = webapp.run_restock_skladom()
+
+    assert stats["status"] == "error"
+    assert len(calls) == 2                                   # batch STOPS after the failing chunk
+    st = json.loads(open(webapp.RESTOCK_STATE, encoding="utf-8").read())
+    assert st["status"] == "error"
+    assert "časti 2/" in st["error_detail"]
+    # candidates are still recorded (what the run TRIED to flip), even on failure
+    assert len(st["candidates"]) == n
+    # the import lock was released despite the failure
+    assert webapp._import_lock.acquire(blocking=False)
+    webapp._import_lock.release()
+
+
+def test_small_restock_batch_still_single_import(iso, monkeypatch):
+    # a small batch must NOT be needlessly chunked — one import call, as before.
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    webapp.run_restock_skladom()
+    assert len(calls) == 1 and len(calls[0]["rows"]) == 1
