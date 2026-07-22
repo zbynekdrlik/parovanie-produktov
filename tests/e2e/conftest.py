@@ -423,6 +423,13 @@ def automations_server(tmp_path_factory):
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
         "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+        # #153 — the manual override 'send' button can reach the REAL _send_mail_html path.
+        # _load_env_file() reads data/.mail_env by REPO PATH (independent of WEBREVIEW_OUT), so
+        # on a dev box that has real SMTP creds checked out, an unguarded e2e click would attempt
+        # a genuine send with real credentials. os.environ.setdefault() never overrides an
+        # ALREADY-SET key, so pinning MAIL_HOST="" here forces the deterministic
+        # not-configured/no-network branch on every machine, CI included.
+        "MAIL_HOST": "",
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
