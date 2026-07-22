@@ -412,8 +412,15 @@ def _send_mail_html(to, subject, html_body, bcc=None) -> bool:
     by the automations (#93 customer notifications). Sender defaults to the
     SMTP account's MAIL_FROM; POSTA_MAIL_FROM (data/.mail_env) overrides it if
     the SMTP server allows the eshop@ alias the old n8n workflow used. bcc is
-    envelope-only (no header), matching the n8n emailSend behavior. Failure is
-    logged + False — the automation records it and retries next run."""
+    envelope-only (no header), matching the n8n emailSend behavior.
+
+    bcc defaults to MAIL_BCC (data/.mail_env) when the caller doesn't pass one
+    — the "BCC vždy" convention (Marek, comment on #105/#126): every
+    automation e-mail is BCC'd to the owner. Pass bcc="" explicitly to opt a
+    specific send out of that default. Failure is logged + False — the
+    automation records it and retries next run."""
+    if bcc is None:
+        bcc = os.environ.get("MAIL_BCC") or None
     host = os.environ.get("MAIL_HOST")
     if not host:
         log.error("mail: SMTP not configured (data/.mail_env) — mail '%s' to %s NOT sent",
@@ -2013,7 +2020,6 @@ def n8n_upload_suppliers():
 # --------------------------------------------------------------------------- #
 AUTOMATIONS_STATE = os.path.join(OUT, "automations.json")
 POSTA_STATE = os.path.join(OUT, "posta_uncollected.json")
-POSTA_BCC = os.environ.get("POSTA_BCC", "drlik.marek@gmail.com")
 
 
 def _load_posta_state() -> dict:
@@ -2086,8 +2092,8 @@ def run_posta_uncollected() -> dict:
                           r["orderCode"], r["packageNumber"])
                 mail_ok = False
             else:
-                mail_ok = _send_mail_html(r["email"], r["email_subject"],
-                                          r["email_body"], bcc=POSTA_BCC)
+                # bcc omitted -> _send_mail_html defaults it to MAIL_BCC (#126)
+                mail_ok = _send_mail_html(r["email"], r["email_subject"], r["email_body"])
             if mail_ok:
                 esc[r["orderCode"]] = r["new_state_value"]
                 sent += 1
