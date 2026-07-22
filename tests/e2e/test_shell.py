@@ -95,6 +95,53 @@ def test_dark_mode_toggle_persists_across_reload(page, live_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_eshop_folder_groups_nav_and_collapses(page, live_server):
+    """#118 — the sidebar nav is grouped under a collapsible 'Eshop' folder:
+    the folder header exists, the work-tab nav lives NESTED under its body, and
+    clicking the header collapses/expands the items with the state persisted in
+    localStorage across a full reload (default = expanded)."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".sidebar #tabs button")
+
+    # The 'Eshop' folder header exists in the sidebar.
+    head = page.locator(".folder-head", has_text="Eshop")
+    assert head.count() == 1
+
+    # The work-tab nav (#tabs) is NESTED under the Eshop folder body.
+    assert page.locator(".nav-folder #folder-eshop-body #tabs").count() == 1
+    naobj = page.locator("#tabs button").filter(has_text="Na objednanie")
+    body_disp = ("() => getComputedStyle(document.getElementById("
+                 "'folder-eshop-body')).display")
+
+    # Default = expanded: the folder body and its items are visible.
+    assert page.evaluate(body_disp) != "none"
+    assert naobj.first.is_visible()
+
+    # Collapse: click the folder header → body hidden, state persisted.
+    head.click()
+    page.wait_for_function(f"{body_disp} === 'none'")
+    assert not naobj.first.is_visible()
+    assert page.evaluate("() => localStorage.getItem('folder:eshop')") == "collapsed"
+
+    # Persists across a full reload (the store, not just the in-page toggle).
+    page.reload()
+    page.wait_for_selector(".sidebar #tabs button")
+    assert page.evaluate(body_disp) == "none"
+    assert not page.locator("#tabs button").filter(
+        has_text="Na objednanie").first.is_visible()
+
+    # Expand again → items visible + 'open' persisted.
+    page.locator(".folder-head", has_text="Eshop").click()
+    page.wait_for_function(f"{body_disp} !== 'none'")
+    assert page.locator("#tabs button").filter(
+        has_text="Na objednanie").first.is_visible()
+    assert page.evaluate("() => localStorage.getItem('folder:eshop')") == "open"
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_hidden_tab_sections_are_display_none_on_review(page, live_server):
     """[hidden] must actually hide: #tab-search/#tab-notes carry display:flex in
     CSS, and an author display rule OVERRIDES the UA [hidden]{display:none} —
