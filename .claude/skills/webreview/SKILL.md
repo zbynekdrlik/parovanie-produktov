@@ -122,12 +122,27 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
    run_fn=…)` do `AUTOMATIONS_REG`. Endpointy `/api/automations*` (status/toggle/run) sú UŽ
    generické — netreba nové.
 3. Frontend: záložka do `AUTOMATION_TABS` (renderuje sa v sidebar sekcii `#autoTabs`
-   „Automatizácie") + `#tab-<key>` sekcia + `render<Key>()` — vzor `renderPosta`.
+   „Automatizácie") + `#tab-<key>` sekcia + `render<Key>()` — vzor `renderPosta`
+   (per-item tab) alebo `renderShoptetSync`/`renderParovaniaEshop` (status-only tab).
+   **Migrácia workflowu, ktorý VOLÁ EXISTUJÚCI endpoint appky** (napr. #109 nočný push
+   párovaní/dodávateľov cez `/api/n8n/upload-pairings|upload-suppliers`) = **NEROB
+   self-HTTP ani neduplikuj logiku**: vyextrahuj jadro endpointu do plain funkcie
+   `_do_<x>(dry) -> (result, status)` (endpoint = auth + `jsonify(*_do_x(dry))`),
+   a `run_<key>()` volá tie jadrá PRIAMO (žiaden bearer, žiaden localhost round-trip).
+   Vzor `_do_upload_pairings`/`_do_upload_suppliers` + `run_parovania_eshop`. Overené:
+   40+ pôvodných endpoint testov ostalo zelených (identický výstup). Idempotenciu drží
+   existujúci `uploaded_*.json`; automatizácia číta manažérove decision/assign stores LEN
+   na čítanie (čo pushnúť), nikdy ich nemení.
 4. **BEZPEČNOSŤ (dohodnuté #93): nová automatizácia štartuje `enabled=false`** — beží až po
    ▶ Štart; `enabled` prežíva reštart (`data/out/automations.json`); zmeškaný beh počas
    výpadku sa preskočí dopredu. „⚡ Spustiť teraz" beží aj vypnutá (explicitná akcia) a
    POSIELA REÁLNE e-maily zákazníkom pri KAŽDOM aktuálne nevyzdvihnutom balíku — pri overovaní
-   na živom webe štandardne NEklikaj Spustiť teraz, toggle Štart→Stop stačí. **Výnimka (#126,
+   na živom webe štandardne NEklikaj Spustiť teraz, toggle Štart→Stop stačí.
+   **`parovania_eshop` (#109) PÍŠE do ŽIVÉHO eshopu** (nočný push párovaní/dodávateľov):
+   pri post-deploy overení NEklikaj ani Spustiť teraz ANI Štart — enable by naplánoval
+   reálny push ~1000 nenahraných párovaní o 21:00; over LEN že tab existuje, default
+   Zastavené, tlačidlá prítomné (persistenciu pokrýva e2e). Manažér ho spustí keď sám
+   chce začať nahrávať. **Výnimka (#126,
    bezpečné post-deploy overenie funkčnosti):** smieš kliknúť Spustiť teraz LEN keď si PRED tým
    z `data/out/posta_uncollected.json` overil `stats.uncollected==0` A `escalation=={}` (žiadna
    rozbehnutá eskalácia) — vtedy je isté, že beh pošle 0 reálnych mailov, aj keď osloví živé
