@@ -196,7 +196,7 @@ def automations_server(tmp_path_factory):
     package from an earlier 'run'), NO automations.json (→ the runner must
     default to DISABLED = Zastavené), and a FRESH orders_cache.csv whose only
     row has NO packageNumber → a manual 'Spustiť teraz' run finds 0 shipments,
-    calls no Pošta API and sends no mail (hermetic green run). SHOTPET creds
+    calls no Pošta API and sends no mail (hermetic green run). Shoptet creds
     are pointed at a nonexistent file so no code path can reach the live shop."""
     out = tmp_path_factory.mktemp("wr_auto_out")
     port = _free_port()

@@ -2081,12 +2081,24 @@ def run_posta_uncollected() -> dict:
                 "orderCode", "packageNumber", "name", "admin_link")})
             continue
         if r["send"]:
-            if _send_mail_html(r["email"], r["email_subject"], r["email_body"],
-                               bcc=POSTA_BCC):
+            if not r["email"]:
+                log.error("posta: obj. %s (%s) nemá e-mail — upozornenie nemožno poslať",
+                          r["orderCode"], r["packageNumber"])
+                mail_ok = False
+            else:
+                mail_ok = _send_mail_html(r["email"], r["email_subject"],
+                                          r["email_body"], bcc=POSTA_BCC)
+            if mail_ok:
                 esc[r["orderCode"]] = r["new_state_value"]
                 sent += 1
                 log.info("posta: email #%d for obj. %s (%s) sent to %s",
                          r["count"], r["orderCode"], r["packageNumber"], r["email"])
+                # persist the bump IMMEDIATELY — a crash later in the run must
+                # never lose a sent-mail record (that would double-send tomorrow)
+                with _lock:
+                    st = _load_posta_state()
+                    st.setdefault("escalation", {})[r["orderCode"]] = r["new_state_value"]
+                    _save_posta_state(st)
             else:
                 failed += 1          # state NOT bumped → retried next run
                 prev_count, prev_last = posta_uncollected.parse_notified(

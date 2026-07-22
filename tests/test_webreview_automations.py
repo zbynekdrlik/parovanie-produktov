@@ -145,6 +145,25 @@ def test_posta_run_smtp_failure_keeps_state_for_retry(iso, monkeypatch):
     assert u["count"] == 0                           # displayed honestly
 
 
+def test_posta_crash_mid_run_keeps_sent_mail_state(iso, monkeypatch):
+    """A crash AFTER a customer mail went out must never lose the escalation
+    bump (a lost bump = the same customer gets the same mail again tomorrow).
+    The bump is persisted immediately per send, not only at run end."""
+    real_eval = webapp.posta_uncollected.evaluate_shipment
+
+    def boom(shipment, tracking_json, state_value, today=None):
+        if shipment["packageNumber"] == "EF000000001SK":     # third shipment
+            raise RuntimeError("simulovaný pád uprostred behu")
+        return real_eval(shipment, tracking_json, state_value, today)
+
+    monkeypatch.setattr(webapp.posta_uncollected, "evaluate_shipment", boom)
+    with pytest.raises(RuntimeError):
+        webapp.run_posta_uncollected()
+    assert len(iso["sent"]) == 1                             # mail did go out
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["escalation"] == {"2026100": f"1|{TODAY.isoformat()}"}
+
+
 def test_posta_run_tracking_error_recorded(iso, monkeypatch):
     def flaky(pkg):
         if pkg == "EF000000002SK":
