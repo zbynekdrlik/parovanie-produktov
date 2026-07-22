@@ -37,6 +37,9 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "DECISIONS", str(tmp_path / "decisions.json"))
     monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded_pairings.json"))
+    # #38: the manager's inline 'Na objednanie' pairings — own tmp path (never the
+    # real live order_pairings.json this box also serves).
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
     monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "supplier_assignments.json"))
     monkeypatch.setattr(webapp, "SUPPLIERS_STATE", str(tmp_path / "uploaded_suppliers.json"))
     products = [_product()]
@@ -51,6 +54,10 @@ def _seed_pairing():
 
 def _seed_supplier():
     webapp._save_supplier_assign({"9/Z": "BETALOV"})
+
+
+def _seed_order_pairing():
+    webapp._save_order_pairings({"7/Y": "https://supplier/inline"})
 
 
 def _ok_import():
@@ -111,6 +118,31 @@ def test_run_pushes_pairings_and_suppliers_and_records_counts(iso, monkeypatch):
     assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())["BETALOV|P1"] \
         == "https://supplier/x"
     assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text())["9/Z"] == "BETALOV"
+
+
+# ── #38: the nightly push ALSO covers inline order_pairings (via the SAME shared
+#    _do_upload_pairings core, no new HTTP round-trip / no duplicated logic) ────
+def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
+    _seed_pairing()
+    _seed_order_pairing()
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["status"] == "ok"
+    assert result["pairings"]["order_count"] == 1
+    assert result["pairings"]["order_blocked"] == 0
+    links = next(c for c in calls if c["header"][2] == "internalNote")
+    assert ["7/Y", "", "https://supplier/inline"] in links["rows"]
+    assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())["order:7/Y"] \
+        == "https://supplier/inline"
+
+    # idempotent: a second run pushes neither the decision nor the order pairing again
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-import")))
+    result2 = webapp.run_parovania_eshop()
+    assert result2["pairings"]["count"] == 0 and result2["pairings"]["order_count"] == 0
 
 
 def test_run_is_idempotent_second_run_pushes_nothing(iso, monkeypatch):
