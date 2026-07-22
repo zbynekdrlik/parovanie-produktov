@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import defaultdict
 
 # Shoptet export image columns, in priority order.
 IMGCOLS = ["defaultImage"] + [f"image{i}" for i in range(2, 16)] + ["image"]
@@ -68,6 +69,61 @@ def fill_missing_prices(items: list[dict], code2price: dict) -> int:
                 filled += 1
                 break
     return filled
+
+
+def resync_current(rows: list[dict], review_data: list[dict], suppliers) -> dict:
+    """Re-sync each review item's export-side fields (variant codes, images,
+    current on/off status + price/stock) against fresh export `rows`, joined by
+    (supplier, name). Mutates `review_data` items IN PLACE; preserves candidates /
+    AI verdict / our_url / key untouched. `suppliers` = the set of supplier NAME
+    strings the review app covers (row's `supplier` column matched case-insensitively).
+
+    Extracted from scripts/resync_export.py (#119) so the manual full re-sync
+    script and the new hourly in-app "Sync zo Shoptetu" automation share ONE
+    tested implementation instead of drifting copies.
+
+    A product not found by name in `rows` is left otherwise UNTOUCHED (its old
+    `current` — price, variant_codes, images — stays as-is) and only flagged
+    `current['stale'] = True`, so a temporary rename/removal never blanks a
+    working review card. Returns {"synced": N, "stale": N, "off": N}."""
+    suppliers = set(suppliers)
+    idx: dict = defaultdict(lambda: {"codes": [], "images": [], "vis": "", "ais": "",
+                                     "aos": "", "price": "", "std": "", "stock": ""})
+    for row in rows:
+        sup = (row.get("supplier") or "").strip().upper()
+        name = (row.get("name") or "").strip()
+        code = (row.get("code") or "").strip()
+        if not name or sup not in suppliers:
+            continue
+        g = idx[(sup, name)]
+        if code:
+            g["codes"].append(code)
+        if not g["images"]:
+            g["images"] = row_images(row)
+        if not g["vis"]:
+            g["vis"] = (row.get("productVisibility") or "").strip()
+            g["ais"] = (row.get("availabilityInStock") or "").strip()
+            g["aos"] = (row.get("availabilityOutOfStock") or "").strip()
+        if not g["price"]:
+            g["price"] = (row.get("price") or "").strip()
+            g["std"] = (row.get("standardPrice") or "").strip()
+            g["stock"] = (row.get("stock") or "").strip()
+
+    synced = stale = 0
+    for p in review_data:
+        g = idx.get((p.get("supplier"), p.get("name")))
+        if g and g["codes"]:
+            p["variant_codes"] = g["codes"]
+            p["our_images"] = g["images"][:6]
+            p["current"] = current_of(g["vis"], g["ais"], g["aos"],
+                                       g["price"], g["std"], g["stock"])
+            synced += 1
+        else:
+            p.setdefault("current", {})["vis"] = p.get("current", {}).get("vis", "?")
+            p["current"]["stale"] = True
+            stale += 1
+    off = sum(1 for p in review_data if p.get("current", {}).get("off"))
+    return {"synced": synced, "stale": stale, "off": off}
 
 
 def row_images(row: dict) -> list[str]:
