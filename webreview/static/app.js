@@ -1540,6 +1540,10 @@ function renderParovaniaEshop() {
       + (p.blocked ? ` · ${p.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${p.total_uploaded ?? 0} / ${p.total_products ?? 0} napárovaných`
       + ` · chýba ${p.remaining ?? 0}`));
+    // #38: inline páry pridané priamo na riadku „Na objednanie" (mimo review setu)
+    box.appendChild(el('div', '',
+      `📦 Inline páry: +${p.order_count ?? 0} nových`
+      + (p.order_blocked ? ` · ${p.order_blocked} prekrytých recenziou` : '')));
     box.appendChild(el('div', '',
       `🏷️ Dodávatelia: +${s.count ?? 0} nových`
       + (s.blocked ? ` · ${s.blocked} zablokovaných (chýbajú kódy)` : '')

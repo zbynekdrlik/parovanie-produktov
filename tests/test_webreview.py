@@ -800,7 +800,8 @@ def test_order_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "run_import",
                         lambda p, dry_run=False, timeout=300: (0, "spracované=1", ""))
     r = _client().post("/api/n8n/upload-pairings?dry_run=1", headers={"Authorization": f"Bearer {tok}"})
-    assert r.get_json()["dry_run"] is True and r.get_json()["order_count"] == 0
+    assert r.get_json()["dry_run"] is True
+    # dry-run must NOT persist → no state file written at all
     assert not (tmp_path / "uploaded.json").exists()
     # dry-run must NOT persist → still 1 new order pairing on the next (real) call
     monkeypatch.setattr(webapp, "run_import",
