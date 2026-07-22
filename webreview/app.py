@@ -2068,13 +2068,20 @@ def _pairing_summary(uploaded):
 
 def _do_upload_pairings(dry):
     """Core of the nightly pairings upload — the SINGLE place the pairing-upload
-    logic lives (NEkopíruj logiku). Reads the review decisions, builds the link
-    import (code;pairCode;internalNote) for only the pairings not yet uploaded,
-    runs the careful import, records what went up, and returns (result, status)
-    for the caller to serialize. Shared by the n8n HTTP endpoint (below) and the
-    in-app „Párovania → eshop" automation (#109) — no auth / Flask request access
-    here. Visibility/stock are NOT touched — the morning restock job turns a
-    product on once the supplier has it in stock."""
+    logic lives (NEkopíruj logiku). Reads the review decisions AND the inline
+    order_pairings (codes pasted directly on a to-order line, OUTSIDE the review
+    set — #38), builds ONE combined link import (code;pairCode;internalNote) for
+    whatever of either source is not yet uploaded, runs the careful import, records
+    what went up, and returns (result, status) for the caller to serialize. Shared
+    by the n8n HTTP endpoint (below) and the in-app „Párovania → eshop" automation
+    (#109) — no auth / Flask request access here. Visibility/stock are NOT touched
+    — the morning restock job turns a product on once the supplier has it in stock.
+
+    order_pairings entries are tracked under a distinct `order:<code>` namespace in
+    the SAME uploaded_pairings.json state (a review key is always `SUPPLIER|pairCode`
+    — never collides) and are excluded from THIS run's order rows when their code is
+    already covered by a reviewed decision — a reviewed decision is authoritative,
+    and Shoptet aborts the whole import on a duplicate code."""
     dec = _load_decisions()
     uploaded = _load_uploaded()
     new_keys = import_builder.new_pairing_keys(dec, uploaded)
@@ -2082,17 +2089,32 @@ def _do_upload_pairings(dry):
     products = [{"name": by_key.get(k, {}).get("name", ""),
                  "our_url": by_key.get(k, {}).get("our_url", ""),
                  "supplier_url": dec[k].get("url", "")} for k in new_keys]
-    if not new_keys:
+
+    order_pairings = _load_order_pairings()
+    new_order_codes = import_builder.new_order_pairing_keys(order_pairings, uploaded)
+
+    if not new_keys and not new_order_codes:
         log.info("n8n pairings: 0 new pairings")
-        return {"ok": True, "count": 0, "products": [],
+        return {"ok": True, "count": 0, "products": [], "order_count": 0, "order_blocked": 0,
                 **_pairing_summary(uploaded)}, 200
 
     rows = import_builder.link_rows(PRODUCTS, {k: dec[k] for k in new_keys}, CODE2PAIR)
-    if not rows:
-        log.warning("n8n pairings: %d new keys but 0 import rows (codes missing)", len(new_keys))
-        # paired but un-uploadable (variant codes missing) — surface so the notifier
-        # warns instead of staying silent (count:0 alone would send nothing)
+    order_rows = import_builder.order_pairing_rows(
+        {c: order_pairings[c] for c in new_order_codes}, CODE2PAIR,
+        exclude_codes={r[0] for r in rows})
+    all_rows = rows + order_rows
+    if not all_rows:
+        log.warning("n8n pairings: %d new keys + %d new order codes but 0 import rows",
+                    len(new_keys), len(new_order_codes))
+        # paired but un-uploadable — every decision key has 0 variant codes (blocked
+        # below the fold). order_pairings can never contribute to this branch on its
+        # own: order_pairing_rows only excludes a code via THIS run's decision rows
+        # (`rows`), and `rows` is empty here (exclude_codes=set()), so any non-empty
+        # new_order_codes would always have produced order_rows. order_blocked is
+        # therefore always 0 here — kept explicit (not hardcoded) so this stays
+        # correct if that invariant ever changes.
         return {"ok": True, "count": 0, "products": products,
+                "order_count": 0, "order_blocked": len(new_order_codes),
                 "message": "no import rows", "blocked": len(new_keys),
                 **_pairing_summary(uploaded)}, 200
 
@@ -2113,7 +2135,7 @@ def _do_upload_pairings(dry):
         from parovanie.writer import shoptet_writer
         w = shoptet_writer(f)
         w.writerow(import_builder.LINK_HEADER)
-        w.writerows(rows)
+        w.writerows(all_rows)
 
     # Not every key in new_keys necessarily landed a row: a product can have zero
     # variant codes, or ALL its codes can be the "seen"-deduped loser of an earlier
@@ -2129,11 +2151,22 @@ def _do_upload_pairings(dry):
         log.warning("n8n pairings: %d of %d keys generated no row (codes missing/deduped): %s",
                     len(blocked_keys), len(new_keys), blocked_keys[:10])
 
+    # An order_pairings code gets no row only when order_pairing_rows excluded it —
+    # i.e. its code is already covered by a reviewed decision this run. It stays
+    # "new" (never marked order:<code>) so it's retried while that stays true.
+    order_written_codes = {r[0] for r in order_rows}
+    uploaded_order_codes = [c for c in new_order_codes if c in order_written_codes]
+    blocked_order_codes = [c for c in new_order_codes if c not in uploaded_order_codes]
+    if blocked_order_codes:
+        log.warning("n8n pairings: %d order_pairings codes already covered by a reviewed decision: %s",
+                    len(blocked_order_codes), blocked_order_codes[:10])
+
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n pairings: another import already running")
         _safe_unlink(out_path)
         return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n pairings: %d products, %d rows, dry_run=%s", len(new_keys), len(rows), dry)
+    log.info("n8n pairings: %d products, %d order codes, %d rows, dry_run=%s",
+             len(new_keys), len(new_order_codes), len(all_rows), dry)
     try:
         # pairing CSVs can be large (an initial bulk of thousands of rows) → more time
         rc, out, err = run_import(out_path, dry_run=dry, timeout=900)
@@ -2142,6 +2175,8 @@ def _do_upload_pairings(dry):
         if ok and not dry:                   # record only after a real success (inside the lock)
             for k in uploaded_keys:          # ONLY keys that actually got a row — never blocked_keys
                 uploaded[k] = (dec[k].get("url") or "").strip()
+            for c in uploaded_order_codes:   # ONLY order codes that actually got a row
+                uploaded[f"order:{c}"] = (order_pairings[c] or "").strip()
             _save_uploaded(uploaded)
     except subprocess.TimeoutExpired:
         log.error("n8n pairings: subprocess timeout — killed import group")
@@ -2152,14 +2187,17 @@ def _do_upload_pairings(dry):
 
     if ok:
         _safe_unlink(out_path)               # success → drop the temp CSV (the catalog backup is the audit record)
-    result = {"ok": ok, "exit_code": rc, "count": len(uploaded_keys), "rows": len(rows),
+    result = {"ok": ok, "exit_code": rc, "count": len(uploaded_keys), "rows": len(all_rows),
               "dry_run": dry, "processed": parsed.get("processed"),
               "updated": parsed.get("updated"), "failed": parsed.get("failed"),
               "error_detail": parsed.get("error_detail"),
               "products": products, "stdout_tail": (out or "")[-800:],
               "blocked": len(blocked_keys),
+              "order_count": len(uploaded_order_codes),
+              "order_blocked": len(blocked_order_codes),
               **_pairing_summary(uploaded)}
-    log.info("n8n pairings: rc=%s processed=%s products=%d", rc, parsed.get("processed"), len(uploaded_keys))
+    log.info("n8n pairings: rc=%s processed=%s products=%d order_codes=%d",
+             rc, parsed.get("processed"), len(uploaded_keys), len(uploaded_order_codes))
     if not ok:
         log.error("n8n pairings FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
     return result, (200 if ok else 502)
@@ -2511,6 +2549,10 @@ def run_parovania_eshop() -> dict:
         status = "blocked"         # paired but un-uploadable (missing codes) → orange row
     else:
         status = "ok"
+    # NOTE: pairings["order_blocked"] deliberately does NOT feed this status — an
+    # inline order_pairing code excluded because a reviewed decision already covers
+    # it (#38) is expected/benign (the decision wins), not a data problem worth an
+    # orange row. It's still surfaced in the tab's own "Inline páry" counters.
 
     result = {
         "status": status,
@@ -2520,6 +2562,10 @@ def run_parovania_eshop() -> dict:
             "total_products": pairings.get("total_products", 0),
             "remaining": pairings.get("remaining", 0),
             "blocked": _blocked(pairings),
+            # #38: inline order_pairings pushed in the SAME run (own namespace,
+            # own counters — see _do_upload_pairings)
+            "order_count": int(pairings.get("order_count") or 0),
+            "order_blocked": int(pairings.get("order_blocked") or 0),
             "ok": p_ok,
             "error": pairings.get("error", ""),
         },

@@ -78,6 +78,10 @@ def test_run_now_zero_new_reports_ok_without_touching_eshop(page, automations_se
     meta = page.locator(".autometa").inner_text()
     assert "Posledný beh" in meta and "OK" in meta and "CHYBA" not in meta
 
+    # #38: the result box also reports the inline order_pairings push (0 seeded here)
+    result_text = page.locator(".autoresult").inner_text()
+    assert "Inline páry" in result_text and "+0 nových" in result_text
+
     # the app itself survived (no crash) — other tabs stay usable
     page.get_by_role("button", name="Nevyzdvihnuté zásielky").click()
     page.wait_for_selector('[data-testid="posta-status"]')

@@ -499,17 +499,23 @@ def test_import_busy_returns_409(monkeypatch, tmp_path):
         webapp._import_lock.release()
 
 
-def _arm_pairings(monkeypatch, tmp_path, decisions, token="secret-tok"):
+def _arm_pairings(monkeypatch, tmp_path, decisions, token="secret-tok", order_pairings=None):
     cred = tmp_path / ".shoptet_admin"
     cred.write_text(f"N8N_IMPORT_TOKEN={token}\n", encoding="utf-8")
     monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded.json"))
+    # #38: isolate the manager's live order_pairings.json — never read the real one
+    # (this box also runs the deployed app; an unmocked path would leak real data
+    # into the test and make the "0 new pairings" tests flaky/failing).
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
     monkeypatch.setattr(webapp, "PRODUCTS",
                         [{"key": "k1", "name": "Vesta XY", "our_url": "https://forestshop/x",
                           "variant_codes": ["A/1", "A/2"]}])
     monkeypatch.setattr(webapp, "CODE2PAIR", {"A/1": "100", "A/2": "100"})
     monkeypatch.setattr(webapp, "_load_decisions", lambda: decisions)
+    if order_pairings is not None:
+        webapp._save_order_pairings(order_pairings)
     return token
 
 
@@ -609,6 +615,7 @@ def test_pairings_blocked_when_codes_missing(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
     monkeypatch.setattr(webapp, "PRODUCTS",
                         [{"key": "k1", "name": "X", "our_url": "u", "variant_codes": []}])
     monkeypatch.setattr(webapp, "CODE2PAIR", {})               # no codes → 0 import rows
@@ -630,6 +637,7 @@ def test_pairings_partial_batch_only_marks_keys_with_rows_uploaded(monkeypatch, 
     monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
     monkeypatch.setattr(webapp, "PRODUCTS", [
         {"key": "k1", "name": "X1", "our_url": "u1", "variant_codes": ["A/1"]},
         {"key": "k2", "name": "X2", "our_url": "u2", "variant_codes": []},
@@ -725,6 +733,96 @@ def test_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (0, "spracované=2", ""))
     r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
     assert r2.get_json()["count"] == 1
+
+
+# --- #38: nightly push ALSO covers order_pairings.json (inline 'Na objednanie' --- #
+# --- pairings, outside the review set) — same import run, own uploaded state.  --- #
+def test_order_pairings_uploaded_and_marked_under_order_namespace(monkeypatch, tmp_path):
+    tok = _arm_pairings(monkeypatch, tmp_path, {},
+                        order_pairings={"B/1": "https://supplier/inline"})
+    seen = {}
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rd = list(_csv.reader(f, delimiter=";"))
+        seen["header"] = rd[0]
+        seen["rows"] = rd[1:]
+        return 0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""
+
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    j = r.get_json()
+    assert r.status_code == 200 and j["ok"]
+    assert j["count"] == 0                          # no decisions this run
+    assert j["order_count"] == 1 and j["order_blocked"] == 0
+    assert seen["header"] == ["code", "pairCode", "internalNote"]
+    assert ["B/1", "", "https://supplier/inline"] in seen["rows"]
+    uploaded = json.loads((tmp_path / "uploaded.json").read_text())
+    assert uploaded["order:B/1"] == "https://supplier/inline"
+
+    # unchanged on the next run → nothing pushed again
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run again")))
+    r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    j2 = r2.get_json()
+    assert j2["count"] == 0 and j2["order_count"] == 0
+
+
+def test_order_pairings_code_covered_by_decision_is_excluded_and_blocked(monkeypatch, tmp_path):
+    # a code already covered by a reviewed decision this run must NOT be duplicated
+    # in the same import CSV (Shoptet aborts the whole import on a duplicate code) —
+    # the reviewed decision wins, the order_pairing stays "blocked" (not uploaded).
+    dec = {"k1": {"status": "good", "url": "https://supplier/x"}}
+    tok = _arm_pairings(monkeypatch, tmp_path, dec,
+                        order_pairings={"A/1": "https://supplier/inline"})
+    calls = []
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rd = list(_csv.reader(f, delimiter=";"))
+        calls.append(rd[1:])
+        return 0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""
+
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    j = r.get_json()
+    assert j["ok"] and j["count"] == 1               # k1's A/1+A/2 uploaded via the decision
+    assert j["order_count"] == 0 and j["order_blocked"] == 1
+    rows = calls[0]
+    assert [row for row in rows if row[0] == "A/1"] == [["A/1", "100", "https://supplier/x"]]
+    uploaded = json.loads((tmp_path / "uploaded.json").read_text())
+    assert "order:A/1" not in uploaded
+
+
+def test_order_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
+    tok = _arm_pairings(monkeypatch, tmp_path, {},
+                        order_pairings={"B/1": "https://supplier/z"})
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (0, "spracované=1", ""))
+    r = _client().post("/api/n8n/upload-pairings?dry_run=1", headers={"Authorization": f"Bearer {tok}"})
+    assert r.get_json()["dry_run"] is True
+    # dry-run must NOT persist → no state file written at all
+    assert not (tmp_path / "uploaded.json").exists()
+    # dry-run must NOT persist → still 1 new order pairing on the next (real) call
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (0, "spracované=1", ""))
+    r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    assert r2.get_json()["order_count"] == 1
+
+
+def test_order_pairings_failed_import_does_not_mark_uploaded(monkeypatch, tmp_path):
+    tok = _arm_pairings(monkeypatch, tmp_path, {},
+                        order_pairings={"B/1": "https://supplier/z"})
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (2, "POZOR: zlyhania", "boom"))
+    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 502 and r.get_json()["ok"] is False
+    assert not (tmp_path / "uploaded.json").exists()
+    # not marked → a later (succeeding) call still sees it as new
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""))
+    r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
+    assert r2.get_json()["order_count"] == 1
 
 
 def test_import_dry_run_passthrough(monkeypatch, tmp_path):

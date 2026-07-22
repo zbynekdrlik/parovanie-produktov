@@ -11,6 +11,7 @@ from parovanie.import_builder import (
     SUPPLIER_HEADER,
     externalcode_rows,
     link_rows,
+    new_order_pairing_keys,
     new_pairing_keys,
     new_supplier_keys,
     order_pairing_rows,
@@ -255,6 +256,17 @@ def test_new_supplier_keys_only_new_or_changed():
     assigns = {"new": "BETALOV", "blank": "", "  ": "X", "same": "WETLAND", "changed": "ODIMON"}
     uploaded = {"same": "WETLAND", "changed": "TRIGONA"}
     assert set(new_supplier_keys(assigns, uploaded)) == {"new", "changed"}
+
+
+# --- new_order_pairing_keys: dedup state for the #38 nightly order_pairings push --- #
+def test_new_order_pairing_keys_only_new_or_changed():
+    # `uploaded` tracks order_pairings under the `order:<code>` namespace — distinct
+    # from new_pairing_keys' review-decision namespace, never collides.
+    order_pairings = {"new": "https://s/a", "blank": "", "  ": "https://s/b",
+                       "same": "https://s/c", "changed": "https://s/NEW"}
+    uploaded = {"order:same": "https://s/c", "order:changed": "https://s/OLD",
+                "same": "https://SHOULD-NOT-MATTER"}   # a decision-namespace key, no clash
+    assert set(new_order_pairing_keys(order_pairings, uploaded)) == {"new", "changed"}
 
 
 # --- externalcode_rows: GRUBE per-size itemId write-back (Task 8) ------------- #

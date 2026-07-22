@@ -140,6 +140,26 @@ def new_supplier_keys(assignments, uploaded):
     return out
 
 
+def new_order_pairing_keys(order_pairings, uploaded):
+    """Forestshop codes from the inline pairings entered on the 'Na objednanie' tab
+    (order_pairings.json -- codes OUTSIDE the review set, #38) ready for the nightly
+    push: a non-empty URL that was NOT yet uploaded (new code) or whose URL changed
+    since the last upload. `uploaded` tracks these under the `order:<code>`
+    namespace -- a distinct namespace inside the SAME uploaded_pairings.json state
+    as the review-decision keys (new_pairing_keys), so the two never collide (a
+    decision key is always `SUPPLIER|pairCode`, never `order:...`). Mirrors
+    new_pairing_keys/new_supplier_keys."""
+    out = []
+    for code, url in order_pairings.items():
+        c = (code or "").strip()
+        u = (url or "").strip()
+        if not c or not u:
+            continue
+        if uploaded.get(f"order:{c}") != u:
+            out.append(code)   # original key (callers index order_pairings[c] with it)
+    return out
+
+
 def link_rows(products, decisions, code2pair):
     """Reorder-link rows → `internalNote` = URL, one per variant, for good/manual
     decisions with a URL. Only code;pairCode;internalNote (no state columns → the
