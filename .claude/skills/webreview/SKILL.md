@@ -221,6 +221,39 @@ Automatizácia, ktorá scrapuje externé weby a/alebo volá LLM (OpenAI). Pure j
   stores. **Default DISABLED** (scrape+LLM stoja) — pri post-deploy NEklikaj Spustiť teraz, len over
   tab existuje + Zastavené + tlačidlá.
 
+### JOIN-automatizácia (žiadne škrabanie) — vzor `riziko_vypadku` (#107)
+
+Automatizácia, ktorá NEROBÍ žiadnu sieť ani LLM — len SPOJÍ náš katalóg export s
+`data/out/<inej-automatizácie>.json`, ktorý UŽ napísal INÝ automation run (napr.
+`dodavatelsky_sklad` #106). Pure jadro je jedna funkcia `compute_risk(csv_text,
+other_rows)` — číta export cez ten istý `_read_export_for_links()`/`internalNote`
+join-kľúč ako scraper, mapuje `{link: row}` z `other_rows` (`by_link` dict),
+a filtruje cez `export_helpers.state_of` (NIKDY nekopíruj 3-stavovú klasifikáciu
+nanovo). **Absencia dát ≠ risk**: chýbajúci link v `by_link`, `ok=False` (chyba pri
+scrapovaní), alebo `available is None` (nevie sa) sa VŽDY preskočí — nikdy sa
+netvári ako "nie je skladom".
+
+**Kontrakt pre tab, keď závislá automatizácia ešte nebežala**: `run_fn` vráti
+(a store nesie) explicitný `has_<x>_data: bool` flag (`bool(other_rows)` — prázdne
+`rows`/chýbajúci store = `False`), NIE len prázdny `risks: []`. Frontend potom
+zobrazí „najprv spusti <závislá automatizácia>" namiesto zavádzajúceho „0 rizík"
+(ktoré vyzerá ako čisté hlásenie, keď v skutočnosti nikto ešte nemeral). Tento
+kontrakt je NUTNÝ pre KAŽDÚ automatizáciu, čo číta iný `data/out/*.json` store bez
+vlastného scrapovania — kopíruj ho, nevymýšľaj vlastnú signalizáciu.
+
+- **Registrácia**: rovnaký `Automation(...)` do `AUTOMATIONS_REG`, **default DISABLED**
+  ako VŠETKY ostatné — aj keď je čisto READ-ONLY (žiadny e-mail, žiadny zápis, žiadna
+  cena) sa drží konzistencie s `shoptet_sync` (tiež read-only, tiež default Stop);
+  deploy nikdy nič sám nezapne.
+- **Tab**: per-item tabuľka (vzor `renderPosta`/`renderDodavatelskySklad`) — žiadne
+  nové CSS triedy netreba (`.autostatus`/`.posta-table`/`.avail`/`.downloads` sa
+  recyklujú). Voliteľné „Stiahnuť CSV" = `_csv_response` + `_csv_safe` (rovnaký
+  formula-injection guard ako `/api/import`).
+- **E2E**: fixture server nasadí PRE-vypočítaný `data/out/<key>.json` priamo (žiadny
+  reálny `products.csv`, žiadna sieť) — presne ako `supplier_stock.json` fixture v
+  `automations_server`; test nikdy neklika „Spustiť teraz" (to by chcelo skutočný
+  export na disku).
+
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
 Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —

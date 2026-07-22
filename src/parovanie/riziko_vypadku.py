@@ -24,7 +24,7 @@ from parovanie.export_helpers import state_of
 # The row fields the risk report carries — kód, názov, náš stav (cena/sklad),
 # dodávateľský stav (text), link, kedy naposledy skontrolované (per the digest's
 # tab column list, minus the n8n-only 'size'/'editUrl' fields this export doesn't
-# carry — see .claude/skills/webreview for the products.csv column set).
+# carry — see .claude/skills/shoptet for the products.csv column set).
 RISK_FIELDS = ("code", "pairCode", "name", "supplier", "ourPrice", "ourStock",
                "supplierAvailabilityText", "link", "checkedAt")
 
