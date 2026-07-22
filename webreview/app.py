@@ -1099,7 +1099,12 @@ def api_images():
         data.setdefault("availability", "")
         return jsonify(data)
     try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+        # Short timeout (was 20s): under a fast-scroll burst the client caps concurrent
+        # /api/images calls (#74), but a slow/unresponsive supplier can still tie up a
+        # worker for the full timeout — 8s sheds a hung supplier fast enough that the
+        # queued requests behind it drain well inside Cloudflare's edge timeout instead
+        # of all piling up and failing with 524.
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=8)
         if r.ok:
             from parovanie.verify import extract_page
             title = extract_page(r.text).get("title", "")

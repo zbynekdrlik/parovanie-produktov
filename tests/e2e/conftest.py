@@ -8,6 +8,7 @@ pre-auth E2E flows keep running as a logged-in manager. The auth E2E itself opts
 out with @pytest.mark.anonymous."""
 import csv
 import http.cookiejar
+import http.server
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -57,7 +59,7 @@ def _admin_session_cookie(base: str) -> str:
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server",
-                    "automations_server")
+                    "automations_server", "imgfail_server", "imgflood_server")
 
 
 @pytest.fixture(autouse=True)
@@ -419,3 +421,150 @@ def search_server(tmp_path_factory):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+class _BaseURL(str):
+    """A base-URL string that also carries extra fixture context (a plain `str`
+    subclass so it still works everywhere a base URL string is expected — e.g.
+    `_authenticated_context`'s cookie seeding, string concatenation)."""
+
+
+def _imgfail_fixture_products(base: str) -> list:
+    """One review product whose OWN forestshop-CDN image is broken (stale/renamed
+    product photo) — regression for #50. The 404 is served by THIS SAME fixture
+    server (an undefined Flask route 404s automatically) — hermetic, no outbound
+    network."""
+    return [
+        {
+            "key": "FAILIMG|p1", "idx": 0, "supplier": "FAILIMG",
+            "name": "Produkt So Zlym Obrazkom", "pairCode": "PF1",
+            "variant_codes": ["1/M"], "our_url": "",
+            "our_images": [f"{base}/definitely-missing-image-404-test.jpg"],
+            "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+            "candidates": [],
+            "current": {"state": 1, "price": "10", "std": "", "stock": "1",
+                        "avail": "Skladom"},
+        },
+    ]
+
+
+@pytest.fixture(scope="function")
+def imgfail_server(tmp_path_factory):
+    """Isolated webreview instance holding ONE product with a broken `our_images`
+    URL — regression for #50 (stale forestshop-CDN image must degrade to a clean
+    'bez obrázka' placeholder, not a broken-image icon)."""
+    out = tmp_path_factory.mktemp("wr_imgfail_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "review_data.json").write_text(
+        json.dumps(_imgfail_fixture_products(base), ensure_ascii=False),
+        encoding="utf-8")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+class _ConcurrencyState:
+    """Shared, thread-safe counters the supplier-simulator handler updates."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.total = 0
+
+
+@pytest.fixture(scope="function")
+def imgflood_server(tmp_path_factory):
+    """Isolated webreview instance + a tiny local 'supplier simulator' HTTP server
+    that tracks concurrent in-flight requests. Regression for #74: a fast scroll
+    through a large filter makes many matched cards' galleries cross the
+    IntersectionObserver's rootMargin within the same tick — each firing its own
+    /api/images scrape. The client MUST cap concurrent fetches (IMG_FETCH_CONCURRENCY
+    in app.js) so the simulated supplier never sees more than that many requests
+    in flight at once, while all of them eventually complete."""
+    state = _ConcurrencyState()
+
+    class _SupplierHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *_a):   # silence default stderr access-log noise
+            pass
+
+        def do_GET(self):
+            with state.lock:
+                state.active += 1
+                state.total += 1
+                state.max_active = max(state.max_active, state.active)
+            time.sleep(0.35)   # simulate a real (slow) supplier product page
+            body = b"<html><head><title>Test</title></head><body></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            with state.lock:
+                state.active -= 1
+
+    sim = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _SupplierHandler)
+    sim_port = sim.server_address[1]
+    sim_thread = threading.Thread(target=sim.serve_forever, daemon=True)
+    sim_thread.start()
+
+    out = tmp_path_factory.mktemp("wr_imgflood_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    n = 10
+    products = [
+        {
+            "key": f"FLOOD|p{i}", "idx": i, "supplier": "FLOOD",
+            "name": f"Produkt Flood {i}", "pairCode": f"P{i}",
+            "variant_codes": [f"{i}/M"], "our_url": "", "our_images": [],
+            "ai_status": "matched",
+            "ai_chosen_url": f"http://127.0.0.1:{sim_port}/item/{i}",
+            "ai_reason": "kód sedí",
+            "candidates": [{"name": f"Produkt Flood {i}",
+                            "url": f"http://127.0.0.1:{sim_port}/item/{i}"}],
+            "current": {"state": 1, "price": "9", "std": "", "stock": "1",
+                        "avail": "Skladom"},
+        }
+        for i in range(n)
+    ]
+    (out / "review_data.json").write_text(
+        json.dumps(products, ensure_ascii=False), encoding="utf-8")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        result = _BaseURL(base)
+        result.state = state
+        result.n = n
+        yield result
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        sim.shutdown()
+        sim.server_close()
