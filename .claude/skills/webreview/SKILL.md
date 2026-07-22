@@ -1,8 +1,40 @@
 # Webreview — kontrolný web (review + „Na objednanie")
 
 Load BEFORE prácou na `webreview/` (Flask `app.py` + vanilla-JS SPA `static/app.js`,
-`style.css`, `templates/index.html`). Dva taby: **Kontrola párovania** (review kariet)
-a **Na objednanie** (otvorené objednávky → doobjednanie u dodávateľa).
+`style.css`, `templates/index.html`). Layout = **ľavý sidebar-dashboard** (redesign v0.42.0):
+sidebar (nav = naše funkcie s outline SVG ikonami + `.navcount` počítadlami, sekcia „Čoskoro"
+na budúce stránky, dole tmavý-mód prepínač + verzia) + top bar (`#pageTitle`/`#pageSub` +
+`.topacts`). Nav (`#tabs`) žije v sidebar-e; `.filters`/`.progress`/`.downloads` v top bar-e.
+
+## UI redesign / shell zmeny — zachovaj SELEKTOROVÝ KONTRAKT (E2E ho merajú)
+
+Pri prestavbe shellu/CSS **NEMEŇ** id/`data-testid`/triedy, na ktoré sa viažu `app.js` AJ
+`tests/e2e/*` — zmapuj ich PRED zásahom (Explore agent nad app.js + testami). Kritické:
+- IDs: `tabs filters progressText progressBar empty searchBox searchResults list tab-search
+  tab-notes dlImport known-suppliers version pageTitle themeBtn`; `data-testid="version"`.
+- **Order-supplier chip farby MUSIA ostať presné** — `body.toorder-wide .filters button.todo`
+  `#16a34a` / `.done` `#dc2626` / `.active` `#f59e0b` (E2E asserty na computed rgb 22,163,74 /
+  220,38,38 / 245,158,11). Review-filter `.active` je oddelený (accent green).
+- Nav-button accessible NAME = holý label ("Na objednanie", "Hľadať / opraviť") — SVG ikona
+  nedáva text, `.navcount` len appenduje, takže `get_by_role(name=...)` substring stále sedí.
+  `render()` viditeľnosť cieli `.progress`/`.downloads`/`#filters`/`#list`/`#tab-*`/`body.toorder-wide`.
+
+## Tmavý mód (v0.42.0)
+
+`[data-theme=dark]` na `<body>` + CSS premenné (`:root` / `body[data-theme=dark]`),
+`localStorage('theme')`, prepínač `#themeBtn` v sidebar-e (`applyTheme`/`initTheme`).
+**FOUC guard** = inline `<script>` ako PRVÉ dieťa `<body>` (body už existuje → nastaví
+`data-theme` pred vykreslením obsahu, žiadny biely záblesk pre dark usera). E2E test
+`tests/e2e/test_shell.py` (sidebar + page-title + tmavý-mód persistencia cez reload).
+
+## Screenshot OSTREJ appky bez reštartu živej služby (:8801)
+
+Náhľad reálneho vzhľadu (reálne dáta, nie fixture): bootni ODHODENÚ inštanciu na inom porte
+`WEBREVIEW_PORT=8811 PYTHONPATH=src nohup .venv/bin/python webreview/app.py &`, Playwright
+screenshot (LEN GET — nav prepínanie + tmavý mód sú bezpečné; NEklikaj row-toggly = POST do
+živých dát), potom `kill`. NIKDY nereštartuj živú :8801 kvôli náhľadu.
+
+Dva taby: **Kontrola párovania** (review kariet) a **Na objednanie** (doobjednanie u dodávateľa).
 
 ## Per-riadkové stavy = 5 gitignored stores v `data/out/` (DÁTA MANAŽÉRA, ŽIVÉ)
 
