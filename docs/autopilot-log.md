@@ -62,3 +62,24 @@
   ordered 146, order_pairings 57, waiting 11, supplier_assignments 1, users 3, reset_tokens 1).
   Live-overenie zámerne BEZ reálneho odoslania reset-mailu (aby sa nepošlo majiteľovi zbytočné
   BCC) — funkčnosť pokrytá unit testom; `/forgot` stránka načítaná (200, 0 console errorov).
+
+## 2026-07-22 — #106 „Dodávateľský sklad" — in-app supplier scraper (worker)
+- Migrácia n8n „Forestshop — Dodávateľský scraper" (`6kn7jzBXTjbmbiVa`) na in-app runner (#93):
+  nová automatizácia `dodavatelsky_sklad`, denne 05:00, **default Zastavené** (veľa externých HTTP
+  volaní + platený OpenAI → beží až po Štart).
+- Pure logika `src/parovanie/supplier_stock.py` (bez siete/OpenAI): `links_from_export` (internalNote
+  http + visible, dedup), `extract_static` (JSON-LD → og/product meta → text-keyword LEN pre 4 overené
+  domény), `need_llm` (available ALEBO price None), `build_llm_messages`/`parse_llm_json`,
+  `is_recently_checked` (stale-skip 20h). 96 % pokrytie.
+- Flask: `run_supplier_stock` + `_fetch_supplier_html` + `_llm_extract` (OpenAI cez `requests.post`,
+  kľúč z `data/.ai_env` cez `_load_env_file`, `response_format=json_object`), `/api/supplier-stock`,
+  store `data/out/supplier_stock.json` (vstup pre #107/#108). Frontend: per-item tab (vzor `renderPosta`)
+  + filtre (všetky/chyby/AI/dodávateľ); poll zovšeobecnený (`_reloadAuto`).
+- Testy hermetické (mock supplier HTTP AJ OpenAI): `test_supplier_stock.py` (53) + `test_webreview_
+  supplier_stock.py` (10) + e2e `test_supplier_stock.py` (3). RED-before-GREEN sa netýka (feature).
+- Verzia 0.57.0, PR #142 merge `014e915`, nasadené v0.57.0.
+- Post-deploy: DOM = v0.57.0, PRED==PO manager stores (decisions 2831, ordered 146, order_pairings 57,
+  waiting 11, supplier_assignments 1). Živé overenie: tab „Dodávateľský sklad" existuje, default
+  Zastavené, Štart/Stop + Spustiť teraz prítomné, plán denne o 05:00, 0 console errorov. Reálny scrape
+  sa ZÁMERNE nespúšťal (hit by mnoho dodávateľských webov + minul OpenAI). Odložené: odpublikovať n8n
+  `6kn7jzBXTjbmbiVa` po zapnutí in-app (ako #109).
