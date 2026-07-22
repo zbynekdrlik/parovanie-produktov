@@ -35,8 +35,8 @@ from flask import (Flask, Response, jsonify, redirect, render_template, request,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
-    __version__, config, import_builder, posta_uncollected, restock_skladom,
-    riziko_vypadku, supplier_stock)
+    __version__, config, import_builder, orders_reminder, posta_uncollected,
+    restock_skladom, riziko_vypadku, supplier_stock)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -2306,6 +2306,7 @@ def n8n_upload_suppliers():
 # --------------------------------------------------------------------------- #
 AUTOMATIONS_STATE = os.path.join(OUT, "automations.json")
 POSTA_STATE = os.path.join(OUT, "posta_uncollected.json")
+ORDERS_REMINDER_STATE = os.path.join(OUT, "orders_reminder.json")   # #105 dedup + display
 
 
 def _load_posta_state() -> dict:
@@ -2887,6 +2888,152 @@ def run_restock_skladom() -> dict:
     return stats
 
 
+# --------------------------------------------------------------------------- #
+# #105 — „Pripomienky objednávok" (migrated from n8n „Forestshop orders",
+# MnskuiOdu3i5GKlF). Daily: „Vybavuje sa" orders older than 4 days →
+#   • NO internal note (shopRemark empty)  → RED „nikto sa jej nedotkol" alert
+#     (was Discord red) — no e-mail.
+#   • HAS a note → AI-classify the note (contacted vs not) → if NOT contacted,
+#     send ONE reminder e-mail to the customer (max once per order, deduped via
+#     data/out/orders_reminder.json), ORANGE „pripomienka odoslaná" (was Discord
+#     orange); if contacted, just log skipped_contacted.
+# SENDS real customer e-mails + costs OpenAI → starts DISABLED (#93 contract).
+# --------------------------------------------------------------------------- #
+def _load_orders_reminder() -> dict:
+    try:
+        with open(ORDERS_REMINDER_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_orders_reminder(d: dict) -> None:
+    tmp = ORDERS_REMINDER_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, ORDERS_REMINDER_STATE)
+
+
+def _classify_contacted(shop_remark: str) -> bool:
+    """OpenAI gpt-4o-mini classification of an order's internal shop note (#105) → True when the
+    customer was ALREADY contacted (skip the reminder), False when NOT (send it). Mirrors the
+    #106 supplier-scraper OpenAI call pattern: requests.post, JSON-object output, key in the
+    Authorization header (never the URL → no secret in any error text). Requires OPENAI_API_KEY —
+    the caller only reaches here when the key is present."""
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY nie je nastavený")
+    payload = {"model": supplier_stock.LLM_MODEL,
+               "messages": orders_reminder.build_classifier_messages(shop_remark),
+               "temperature": 0,
+               "response_format": {"type": "json_object"}}
+    r = requests.post(OPENAI_URL, json=payload, timeout=OPENAI_TIMEOUT,
+                      headers={"Authorization": f"Bearer {key}",
+                               "Content-Type": "application/json"})
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"]
+    return orders_reminder.parse_classification(content)
+
+
+def run_orders_reminder() -> dict:
+    """One check run (daily 08:00 or „Spustiť teraz"): „Vybavuje sa" orders >4d from the app's
+    cached orders export → red (no note) / AI-classified (with note) → one reminder e-mail per
+    not-yet-contacted order, max once per order (data/out/orders_reminder.json). Returns the
+    summary the runner stores; the full red/orange snapshot is persisted for the tab.
+
+    Robust: a failing OpenAI or SMTP call for ONE order is logged and skipped (that order is not
+    recorded → retried next run), never crashing the scheduler. No key → the AI branch degrades
+    gracefully (never e-mails blind). Reads ONLY its own store + the orders export; never touches
+    the manager's decision / to-order stores."""
+    csv_bytes = _orders_csv_cached()
+    orders = orders_reminder.select_orders(csv_bytes)
+    with _lock:
+        done = dict(_load_orders_reminder().get("orders") or {})   # code -> {status, ...}
+    have_key = bool(os.environ.get("OPENAI_API_KEY"))
+    now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    red, orange, skipped = [], [], []
+    emailed_now = skipped_now = ai_unavailable = errors = 0
+
+    def _persist_done(code: str, entry: dict) -> None:
+        # persist the dedup record IMMEDIATELY — a crash later in the run must never lose a
+        # sent-mail record (that would double-send tomorrow), mirroring run_posta_uncollected.
+        done[code] = entry
+        with _lock:
+            st = _load_orders_reminder()
+            st.setdefault("orders", {})[code] = entry
+            _save_orders_reminder(st)
+
+    for o in orders:
+        code = o["code"]
+        if not o["has_note"]:
+            red.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
+                                          "itemName", "days", "admin_link")})
+            continue
+        prev = done.get(code)
+        if prev:                                   # already processed once — reflect its status
+            row = {k: o[k] for k in ("code", "billFullName", "email", "itemName",
+                                     "shopRemark", "days", "admin_link")}
+            row["sent_date"] = prev.get("date", "")
+            (orange if prev.get("status") == "emailed" else skipped).append(row)
+            continue
+        if not have_key:
+            ai_unavailable += 1
+            log.warning("orders_reminder: obj. %s má poznámku, ale OPENAI_API_KEY nie je "
+                        "nastavený — AI nedostupné, pripomienku neposielam (skúsim ďalší beh)", code)
+            continue                                # do NOT record → retried when key is present
+        try:
+            contacted = _classify_contacted(o["shopRemark"])
+        except Exception as e:  # noqa: BLE001 — recorded per order, run continues
+            errors += 1
+            log.error("orders_reminder: klasifikácia obj. %s zlyhala: %r", code, e)
+            continue
+        base = {"name": o["billFullName"], "email": o["email"],
+                "itemName": o["itemName"], "note": o["shopRemark"], "date": now_iso}
+        if contacted:
+            _persist_done(code, {**base, "status": "skipped_contacted"})
+            skipped_now += 1
+            log.info("orders_reminder: obj. %s — AI: zákazník už kontaktovaný, skipped_contacted", code)
+            row = {k: o[k] for k in ("code", "billFullName", "email", "itemName",
+                                     "shopRemark", "days", "admin_link")}
+            row["sent_date"] = now_iso
+            skipped.append(row)
+            continue
+        if not o["email"]:
+            log.error("orders_reminder: obj. %s nemá e-mail — pripomienku nemožno poslať", code)
+            errors += 1
+            continue
+        subject, html = orders_reminder.build_reminder_email(o["billFullName"], code)
+        # bcc omitted → _send_mail_html defaults it to MAIL_BCC (the „BCC vždy" convention #105)
+        if _send_mail_html(o["email"], subject, html):
+            _persist_done(code, {**base, "status": "emailed"})
+            emailed_now += 1
+            log.info("orders_reminder: obj. %s — pripomienka odoslaná zákazníkovi %s", code, o["email"])
+            row = {k: o[k] for k in ("code", "billFullName", "email", "itemName",
+                                     "shopRemark", "days", "admin_link")}
+            row["sent_date"] = now_iso
+            orange.append(row)
+        else:
+            errors += 1                             # SMTP failed → not recorded → retried next run
+
+    emailed_total = sum(1 for v in done.values() if v.get("status") == "emailed")
+    stats = {"orders_4d": len(orders), "no_note": len(red),
+             "with_note": len(orders) - len(red),
+             "emailed_now": emailed_now, "emailed_total": emailed_total,
+             "skipped_now": skipped_now, "ai_unavailable": ai_unavailable,
+             "errors": errors}
+    with _lock:
+        _save_orders_reminder({
+            "orders": done,
+            "last_check": now_iso,
+            "red": red, "orange": orange, "skipped": skipped,
+            "stats": stats,
+        })
+    log.info("orders_reminder: run done %s", stats)
+    return stats
+
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
@@ -2935,6 +3082,14 @@ AUTOMATIONS_REG = [
                name="Vypredané → Skladom",
                schedule={"daily_at": "06:00", "tz": "Europe/Bratislava"},
                run_fn=run_restock_skladom),
+    # #105 — daily „Vybavuje sa" >4d orders → red (no note) / AI-classified reminder e-mail
+    # (with note). SAFETY (#93 contract): starts DISABLED — it SENDS real customer e-mails AND
+    # costs money via OpenAI, so it runs ONLY after the manager clicks ▶ Štart; a deploy never
+    # e-mails or spends on its own. Scheduled 08:00 like the original n8n workflow.
+    Automation(key="orders_reminder",
+               name="Pripomienky objednávok",
+               schedule={"daily_at": "08:00", "tz": "Europe/Bratislava"},
+               run_fn=run_orders_reminder),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
@@ -2981,6 +3136,21 @@ def api_posta_uncollected():
         "uncollected": st.get("uncollected") or [],
         "invalid": st.get("invalid") or [],
         "errors": st.get("errors") or [],
+        "stats": st.get("stats") or {},
+    })
+
+
+@app.route("/api/orders-reminder")
+def api_orders_reminder():
+    """Display data for the „Pripomienky objednávok" tab (#105) — the last run's red list (no-note
+    >4d orders), orange list (reminder e-mail sent) + summary stats."""
+    with _lock:
+        st = _load_orders_reminder()
+    return jsonify({
+        "last_check": st.get("last_check", ""),
+        "red": st.get("red") or [],
+        "orange": st.get("orange") or [],
+        "skipped": st.get("skipped") or [],
         "stats": st.get("stats") or {},
     })
 
