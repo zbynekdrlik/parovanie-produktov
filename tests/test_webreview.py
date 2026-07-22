@@ -459,7 +459,7 @@ def test_import_sanitizes_then_runs(monkeypatch, tmp_path):
     tok = _arm_token(monkeypatch, tmp_path)
     seen = {}
 
-    def fake_run(csv_path, dry_run=False):
+    def fake_run(csv_path, dry_run=False, timeout=300):
         seen["path"] = csv_path
         seen["dry_run"] = dry_run
         with open(csv_path, encoding="utf-8-sig", newline="") as f:
@@ -829,7 +829,8 @@ def test_import_dry_run_passthrough(monkeypatch, tmp_path):
     tok = _arm_token(monkeypatch, tmp_path)
     seen = {}
     monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False: (seen.update(dry_run=dry_run), (0, "spracované=1", ""))[1])
+                        lambda p, dry_run=False, timeout=300:
+                        (seen.update(dry_run=dry_run), (0, "spracované=1", ""))[1])
     r = _client().post("/api/n8n/shoptet-import?dry_run=1", data=_FEED,
                        headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 200 and seen["dry_run"] is True
@@ -884,6 +885,81 @@ def test_import_hard_error_surfaces_error_detail(monkeypatch, tmp_path):
     assert r.status_code == 502 and j["ok"] is False
     assert j["processed"] is None
     assert j["error_detail"] == err
+
+
+# ── #158: the restock feed has the SAME 120s browser-redirect-timeout risk #156
+#    fixed for the pairings/suppliers pushes — must route through the SAME chunked
+#    import helper (_import_rows_chunked). Hermetic: run_import stubbed. ──────────
+def _large_feed(n):
+    header = ("code;pairCode;name;purchasePrice;productVisibility;availabilityInStock;"
+              "availabilityOutOfStock;stock\r\n")
+    rows = "".join(f"{i}/M;P{i};Vesta {i};9;visible;Skladom;Skladom;5\r\n" for i in range(n))
+    return (header + rows).encode("utf-8")
+
+
+def _recording_import(fail_on_call=None):
+    """run_import stub recording each chunk CSV's rows; optionally FAIL the Nth call
+    (1-based) to simulate a mid-batch chunk failure (mirrors
+    test_webreview_parovania_eshop.py's #156 pattern)."""
+    calls = []
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rd = list(_csv.reader(f, delimiter=";"))
+        rows = rd[1:]
+        calls.append({"header": rd[0], "rows": rows, "dry_run": dry_run})
+        if fail_on_call is not None and len(calls) == fail_on_call:
+            return 2, "POZOR: Shoptet hlási zlyhania", "boom"
+        return 0, f"VÝSLEDOK: spracované={len(rows)} upravené={len(rows)} zlyhania=0", ""
+    return fake_run, calls
+
+
+def test_n8n_import_large_batch_split_into_chunks(monkeypatch, tmp_path):
+    # 650 rows -> must be imported in >=2 chunks, each <= IMPORT_CHUNK_ROWS.
+    # RED before the fix: a single 650-row import call.
+    tok = _arm_token(monkeypatch, tmp_path)
+    n = 650
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    r = _client().post("/api/n8n/shoptet-import", data=_large_feed(n),
+                       headers={"Authorization": f"Bearer {tok}"})
+    j = r.get_json()
+    assert r.status_code == 200 and j["ok"] and j["rows"] == n and j["processed"] == n
+    assert len(calls) >= 2                                   # split, not one giant import
+    assert max(len(c["rows"]) for c in calls) <= webapp.IMPORT_CHUNK_ROWS
+    imported = [row[0] for c in calls for row in c["rows"]]
+    assert sorted(imported) == sorted(f"{i}/M" for i in range(n))
+    assert all(c["dry_run"] is False for c in calls)
+
+
+def test_n8n_import_mid_batch_chunk_failure_returns_502_with_progress(monkeypatch, tmp_path):
+    # a chunk failing mid-batch must -> 502 with a clear, tab-surfaced error
+    # message, STOP after the failing chunk, and release the import lock.
+    tok = _arm_token(monkeypatch, tmp_path)
+    n = 650
+    fake_run, calls = _recording_import(fail_on_call=2)      # 1st chunk ok, 2nd fails
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    r = _client().post("/api/n8n/shoptet-import", data=_large_feed(n),
+                       headers={"Authorization": f"Bearer {tok}"})
+    j = r.get_json()
+    assert r.status_code == 502 and j["ok"] is False
+    assert len(calls) == 2                                   # batch STOPS after the failing chunk
+    assert "časti 2/" in j["error"]
+    assert "z 650 riadkov" in j["error"]
+    # the import lock was released despite the failure (else the next call 409s)
+    assert webapp._import_lock.acquire(blocking=False)
+    webapp._import_lock.release()
+
+
+def test_n8n_import_small_batch_still_single_import(monkeypatch, tmp_path):
+    # a small batch must NOT be needlessly chunked — one import call, as before.
+    tok = _arm_token(monkeypatch, tmp_path)
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    r = _client().post("/api/n8n/shoptet-import", data=_FEED,
+                       headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 200
+    assert len(calls) == 1 and len(calls[0]["rows"]) == 1
 
 
 # --- n8n nightly supplier write-back (assigned names → eshop `supplier`) ----- #
