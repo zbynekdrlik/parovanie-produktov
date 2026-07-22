@@ -34,7 +34,8 @@ from flask import (Flask, Response, jsonify, redirect, render_template, request,
                    send_from_directory, session)
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from parovanie import __version__, config, import_builder, posta_uncollected
+from parovanie import (
+    __version__, config, import_builder, posta_uncollected, supplier_stock)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -147,6 +148,9 @@ def _load_env_file(path):
 
 _load_env_file(os.path.join(ROOT, "data", ".auth_env"))
 _load_env_file(os.path.join(ROOT, "data", ".mail_env"))
+# #106 — OPENAI_API_KEY for the „Dodávateľský sklad" scraper's LLM fallback.
+# Gitignored, chmod 600; absent = LLM fallback degrades gracefully (static-only).
+_load_env_file(os.path.join(ROOT, "data", ".ai_env"))
 
 
 def _secret_key():
@@ -2368,6 +2372,182 @@ def run_parovania_eshop() -> dict:
     return result
 
 
+# --------------------------------------------------------------------------- #
+# #106 — „Dodávateľský sklad": daily supplier availability/price scraper (in-app
+# migration of the n8n „Forestshop — Dodávateľský scraper" 6kn7jzBXTjbmbiVa).
+# For each product's supplier link (internalNote) it fetches the supplier page,
+# extracts availability + price via a STATIC tier (JSON-LD → meta → text keywords)
+# and, only when static can't decide, an OpenAI gpt-4o-mini fallback. Results land
+# in data/out/supplier_stock.json — the input for #107/#108. Pure logic lives in
+# parovanie.supplier_stock; this wires it to the network, OpenAI and the store.
+# --------------------------------------------------------------------------- #
+SUPPLIER_STOCK_STATE = os.path.join(OUT, "supplier_stock.json")
+# Refetch only links not checked in the last N hours (skip fresh OK rows) — saves
+# HTTP + paid LLM cost. Chosen < 24h so a daily run still re-checks everything once.
+SUPPLIER_STOCK_MAX_AGE_H = 20.0
+SUPPLIER_FETCH_DELAY_S = 1.0      # per-domain politeness gap (don't hammer one shop)
+SUPPLIER_FETCH_TIMEOUT = 30      # s per supplier page
+OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_TIMEOUT = 60              # s per LLM call
+
+
+def _load_supplier_stock() -> dict:
+    try:
+        with open(SUPPLIER_STOCK_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_supplier_stock(d: dict) -> None:
+    tmp = SUPPLIER_STOCK_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, SUPPLIER_STOCK_STATE)
+
+
+def _read_export_for_links() -> str:
+    """The on-disk Shoptet catalog export (data/products.csv), cp1250-decoded — the
+    source of supplier links. Refreshed hourly by the „Sync zo Shoptetu" automation
+    and at startup; a missing file simply yields 0 links (never crashes)."""
+    try:
+        with open(SRC, "rb") as f:
+            return f.read().decode("cp1250", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _fetch_supplier_html(url: str) -> str:
+    """GET one supplier product page (3 tries, exponential-ish backoff). Raises on
+    the final failure so the run records THAT link as an error row and continues.
+    The URL is a public product page (no secret) — safe to keep in error text."""
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=SUPPLIER_FETCH_TIMEOUT)
+            r.raise_for_status()
+            if not r.encoding or r.encoding.lower() == "iso-8859-1":
+                r.encoding = r.apparent_encoding or r.encoding
+            return r.text
+        except Exception as e:  # noqa: BLE001 — retried; the last failure propagates
+            log.warning("supplier_stock: fetch %s attempt %d/3 failed: %r", url, attempt, e)
+            if attempt == 3:
+                raise
+            time.sleep(2 * attempt)
+    raise RuntimeError("unreachable")
+
+
+def _llm_extract(text: str, url: str) -> dict:
+    """OpenAI gpt-4o-mini structured extraction of availability/price from page text.
+    Requires OPENAI_API_KEY (data/.ai_env) — the caller only reaches here when the
+    key is present. The key lives in the Authorization header (never the URL), so an
+    error string carries no secret."""
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY nie je nastavený")
+    payload = {"model": supplier_stock.LLM_MODEL,
+               "messages": supplier_stock.build_llm_messages(text, url),
+               "temperature": 0,
+               "response_format": {"type": "json_object"}}
+    r = requests.post(OPENAI_URL, json=payload, timeout=OPENAI_TIMEOUT,
+                      headers={"Authorization": f"Bearer {key}",
+                               "Content-Type": "application/json"})
+    r.raise_for_status()
+    content = r.json()["choices"][0]["message"]["content"]
+    return supplier_stock.parse_llm_json(content)
+
+
+def _politeness_wait(domain: str, last_ts: dict) -> None:
+    """Sleep so consecutive fetches to the SAME supplier domain are ≥ the politeness
+    gap apart (different domains never wait on each other)."""
+    prev = last_ts.get(domain)
+    if prev is not None and SUPPLIER_FETCH_DELAY_S > 0:
+        gap = SUPPLIER_FETCH_DELAY_S - (time.monotonic() - prev)
+        if gap > 0:
+            time.sleep(gap)
+    last_ts[domain] = time.monotonic()
+
+
+def run_supplier_stock() -> dict:
+    """One scraper run (daily 05:00 or „Spustiť teraz"): supplier links from the
+    export → per link fetch + STATIC extraction (+ LLM fallback when static can't
+    decide AND a key is configured) → upsert into data/out/supplier_stock.json.
+
+    Cost-aware: recently-checked OK links are skipped (stale-skip); the LLM is
+    called ONLY when static fails; per-domain politeness spreads same-shop hits.
+    Robust: a failing fetch / LLM call for one link is recorded as an error row and
+    the run continues — one bad supplier never crashes the run or the app. Reads
+    ONLY its own store + the export; never touches the manager's decision stores."""
+    csv_text = _read_export_for_links()
+    links = supplier_stock.links_from_export(csv_text, config.SUPPLIERS)
+    prev = {r.get("link"): r for r in (_load_supplier_stock().get("rows") or [])}
+    now = datetime.now(timezone.utc).astimezone()
+    have_key = bool(os.environ.get("OPENAI_API_KEY"))
+    last_ts: dict[str, float] = {}
+    rows = []
+    stats = {"total": len(links), "checked": 0, "skipped": 0, "static": 0, "llm": 0,
+             "available": 0, "unavailable": 0, "unknown": 0, "errors": 0, "llm_calls": 0}
+
+    for lk in links:
+        link = lk["link"]
+        prow = prev.get(link)
+        if supplier_stock.is_recently_checked(prow, now, SUPPLIER_STOCK_MAX_AGE_H):
+            rows.append(prow)                       # keep the fresh result untouched
+            stats["skipped"] += 1
+            continue
+        row = {"link": link, "supplier": lk.get("supplier", ""), "name": lk.get("name", ""),
+               "codes": lk.get("codes", []), "product_count": lk.get("count", 0)}
+        try:
+            _politeness_wait(supplier_stock.host_of(link), last_ts)
+            html = _fetch_supplier_html(link)
+            static = supplier_stock.extract_static(html, link)
+            available = static["available"]
+            price = static["price"]
+            currency = static["currency"]
+            variants = static["variants"]
+            avail_text = static["availabilityText"]
+            extracted_by = static["extractedBy"]
+            if supplier_stock.need_llm(static):
+                if have_key:
+                    llm = _llm_extract(supplier_stock.page_text(html), link)
+                    stats["llm_calls"] += 1
+                    extracted_by = "llm"
+                    if llm["available"] is not None:
+                        available = llm["available"]
+                    if llm["price"] is not None:
+                        price = llm["price"]
+                    currency = llm["currency"] or currency
+                    variants = llm["variants"] or variants
+                    avail_text = llm["availabilityText"] or avail_text
+                else:
+                    # no key → don't call LLM; keep whatever static found, flag it
+                    extracted_by = "static-only"
+            row.update(ok=True, error="", available=available, price=price,
+                       currency=currency, availabilityText=avail_text, variants=variants,
+                       extractedBy=extracted_by, checkedAt=now.isoformat(timespec="seconds"))
+            stats["checked"] += 1
+            stats["llm" if extracted_by == "llm" else "static"] += 1
+            if available is True:
+                stats["available"] += 1
+            elif available is False:
+                stats["unavailable"] += 1
+            else:
+                stats["unknown"] += 1
+        except Exception as e:  # noqa: BLE001 — per-link error recorded, run continues
+            log.warning("supplier_stock: link %s FAILED: %r", link, e)
+            row.update(ok=False, error=str(e)[:300], available=None, price=None,
+                       currency="", availabilityText="", variants=[], extractedBy="error",
+                       checkedAt=now.isoformat(timespec="seconds"))
+            stats["errors"] += 1
+        rows.append(row)
+
+    _save_supplier_stock({"last_check": now.isoformat(timespec="seconds"),
+                          "rows": rows, "stats": stats})
+    log.info("supplier_stock: run done %s", stats)
+    return stats
+
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
@@ -2390,6 +2570,14 @@ AUTOMATIONS_REG = [
                name="Párovania → eshop",
                schedule={"daily_at": "21:00", "tz": "Europe/Bratislava"},
                run_fn=run_parovania_eshop),
+    # #106 — daily supplier availability/price scraper. SAFETY (#93 contract):
+    # starts DISABLED — a run makes MANY external HTTP calls AND costs money via
+    # OpenAI, so it runs ONLY after the manager clicks ▶ Štart; a deploy never
+    # scrapes or spends on its own.
+    Automation(key="dodavatelsky_sklad",
+               name="Dodávateľský sklad",
+               schedule={"daily_at": "05:00", "tz": "Europe/Bratislava"},
+               run_fn=run_supplier_stock),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
@@ -2436,6 +2624,19 @@ def api_posta_uncollected():
         "uncollected": st.get("uncollected") or [],
         "invalid": st.get("invalid") or [],
         "errors": st.get("errors") or [],
+        "stats": st.get("stats") or {},
+    })
+
+
+@app.route("/api/supplier-stock")
+def api_supplier_stock():
+    """Display data for the „Dodávateľský sklad" tab — the last scraper run's rows
+    (availability / price / source / last-checked / errors) + summary stats."""
+    with _lock:
+        st = _load_supplier_stock()
+    return jsonify({
+        "last_check": st.get("last_check", ""),
+        "rows": st.get("rows") or [],
         "stats": st.get("stats") or {},
     })
 

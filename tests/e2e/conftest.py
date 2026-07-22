@@ -229,6 +229,28 @@ def automations_server(tmp_path_factory):
         "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
         "2026200;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
         encoding="cp1250")
+    # #106 — pre-existing „Dodávateľský sklad" rows (one OK, one error) so the tab's
+    # table + filters render WITHOUT any network. No products.csv → a manual run
+    # would find 0 links, but the E2E never clicks Spustiť teraz (it would scrape +
+    # spend OpenAI) — it only verifies the tab UI + toggle persistence.
+    (out / "supplier_stock.json").write_text(json.dumps({
+        "last_check": "2026-07-22T05:00:07+02:00",
+        "rows": [
+            {"link": "https://www.huntingshop.eu/p/bunda", "supplier": "BETALOV",
+             "name": "Poľovnícka bunda", "codes": ["1/M"], "product_count": 1,
+             "ok": True, "error": "", "available": True, "price": 129.90,
+             "currency": "EUR", "availabilityText": "Skladom", "variants": [],
+             "extractedBy": "jsonld", "checkedAt": "2026-07-22T05:00:03+02:00"},
+            {"link": "https://www.zubicek.cz/p/noz", "supplier": "ZUBÍČEK",
+             "name": "Lovecký nôž", "codes": ["2/S"], "product_count": 1,
+             "ok": False, "error": "HTTP 503 od dodávateľa", "available": None,
+             "price": None, "currency": "", "availabilityText": "", "variants": [],
+             "extractedBy": "error", "checkedAt": "2026-07-22T05:00:05+02:00"},
+        ],
+        "stats": {"total": 2, "checked": 1, "skipped": 0, "static": 1, "llm": 0,
+                  "available": 1, "unavailable": 0, "unknown": 0, "errors": 1,
+                  "llm_calls": 0},
+    }, ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
         **_AUTH_ENV,

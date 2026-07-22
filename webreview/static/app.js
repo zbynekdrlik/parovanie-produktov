@@ -11,6 +11,8 @@ let UNAVAIL = {};           // key -> true (nedostupné — u dodávateľa)
 let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
 let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
 let POSTA = null;           // /api/posta-uncollected — last run's display data
+let SUPPLIER_STOCK = null;  // /api/supplier-stock — last scraper run's rows (#106)
+let STOCK_FILTER = 'all';   // dodávateľský sklad filter: all | errors | llm | <supplier>
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'toorder';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
@@ -300,7 +302,7 @@ const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
 // sidebar section (#autoTabs) + its own tab section. New automations: add here.
 const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['shoptet_sync', 'Sync zo Shoptetu'],
-  ['parovania_eshop', 'Párovania → eshop']];
+  ['parovania_eshop', 'Párovania → eshop'], ['dodavatelsky_sklad', 'Dodávateľský sklad']];
 
 const NAV_ICONS = {
   review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
@@ -313,6 +315,8 @@ const NAV_ICONS = {
     + '<path d="M21 3v6h-6M3 21v-6h6"/>',
   parovania_eshop: '<path d="M12 3v12"/><path d="M8 7l4-4 4 4"/>'
     + '<path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
+  dodavatelsky_sklad: '<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M3 7l9 4 9-4"/>'
+    + '<path d="M12 11v10"/>',
 };
 
 // 'Užívatelia' is an ADMIN-ONLY nav item (the server 403s non-admins anyway).
@@ -327,6 +331,7 @@ function navCount(key) {
   if (key === 'notes') return NOTES.length;
   if (key === 'users') return USERS_LIST.length;
   if (key === 'posta') return POSTA ? (POSTA.uncollected || []).length : 0;
+  if (key === 'dodavatelsky_sklad') return SUPPLIER_STOCK ? (SUPPLIER_STOCK.stats || {}).errors || 0 : 0;
   return 0;
 }
 
@@ -363,7 +368,7 @@ const PAGE_TITLES = {
   review: 'Kontrola párovania', toorder: 'Na objednanie',
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
-  parovania_eshop: 'Párovania → eshop',
+  parovania_eshop: 'Párovania → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
@@ -387,6 +392,9 @@ function setPageHead() {
     s.textContent = 'Hodinové obnovenie objednávok a katalógu zo Shoptetu';
   } else if (ACTIVE_TAB === 'parovania_eshop') {
     s.textContent = 'Denné nahranie nových párovaní a dodávateľov do eshopu (o 21:00)';
+  } else if (ACTIVE_TAB === 'dodavatelsky_sklad') {
+    const n = SUPPLIER_STOCK ? (SUPPLIER_STOCK.rows || []).length : 0;
+    s.textContent = `${n} dodávateľských liniek · denná kontrola dostupnosti a cien`;
   } else { s.textContent = ''; }
 }
 
@@ -442,6 +450,7 @@ async function switchTab(tab) {
   if (tab === 'posta') await loadPosta();   // always fresh — status can change
   if (tab === 'shoptet_sync') await loadAutomations();   // always fresh — status can change
   if (tab === 'parovania_eshop') await loadAutomations();   // always fresh — status can change
+  if (tab === 'dodavatelsky_sklad') await loadSupplierStock();   // always fresh — status can change
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
@@ -1077,6 +1086,19 @@ async function loadPosta() {
   catch (_) { POSTA = null; }
 }
 
+async function loadSupplierStock() {
+  await loadAutomations();
+  try { SUPPLIER_STOCK = await (await fetch('/api/supplier-stock')).json(); }
+  catch (_) { SUPPLIER_STOCK = null; }
+}
+
+// Reload AUTOMATIONS + the active tab's display data (used by toggle + run poll,
+// so a live run refreshes whichever automation tab is open).
+async function _reloadAuto(tab) {
+  if (tab === 'dodavatelsky_sklad') { await loadSupplierStock(); return; }
+  await loadPosta();   // loads AUTOMATIONS too; POSTA fetch is harmless elsewhere
+}
+
 function autoByKey(key) { return AUTOMATIONS.find(x => x.key === key); }
 
 async function toggleAutomation(key, enabled) {
@@ -1084,9 +1106,7 @@ async function toggleAutomation(key, enabled) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ enabled }),
   });
-  // loadPosta() also refreshes AUTOMATIONS (needed by every tab) — the extra
-  // /api/posta-uncollected fetch is harmless on a non-posta tab, unused there.
-  await loadPosta(); render();
+  await _reloadAuto(ACTIVE_TAB); render();
 }
 
 let _postaPoll = null;
@@ -1094,11 +1114,11 @@ let _postaPoll = null;
 // 'posta' keeps the original single-caller behavior unchanged).
 async function runAutomation(key, tab = 'posta') {
   await fetch(`/api/automations/${key}/run`, { method: 'POST' });
-  await loadPosta(); render();
+  await _reloadAuto(tab); render();
   clearInterval(_postaPoll);
   _postaPoll = setInterval(async () => {           // refresh until the run ends
     if (ACTIVE_TAB !== tab) { clearInterval(_postaPoll); _postaPoll = null; return; }
-    await loadPosta(); render();
+    await _reloadAuto(tab); render();
     const a = autoByKey(key);
     if (!a || !a.running) { clearInterval(_postaPoll); _postaPoll = null; }
   }, 2000);
@@ -1354,6 +1374,142 @@ function renderParovaniaEshop() {
   wrap.appendChild(st);
 }
 
+// ---- Automatizácie (#106): tab „Dodávateľský sklad" ----------------------- //
+// Per-item table tab (like posta): status controls + filters + a table of every
+// supplier link's availability / price / source / last-checked / error.
+const _EXTRACTED_LABEL = {
+  jsonld: 'JSON-LD', meta: 'meta', text: 'text', llm: 'AI (LLM)',
+  'static-only': 'staticky', error: 'chyba',
+};
+
+function _availChip(av) {
+  if (av === true) return '<span class="avail avail-yes">Skladom</span>';
+  if (av === false) return '<span class="avail avail-no">Nie je skladom</span>';
+  return '<span class="avail avail-unknown">Neznáme</span>';
+}
+
+function _stockRowsFiltered() {
+  const rows = (SUPPLIER_STOCK && SUPPLIER_STOCK.rows) || [];
+  if (STOCK_FILTER === 'all') return rows;
+  if (STOCK_FILTER === 'errors') return rows.filter(r => !r.ok);
+  if (STOCK_FILTER === 'llm') return rows.filter(r => r.extractedBy === 'llm');
+  return rows.filter(r => (r.supplier || '') === STOCK_FILTER);   // a supplier name
+}
+
+function renderDodavatelskySklad() {
+  const wrap = document.getElementById('tab-dodavatelsky_sklad');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('dodavatelsky_sklad');
+
+  const st = el('div', 'autostatus');
+  if (!a) {
+    st.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    wrap.appendChild(st);
+    return;
+  }
+  const head = el('div', 'autohead');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'sklad-status';
+  head.appendChild(pill);
+  if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha kontrola…'));
+  const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+    a.enabled ? '⏹ Stop' : '▶ Štart');
+  btn.dataset.testid = 'sklad-toggle';
+  btn.onclick = () => toggleAutomation('dodavatelsky_sklad', !a.enabled);
+  head.appendChild(btn);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'sklad-run';
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation('dodavatelsky_sklad', 'dodavatelsky_sklad');
+  head.appendChild(run);
+  st.appendChild(head);
+
+  const meta = el('div', 'autometa');
+  const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+  bits.push('Posledný beh: ' + (a.last_run
+    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+    : 'zatiaľ nikdy'));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+  st.appendChild(meta);
+  if (a.last_status === 'error' && a.last_error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+  }
+  const lr = a.last_result || {};
+  if (a.last_run && a.last_status === 'ok') {
+    st.appendChild(el('div', 'muted',
+      `Liniek: ${lr.total ?? 0} · skontrolovaných: ${lr.checked ?? 0}`
+      + ` · preskočených (čerstvé): ${lr.skipped ?? 0}`
+      + ` · skladom: ${lr.available ?? 0} · nie je: ${lr.unavailable ?? 0}`
+      + ` · neznáme: ${lr.unknown ?? 0}`
+      + ` · AI volaní: ${lr.llm_calls ?? 0}`
+      + (lr.errors ? ` · chyby: ${lr.errors}` : '')));
+  }
+  wrap.appendChild(st);
+
+  const s = SUPPLIER_STOCK || {};
+  const rows = s.rows || [];
+  if (!rows.length) {
+    wrap.appendChild(el('div', 'empty2',
+      s.last_check ? `Žiadne dáta (kontrola ${fmtDt(s.last_check)}).`
+                   : 'Zatiaľ neprebehla žiadna kontrola — spusti automatizáciu (▶ Štart) alebo klikni ⚡ Spustiť teraz.'));
+    return;
+  }
+
+  // filters: all / errors / llm + per-supplier dropdown
+  const filt = el('div', 'stockfilters');
+  filt.dataset.testid = 'sklad-filters';
+  const mk = (key, lbl) => {
+    const b = el('button', 'sf' + (STOCK_FILTER === key ? ' active' : ''), escapeHtml(lbl));
+    b.onclick = () => { STOCK_FILTER = key; render(); };
+    return b;
+  };
+  filt.appendChild(mk('all', `Všetky (${rows.length})`));
+  filt.appendChild(mk('errors', `Len chyby (${rows.filter(r => !r.ok).length})`));
+  filt.appendChild(mk('llm', `Len AI (${rows.filter(r => r.extractedBy === 'llm').length})`));
+  const suppliers = [...new Set(rows.map(r => r.supplier).filter(Boolean))].sort();
+  if (suppliers.length > 1) {
+    const sel = el('select', 'sfsel');
+    const optAll = el('option', '', 'Všetci dodávatelia'); optAll.value = '';
+    sel.appendChild(optAll);
+    for (const sup of suppliers) {
+      const o = el('option', '', escapeHtml(sup)); o.value = sup;
+      if (STOCK_FILTER === sup) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.onchange = () => { STOCK_FILTER = sel.value || 'all'; render(); };
+    filt.appendChild(sel);
+  }
+  wrap.appendChild(filt);
+
+  const shown = _stockRowsFiltered();
+  const tbl = el('table', 'posta-table');
+  tbl.dataset.testid = 'sklad-table';
+  tbl.innerHTML = '<thead><tr><th>Dodávateľ</th><th>Produkt</th><th>Dostupnosť</th>'
+    + '<th>Cena</th><th>Zdroj</th><th>Kontrolované</th></tr></thead>';
+  const tb = el('tbody');
+  for (const r of shown) {
+    const tr = el('tr', r.ok ? '' : 'callneeded');
+    const price = (r.price != null)
+      ? `${r.price} ${escapeHtml(r.currency || '')}`.trim() : '—';
+    const src = r.ok ? (_EXTRACTED_LABEL[r.extractedBy] || escapeHtml(r.extractedBy || '—'))
+                     : '❌ chyba';
+    tr.innerHTML =
+      `<td>${escapeHtml(r.supplier || '—')}</td>`
+      + `<td><a href="${escapeHtml(r.link)}" target="_blank" rel="noopener">`
+      + `${escapeHtml(r.name || r.link)}</a>`
+      + (r.error ? `<div class="sub2 err">${escapeHtml(r.error)}</div>` : '') + '</td>'
+      + `<td>${r.ok ? _availChip(r.available) : '<span class="avail avail-unknown">—</span>'}</td>`
+      + `<td>${price}</td>`
+      + `<td>${src}</td>`
+      + `<td>${fmtDt(r.checkedAt)}</td>`;
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb);
+  wrap.appendChild(tbl);
+}
+
 function render() {
   renderTabs();
   setPageHead();
@@ -1364,7 +1520,8 @@ function render() {
   const posta = ACTIVE_TAB === 'posta';
   const shoptetSync = ACTIVE_TAB === 'shoptet_sync';
   const parovaniaEshop = ACTIVE_TAB === 'parovania_eshop';
-  const auto = posta || shoptetSync || parovaniaEshop;      // any status-only automation tab
+  const dodavatelskySklad = ACTIVE_TAB === 'dodavatelsky_sklad';
+  const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad;  // any automation tab
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || search || notes || users || auto) ? 'none' : '';
   const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || search || notes || users || auto) ? 'none' : '';
@@ -1375,7 +1532,9 @@ function render() {
   const secPosta = document.getElementById('tab-posta'); if (secPosta) secPosta.hidden = !posta;
   const secShoptetSync = document.getElementById('tab-shoptet_sync'); if (secShoptetSync) secShoptetSync.hidden = !shoptetSync;
   const secParovania = document.getElementById('tab-parovania_eshop'); if (secParovania) secParovania.hidden = !parovaniaEshop;
+  const secSklad = document.getElementById('tab-dodavatelsky_sklad'); if (secSklad) secSklad.hidden = !dodavatelskySklad;
   const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = (search || notes || users || auto) ? 'none' : '';
+  if (dodavatelskySklad) { document.getElementById('empty').hidden = true; renderDodavatelskySklad(); return; }
   if (parovaniaEshop) { document.getElementById('empty').hidden = true; renderParovaniaEshop(); return; }
   if (shoptetSync) { document.getElementById('empty').hidden = true; renderShoptetSync(); return; }
   if (posta) { document.getElementById('empty').hidden = true; renderPosta(); return; }
