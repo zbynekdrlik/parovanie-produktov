@@ -24,7 +24,10 @@ test_auth.py's `_PROVOKED` pattern for a deliberately-provoked 401/403."""
 import re
 
 
-_PROVOKED_404 = re.compile(r"Failed to load resource: .*missing-image-404-test\.jpg")
+# Playwright's local console messages carry the STATUS but not the resource URL
+# (unlike some browser devtools UIs) — same filtering shape as test_auth.py's
+# `_PROVOKED` (401/403): match on the status code, not the URL text.
+_PROVOKED_404 = re.compile(r"Failed to load resource: .*\b404\b")
 
 
 def _unexpected(console):
