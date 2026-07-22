@@ -1844,22 +1844,15 @@ def _pairing_summary(uploaded):
             "remaining": max(0, total - up), "review_url": PUBLIC_URL}
 
 
-@app.route("/api/n8n/upload-pairings", methods=["POST"])
-def n8n_upload_pairings():
-    """Upload the workers' NEW pairings (reorder links) to the eshop. Reads the
-    local review decisions, builds the link import (code;pairCode;internalNote) for
-    only the pairings not yet uploaded, runs the careful import, and records what
-    went up. Bearer-auth'd; dry_run=1 reaches the import without changing anything.
-    Visibility/stock are NOT touched here — the morning restock job turns a product
-    on once the supplier has it in stock."""
-    token = _import_token()
-    auth = request.headers.get("Authorization", "")
-    expected = f"Bearer {token}".encode() if token else b""
-    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
-        log.warning("n8n pairings: unauthorized call from %s", _client_ip())
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+def _do_upload_pairings(dry):
+    """Core of the nightly pairings upload — the SINGLE place the pairing-upload
+    logic lives (NEkopíruj logiku). Reads the review decisions, builds the link
+    import (code;pairCode;internalNote) for only the pairings not yet uploaded,
+    runs the careful import, records what went up, and returns (result, status)
+    for the caller to serialize. Shared by the n8n HTTP endpoint (below) and the
+    in-app „Párovania → eshop" automation (#109) — no auth / Flask request access
+    here. Visibility/stock are NOT touched — the morning restock job turns a
+    product on once the supplier has it in stock."""
     dec = _load_decisions()
     uploaded = _load_uploaded()
     new_keys = import_builder.new_pairing_keys(dec, uploaded)
@@ -1869,17 +1862,17 @@ def n8n_upload_pairings():
                  "supplier_url": dec[k].get("url", "")} for k in new_keys]
     if not new_keys:
         log.info("n8n pairings: 0 new pairings")
-        return jsonify({"ok": True, "count": 0, "products": [],
-                        **_pairing_summary(uploaded)}), 200
+        return {"ok": True, "count": 0, "products": [],
+                **_pairing_summary(uploaded)}, 200
 
     rows = import_builder.link_rows(PRODUCTS, {k: dec[k] for k in new_keys}, CODE2PAIR)
     if not rows:
         log.warning("n8n pairings: %d new keys but 0 import rows (codes missing)", len(new_keys))
         # paired but un-uploadable (variant codes missing) — surface so the notifier
         # warns instead of staying silent (count:0 alone would send nothing)
-        return jsonify({"ok": True, "count": 0, "products": products,
-                        "message": "no import rows", "blocked": len(new_keys),
-                        **_pairing_summary(uploaded)}), 200
+        return {"ok": True, "count": 0, "products": products,
+                "message": "no import rows", "blocked": len(new_keys),
+                **_pairing_summary(uploaded)}, 200
 
     # surface a real data inconsistency: the same variant code paired to two different
     # supplier URLs (a code can hold only one link, so first-wins drops the rest)
@@ -1903,7 +1896,7 @@ def n8n_upload_pairings():
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n pairings: another import already running")
         _safe_unlink(out_path)
-        return jsonify({"ok": False, "error": "import already running"}), 409
+        return {"ok": False, "error": "import already running"}, 409
     log.info("n8n pairings: %d products, %d rows, dry_run=%s", len(new_keys), len(rows), dry)
     try:
         # pairing CSVs can be large (an initial bulk of thousands of rows) → more time
@@ -1917,7 +1910,7 @@ def n8n_upload_pairings():
     except subprocess.TimeoutExpired:
         log.error("n8n pairings: subprocess timeout — killed import group")
         _safe_unlink(out_path)
-        return jsonify({"ok": False, "error": "import timeout"}), 504
+        return {"ok": False, "error": "import timeout"}, 504
     finally:
         _import_lock.release()
 
@@ -1931,7 +1924,22 @@ def n8n_upload_pairings():
     log.info("n8n pairings: rc=%s processed=%s products=%d", rc, parsed.get("processed"), len(new_keys))
     if not ok:
         log.error("n8n pairings FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
-    return jsonify(result), (200 if ok else 502)
+    return result, (200 if ok else 502)
+
+
+@app.route("/api/n8n/upload-pairings", methods=["POST"])
+def n8n_upload_pairings():
+    """n8n's nightly caller: Bearer-auth then delegate to _do_upload_pairings.
+    dry_run=1 reaches the import without changing anything."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {token}".encode() if token else b""
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n pairings: unauthorized call from %s", _client_ip())
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    result, status = _do_upload_pairings(dry)
+    return jsonify(result), status
 
 
 # --------------------------------------------------------------------------- #
@@ -1970,36 +1978,29 @@ def _supplier_summary(uploaded, assigns):
             "remaining": max(0, total - up), "review_url": PUBLIC_URL}
 
 
-@app.route("/api/n8n/upload-suppliers", methods=["POST"])
-def n8n_upload_suppliers():
-    """Write newly assigned supplier names back to the eshop `supplier` field. Reads
-    the local supplier assignments, builds code;pairCode;supplier for only the codes
-    not yet uploaded (or whose name changed), runs the careful import, records what
-    went up. Bearer-auth'd; dry_run=1 reaches the import without changing anything.
-    Touches ONLY the supplier column — links/state/prices are left untouched."""
-    token = _import_token()
-    auth = request.headers.get("Authorization", "")
-    expected = f"Bearer {token}".encode() if token else b""
-    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
-        log.warning("n8n suppliers: unauthorized call from %s", _client_ip())
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+def _do_upload_suppliers(dry):
+    """Core of the nightly supplier write-back — the SINGLE place the logic lives
+    (NEkopíruj logiku). Reads the supplier assignments, builds code;pairCode;supplier
+    for only the codes not yet uploaded (or whose name changed), runs the careful
+    import, records what went up, and returns (result, status). Shared by the n8n
+    HTTP endpoint (below) and the in-app „Párovania → eshop" automation (#109) — no
+    auth / Flask request access here. Touches ONLY the `supplier` column —
+    links/state/prices are left untouched."""
     assigns = _load_supplier_assign()
     uploaded = _load_uploaded_suppliers()
     new_codes = import_builder.new_supplier_keys(assigns, uploaded)
     products = [{"code": c, "supplier": assigns[c]} for c in new_codes]
     if not new_codes:
         log.info("n8n suppliers: 0 new assignments")
-        return jsonify({"ok": True, "count": 0, "products": [],
-                        **_supplier_summary(uploaded, assigns)}), 200
+        return {"ok": True, "count": 0, "products": [],
+                **_supplier_summary(uploaded, assigns)}, 200
 
     rows = import_builder.supplier_rows({c: assigns[c] for c in new_codes}, CODE2PAIR)
     if not rows:
         log.warning("n8n suppliers: %d new codes but 0 import rows", len(new_codes))
-        return jsonify({"ok": True, "count": 0, "products": products,
-                        "message": "no import rows", "blocked": len(new_codes),
-                        **_supplier_summary(uploaded, assigns)}), 200
+        return {"ok": True, "count": 0, "products": products,
+                "message": "no import rows", "blocked": len(new_codes),
+                **_supplier_summary(uploaded, assigns)}, 200
 
     os.makedirs(OUT, exist_ok=True)
     out_fd, out_path = tempfile.mkstemp(prefix="import_suppliers_", suffix=".csv", dir=OUT)
@@ -2014,7 +2015,7 @@ def n8n_upload_suppliers():
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n suppliers: another import already running")
         _safe_unlink(out_path)
-        return jsonify({"ok": False, "error": "import already running"}), 409
+        return {"ok": False, "error": "import already running"}, 409
     log.info("n8n suppliers: %d codes, %d rows, dry_run=%s", len(new_codes), len(rows), dry)
     try:
         rc, out, err = run_import(out_path, dry_run=dry, timeout=900)
@@ -2027,7 +2028,7 @@ def n8n_upload_suppliers():
     except subprocess.TimeoutExpired:
         log.error("n8n suppliers: subprocess timeout — killed import group")
         _safe_unlink(out_path)
-        return jsonify({"ok": False, "error": "import timeout"}), 504
+        return {"ok": False, "error": "import timeout"}, 504
     finally:
         _import_lock.release()
 
@@ -2041,7 +2042,22 @@ def n8n_upload_suppliers():
     log.info("n8n suppliers: rc=%s processed=%s codes=%d", rc, parsed.get("processed"), len(new_codes))
     if not ok:
         log.error("n8n suppliers FAILED rc=%s stderr=%s", rc, (err or "")[-400:])
-    return jsonify(result), (200 if ok else 502)
+    return result, (200 if ok else 502)
+
+
+@app.route("/api/n8n/upload-suppliers", methods=["POST"])
+def n8n_upload_suppliers():
+    """n8n's nightly caller: Bearer-auth then delegate to _do_upload_suppliers.
+    dry_run=1 reaches the import without changing anything."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {token}".encode() if token else b""
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n suppliers: unauthorized call from %s", _client_ip())
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    result, status = _do_upload_suppliers(dry)
+    return jsonify(result), status
 
 
 # --------------------------------------------------------------------------- #
@@ -2225,6 +2241,64 @@ def run_shoptet_sync() -> dict:
     return result
 
 
+def run_parovania_eshop() -> dict:
+    """Nightly push (daily 21:00) of the workers' NEW pairings (reorder links →
+    internalNote) + newly assigned suppliers (→ supplier field) to the Shoptet
+    eshop — the in-app migration of the n8n „Forestshop — Párovania → eshop"
+    workflow (YuDugCCOnwejRfva, #109). Reuses the SAME careful upload path as the
+    two n8n endpoints (_do_upload_pairings / _do_upload_suppliers — no Shoptet
+    logic reimplemented). The write stays IDEMPOTENT: already-uploaded pairings/
+    suppliers are skipped via uploaded_pairings.json / uploaded_suppliers.json,
+    so a re-run never double-uploads. Records combined counts for the tab. Both
+    steps run sequentially (mirroring the n8n chain); a step that completes with
+    ok:false (import failed) or blocked is surfaced in the returned `status`
+    without crashing the run. A genuine exception propagates to the runner, which
+    records last_status='error' and keeps the app alive (degrade, never crash).
+
+    Reads ONLY the manager's decision/assignment stores (what to push) — never
+    modifies them; its own progress lives in the two uploaded_*.json state files."""
+    pairings, _ps = _do_upload_pairings(dry=False)
+    suppliers, _ss = _do_upload_suppliers(dry=False)
+
+    def _blocked(d):
+        return int(d.get("blocked") or 0)
+
+    p_ok = bool(pairings.get("ok"))
+    s_ok = bool(suppliers.get("ok"))
+    if not (p_ok and s_ok):
+        status = "failed"          # an import (or lock/timeout) failed → red row
+    elif _blocked(pairings) or _blocked(suppliers):
+        status = "blocked"         # paired but un-uploadable (missing codes) → orange row
+    else:
+        status = "ok"
+
+    result = {
+        "status": status,
+        "pairings": {
+            "count": pairings.get("count", 0),
+            "total_uploaded": pairings.get("total_uploaded", 0),
+            "total_products": pairings.get("total_products", 0),
+            "remaining": pairings.get("remaining", 0),
+            "blocked": _blocked(pairings),
+            "ok": p_ok,
+            "error": pairings.get("error", ""),
+        },
+        "suppliers": {
+            "count": suppliers.get("count", 0),
+            "total_uploaded": suppliers.get("total_uploaded", 0),
+            "total_assigned": suppliers.get("total_assigned", 0),
+            "remaining": suppliers.get("remaining", 0),
+            "blocked": _blocked(suppliers),
+            "ok": s_ok,
+            "error": suppliers.get("error", ""),
+        },
+        "review_url": PUBLIC_URL,
+    }
+    log.info("parovania_eshop: run done status=%s pairings=%d suppliers=%d",
+             status, result["pairings"]["count"], result["suppliers"]["count"])
+    return result
+
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
@@ -2239,6 +2313,14 @@ AUTOMATIONS_REG = [
                name="Sync zo Shoptetu",
                schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
                run_fn=run_shoptet_sync),
+    # #109 — nightly push of new pairings + assigned suppliers to the Shoptet
+    # eshop (migrated from n8n YuDugCCOnwejRfva). SAFETY (#93 contract): starts
+    # DISABLED — this one WRITES to the live production eshop, so it runs ONLY
+    # after the manager clicks ▶ Štart; a deploy never auto-pushes on its own.
+    Automation(key="parovania_eshop",
+               name="Párovania → eshop",
+               schedule={"daily_at": "21:00", "tz": "Europe/Bratislava"},
+               run_fn=run_parovania_eshop),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 

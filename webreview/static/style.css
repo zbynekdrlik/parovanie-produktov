@@ -328,6 +328,16 @@ body[data-theme=dark] .pill.on{background:#064e3b;color:#6ee7b7}
 .autoerr{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
   border-radius:8px;padding:8px 10px;word-break:break-word}
 body[data-theme=dark] .autoerr{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
+/* #109 „Párovania → eshop" — per-run result box coloured by outcome (ok/blocked/failed) */
+.autoresult{font-size:13px;border-radius:8px;padding:10px 12px;display:flex;
+  flex-direction:column;gap:4px;border:1px solid var(--border)}
+.autoresult-head{font-weight:700}
+.autoresult.ok{background:#ecfdf5;border-color:#a7f3d0;color:#065f46}
+.autoresult.warn{background:#fffbeb;border-color:#fde68a;color:#92400e}
+.autoresult.bad{background:#fef2f2;border-color:#fecaca;color:#b91c1c}
+body[data-theme=dark] .autoresult.ok{background:#052e21;border-color:#065f46;color:#6ee7b7}
+body[data-theme=dark] .autoresult.warn{background:#2a1e05;border-color:#78350f;color:#fcd34d}
+body[data-theme=dark] .autoresult.bad{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
 .muted{font-size:13px;color:var(--muted)}
 .empty2{margin-top:16px;text-align:center;color:var(--muted);font-size:14px;padding:26px 10px;
   background:var(--panel);border:1px dashed var(--border);border-radius:var(--radius)}
