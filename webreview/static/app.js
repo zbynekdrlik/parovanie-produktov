@@ -235,18 +235,84 @@ function renderFilters() {
   }
 }
 
-// ---- Na objednanie (to-order) tab ---------------------------------------- //
-const TABS = [['review', '🔍 Kontrola párovania'], ['toorder', '📋 Na objednanie'],
-  ['search', '🔎 Hľadať / opraviť'], ['notes', '📝 Poznámky']];
+// ---- Sidebar nav + page head --------------------------------------------- //
+// Nav labels carry NO emoji — the outline SVG icon replaces it (moderný sidebar).
+// The accessible name stays the plain label ("Na objednanie", "Hľadať / opraviť"),
+// which the E2E tests match on, so an added count badge doesn't break them.
+const TABS = [['review', 'Kontrola párovania'], ['toorder', 'Na objednanie'],
+  ['search', 'Hľadať / opraviť'], ['notes', 'Poznámky']];
+
+const NAV_ICONS = {
+  review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
+  toorder: '<path d="M9 5h6M9 9h6M9 13h4"/><rect x="4" y="3" width="16" height="18" rx="2"/>',
+  search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/>',
+  notes: '<path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4"/>',
+};
+
+// count badge per nav item — review: still-unreviewed, toorder: open lines, notes: count
+function navCount(key) {
+  if (key === 'review') return PRODUCTS.filter(p => !statusOf(p)).length;
+  if (key === 'toorder') return ORDERS.length;
+  if (key === 'notes') return NOTES.length;
+  return 0;
+}
 
 function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
   t.innerHTML = '';
   for (const [key, lbl] of TABS) {
-    const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''), lbl);
+    const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
+    const n = navCount(key);
+    bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
+      + `<span class="tlabel">${escapeHtml(lbl)}</span>`
+      + (n > 0 ? `<span class="navcount">${n}</span>` : '');
     bt.onclick = () => switchTab(key);
     t.appendChild(bt);
   }
+}
+
+// Top-bar per-page title + a plain-language subtitle (with live counts).
+const PAGE_TITLES = {
+  review: 'Kontrola párovania', toorder: 'Na objednanie',
+  search: 'Hľadať / opraviť', notes: 'Poznámky',
+};
+function setPageHead() {
+  const h = document.getElementById('pageTitle');
+  if (h) h.textContent = PAGE_TITLES[ACTIVE_TAB] || '';
+  const s = document.getElementById('pageSub'); if (!s) return;
+  if (ACTIVE_TAB === 'review') {
+    const un = PRODUCTS.filter(p => !statusOf(p)).length;
+    s.textContent = `${PRODUCTS.length} produktov · ${un} čaká na kontrolu`;
+  } else if (ACTIVE_TAB === 'toorder') {
+    s.textContent = `${ORDERS.length} otvorených položiek u dodávateľov`;
+  } else if (ACTIVE_TAB === 'search') {
+    s.textContent = 'Prehľadá všetky polia všetkých produktov';
+  } else if (ACTIVE_TAB === 'notes') {
+    s.textContent = `${NOTES.length} poznámok`;
+  } else { s.textContent = ''; }
+}
+
+// Dark mode: [data-theme=dark] on <body>, persisted in localStorage('theme').
+function applyTheme(theme) {
+  if (theme === 'dark') document.body.setAttribute('data-theme', 'dark');
+  else document.body.removeAttribute('data-theme');
+  const btn = document.getElementById('themeBtn');
+  if (btn) btn.setAttribute('aria-pressed', theme === 'dark' ? 'true' : 'false');
+  const lbl = document.getElementById('themeLbl');
+  if (lbl) lbl.textContent = theme === 'dark' ? 'Svetlý mód' : 'Tmavý mód';
+  const ic = document.getElementById('themeIcon');
+  if (ic) ic.innerHTML = theme === 'dark'
+    ? '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>'
+    : '<path d="M21 12.8A9 9 0 1111.2 3 7 7 0 0021 12.8z"/>';
+}
+function initTheme() {
+  applyTheme(localStorage.getItem('theme') || 'light');
+  const b = document.getElementById('themeBtn'); if (!b) return;
+  b.onclick = () => {
+    const next = document.body.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    localStorage.setItem('theme', next);
+    applyTheme(next);
+  };
 }
 
 async function switchTab(tab) {
@@ -795,6 +861,7 @@ function renderNotes() {
 
 function render() {
   renderTabs();
+  setPageHead();
   const toorder = ACTIVE_TAB === 'toorder';
   const search = ACTIVE_TAB === 'search';
   const notes = ACTIVE_TAB === 'notes';
@@ -841,6 +908,7 @@ async function loadVersion() {
 }
 
 async function init() {
+  initTheme();
   loadVersion();
   const j = await (await fetch('/api/products')).json();
   PRODUCTS = j.products;

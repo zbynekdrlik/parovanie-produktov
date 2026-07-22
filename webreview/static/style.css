@@ -1,241 +1,267 @@
-* { box-sizing: border-box; }
-body { margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
-  background: #f3f4f6; color: #1f2430; }
-header { position: sticky; top: 0; z-index: 10; background: #1f2937; color: #fff;
-  padding: 10px 16px; box-shadow: 0 2px 6px rgba(0,0,0,.2); }
-.title { font-size: 18px; font-weight: 700; }
-.progress { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 13px; }
-.progress .bar { flex: 1; height: 8px; background: #374151; border-radius: 4px; overflow: hidden; }
-.progress #progressBar { height: 100%; width: 0; background: #34d399; transition: width .2s; }
-.filters { display: flex; flex-wrap: wrap; gap: 6px; }
-.filters button { background: #374151; color: #cbd5e1; border: 0; padding: 5px 11px;
-  border-radius: 6px; cursor: pointer; font-size: 13px; }
-.filters button.active { background: #34d399; color: #06281d; font-weight: 700; }
-/* Na-objednanie supplier chips only (scoped by body.toorder-wide): GREEN = still to
-   resolve, RED = all lines flagged (nothing to deal with), ORANGE = the active chip.
-   The review-tab status filters carry no .todo/.done class, so they stay grey/green. */
-body.toorder-wide .filters button.todo { background: #16a34a; color: #eafff2; }
-body.toorder-wide .filters button.done { background: #dc2626; color: #fee2e2; }
-body.toorder-wide .filters button.active { background: #f59e0b; color: #3b1d00; font-weight: 700; }
-.appfoot { position: fixed; bottom: 6px; right: 10px; z-index: 50; font-size: 11px;
-  color: #6b7280; background: rgba(255,255,255,.85); padding: 1px 7px;
-  border-radius: 4px; pointer-events: none; }
+/* Forestshop párovač — moderný sidebar-dashboard (redesign 2026-07-22).
+   Spec: docs/superpowers/specs/2026-07-22-webreview-modern-dashboard-redesign.md
+   Mení sa LAYOUT + vzhľad; všetky triedy/id/data-testid + chip-farby ostávajú
+   (E2E ich merajú: order chip todo=#16a34a done=#dc2626 active=#f59e0b). */
 
-main { max-width: 1200px; margin: 14px auto; padding: 0 12px; display: flex; flex-direction: column; gap: 12px; }
-/* „Na objednanie" tab = od kraja po kraj — zoznam má veľa stĺpcov (názov, dodávateľ,
-   párovacia URL), 1200px cap nechával ~720px nevyužitých a názov produktu sa orezával */
-body.toorder-wide main { max-width: none; }
-.card { background: #fff; border-radius: 10px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
-  display: grid; grid-template-columns: 1fr 1fr; overflow: hidden; border: 2px solid transparent; }
-.card.good { border-color: #34d399; }
-.card.bad { border-color: #f87171; }
-.card.manual { border-color: #60a5fa; }
-.card.unavailable { border-color: #9ca3af; }
-.panel { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #e5e7eb; }
-.noimg { font-size: 12px; color: #9ca3af; }
-.curbadge { display: inline-block; font-size: 11px; font-weight: 600; padding: 2px 8px;
-  border-radius: 10px; margin: 2px 0 6px; }
-.curbadge.off { background: #fee2e2; color: #991b1b; }
-.curbadge.on { background: #d1fae5; color: #065f46; }
-.btn.warn { background: #fca5a5; color: #7f1d1d; }
-/* #82 — .side is a CSS Grid item (.card{display:grid}); without min-width:0 a grid
-   item's "automatic minimum size" is its content's min-content, which a long
-   unbreakable candidate name/URL can drive far past the viewport — the grid TRACK
-   then renders wider than .card's own box and the excess (incl. this row's green
-   button) lands in the area .card{overflow:hidden} clips: invisible + unclickable on
-   the manager's phone. min-width:0 opts the item out, same fix as flex children. */
-.side { padding: 12px; min-width: 0; }
-.side.left { border-right: 1px solid #eef0f3; }
-.label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; margin-bottom: 4px; }
-.pname { font-weight: 600; font-size: 15px; line-height: 1.25; margin-bottom: 4px; }
-.meta { font-size: 12px; color: #6b7280; margin-bottom: 8px; }
-.imgs { display: flex; gap: 6px; flex-wrap: wrap; }
-.imgs img { width: 84px; height: 84px; object-fit: contain; background: #f7f7f9;
-  border: 1px solid #eee; border-radius: 6px; }
-.imgs.loading::after { content: "načítavam obrázky…"; font-size: 12px; color: #9ca3af; }
-a.supurl { color: #2563eb; font-size: 12px; text-decoration: none; display: block;
-  max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-a.supurl:hover { text-decoration: underline; }
-.thumb { width: 54px; height: 54px; flex: 0 0 54px; background: #f7f7f9;
-  border: 1px solid #eee; border-radius: 5px; overflow: hidden;
-  display: flex; align-items: center; justify-content: center; }
-.thumb img { width: 54px; height: 54px; object-fit: contain; }
-.thumb.loading::after { content: '…'; color: #bbb; font-size: 12px; }
-.reason { font-size: 12px; color: #92400e; background: #fffbeb; border: 1px solid #fde68a;
-  border-radius: 6px; padding: 5px 8px; margin: 6px 0; }
-.actions { display: flex; gap: 8px; margin-top: 10px; align-items: center; flex-wrap: wrap; }
-.btn { border: 0; border-radius: 7px; padding: 8px 14px; font-size: 14px; cursor: pointer; font-weight: 600; }
-.btn.good { background: #34d399; color: #06281d; }
-.btn.bad { background: #f87171; color: #3b0a0a; }
-.btn.ghost { background: #e5e7eb; color: #374151; }
-.btn.sm { padding: 4px 9px; font-size: 12px; }
-.btn.active { outline: 3px solid #111827; }
-.cand { border-top: 1px solid #f0f0f3; padding: 7px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.cand img { width: 54px; height: 54px; object-fit: contain; background: #f7f7f9; border-radius: 5px; border: 1px solid #eee; }
-.cand .c-main { flex: 1; min-width: 0; }
-.cand .c-name { font-size: 13px; }
-.manualrow { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-.manualrow input { flex: 1 1 160px; min-width: 0; padding: 7px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; }
-/* #82 (cont'd) — flex-wrap on .cand/.manualrow lets each row's OWN min-content
-   collapse to its largest single item instead of the sum of all items (the
-   manual-URL <input> lacked min-width:0 too — its intrinsic min width alone could
-   push the button off); these two rules keep the buttons from shrinking/wrapping
-   mid-label once a row does wrap. Desktop (≥780px) is untouched — wrapping only
-   engages when a line genuinely doesn't fit. */
-.cand .btn, .manualrow .btn { flex-shrink: 0; white-space: nowrap; }
-.badge { font-size: 12px; font-weight: 700; padding: 2px 8px; border-radius: 10px; }
-.badge.good { background: #d1fae5; color: #065f46; }
-.badge.bad { background: #fee2e2; color: #991b1b; }
-.badge.manual { background: #dbeafe; color: #1e40af; }
-.badge.unavailable { background: #e5e7eb; color: #374151; }
-.empty { text-align: center; color: #6b7280; padding: 40px; }
-@media (max-width: 760px) { .card { grid-template-columns: 1fr; } .side.left { border-right: 0; border-bottom: 1px solid #eef0f3; } }
-.card.curoff { box-shadow: 0 1px 4px rgba(0,0,0,.08), inset 4px 0 0 #fbbf24; }
-.downloads { display: flex; gap: 8px; margin-top: 8px; }
-.downloads a { background: #2563eb; color: #fff; text-decoration: none; font-size: 13px;
-  font-weight: 600; padding: 6px 12px; border-radius: 7px; }
-.downloads a:hover { background: #1d4ed8; }
-.priceline { font-size: 12px; font-weight: 600; color: #1f2937; margin: 3px 0 4px; }
-.supmeta { font-size: 12px; font-weight: 600; color: #1f2937; margin: 2px 0; }
-.card.discontinued { border-color: #9ca3af; }
-.badge.discontinued { background: #f3f4f6; color: #4b5563; }
-.staterow { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
-.curbadge.st1 { background: #d1fae5; color: #065f46; }
-.curbadge.st2 { background: #fef3c7; color: #92400e; }
-.curbadge.st3 { background: #f3f4f6; color: #4b5563; }
-
-/* Na objednanie (to-order) tab */
-.tabs { display: flex; gap: 6px; margin: 6px 0; }
-.tabs .tab { background: #1f2937; color: #cbd5e1; border: 0; padding: 7px 14px;
-  border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
-.tabs .tab.active { background: #34d399; color: #06281d; }
-.toorder-supplier { font-weight: 700; color: #1f2937; margin: 14px 0 6px; padding: 4px 0;
-  border-bottom: 2px solid #e5e7eb; font-size: 15px; }
-.toorder-row { display: flex; gap: 12px; align-items: center; padding: 8px 10px;
-  background: #fff; border: 1px solid #e5e7eb; border-radius: 7px; margin-bottom: 6px; }
-.toorder-row.done { opacity: .5; background: #f0fdf4; }
-.toorder-row.waiting { background: #fffbeb; box-shadow: inset 4px 0 0 #f59e0b; }  /* čaká sa — amber, viditeľné */
-.toorder-row .to-wait { flex: 0 0 auto; background: #e5e7eb; color: #6b7280; border: 0; border-radius: 6px;
-  padding: 4px 9px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-.toorder-row .to-wait:hover { background: #d1d5db; }
-.toorder-row .to-wait.on { background: #f59e0b; color: #422006; }
-/* #84 — 'skladom' (green) / 'nedostupné' (red), two independent per-line flags —
-   same chip shape as 'čaká sa', different colors so the three never look alike. */
-.toorder-row.instock { background: #f0fdf4; box-shadow: inset 4px 0 0 #16a34a; }
-.toorder-row .to-instock { flex: 0 0 auto; background: #e5e7eb; color: #6b7280; border: 0; border-radius: 6px;
-  padding: 4px 9px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-.toorder-row .to-instock:hover { background: #d1d5db; }
-.toorder-row .to-instock.on { background: #16a34a; color: #fff; }
-.toorder-row.unavail { background: #fef2f2; box-shadow: inset 4px 0 0 #dc2626; }
-.toorder-row .to-unavail { flex: 0 0 auto; background: #e5e7eb; color: #6b7280; border: 0; border-radius: 6px;
-  padding: 4px 9px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-.toorder-row .to-unavail:hover { background: #d1d5db; }
-.toorder-row .to-unavail.on { background: #dc2626; color: #fff; }
-.toorder-row input[type=checkbox] { width: 20px; height: 20px; cursor: pointer; flex: 0 0 auto; }
-.toorder-row .to-link { color: #2563eb; text-decoration: none; font-weight: 600; font-size: 13px;
-  flex: 0 0 auto; min-width: 110px; }
-.toorder-row .to-link:hover { text-decoration: underline; }
-.toorder-row .to-pair { display: flex; align-items: center; gap: 6px; flex: 1 1 320px; min-width: 230px; }
-.toorder-row .to-pcode { color: #9ca3af; font-size: 12px; flex: 0 0 auto; }
-.toorder-row .to-pairurl { flex: 1 1 auto; min-width: 110px; padding: 5px 7px; border: 1px solid #d1d5db;
-  border-radius: 6px; font-size: 12px; }
-.toorder-row .to-pairsave { flex: 0 0 auto; background: #6d28d9; color: #fff; border: 0; border-radius: 6px;
-  padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-.toorder-row .to-pairsave:hover { background: #5b21b6; }
-.toorder-row .to-pairedit { background: transparent; border: 0; cursor: pointer; font-size: 13px;
-  padding: 2px 4px; flex: 0 0 auto; opacity: .55; }
-.toorder-row .to-pairedit:hover { opacity: 1; }
-/* doplnenie dodávateľa (pre riadky bez dodávateľa) — rovnaký štýl ako párovanie URL */
-.toorder-row .to-supplier { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
-.toorder-row .to-supinput { width: 140px; padding: 5px 7px; border: 1px solid #d1d5db;
-  border-radius: 6px; font-size: 12px; }
-.toorder-row .to-supsave { background: #0d9488; color: #fff; border: 0; border-radius: 6px;
-  padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap; }
-.toorder-row .to-supsave:hover { background: #0f766e; }
-.toorder-row .to-suptag { background: #ccfbf1; color: #0f5132; font-size: 12px; font-weight: 600;
-  padding: 3px 8px; border-radius: 10px; flex: 0 0 auto; white-space: nowrap; }
-/* GRUBE per-veľkosť kód — kopírovateľný čip (klik → clipboard) */
-.toorder-row .to-grube { background: #eef; border: 1px solid #99c; color: #1e1e6b;
-  border-radius: 4px; padding: 1px 6px; font-family: monospace; font-size: 12px;
-  cursor: pointer; flex: 0 0 auto; white-space: nowrap; }
-.toorder-row .to-grube:hover { background: #dde; }
-.toorder-row .to-supedit { background: transparent; border: 0; cursor: pointer; font-size: 13px;
-  padding: 2px 4px; flex: 0 0 auto; opacity: .55; }
-.toorder-row .to-supedit:hover { opacity: 1; }
-.toorder-row .to-size { font-weight: 600; font-size: 13px; min-width: 90px; }
-.toorder-row .to-qty { font-weight: 700; color: #065f46; font-size: 13px; min-width: 52px; }
-.toorder-row .to-name { color: #4b5563; font-size: 13px; flex: 1; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
-.toorder-row .to-date { color: #6b7280; font-size: 12px; flex: 0 0 auto; white-space: nowrap; }
-.toorder-row .to-order { color: #6d28d9; text-decoration: none; font-weight: 600; font-size: 12px;
-  flex: 0 0 auto; background: #ede9fe; padding: 3px 8px; border-radius: 6px; white-space: nowrap; }
-.toorder-row .to-order:hover { background: #ddd6fe; text-decoration: underline; }
-@media (max-width: 760px) {
-  .toorder-row { flex-wrap: wrap; gap: 6px 10px; }
-  .toorder-row .to-name { flex-basis: 100%; white-space: normal; }
-  .toorder-row .to-pair { flex-basis: 100%; }
+:root{
+  --bg:#f6f7f9; --panel:#ffffff; --side:#ffffff; --border:#e8eaed; --border2:#eef0f3;
+  --text:#1f2430; --muted:#6b7280; --soft:#9aa1ac;
+  --accent:#15803d; --accent-hov:#116330; --accent-soft:#dcfce7;
+  --input-bg:#ffffff; --chip-off-bg:#e5e7eb; --chip-off-tx:#6b7280;
+  --row-done:#f0fdf4; --row-wait:#fffbeb; --row-instock:#f0fdf4; --row-unavail:#fef2f2;
+  --radius:12px; --shadow:0 1px 3px rgba(16,24,40,.06),0 1px 2px rgba(16,24,40,.04);
+}
+body[data-theme=dark]{
+  --bg:#0f1420; --panel:#161c28; --side:#141a26; --border:#26303f; --border2:#222c3a;
+  --text:#e6e9ef; --muted:#98a2b3; --soft:#6b7686;
+  --accent:#22c55e; --accent-hov:#16a34a; --accent-soft:#123122;
+  --input-bg:#0f1724; --chip-off-bg:#26303f; --chip-off-tx:#98a2b3;
+  --row-done:#0f2318; --row-wait:#241c07; --row-instock:#0f2318; --row-unavail:#2a1315;
+  --shadow:0 1px 3px rgba(0,0,0,.45);
 }
 
-/* Hľadať / opraviť (catalog search) tab */
-#tab-search { max-width: 1200px; margin: 14px auto; padding: 0 12px;
-  display: flex; flex-direction: column; gap: 10px; }
-#searchBox { width: 100%; padding: 11px 14px; border: 1px solid #d1d5db; border-radius: 8px;
-  font-size: 15px; box-shadow: 0 1px 4px rgba(0,0,0,.06); }
-#searchBox:focus { outline: 2px solid #34d399; border-color: #34d399; }
-#searchResults { display: flex; flex-direction: column; gap: 8px; }
-.search-row { background: #fff; border: 1px solid #e5e7eb; border-radius: 9px;
-  box-shadow: 0 1px 4px rgba(0,0,0,.06); overflow: hidden; }
-.search-row .srch-head { display: flex; gap: 12px; align-items: center; padding: 9px 12px; cursor: pointer; }
-.search-row .srch-head:hover { background: #f9fafb; }
-.search-row .srch-thumb { width: 54px; height: 54px; flex: 0 0 54px; background: #f7f7f9;
-  border: 1px solid #eee; border-radius: 6px; overflow: hidden;
-  display: flex; align-items: center; justify-content: center; }
-.search-row .srch-thumb img { width: 54px; height: 54px; object-fit: contain; }
-.search-row .srch-main { flex: 1; min-width: 0; }
-.search-row .srch-name { font-weight: 600; font-size: 14px; line-height: 1.25;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.search-row .srch-meta { font-size: 12px; color: #6b7280; margin-top: 2px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.search-row .srch-link { margin-top: 2px; }
-.search-row .srch-panel { padding: 0 12px 12px; }
-.search-row .srch-saved { font-size: 13px; font-weight: 600; color: #065f46;
-  background: #d1fae5; border-radius: 6px; padding: 6px 10px; }
-/* commerce line na výsledku: cena · stavový chip · sklad (chip reusuje .curbadge.stN) */
-.search-row .srch-comm { display: flex; align-items: center; gap: 8px; margin-top: 3px; }
-.search-row .srch-comm .curbadge { margin: 0; }
-.search-row .srch-price { font-size: 12px; font-weight: 600; color: #1f2937; }
-.search-row .srch-stock { font-size: 12px; color: #6b7280; }
-/* dva odkazy (náš produkt + dodávateľ) vedľa seba — a.supurl je inak display:block */
-.search-row .srch-link a.supurl { display: inline-block; margin-right: 12px; max-width: 340px; }
-/* plná review karta vnorená v paneli výsledku — bez dvojitého tieňa (border-color
-   nechávame na stavových triedach .card.good/.manual/…) */
-.search-row .srch-panel .card { box-shadow: none; }
-.sbadge { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 10px;
-  flex: 0 0 auto; white-space: nowrap; }
-.sbadge.inreview { background: #dbeafe; color: #1e40af; }
-.sbadge.new { background: #fef3c7; color: #92400e; }
-.sbadge.paired { background: #d1fae5; color: #065f46; }
-.srch-empty { text-align: center; color: #6b7280; padding: 24px; }
+*{box-sizing:border-box}
+body{margin:0;display:flex;min-height:100vh;background:var(--bg);color:var(--text);
+  font-family:-apple-system,"Segoe UI",Roboto,Inter,sans-serif;-webkit-font-smoothing:antialiased}
+a{color:inherit}
 
-/* Poznámky (notes) tab — free-form reminders, Discord replacement (#83) */
-#tab-notes { max-width: 800px; margin: 14px auto; padding: 0 12px;
-  display: flex; flex-direction: column; gap: 10px; }
-.note-add { display: flex; flex-direction: column; gap: 8px; background: #fff;
-  border: 1px solid #e5e7eb; border-radius: 9px; padding: 10px;
-  box-shadow: 0 1px 4px rgba(0,0,0,.06); }
-.note-add textarea { width: 100%; min-height: 64px; padding: 8px 10px; border: 1px solid #d1d5db;
-  border-radius: 6px; font: inherit; font-size: 14px; resize: vertical; }
-.note-add .btn { align-self: flex-end; }
-.note-list { display: flex; flex-direction: column; gap: 8px; }
-.note { background: #fff; border: 1px solid #e5e7eb; border-radius: 9px; padding: 10px 12px;
-  box-shadow: 0 1px 4px rgba(0,0,0,.06); }
-.note.done { opacity: .55; }
-.note.done .note-text { text-decoration: line-through; }
-.note-text { white-space: pre-wrap; word-break: break-word; font-size: 14px; margin-bottom: 6px; }
-.note-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #6b7280; }
-.note-meta .note-ts { flex: 1; }
-.note-meta button { border: 0; border-radius: 6px; padding: 3px 9px; font-size: 12px;
-  font-weight: 600; cursor: pointer; background: #e5e7eb; color: #374151; white-space: nowrap; }
-.note-meta .note-done:hover { background: #d1d5db; }
-.note-meta .note-del { background: #fee2e2; color: #991b1b; }
-.note-meta .note-del:hover { background: #fecaca; }
+/* ---------------- SIDEBAR ---------------- */
+.sidebar{width:242px;flex:0 0 242px;background:var(--side);border-right:1px solid var(--border);
+  display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+.brand{display:flex;align-items:center;gap:10px;padding:16px 18px 14px;font-weight:800;
+  font-size:17px;letter-spacing:-.01em}
+.brand .logo{width:30px;height:30px;flex:0 0 30px;border-radius:9px;background:var(--accent);
+  display:flex;align-items:center;justify-content:center}
+.brand .logo svg{width:18px;height:18px;stroke:#fff;fill:none;stroke-width:1.7}
+.brand .brandtxt small{display:block;font-weight:500;font-size:11px;color:var(--muted);margin-top:1px}
+.side-nav{padding:6px 10px;overflow-y:auto;flex:1}
+.nav-sec{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--soft);padding:16px 10px 6px}
+.tabs{display:flex;flex-direction:column;gap:2px}
+.tabs .tab,.soon{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:9px;
+  color:var(--muted);font-size:14px;font-weight:500;cursor:pointer;border:0;background:none;
+  width:100%;text-align:left;transition:background .12s,color .12s;font-family:inherit}
+.tabs .tab svg,.soon svg{width:19px;height:19px;flex:0 0 19px;stroke:currentColor;fill:none;
+  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.tabs .tab .tlabel,.soon .tlabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tabs .tab:hover{background:var(--bg);color:var(--text)}
+.tabs .tab.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.tabs .tab.active svg{stroke:var(--accent)}
+.tabs .tab .navcount{background:var(--accent);color:#fff;font-size:11px;font-weight:700;
+  border-radius:20px;padding:1px 8px;min-width:20px;text-align:center}
+.soon{opacity:.5;cursor:default}
+.soon .soonpill{font-size:9.5px;font-weight:700;color:var(--soft);border:1px solid var(--border);
+  border-radius:6px;padding:1px 6px}
+.sidefoot{border-top:1px solid var(--border);padding:10px 12px}
+.themebtn{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:9px;
+  color:var(--muted);font-size:14px;font-weight:500;cursor:pointer;background:none;border:0;
+  width:100%;text-align:left;font-family:inherit}
+.themebtn svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.7;
+  stroke-linecap:round;stroke-linejoin:round}
+.themebtn:hover{background:var(--bg);color:var(--text)}
+.ver{font-size:11px;color:var(--soft);padding:6px 11px 2px}
+
+/* ---------------- MAIN + TOPBAR ---------------- */
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{position:sticky;top:0;z-index:10;background:var(--bg);border-bottom:1px solid var(--border);
+  padding:18px 28px 14px;display:grid;grid-template-columns:1fr auto;gap:6px 16px;align-items:start}
+.topbar-head h1{margin:0;font-size:22px;font-weight:800;letter-spacing:-.02em}
+.topbar-head .sub{font-size:13px;color:var(--muted);margin-top:3px}
+.topacts{grid-column:2;grid-row:1;display:flex;gap:9px;align-items:center;flex-wrap:wrap;justify-self:end}
+.progress{grid-column:1 / -1;display:flex;align-items:center;gap:10px;font-size:12.5px;
+  color:var(--muted);margin-top:4px}
+.progress .bar{flex:1;height:7px;background:var(--border);border-radius:4px;overflow:hidden}
+.progress #progressBar{height:100%;width:0;background:var(--accent);transition:width .2s}
+.filters{grid-column:1 / -1;display:flex;flex-wrap:wrap;gap:7px;margin-top:4px}
+.filters button{background:var(--panel);color:var(--muted);border:1px solid var(--border);
+  padding:6px 12px;border-radius:20px;cursor:pointer;font-size:13px;font-weight:600;transition:.12s}
+.filters button:hover{border-color:var(--soft)}
+.filters button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+/* „Na objednanie" supplier chips (scoped by body.toorder-wide): GREEN=treba riešiť,
+   RED=všetko poriešené, ORANGE=vybraná. E2E merajú presné rgb — NEMEŇ. */
+body.toorder-wide .filters button.todo{background:#16a34a;border-color:#16a34a;color:#eafff2}
+body.toorder-wide .filters button.done{background:#dc2626;border-color:#dc2626;color:#fee2e2}
+body.toorder-wide .filters button.active{background:#f59e0b;border-color:#f59e0b;color:#3b1d00;font-weight:700}
+.downloads{display:flex;gap:8px}
+.downloads a{background:var(--accent);color:#fff;text-decoration:none;font-size:13.5px;
+  font-weight:600;padding:9px 15px;border-radius:9px}
+.downloads a:hover{background:var(--accent-hov)}
+
+/* content area */
+main#list{padding:20px 28px 60px;display:flex;flex-direction:column;gap:12px;
+  max-width:1180px;width:100%}
+body.toorder-wide main#list{max-width:none}
+.empty{text-align:center;color:var(--muted);padding:44px}
+
+/* ---------------- REVIEW CARD ---------------- */
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  box-shadow:var(--shadow);display:grid;grid-template-columns:1fr 1fr;overflow:hidden}
+.card.good{border-color:#16a34a}
+.card.manual{border-color:#3b82f6} .card.unavailable{border-color:#9ca3af}
+.card.discontinued{border-color:#9ca3af}
+.card.curoff{box-shadow:var(--shadow),inset 4px 0 0 #f59e0b}
+.side{padding:14px 16px;min-width:0}
+.side.left{border-right:1px solid var(--border2)}
+@media(max-width:760px){.card{grid-template-columns:1fr}.side.left{border-right:0;border-bottom:1px solid var(--border2)}}
+.label{font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--soft);
+  font-weight:700;margin-bottom:6px}
+.pname{font-weight:600;font-size:14.5px;line-height:1.3;margin-bottom:4px}
+.meta{font-size:12.5px;color:var(--muted);margin-bottom:6px}
+.priceline{font-size:12px;font-weight:600;color:var(--text);margin:3px 0 4px}
+.supmeta{font-size:12px;font-weight:600;color:var(--text);margin:2px 0}
+a.supurl{color:#2563eb;font-size:12px;text-decoration:none;display:block;max-width:100%;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px}
+a.supurl:hover{text-decoration:underline}
+body[data-theme=dark] a.supurl{color:#60a5fa}
+.imgs{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.imgs img{width:82px;height:82px;object-fit:contain;background:var(--bg);
+  border:1px solid var(--border);border-radius:8px}
+.imgs.loading::after{content:"načítavam obrázky…";font-size:12px;color:var(--soft)}
+.noimg{font-size:12px;color:var(--soft)}
+.reason{font-size:12px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
+  border-radius:8px;padding:6px 9px;margin:6px 0}
+body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f320c}
+.curbadge{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:10px;margin:2px 0 6px}
+.curbadge.st1{background:#d1fae5;color:#065f46} .curbadge.st2{background:#fef3c7;color:#92400e}
+.curbadge.st3{background:#f3f4f6;color:#4b5563}
+.staterow{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.badge{font-size:12px;font-weight:700;padding:2px 8px;border-radius:10px}
+.badge.good{background:#d1fae5;color:#065f46}
+.badge.manual{background:#dbeafe;color:#1e40af} .badge.unavailable{background:#e5e7eb;color:#374151}
+.badge.discontinued{background:#f3f4f6;color:#4b5563}
+.actions{display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}
+.btn{border:1px solid transparent;border-radius:8px;padding:8px 14px;font-size:14px;
+  cursor:pointer;font-weight:600;font-family:inherit}
+.btn.good{background:#16a34a;color:#fff} .btn.good:hover{background:#15803d}
+.btn.ghost{background:var(--chip-off-bg);color:var(--text)}
+.btn.warn{background:#fca5a5;color:#7f1d1d}
+.btn.sm{padding:5px 10px;font-size:12px}
+.btn.active{outline:3px solid var(--accent)}
+.panel{margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)}
+.cand{border-top:1px solid var(--border2);padding:8px 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.cand img{width:54px;height:54px;object-fit:contain;background:var(--bg);border-radius:5px;border:1px solid var(--border)}
+.cand .c-main{flex:1;min-width:0} .cand .c-name{font-size:13px}
+.cand .btn,.manualrow .btn{flex-shrink:0;white-space:nowrap}
+.thumb{width:54px;height:54px;flex:0 0 54px;background:var(--bg);border:1px solid var(--border);
+  border-radius:5px;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.thumb img{width:54px;height:54px;object-fit:contain}
+.thumb.loading::after{content:'…';color:var(--soft);font-size:12px}
+.manualrow{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.manualrow input{flex:1 1 160px;min-width:0;padding:8px;border:1px solid var(--border);
+  border-radius:7px;font-size:13px;background:var(--input-bg);color:var(--text)}
+
+/* ---------------- NA OBJEDNANIE ---------------- */
+.toorder-supplier{font-weight:700;color:var(--text);margin:16px 0 8px;padding:4px 0;
+  border-bottom:2px solid var(--border);font-size:15px}
+.toorder-row{display:flex;gap:12px;align-items:center;padding:10px 12px;background:var(--panel);
+  border:1px solid var(--border);border-radius:10px;margin-bottom:8px;box-shadow:var(--shadow)}
+.toorder-row.done{opacity:.55;background:var(--row-done)}
+.toorder-row.waiting{background:var(--row-wait);box-shadow:inset 4px 0 0 #f59e0b}
+.toorder-row.instock{background:var(--row-instock);box-shadow:inset 4px 0 0 #16a34a}
+.toorder-row.unavail{background:var(--row-unavail);box-shadow:inset 4px 0 0 #dc2626}
+.toorder-row input[type=checkbox]{width:20px;height:20px;cursor:pointer;flex:0 0 auto}
+.toorder-row .to-wait,.toorder-row .to-instock,.toorder-row .to-unavail{flex:0 0 auto;
+  background:var(--chip-off-bg);color:var(--chip-off-tx);border:0;border-radius:7px;
+  padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+.toorder-row .to-wait.on{background:#f59e0b;color:#422006}
+.toorder-row .to-instock.on{background:#16a34a;color:#fff}
+.toorder-row .to-unavail.on{background:#dc2626;color:#fff}
+.toorder-row .to-link{color:#2563eb;text-decoration:none;font-weight:600;font-size:13px;flex:0 0 auto;min-width:110px}
+.toorder-row .to-link:hover{text-decoration:underline}
+body[data-theme=dark] .toorder-row .to-link{color:#60a5fa}
+.toorder-row .to-pair{display:flex;align-items:center;gap:6px;flex:1 1 320px;min-width:230px}
+.toorder-row .to-pcode{color:var(--soft);font-size:12px;flex:0 0 auto}
+.toorder-row .to-pairurl{flex:1 1 auto;min-width:110px;padding:6px 8px;border:1px solid var(--border);
+  border-radius:7px;font-size:12px;background:var(--input-bg);color:var(--text)}
+.toorder-row .to-pairsave{flex:0 0 auto;background:#6d28d9;color:#fff;border:0;border-radius:7px;
+  padding:6px 11px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+.toorder-row .to-pairsave:hover{background:#5b21b6}
+.toorder-row .to-pairedit,.toorder-row .to-supedit{background:transparent;border:0;cursor:pointer;
+  font-size:13px;padding:2px 4px;flex:0 0 auto;opacity:.55}
+.toorder-row .to-pairedit:hover,.toorder-row .to-supedit:hover{opacity:1}
+.toorder-row .to-supplier{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.toorder-row .to-supinput{width:140px;padding:6px 8px;border:1px solid var(--border);
+  border-radius:7px;font-size:12px;background:var(--input-bg);color:var(--text)}
+.toorder-row .to-supsave{background:#0d9488;color:#fff;border:0;border-radius:7px;padding:6px 11px;
+  font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+.toorder-row .to-supsave:hover{background:#0f766e}
+.toorder-row .to-suptag{background:#ccfbf1;color:#0f5132;font-size:12px;font-weight:600;
+  padding:3px 8px;border-radius:10px;flex:0 0 auto;white-space:nowrap}
+.toorder-row .to-grube{background:#eef;border:1px solid #99c;color:#1e1e6b;border-radius:5px;
+  padding:1px 6px;font-family:monospace;font-size:12px;cursor:pointer;flex:0 0 auto;white-space:nowrap}
+.toorder-row .to-grube:hover{background:#dde}
+.toorder-row .to-size{font-weight:600;font-size:13px;min-width:90px}
+.toorder-row .to-qty{font-weight:700;color:#065f46;font-size:13px;min-width:52px}
+body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
+.toorder-row .to-name{color:var(--muted);font-size:13px;flex:1;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.toorder-row .to-date{color:var(--soft);font-size:12px;flex:0 0 auto;white-space:nowrap}
+.toorder-row .to-order{color:#6d28d9;text-decoration:none;font-weight:600;font-size:12px;flex:0 0 auto;
+  background:#ede9fe;padding:3px 8px;border-radius:6px;white-space:nowrap}
+.toorder-row .to-order:hover{background:#ddd6fe;text-decoration:underline}
+@media(max-width:760px){
+  .toorder-row{flex-wrap:wrap;gap:6px 10px}
+  .toorder-row .to-name{flex-basis:100%;white-space:normal}
+  .toorder-row .to-pair{flex-basis:100%}
+}
+
+/* ---------------- HĽADAŤ / OPRAVIŤ ---------------- */
+#tab-search{padding:20px 28px 60px;max-width:1180px;width:100%;display:flex;flex-direction:column;gap:12px}
+#searchBox{width:100%;padding:12px 15px;border:1px solid var(--border);border-radius:11px;
+  font-size:15px;background:var(--panel);color:var(--text);box-shadow:var(--shadow)}
+#searchBox:focus{outline:2px solid var(--accent);border-color:var(--accent)}
+#searchResults{display:flex;flex-direction:column;gap:8px}
+.search-row{background:var(--panel);border:1px solid var(--border);border-radius:11px;
+  box-shadow:var(--shadow);overflow:hidden}
+.search-row .srch-head{display:flex;gap:12px;align-items:center;padding:10px 13px;cursor:pointer}
+.search-row .srch-head:hover{background:var(--bg)}
+.search-row .srch-thumb{width:54px;height:54px;flex:0 0 54px;background:var(--bg);border:1px solid var(--border);
+  border-radius:6px;overflow:hidden;display:flex;align-items:center;justify-content:center}
+.search-row .srch-thumb img{width:54px;height:54px;object-fit:contain}
+.search-row .srch-main{flex:1;min-width:0}
+.search-row .srch-name{font-weight:600;font-size:14px;line-height:1.25;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.search-row .srch-meta{font-size:12px;color:var(--muted);margin-top:2px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.search-row .srch-link{margin-top:2px}
+.search-row .srch-panel{padding:0 13px 13px}
+.search-row .srch-saved{font-size:13px;font-weight:600;color:#065f46;background:#d1fae5;
+  border-radius:7px;padding:6px 10px}
+.search-row .srch-comm{display:flex;align-items:center;gap:8px;margin-top:3px}
+.search-row .srch-comm .curbadge{margin:0}
+.search-row .srch-price{font-size:12px;font-weight:600;color:var(--text)}
+.search-row .srch-stock{font-size:12px;color:var(--muted)}
+.search-row .srch-link a.supurl{display:inline-block;margin-right:12px;max-width:340px}
+.search-row .srch-panel .card{box-shadow:none}
+.sbadge{font-size:12px;font-weight:700;padding:3px 9px;border-radius:10px;flex:0 0 auto;white-space:nowrap}
+.sbadge.inreview{background:#dbeafe;color:#1e40af} .sbadge.new{background:#fef3c7;color:#92400e}
+.sbadge.paired{background:#d1fae5;color:#065f46}
+.srch-empty{text-align:center;color:var(--muted);padding:24px}
+
+/* ---------------- POZNÁMKY ---------------- */
+#tab-notes{padding:20px 28px 60px;max-width:820px;width:100%;display:flex;flex-direction:column;gap:10px}
+.note-add{display:flex;flex-direction:column;gap:8px;background:var(--panel);border:1px solid var(--border);
+  border-radius:11px;padding:11px;box-shadow:var(--shadow)}
+.note-add textarea{width:100%;min-height:64px;padding:9px 11px;border:1px solid var(--border);
+  border-radius:7px;font:inherit;font-size:14px;resize:vertical;background:var(--input-bg);color:var(--text)}
+.note-add .btn{align-self:flex-end}
+.note-list{display:flex;flex-direction:column;gap:8px}
+.note{background:var(--panel);border:1px solid var(--border);border-radius:11px;padding:11px 13px;box-shadow:var(--shadow)}
+.note.done{opacity:.55} .note.done .note-text{text-decoration:line-through}
+.note-text{white-space:pre-wrap;word-break:break-word;font-size:14px;margin-bottom:6px}
+.note-meta{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+.note-meta .note-ts{flex:1}
+.note-meta button{border:0;border-radius:7px;padding:4px 10px;font-size:12px;font-weight:600;
+  cursor:pointer;background:var(--chip-off-bg);color:var(--text);white-space:nowrap}
+.note-meta .note-del{background:#fee2e2;color:#991b1b}
+.note-meta .note-del:hover{background:#fecaca}
+
+/* ---------------- RESPONSIVE ---------------- */
+@media(max-width:820px){
+  body{flex-direction:column}
+  .sidebar{width:100%;flex:0 0 auto;height:auto;position:static;flex-direction:column;
+    border-right:0;border-bottom:1px solid var(--border)}
+  .side-nav .tabs{flex-direction:row;flex-wrap:wrap}
+  .nav-sec,.soon-nav{display:none}
+  .topbar,main#list,#tab-search,#tab-notes{padding-left:16px;padding-right:16px}
+}
