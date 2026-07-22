@@ -15,6 +15,7 @@ let SUPPLIER_STOCK = null;  // /api/supplier-stock — last scraper run's rows (
 let STOCK_FILTER = 'all';   // dodávateľský sklad filter: all | errors | llm | <supplier>
 let RIZIKO = null;          // /api/riziko-vypadku — last risk-report run (#107)
 let RESTOCK = null;         // /api/restock-skladom — last restock run (#108)
+let ORDERS_REMINDER = null; // /api/orders-reminder — last orders-reminder run (#105)
 let DEV = null;             // /api/dev/issues — {available, issues:[...]} or null (#115)
 let DEV_FILTER = 'open';    // 'Vývoj' tab filter: open | closed | all
 let ORDER_SUPPLIER = 'all';
@@ -305,7 +306,8 @@ const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
 
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
 // sidebar section (#autoTabs) + its own tab section. New automations: add here.
-const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['shoptet_sync', 'Sync zo Shoptetu'],
+const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['orders_reminder', 'Pripomienky objednávok'],
+  ['shoptet_sync', 'Sync zo Shoptetu'],
   ['parovania_eshop', 'Párovania → eshop'], ['dodavatelsky_sklad', 'Dodávateľský sklad'],
   ['riziko_vypadku', 'Riziko výpadku'], ['restock_skladom', 'Vypredané → Skladom']];
 
@@ -324,6 +326,8 @@ const NAV_ICONS = {
     + '<path d="M12 11v10"/>',
   riziko_vypadku: '<path d="M12 3L2 20h20L12 3z"/><path d="M12 9.5v4"/><path d="M12 17v.01"/>',
   restock_skladom: '<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M9 12l3-3 3 3"/><path d="M12 9v7"/>',
+  orders_reminder: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/>'
+    + '<path d="M8 2v4M16 2v4"/><path d="M12 12v3"/><path d="M12 17.5v.01"/>',
   dev: '<path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 5l-2 14"/>',
 };
 
@@ -342,6 +346,7 @@ function navCount(key) {
   if (key === 'dodavatelsky_sklad') return SUPPLIER_STOCK ? (SUPPLIER_STOCK.stats || {}).errors || 0 : 0;
   if (key === 'riziko_vypadku') return RIZIKO ? (RIZIKO.risks || []).length : 0;
   if (key === 'restock_skladom') return RESTOCK ? (RESTOCK.candidates || []).length : 0;
+  if (key === 'orders_reminder') return ORDERS_REMINDER ? (ORDERS_REMINDER.red || []).length : 0;
   if (key === 'dev') return DEV ? (DEV.issues || []).filter(i => i.state === 'open').length : 0;
   return 0;
 }
@@ -485,6 +490,7 @@ async function switchTab(tab) {
   if (tab === 'dodavatelsky_sklad') await loadSupplierStock();   // always fresh — status can change
   if (tab === 'riziko_vypadku') await loadRiziko();   // always fresh — status can change
   if (tab === 'restock_skladom') await loadRestock();   // always fresh — status can change
+  if (tab === 'orders_reminder') await loadOrdersReminder();   // always fresh — status can change
   if (tab === 'dev') await loadDevIssues();   // always fresh — issues change on GitHub
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
@@ -1256,12 +1262,19 @@ async function loadRestock() {
   catch (_) { RESTOCK = null; }
 }
 
+async function loadOrdersReminder() {
+  await loadAutomations();
+  try { ORDERS_REMINDER = await (await fetch('/api/orders-reminder')).json(); }
+  catch (_) { ORDERS_REMINDER = null; }
+}
+
 // Reload AUTOMATIONS + the active tab's display data (used by toggle + run poll,
 // so a live run refreshes whichever automation tab is open).
 async function _reloadAuto(tab) {
   if (tab === 'dodavatelsky_sklad') { await loadSupplierStock(); return; }
   if (tab === 'riziko_vypadku') { await loadRiziko(); return; }
   if (tab === 'restock_skladom') { await loadRestock(); return; }
+  if (tab === 'orders_reminder') { await loadOrdersReminder(); return; }
   await loadPosta();   // loads AUTOMATIONS too; POSTA fetch is harmless elsewhere
 }
 
@@ -1856,6 +1869,116 @@ function renderRestockSkladom() {
   wrap.appendChild(tbl);
 }
 
+// ---- Automatizácie (#105): tab „Pripomienky objednávok" -------------------- //
+// „Vybavuje sa" objednávky >4 dni: BEZ poznámky → červený „nikto sa jej nedotkol"
+// alert (žiaden mail); S poznámkou → AI klasifikuje, či bol zákazník kontaktovaný —
+// ak nie, pošle jednu pripomienku (max raz/obj) a ukáže oranžovo. POSIELA reálne
+// zákaznícke e-maily + stojí OpenAI → automatizácia štartuje Zastavené (#93).
+function renderOrdersReminder() {
+  const wrap = document.getElementById('tab-orders_reminder');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('orders_reminder');
+  const st = el('div', 'autostatus');
+  if (!a) {
+    st.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    wrap.appendChild(st);
+    return;
+  }
+  const head = el('div', 'autohead');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'ordrem-status';
+  head.appendChild(pill);
+  if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha kontrola…'));
+  const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+    a.enabled ? '⏹ Stop' : '▶ Štart');
+  btn.dataset.testid = 'ordrem-toggle';
+  btn.onclick = () => toggleAutomation('orders_reminder', !a.enabled);
+  head.appendChild(btn);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'ordrem-run';
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation('orders_reminder', 'orders_reminder');
+  head.appendChild(run);
+  st.appendChild(head);
+
+  const meta = el('div', 'autometa');
+  const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+  bits.push('Posledný beh: ' + (a.last_run
+    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+    : 'zatiaľ nikdy'));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+  st.appendChild(meta);
+  if (a.last_status === 'error' && a.last_error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+  }
+  const lr = a.last_result || {};
+  if (a.last_run && a.last_status === 'ok') {
+    st.appendChild(el('div', 'muted',
+      `Objednávky >4 dni: ${lr.orders_4d ?? 0} · bez poznámky: ${lr.no_note ?? 0}`
+      + ` · odoslané pripomienky teraz: ${lr.emailed_now ?? 0}`
+      + (lr.emailed_total ? ` · spolu pripomenutých: ${lr.emailed_total}` : '')
+      + (lr.ai_unavailable ? ` · AI nedostupné: ${lr.ai_unavailable}` : '')
+      + (lr.errors ? ` · chyby: ${lr.errors}` : '')));
+  }
+  wrap.appendChild(st);
+
+  const d = ORDERS_REMINDER || {};
+  const red = d.red || [];
+  const orange = d.orange || [];
+  if (!red.length && !orange.length) {
+    wrap.appendChild(el('div', 'empty2',
+      d.last_check ? `Žiadne objednávky na pripomenutie (kontrola ${fmtDt(d.last_check)}).`
+                   : 'Zatiaľ neprebehla žiadna kontrola — spusti automatizáciu (▶ Štart) alebo klikni ⚡ Spustiť teraz.'));
+    return;
+  }
+
+  // RED — >4d orders with NO internal note (nobody has touched them yet)
+  if (red.length) {
+    wrap.appendChild(el('div', 'warnhead', `🔴 ${red.length} bez internej poznámky — nikto sa jej ešte nedotkol`));
+    const tbl = el('table', 'posta-table');
+    tbl.dataset.testid = 'ordrem-red';
+    tbl.innerHTML = '<thead><tr><th>Objednávka</th><th>Zákazník</th><th>Položka</th>'
+      + '<th>Bez pohybu</th></tr></thead>';
+    const tb = el('tbody');
+    for (const o of red) {
+      const tr = el('tr', 'callneeded');
+      tr.innerHTML =
+        `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
+        + `<td>${escapeHtml(o.billFullName || '')}`
+        + `<div class="sub2">${escapeHtml(o.phone || '')} · ${escapeHtml(o.email || '')}</div></td>`
+        + `<td>${escapeHtml(o.itemName || '')}</td>`
+        + `<td>${o.days || 0} ${dniLabel(o.days || 0)}</td>`;
+      tb.appendChild(tr);
+    }
+    tbl.appendChild(tb);
+    wrap.appendChild(tbl);
+  }
+
+  // ORANGE — reminder e-mail sent to the customer
+  if (orange.length) {
+    wrap.appendChild(el('div', 'warnhead', `🟠 ${orange.length} — pripomienka odoslaná zákazníkovi`));
+    const tbl = el('table', 'posta-table');
+    tbl.dataset.testid = 'ordrem-orange';
+    tbl.innerHTML = '<thead><tr><th>Objednávka</th><th>Zákazník</th><th>Položka</th>'
+      + '<th>Interná poznámka</th><th>Odoslané</th></tr></thead>';
+    const tb = el('tbody');
+    for (const o of orange) {
+      const tr = el('tr', '');
+      tr.innerHTML =
+        `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
+        + `<td>${escapeHtml(o.billFullName || '')}<div class="sub2">${escapeHtml(o.email || '')}</div></td>`
+        + `<td>${escapeHtml(o.itemName || '')}<div class="sub2">${o.days || 0} ${dniLabel(o.days || 0)} v stave</div></td>`
+        + `<td class="sub2">${escapeHtml(o.shopRemark || '—')}</td>`
+        + `<td>${fmtDt(o.sent_date)}</td>`;
+      tb.appendChild(tr);
+    }
+    tbl.appendChild(tb);
+    wrap.appendChild(tbl);
+  }
+}
+
 function render() {
   renderTabs();
   setPageHead();
@@ -1869,8 +1992,9 @@ function render() {
   const dodavatelskySklad = ACTIVE_TAB === 'dodavatelsky_sklad';
   const rizikoVypadku = ACTIVE_TAB === 'riziko_vypadku';
   const restockSkladom = ACTIVE_TAB === 'restock_skladom';
+  const ordersReminder = ACTIVE_TAB === 'orders_reminder';
   const dev = ACTIVE_TAB === 'dev';
-  const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad || rizikoVypadku || restockSkladom;  // any automation tab
+  const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad || rizikoVypadku || restockSkladom || ordersReminder;  // any automation tab
   const plain = search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
@@ -1885,9 +2009,11 @@ function render() {
   const secSklad = document.getElementById('tab-dodavatelsky_sklad'); if (secSklad) secSklad.hidden = !dodavatelskySklad;
   const secRiziko = document.getElementById('tab-riziko_vypadku'); if (secRiziko) secRiziko.hidden = !rizikoVypadku;
   const secRestock = document.getElementById('tab-restock_skladom'); if (secRestock) secRestock.hidden = !restockSkladom;
+  const secOrdRem = document.getElementById('tab-orders_reminder'); if (secOrdRem) secOrdRem.hidden = !ordersReminder;
   const secDev = document.getElementById('tab-dev'); if (secDev) secDev.hidden = !dev;
   const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = plain ? 'none' : '';
   if (dev) { document.getElementById('empty').hidden = true; renderDev(); return; }
+  if (ordersReminder) { document.getElementById('empty').hidden = true; renderOrdersReminder(); return; }
   if (restockSkladom) { document.getElementById('empty').hidden = true; renderRestockSkladom(); return; }
   if (rizikoVypadku) { document.getElementById('empty').hidden = true; renderRizikoVypadku(); return; }
   if (dodavatelskySklad) { document.getElementById('empty').hidden = true; renderDodavatelskySklad(); return; }

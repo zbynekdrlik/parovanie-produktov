@@ -378,6 +378,25 @@ def automations_server(tmp_path_factory):
         ],
         "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
     }, ensure_ascii=False), encoding="utf-8")
+    # #105 — pre-existing „Pripomienky objednávok" result (one red no-note order + one order
+    # where a reminder WAS e-mailed) so the tab's status + both sections render WITHOUT any
+    # network. The E2E never clicks Spustiť teraz (it SENDS real customer e-mails + costs OpenAI).
+    (out / "orders_reminder.json").write_text(json.dumps({
+        "last_check": "2026-07-22T08:00:05+02:00",
+        "orders": {"20261001": {"status": "emailed", "date": "2026-07-22T08:00:03+02:00",
+                                "name": "Eva Nová", "email": "eva@example.com",
+                                "itemName": "Nohavice", "note": "volať zákazníka"}},
+        "red": [{"code": "20261000", "billFullName": "Ján Bez", "phone": "+421900111222",
+                 "email": "jan@example.com", "itemName": "Bunda Test Red", "days": 9,
+                 "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261000&src=orders"}],
+        "orange": [{"code": "20261001", "billFullName": "Eva Nová", "email": "eva@example.com",
+                    "itemName": "Nohavice Test Orange", "shopRemark": "volať zákazníka", "days": 8,
+                    "sent_date": "2026-07-22T08:00:03+02:00",
+                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261001&src=orders"}],
+        "skipped": [],
+        "stats": {"orders_4d": 2, "no_note": 1, "with_note": 1, "emailed_now": 0,
+                  "emailed_total": 1, "skipped_now": 0, "ai_unavailable": 0, "errors": 0},
+    }, ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
         **_AUTH_ENV,
