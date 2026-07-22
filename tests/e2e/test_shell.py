@@ -126,8 +126,10 @@ def test_eshop_folder_groups_nav_and_collapses(page, live_server):
     assert page.evaluate("() => localStorage.getItem('folder:eshop')") == "collapsed"
 
     # Persists across a full reload (the store, not just the in-page toggle).
+    # #tabs buttons are collapsed (display:none) now, so wait for them ATTACHED.
     page.reload()
-    page.wait_for_selector(".sidebar #tabs button")
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".sidebar #tabs button", state="attached")
     assert page.evaluate(body_disp) == "none"
     assert not page.locator("#tabs button").filter(
         has_text="Na objednanie").first.is_visible()

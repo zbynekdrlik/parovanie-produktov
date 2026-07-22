@@ -357,6 +357,27 @@ function initTheme() {
   };
 }
 
+// Sidebar folders (#118): collapsible nav groups, system-like tree. Each folder's
+// expanded/collapsed state persists per-key in localStorage (default = expanded).
+// Designed for extensibility — register more folders by calling initFolder().
+function initFolder(id, key) {
+  const folder = document.getElementById(id);
+  const head = folder && folder.querySelector('.folder-head');
+  if (!folder || !head) return;
+  const collapsed = localStorage.getItem(key) === 'collapsed';
+  folder.classList.toggle('collapsed', collapsed);
+  head.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  head.onclick = () => {
+    const nowCollapsed = !folder.classList.contains('collapsed');
+    folder.classList.toggle('collapsed', nowCollapsed);
+    head.setAttribute('aria-expanded', nowCollapsed ? 'false' : 'true');
+    localStorage.setItem(key, nowCollapsed ? 'collapsed' : 'open');
+  };
+}
+function initFolders() {
+  initFolder('folder-eshop', 'folder:eshop');
+}
+
 async function switchTab(tab) {
   ACTIVE_TAB = tab; localStorage.setItem('tab', tab); window.scrollTo(0, 0);
   if (tab === 'toorder' && !ORDERS.length) await loadOrders();
@@ -1192,6 +1213,7 @@ async function loadVersion() {
 
 async function init() {
   initTheme();
+  initFolders();
   // Who am I? (#91) — 401 → the fetch guard above already navigates to /login.
   try {
     const meR = await fetch('/api/me');

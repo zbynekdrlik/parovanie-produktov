@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrola párovania — Forestshop</title>
-  <link rel="stylesheet" href="/static/style.css?v=35">
+  <link rel="stylesheet" href="/static/style.css?v=36">
 </head>
 <body>
   <script>try{if(localStorage.getItem('theme')==='dark')document.body.setAttribute('data-theme','dark');}catch(e){}</script>
@@ -14,9 +14,18 @@
       <span class="brandtxt">Forestshop<small>Párovač &amp; dashboard</small></span>
     </div>
     <nav class="side-nav">
-      <div class="tabs" id="tabs"></div>
-      <div class="nav-sec">Automatizácie</div>
-      <div class="tabs" id="autoTabs"></div>
+      <div class="nav-folder" id="folder-eshop">
+        <button class="folder-head" id="folderEshopHead" type="button" aria-expanded="true" aria-controls="folder-eshop-body">
+          <svg class="folder-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
+          <span class="ftitle">Eshop</span>
+          <svg class="folder-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="folder-body" id="folder-eshop-body">
+          <div class="tabs" id="tabs"></div>
+          <div class="nav-sec">Automatizácie</div>
+          <div class="tabs" id="autoTabs"></div>
+        </div>
+      </div>
       <div class="nav-sec">Čoskoro — rozšírime</div>
       <div class="soon-nav">
         <span class="soon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span class="tlabel">Prehľad eshopu</span><span class="soonpill">soon</span></span>
@@ -62,6 +71,6 @@
     <section id="tab-users" hidden></section>
     <section id="tab-posta" hidden></section>
   </div>
-  <script src="/static/app.js?v=35"></script>
+  <script src="/static/app.js?v=36"></script>
 </body>
 </html>

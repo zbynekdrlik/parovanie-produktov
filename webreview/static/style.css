@@ -55,6 +55,20 @@ a{color:inherit}
 .soon{opacity:.5;cursor:default}
 .soon .soonpill{font-size:9.5px;font-weight:700;color:var(--soft);border:1px solid var(--border);
   border-radius:6px;padding:1px 6px}
+/* Sidebar folders (#118): collapsible, system-like nav groups. */
+.nav-folder{margin-bottom:2px}
+.folder-head{display:flex;align-items:center;gap:11px;width:100%;padding:9px 11px;border:0;
+  background:none;cursor:pointer;font-family:inherit;color:var(--text);font-size:13.5px;
+  font-weight:600;border-radius:9px;text-align:left;transition:background .12s}
+.folder-head:hover{background:var(--bg)}
+.folder-head .folder-ico{width:19px;height:19px;flex:0 0 19px;stroke:currentColor;fill:none;
+  stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.folder-head .ftitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.folder-head .folder-chev{width:16px;height:16px;flex:0 0 16px;stroke:var(--soft);fill:none;
+  stroke-width:2;stroke-linecap:round;stroke-linejoin:round;transition:transform .15s}
+.nav-folder.collapsed .folder-head .folder-chev{transform:rotate(-90deg)}
+.folder-body{margin:2px 0 4px 16px;padding-left:8px;border-left:1px solid var(--border)}
+.nav-folder.collapsed .folder-body{display:none}
 .sidefoot{border-top:1px solid var(--border);padding:10px 12px}
 .themebtn{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:9px;
   color:var(--muted);font-size:14px;font-weight:500;cursor:pointer;background:none;border:0;
@@ -265,7 +279,10 @@ body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
   .sidebar{width:100%;flex:0 0 auto;height:auto;position:static;flex-direction:column;
     border-right:0;border-bottom:1px solid var(--border)}
   .side-nav .tabs{flex-direction:row;flex-wrap:wrap}
-  .nav-sec,.soon-nav{display:none}
+  .nav-sec,.soon-nav,.folder-head{display:none}
+  /* Flatten the folder on the mobile strip: keep items visible even if the
+     folder was collapsed on desktop (its header is hidden here). */
+  .folder-body,.nav-folder.collapsed .folder-body{display:block;margin:0;padding:0;border:0}
   .topbar,main#list,#tab-search,#tab-notes{padding-left:16px;padding-right:16px}
 }
 
