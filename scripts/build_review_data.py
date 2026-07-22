@@ -10,6 +10,7 @@ import re
 
 import requests
 
+from parovanie import candidates_io
 from parovanie.export_helpers import current_of, row_images
 from parovanie.url_resolver import assign_urls
 
@@ -45,7 +46,9 @@ with open(SRC, encoding="cp1250", errors="replace") as f:
         code2img[c] = row_images(row)
 
 recs = json.load(open(f"{OUT}/candidates.json", encoding="utf-8"))
-verds = {v["idx"]: v for v in json.load(open(f"{OUT}/ai_verdicts.json", encoding="utf-8"))}
+verdicts = json.load(open(f"{OUT}/ai_verdicts.json", encoding="utf-8"))
+# keyed by pair_key, never by array position — see candidates_io.join_verdicts (#43)
+verds_by_rec = candidates_io.join_verdicts(recs, verdicts)
 
 out = []
 for i, r in enumerate(recs):
@@ -57,7 +60,7 @@ for i, r in enumerate(recs):
                 our_imgs.append(u)
         if our_imgs:
             break
-    v = verds.get(i)
+    v = verds_by_rec[i]
     ci = v["chosen_i"] if v else -1
     cands = r["candidates"]
     matched = isinstance(ci, int) and 0 <= ci < len(cands)

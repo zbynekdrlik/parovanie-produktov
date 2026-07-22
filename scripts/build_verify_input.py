@@ -1,5 +1,11 @@
 """Build verify_input.json (the AI-verification Workflow's input) from a gather
-candidates.json. Each record: {idx, supplier, name, code, cands:[{i,name,url}]}.
+candidates.json. Each record: {idx, pair_key, supplier, name, code, cands:[{i,name,url}]}.
+
+`pair_key` MUST be echoed back into ai_verdicts.json ({pair_key, idx, chosen_i,
+reason}) by whatever produces the verdicts — the merge (candidates_io.join_verdicts)
+joins on pair_key, never on idx/position (#43). idx stays only as a display/order
+aid for the verify step itself. Keep pair_key when stripping to a "slim" (no-url)
+input for the AI — it's an opaque key, harmless to show the model.
 
 Usage: PYTHONPATH=src .venv/bin/python scripts/build_verify_input.py \
            data/out_odimon/candidates.json data/out_odimon/verify_input.json
@@ -13,6 +19,7 @@ out = []
 for idx, r in enumerate(recs):
     out.append({
         "idx": idx,
+        "pair_key": r["pair_key"],
         "supplier": r["supplier"],
         "name": r["name"],
         "code": r.get("external_code") or "",
