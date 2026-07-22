@@ -1299,47 +1299,54 @@ def _our_url_for_entry(ce: dict):
     return None
 
 
-def _review_product_for(e: dict, by_paircode=None, by_code=None):
-    """The in-review product matching a catalog entry, if any. Match by pairCode (when the
-    entry has one) — most review entries are keyed "SUPPLIER|pairCode", so a key==pairCode
-    test missed them (C1) — ELSE by a shared variant code (single-variant products have an
-    empty pairCode, so matching an empty e["pairCode"] against PRODUCTS would wrongly hit
-    every other empty-pairCode product; match by code instead). Lookup maps are built once
-    per request by the caller."""
+def _review_products_for(e: dict, by_paircode=None, by_code=None) -> list:
+    """ALL in-review products matching a catalog entry — by pairCode (most review entries
+    are keyed "SUPPLIER|pairCode", so a key==pairCode test missed them, C1) PLUS any
+    sharing a variant code (single-variant products have an empty pairCode, so matching an
+    empty e["pairCode"] against PRODUCTS would wrongly hit every other empty-pairCode
+    product; match those by code instead).
+
+    #64: the SAME pairCode can be reviewed under TWO+ DIFFERENT suppliers (e.g.
+    GRUBE|425 AND WETLAND|425 for one forestshop product, when it was matched against
+    candidates from more than one supplier) — a "first match wins" lookup silently hid
+    every duplicate past the first, and its decision could never be repaired via search.
+    Returns every distinct match (by identity — a product matched by BOTH pairCode and a
+    shared code counts once), in stable PRODUCTS order. Lookup maps are built once per
+    request by the caller."""
+    seen: set = set()
+    out: list = []
     pc = e.get("pairCode")
     if pc and by_paircode is not None:
-        p = by_paircode.get(pc)
-        if p is not None:
-            return p
+        for p in by_paircode.get(pc, []):
+            if id(p) not in seen:
+                seen.add(id(p))
+                out.append(p)
     if by_code is not None:
         for c in e.get("variant_codes") or []:
-            p = by_code.get(c)
-            if p is not None:
-                return p
-    return None
+            for p in by_code.get(c, []):
+                if id(p) not in seen:
+                    seen.add(id(p))
+                    out.append(p)
+    return out
 
 
-def _search_result(e: dict, decisions=None, by_paircode=None, by_code=None) -> dict:
-    """Shape one catalog entry for /api/search. `key` (pairCode-or-code) is the identity
-    the client re-pairs by. idx + our_url come from the matching in-review product (if
-    any) so the UI can deep-link an already-paired item.
+def _search_results_for_entry(e: dict, decisions=None, by_paircode=None, by_code=None) -> list:
+    """Shape one catalog entry into one-or-more /api/search result rows. `key`
+    (pairCode-or-code) is the catalog identity the client promotes-and-pairs by.
+
+    Normally a catalog entry matches at most one in-review product, so this returns a
+    single row. #64: when the pairCode is reviewed under MULTIPLE suppliers, EVERY
+    matching review product gets its OWN row — own `idx`/`our_url`/`paired_url` and a
+    `review_key` (that product's REAL key) the client uses to open/repair THAT specific
+    one, instead of always landing on the first duplicate. A catalog entry with zero
+    review matches still returns exactly one "not yet paired" row (unchanged shape).
 
     price/stock/state come from the catalog entry (the manager's "almost no data"
-    complaint). `paired_url` = the in-review product's CURRENT decision URL (good/manual
-    only), read under the entry's REAL key; a GRUBE product's URL is DISPLAY-normalized
-    to grube.de (mirrors /api/products — storage untouched). `decisions` is loaded ONCE
-    per request by the caller."""
-    p = _review_product_for(e, by_paircode, by_code)
-    paired_url = None
-    if p is not None and decisions is not None:
-        d = decisions.get(p.get("key"))
-        if isinstance(d, dict) and d.get("status") in ("good", "manual"):
-            url = (d.get("url") or "").strip()
-            if url:
-                if p.get("supplier") == "GRUBE":
-                    url = import_builder.to_grube_de(url) or url
-                paired_url = url
-    return {
+    complaint) and are the same on every row of a duplicated entry. `paired_url` = the
+    matching product's CURRENT decision URL (good/manual only), read under its REAL key;
+    a GRUBE product's URL is DISPLAY-normalized to grube.de (mirrors /api/products —
+    storage untouched). `decisions` is loaded ONCE per request by the caller."""
+    base = {
         "key": e["key"],
         "pairCode": e["pairCode"],
         "name": e["name"],
@@ -1347,28 +1354,49 @@ def _search_result(e: dict, decisions=None, by_paircode=None, by_code=None) -> d
         "codes": e["variant_codes"],
         "image": e["image"],
         "in_review": e["in_review"],
-        "our_url": (p or {}).get("our_url"),
-        "idx": (p or {}).get("idx"),
         "price": e.get("price", ""),
         "stock": e.get("stock", 0),
         "state": e.get("state", 1),
-        "paired_url": paired_url,
     }
+    matches = _review_products_for(e, by_paircode, by_code)
+    if not matches:
+        return [dict(base, our_url=None, idx=None, paired_url=None, review_key=None,
+                      review_supplier=None)]
+    rows = []
+    for p in matches:
+        paired_url = None
+        if decisions is not None:
+            d = decisions.get(p.get("key"))
+            if isinstance(d, dict) and d.get("status") in ("good", "manual"):
+                url = (d.get("url") or "").strip()
+                if url:
+                    if p.get("supplier") == "GRUBE":
+                        url = import_builder.to_grube_de(url) or url
+                    paired_url = url
+        # review_supplier = THIS matching product's OWN supplier (may differ from the
+        # catalog entry's generic `supplier` column) — #64: when a pairCode is reviewed
+        # under 2+ suppliers, every row shares the same catalog `supplier`, so the client
+        # needs the per-match supplier to tell duplicate rows apart.
+        rows.append(dict(base, our_url=p.get("our_url"), idx=p.get("idx"),
+                          paired_url=paired_url, review_key=p.get("key"),
+                          review_supplier=p.get("supplier")))
+    return rows
 
 
 def _product_lookups():
-    """{pairCode: product}, {code: product} over PRODUCTS — built once per /api/search so
-    _search_result matches an in-review product in O(1) (by pairCode or shared code)
-    instead of scanning PRODUCTS per result. First writer wins for a shared pairCode/code
-    (single manager user — a tiny ambiguity is fine)."""
+    """{pairCode: [products]}, {code: [products]} over PRODUCTS — built once per
+    /api/search so _search_results_for_entry finds EVERY in-review product matching a
+    catalog entry (by pairCode or shared code), not just the first. #64: a pairCode CAN
+    be reviewed under more than one product (different suppliers) — collecting lists
+    (instead of first-writer-wins) is what lets every duplicate surface as its own row."""
     by_paircode: dict = {}
     by_code: dict = {}
     for p in PRODUCTS:
         pc = p.get("pairCode")
-        if pc and pc not in by_paircode:
-            by_paircode[pc] = p
+        if pc:
+            by_paircode.setdefault(pc, []).append(p)
         for c in (p.get("variant_codes") or []):
-            by_code.setdefault(c, p)
+            by_code.setdefault(c, []).append(p)
     return by_paircode, by_code
 
 
@@ -1376,12 +1404,15 @@ def _product_lookups():
 def api_search():
     """Accent-insensitive catalog search over the whole per-product blob (name / supplier
     / codes / externalCode / description / category / manufacturer / ean / productNumber)
-    — pure search_catalog over the startup CATALOG. Empty/short query -> no results."""
+    — pure search_catalog over the startup CATALOG. Empty/short query -> no results.
+    A catalog entry reviewed under more than one supplier (#64) yields more than one
+    result row — see _search_results_for_entry."""
     q = request.args.get("q", "")
     dec = _load_decisions()   # once per request, not per result
     by_paircode, by_code = _product_lookups()
-    results = [_search_result(e, dec, by_paircode, by_code)
-               for e in search_catalog(CATALOG, q)]
+    results = []
+    for e in search_catalog(CATALOG, q):
+        results.extend(_search_results_for_entry(e, dec, by_paircode, by_code))
     return jsonify({"results": results})
 
 
@@ -1392,10 +1423,18 @@ def api_search_pair():
     fallback). If the product is not yet in the review set it is PROMOTED (a minimal
     review_data entry built from the catalog row + the export `current` snapshot +
     best-effort our_url), appended to PRODUCTS and persisted; then a `manual` decision is
-    recorded. The URL must be http(s) (else 400); an unknown key -> 404."""
+    recorded. The URL must be http(s) (else 400); an unknown key -> 404.
+
+    #64: `review_key` (optional) targets a SPECIFIC review product's REAL key —
+    required to repair one of several review entries duplicated under the same catalog
+    key (the same pairCode reviewed under two+ different suppliers, e.g. GRUBE|425 AND
+    WETLAND|425). Without it, "first PRODUCTS match wins" is ambiguous and can silently
+    fix the wrong duplicate. An unknown `review_key` -> 404 (never falls back to the
+    ambiguous scan)."""
     body = request.get_json(silent=True) or {}
     key = str(body.get("key") or body.get("pairCode") or "").strip()
     url = str(body.get("url") or "").strip()
+    review_key = str(body.get("review_key") or "").strip()
     # authoritative URL guard (matches /api/order-pair) — blocks javascript:/data: and
     # malformed values from reaching the import's internalNote / a CSV cell.
     if not re.match(r"^https?://", url):
@@ -1403,6 +1442,8 @@ def api_search_pair():
     ce = CATALOG.get(key)
     if not ce:
         return jsonify({"ok": False, "error": "unknown key"}), 404
+    if review_key and not any(p.get("key") == review_key for p in PRODUCTS):
+        return jsonify({"ok": False, "error": "unknown review_key"}), 404
     # Match an already-in-review product by pairCode (when the entry has one) OR by a
     # shared variant code. Most review entries are keyed "SUPPLIER|pairCode" (e.g.
     # GRUBE|425); a key==entry test missed every such entry → it wrongly promoted a
@@ -1413,6 +1454,11 @@ def api_search_pair():
     entry_codes = set(ce.get("variant_codes") or [])
 
     def _find_existing():
+        if review_key:
+            # explicit target (#64) — bypasses the ambiguous first-match scan below,
+            # which is exactly what's needed when the same pairCode is duplicated
+            # across suppliers. Validity already checked above (404 if unknown).
+            return next((p for p in PRODUCTS if p.get("key") == review_key), None)
         for p in PRODUCTS:
             if pc and p.get("pairCode") == pc:
                 return p

@@ -781,6 +781,10 @@ function searchBadge(res) {
 function renderSearchRow(res) {
   const row = el('div', 'search-row');
   row.dataset.key = res.key;   // pairCode-or-code identity (empty-pairCode products keyed by code)
+  // #64: a pairCode reviewed under 2+ suppliers yields MULTIPLE rows sharing the same
+  // res.key — dataset.reviewKey is the per-ROW identity (that specific review product's
+  // real key, e.g. 'WETLAND|425'), empty for a not-yet-paired row.
+  row.dataset.reviewKey = res.review_key || '';
 
   const head = el('div', 'srch-head');
   const thumb = el('div', 'srch-thumb');
@@ -797,7 +801,11 @@ function renderSearchRow(res) {
   const nm = el('div', 'srch-name'); nm.textContent = res.name || '(produkt)';   // .textContent → XSS-safe
   main.appendChild(nm);
   const meta = el('div', 'srch-meta');
-  meta.textContent = (res.supplier || '—') + ' · '
+  // #64: a pairCode reviewed under 2+ suppliers renders as multiple rows sharing the
+  // SAME catalog res.supplier — show the row's OWN review_supplier (this specific
+  // pairing's real supplier) so the manager can tell the duplicates apart; falls back
+  // to the catalog supplier for the common (non-duplicate) case.
+  meta.textContent = (res.review_supplier || res.supplier || '—') + ' · '
     + ((res.codes || []).join(', ') || 'bez kódu');
   main.appendChild(meta);
   // commerce line — NAŠA cena + eshop stav (rovnaké labely ako filtre) + sklad;
@@ -851,14 +859,14 @@ function renderSearchRow(res) {
 function openSearchRow(res, panel, badge, link) {
   if (!panel.hidden) { panel.hidden = true; panel.innerHTML = ''; return; }   // toggle closed
   panel.innerHTML = '';
-  if (res.in_review) {
-    // match by pairCode (when the result has one) OR by a shared variant code — most
-    // review entries are keyed "SUPPLIER|pairCode" (e.g. GRUBE|425), so a key===key
-    // lookup missed them and wrongly opened the manual-promote panel (C1); a
-    // single-variant product (empty pairCode) is matched by its code instead.
-    const product = PRODUCTS.find(p =>
-      (res.pairCode && p.pairCode === res.pairCode) ||
-      (p.variant_codes || []).some(c => (res.codes || []).includes(c)));
+  if (res.in_review && res.review_key) {
+    // Match by the row's OWN review_key — the EXACT product THIS row represents. #64:
+    // a pairCode reviewed under 2+ suppliers (GRUBE|425 AND WETLAND|425) yields multiple
+    // rows for the same catalog entry; matching by pairCode/shared-code alone (the old
+    // approach) always finds the FIRST such product no matter which row was clicked, so
+    // every duplicate past the first was unreachable/unfixable. review_key removes the
+    // ambiguity — each row opens its own product.
+    const product = PRODUCTS.find(p => p.key === res.review_key);
     // FULL review card (obrázky, náš stav/cena, stav párovania, decision buttony) —
     // holý resolutionPanel ukazoval „skoro žiadne údaje". saveDecision→render() na
     // search tabe early-returnuje (#searchResults ostáva), karta sa len live-nerefreshne
@@ -887,7 +895,10 @@ function manualPairPanel(res, panel, badge, link) {
     try {
       r = await fetch('/api/search-pair', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key: res.key, url: v })
+        // review_key (#64): when this row IS a specific duplicate (res.in_review true but
+        // its product wasn't found client-side, above), targets that exact review entry
+        // instead of letting the server fall back to its first-match scan.
+        body: JSON.stringify({ key: res.key, url: v, review_key: res.review_key || '' })
       });
     } catch (_) { save.disabled = false; return; }
     if (!r.ok) { save.disabled = false; return; }
