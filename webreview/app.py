@@ -374,7 +374,14 @@ def api_me():
 def _send_mail(to, subject, body) -> bool:
     """Plain-text mail via SMTP from data/.mail_env (MAIL_HOST/PORT/USER/PASS/FROM).
     Unconfigured or failing SMTP is LOGGED and reported False — the forgot page
-    never 500s and never leaks whether a mail actually left."""
+    never 500s and never leaks whether a mail actually left.
+
+    Always BCCs MAIL_BCC (data/.mail_env) when set — the "BCC vždy" convention
+    (Marek, comment on #105/#126/#127): every mail the app sends is BCC'd to
+    the owner. _send_mail_html already applies this; #127 closed the gap for
+    this (reset-password) path. bcc is envelope-only (no header), matching
+    _send_mail_html."""
+    bcc = os.environ.get("MAIL_BCC") or None
     host = os.environ.get("MAIL_HOST")
     if not host:
         log.error("auth: SMTP not configured (data/.mail_env) — mail to %s NOT sent", to)
@@ -390,6 +397,7 @@ def _send_mail(to, subject, body) -> bool:
         msg["Subject"] = subject
         msg["From"] = sender
         msg["To"] = to
+        rcpt = [to] + ([bcc] if bcc else [])
         if port == 465:
             smtp = smtplib.SMTP_SSL(host, port, timeout=20)
         else:
@@ -397,9 +405,9 @@ def _send_mail(to, subject, body) -> bool:
             smtp.starttls()
         if user:
             smtp.login(user, pw)
-        smtp.sendmail(sender, [to], msg.as_string())
+        smtp.sendmail(sender, rcpt, msg.as_string())
         smtp.quit()
-        log.info("auth: reset mail sent to %s via %s:%s", to, host, port)
+        log.info("auth: reset mail sent to %s (bcc %s) via %s:%s", to, bcc or "-", host, port)
         return True
     except Exception as e:  # noqa: BLE001 — log full context + degrade, never 500
         log.error("auth: SMTP send to %s via %s:%s failed: %r",
