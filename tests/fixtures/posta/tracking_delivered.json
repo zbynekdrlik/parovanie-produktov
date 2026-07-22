@@ -1,0 +1,15 @@
+{
+  "results": [
+    {
+      "events": [
+        {"detailCode": "PODOD", "detailDescription": "Podaná Oblastný uzol Poprad", "localDate": "2026-04-28T16:53:41", "stateCode": "received"},
+        {"detailCode": "VDOIO", "detailDescription": "V preprave", "localDate": "2026-04-28T17:16:39", "stateCode": "transit"},
+        {"detailCode": "VDOOK", "detailDescription": "Prevzatá na doručenie", "localDate": "2026-04-29T07:57:47", "postOffice": {"city": "Skalica", "districtStamp": "809382", "name": "Skalica 1", "postcode": "90901", "street": "Potočná 24"}, "stateCode": "transit"},
+        {"detailCode": "OK", "detailDescription": "Doručená", "localDate": "2026-04-29T11:10:50", "postOffice": {"city": "Skalica", "districtStamp": "809382", "name": "Skalica 1", "postcode": "90901", "street": "Potočná 24"}, "stateCode": "delivered"}
+      ],
+      "number": "EF000000001SK",
+      "status": "ok"
+    }
+  ],
+  "status": "ok"
+}

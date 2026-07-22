@@ -25,6 +25,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
+from email.utils import formataddr
 from urllib.parse import quote, urljoin
 
 import requests
@@ -33,7 +34,8 @@ from flask import (Flask, Response, jsonify, redirect, render_template, request,
                    send_from_directory, session)
 from werkzeug.security import check_password_hash, generate_password_hash
 
-from parovanie import __version__, config, import_builder
+from parovanie import __version__, config, import_builder, posta_uncollected
+from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of
@@ -402,6 +404,47 @@ def _send_mail(to, subject, body) -> bool:
     except Exception as e:  # noqa: BLE001 — log full context + degrade, never 500
         log.error("auth: SMTP send to %s via %s:%s failed: %r",
                   to, host, os.environ.get("MAIL_PORT", "587"), e)
+        return False
+
+
+def _send_mail_html(to, subject, html_body, bcc=None) -> bool:
+    """HTML mail via the same SMTP config (data/.mail_env) as _send_mail — used
+    by the automations (#93 customer notifications). Sender defaults to the
+    SMTP account's MAIL_FROM; POSTA_MAIL_FROM (data/.mail_env) overrides it if
+    the SMTP server allows the eshop@ alias the old n8n workflow used. bcc is
+    envelope-only (no header), matching the n8n emailSend behavior. Failure is
+    logged + False — the automation records it and retries next run."""
+    host = os.environ.get("MAIL_HOST")
+    if not host:
+        log.error("mail: SMTP not configured (data/.mail_env) — mail '%s' to %s NOT sent",
+                  subject, to)
+        return False
+    try:
+        port = int(os.environ.get("MAIL_PORT", "587"))
+        user = os.environ.get("MAIL_USER", "")
+        pw = os.environ.get("MAIL_PASS", "")
+        sender = (os.environ.get("POSTA_MAIL_FROM")
+                  or os.environ.get("MAIL_FROM") or user)
+        msg = MIMEText(html_body, "html", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = formataddr(("Forestshop.sk", sender))
+        msg["To"] = to
+        rcpt = [to] + ([bcc] if bcc else [])
+        if port == 465:
+            smtp = smtplib.SMTP_SSL(host, port, timeout=20)
+        else:
+            smtp = smtplib.SMTP(host, port, timeout=20)
+            smtp.starttls()
+        if user:
+            smtp.login(user, pw)
+        smtp.sendmail(sender, rcpt, msg.as_string())
+        smtp.quit()
+        log.info("mail: sent '%s' to %s (bcc %s) via %s:%s", subject, to,
+                 bcc or "-", host, port)
+        return True
+    except Exception as e:  # noqa: BLE001 — log full context + degrade, never crash the run
+        log.error("mail: send '%s' to %s via %s:%s failed: %r",
+                  subject, to, host, os.environ.get("MAIL_PORT", "587"), e)
         return False
 
 
@@ -1963,6 +2006,185 @@ def n8n_upload_suppliers():
     return jsonify(result), (200 if ok else 502)
 
 
+# --------------------------------------------------------------------------- #
+# In-app automations (#93): generic runner + the Pošta SK uncollected-shipments
+# automation. New automations (#105-#111) register themselves in AUTOMATIONS_REG
+# below — the runner, endpoints and sidebar section are shared.
+# --------------------------------------------------------------------------- #
+AUTOMATIONS_STATE = os.path.join(OUT, "automations.json")
+POSTA_STATE = os.path.join(OUT, "posta_uncollected.json")
+POSTA_BCC = os.environ.get("POSTA_BCC", "drlik.marek@gmail.com")
+
+
+def _load_posta_state() -> dict:
+    try:
+        with open(POSTA_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_posta_state(d: dict) -> None:
+    tmp = POSTA_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, POSTA_STATE)
+
+
+def _fetch_tracking(pkg: str) -> dict:
+    """Pošta SK tracking for one package — 3 tries (n8n: retryOnFail maxTries=3,
+    3s between), 60s timeout. Raises after the last failure so the run records
+    the shipment under errors instead of silently skipping it."""
+    url = posta_uncollected.TRACKING_API.format(q=quote(pkg))
+    for attempt in range(1, 4):
+        try:
+            r = requests.get(url, headers={"User-Agent": UA}, timeout=60)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:  # noqa: BLE001 — retried; the last failure propagates
+            log.warning("posta: tracking %s attempt %d/3 failed: %r", pkg, attempt, e)
+            if attempt == 3:
+                raise
+            time.sleep(3)
+    raise RuntimeError("unreachable")
+
+
+def run_posta_uncollected() -> dict:
+    """One check run (daily 09:00 or 'Spustiť teraz'): shipments from the app's
+    orders export → Pošta SK tracking per shipment → escalation e-mails to
+    customers per the n8n cadence → full display state for the tab persisted
+    to data/out/posta_uncollected.json. Returns the summary the runner stores."""
+    csv_bytes = _orders_csv_cached()
+    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes)
+    with _lock:
+        esc = dict(_load_posta_state().get("escalation") or {})
+    uncollected, invalid, errors = [], [], []
+    sent = failed = 0
+    for s in shipments:
+        try:
+            tj = _fetch_tracking(s["packageNumber"])
+        except Exception as e:  # noqa: BLE001 — recorded per shipment, run continues
+            log.error("posta: tracking %s (obj. %s) FAILED after retries: %r",
+                      s["packageNumber"], s["code"], e)
+            errors.append({"orderCode": s["code"],
+                           "packageNumber": s["packageNumber"], "error": str(e)})
+            continue
+        r = posta_uncollected.evaluate_shipment(s, tj, esc.get(s["code"], ""))
+        if r["invalid"]:
+            # The exact class of package numbers that silently broke the n8n
+            # workflow (13-14 digit numeric labels) — surfaced, never skipped.
+            log.warning("posta: INVALID_FORMAT balík %s (obj. %s) — Pošta SK ho "
+                        "nevie sledovať, treba preveriť ručne", r["packageNumber"], r["orderCode"])
+            invalid.append({k: r[k] for k in (
+                "orderCode", "packageNumber", "name", "admin_link")})
+            continue
+        if r["send"]:
+            if not r["email"]:
+                log.error("posta: obj. %s (%s) nemá e-mail — upozornenie nemožno poslať",
+                          r["orderCode"], r["packageNumber"])
+                mail_ok = False
+            else:
+                mail_ok = _send_mail_html(r["email"], r["email_subject"],
+                                          r["email_body"], bcc=POSTA_BCC)
+            if mail_ok:
+                esc[r["orderCode"]] = r["new_state_value"]
+                sent += 1
+                log.info("posta: email #%d for obj. %s (%s) sent to %s",
+                         r["count"], r["orderCode"], r["packageNumber"], r["email"])
+                # persist the bump IMMEDIATELY — a crash later in the run must
+                # never lose a sent-mail record (that would double-send tomorrow)
+                with _lock:
+                    st = _load_posta_state()
+                    st.setdefault("escalation", {})[r["orderCode"]] = r["new_state_value"]
+                    _save_posta_state(st)
+            else:
+                failed += 1          # state NOT bumped → retried next run
+                prev_count, prev_last = posta_uncollected.parse_notified(
+                    esc.get(r["orderCode"], ""))
+                r["count"] = prev_count
+                r["last_sent"] = prev_last.isoformat() if prev_last else ""
+                r["call_needed"] = prev_count >= posta_uncollected.MAX_EMAILS
+        if r["uncollected"]:
+            uncollected.append({k: r[k] for k in (
+                "orderCode", "packageNumber", "name", "phone", "email",
+                "office_name", "office_addr", "retained_till", "notified_since",
+                "days_at_post", "count", "last_sent", "call_needed",
+                "tracking_link", "admin_link")})
+    # prune escalation state for orders that left the 30-day source window
+    codes = {s["code"] for s in shipments}
+    esc = {k: v for k, v in esc.items() if k in codes}
+    stats = {"checked": len(shipments), "uncollected": len(uncollected),
+             "invalid": len(invalid), "errors": len(errors),
+             "emails_sent": sent, "emails_failed": failed}
+    with _lock:
+        _save_posta_state({
+            "escalation": esc,
+            "last_check": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+            "uncollected": uncollected, "invalid": invalid, "errors": errors,
+            "stats": stats,
+        })
+    log.info("posta: run done %s", stats)
+    return stats
+
+
+AUTOMATIONS_REG = [
+    Automation(key="posta_uncollected",
+               name="Nevyzdvihnuté zásielky — Pošta SK",
+               schedule={"daily_at": "09:00", "tz": "Europe/Bratislava"},
+               run_fn=run_posta_uncollected),
+]
+RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
+
+
+@app.route("/api/automations")
+def api_automations():
+    """Status of every registered automation (sidebar + tab header). Session-
+    gated by the default-deny before_request like every other endpoint."""
+    return jsonify({"automations": RUNNER.status()})
+
+
+@app.route("/api/automations/<key>/toggle", methods=["POST"])
+def api_automation_toggle(key):
+    body = request.get_json(silent=True) or {}
+    enabled = bool(body.get("enabled"))
+    try:
+        RUNNER.set_enabled(key, enabled)
+    except KeyError:
+        return jsonify({"ok": False, "error": "neznáma automatizácia"}), 404
+    log.info("automations: %s -> %s (user %s)", key,
+             "enabled" if enabled else "disabled", session.get("user"))
+    return jsonify({"ok": True, "enabled": enabled})
+
+
+@app.route("/api/automations/<key>/run", methods=["POST"])
+def api_automation_run(key):
+    try:
+        started = RUNNER.run_now(key)
+    except KeyError:
+        return jsonify({"ok": False, "error": "neznáma automatizácia"}), 404
+    log.info("automations: manual run of %s by %s (started=%s)",
+             key, session.get("user"), started)
+    return jsonify({"ok": True, "started": started})
+
+
+@app.route("/api/posta-uncollected")
+def api_posta_uncollected():
+    """Display data for the 'Nevyzdvihnuté zásielky' tab — the last run's full
+    result (uncollected + invalid-format + per-shipment errors)."""
+    with _lock:
+        st = _load_posta_state()
+    return jsonify({
+        "last_check": st.get("last_check", ""),
+        "uncollected": st.get("uncollected") or [],
+        "invalid": st.get("invalid") or [],
+        "errors": st.get("errors") or [],
+        "stats": st.get("stats") or {},
+    })
+
+
 if __name__ == "__main__":
+    RUNNER.start()
     app.run(host="0.0.0.0", port=int(os.environ.get("WEBREVIEW_PORT", "8801")),
             threaded=True)
