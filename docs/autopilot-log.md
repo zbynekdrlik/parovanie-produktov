@@ -83,3 +83,26 @@
   Zastavené, Štart/Stop + Spustiť teraz prítomné, plán denne o 05:00, 0 console errorov. Reálny scrape
   sa ZÁMERNE nespúšťal (hit by mnoho dodávateľských webov + minul OpenAI). Odložené: odpublikovať n8n
   `6kn7jzBXTjbmbiVa` po zapnutí in-app (ako #109).
+
+## 2026-07-22 — #143 „Jemnejšie/tlmenejšie farby" — softer palette (worker)
+- Šéf: zelená v menu príliš krikľavá; presné hex farby dodal cez komentár na #143
+  (green `#6CAB68` rgb 108,171,104, red `#D14D3B` rgb 209,77,59).
+- `--accent`/`--accent-hov`/`--accent-soft` (svetlý aj tmavý mód) preladené na tlmenú
+  zelenú v ROVNAKOM odtieni ako `#6CAB68` (~116° hue, len tmavšia kde treba biely text
+  na plnej výplni — kontrast overený WCAG luminanciou skriptom, ≥4.3:1 všade, väčšina
+  ≥4.8:1). Boss's presný hex `#6CAB68`/`#D14D3B` použitý DOSLOVA na miestach, ktoré
+  explicitne pomenoval: order-supplier chip `.todo`/`.done`, „Skladom"/„Nedostupné"
+  to-order tlačidlá + ich riadkové pásiky. `.active` chip (oranžová) jemne stlmená
+  `#f59e0b`→`#DDA43C`, ostala odlíšiteľná; ten istý amber teraz aj na „Počkať"/curoff/
+  warnbox. Review-karta „Dobré" border + primárne tlačidlá prepnuté na novú zelenú.
+  Jemne stlmené aj fialové (`to-pairsave`+`to-order` link, zjednotené na `#713AC7`) a
+  tyrkysové (`to-supsave`, `#1F7A72`) tlačidlá pre celkovú súdržnosť.
+- `tests/e2e/test_order_chips.py` — 3 presné rgb asserty prepočítané a upravené
+  ((108,171,104)/(209,77,59)/(221,164,60)); `.claude/skills/webreview/SKILL.md`
+  selektorový kontrakt aktualizovaný na nové hex/rgb.
+- Verzia 0.58.1, PR #145 merge `226ab46`, nasadené v0.58.1.
+- Post-deploy: DOM = v0.58.1, PRED==PO manager stores (decisions 2831, ordered 146,
+  order_pairings 57, waiting 11, supplier_assignments 1). Živé overenie na
+  parovanie-forestshop.newlevel.media (Playwright, sidebar + Na objednanie + Kontrola
+  párovania, svetlý aj tmavý mód): menu accent už nie je krikľavý, chip-y/tlačidlá
+  jemnejšie a čitateľné v oboch módoch, 0 console errorov.
