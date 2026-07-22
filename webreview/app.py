@@ -151,6 +151,12 @@ _load_env_file(os.path.join(ROOT, "data", ".mail_env"))
 # #106 — OPENAI_API_KEY for the „Dodávateľský sklad" scraper's LLM fallback.
 # Gitignored, chmod 600; absent = LLM fallback degrades gracefully (static-only).
 _load_env_file(os.path.join(ROOT, "data", ".ai_env"))
+# #115 — GITHUB_TOKEN + GITHUB_REPO for the „Vývoj" tab (list issues) + the idea
+# lightbulb (create issue). Gitignored, chmod 600; absent = the tab + lightbulb
+# degrade gracefully („GitHub nedostupný"), never crash. The token is a repo-write
+# credential — it lives ONLY in the server-side Authorization header (never sent to
+# the browser, never in a URL or log).
+_load_env_file(os.path.join(ROOT, "data", ".gh_env"))
 
 
 def _secret_key():
@@ -1626,6 +1632,165 @@ def api_note():
         _save_notes(d)
     log.info("note update id=%s delete=%s done=%s", nid, body.get("delete"), body.get("done"))
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# „Vývoj" tab (#115): list this repo's GitHub issues (open + closed, PRs filtered)
+# + the idea lightbulb (create an issue). ALL GitHub traffic is proxied through the
+# backend — the repo-write token (data/.gh_env) NEVER reaches the browser. It lives
+# only in the server-side Authorization header (never a URL, never a log), so an
+# error string carries no secret. No token/repo configured → every path degrades
+# gracefully to „GitHub nedostupný" (available=False), never a 500.
+# --------------------------------------------------------------------------- #
+GITHUB_API = (os.environ.get("GITHUB_API_BASE") or "https://api.github.com").rstrip("/")
+GH_TIMEOUT = 15                 # s per GitHub API call
+GH_LIST_PER_PAGE = 100          # GitHub max page size
+GH_MAX_PAGES = 5                # bounded pagination (≤500 items): /issues returns
+#                                 issues AND PRs, so a single page could push older
+#                                 issues off after PR-filtering — page through so the
+#                                 boss sees every issue (incl. all the closed/done ones).
+IDEA_TITLE_MAX = 200
+IDEA_BODY_MAX = 5000
+IDEA_RATE_MAX = 20              # ideas per user per window (anti-spam / runaway guard)
+IDEA_RATE_WINDOW = 300          # 5 min
+_idea_times: dict = {}          # user email -> [timestamps]
+
+
+def _gh_config():
+    """(token, repo) from data/.gh_env — or (None, None) when unconfigured, so the
+    Vývoj tab + lightbulb degrade gracefully instead of crashing."""
+    token = (os.environ.get("GITHUB_TOKEN") or "").strip()
+    repo = (os.environ.get("GITHUB_REPO") or "").strip()
+    if not token or not repo:
+        return None, None
+    return token, repo
+
+
+def _gh_headers(token):
+    """GitHub REST headers — the token is a Bearer credential in the HEADER only."""
+    return {"Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "parovanie-webreview"}
+
+
+def _slim_issue(it: dict) -> dict:
+    """GitHub issue JSON → the slim shape the frontend renders (no token, no PII)."""
+    return {
+        "number": it.get("number"),
+        "title": it.get("title") or "",
+        "state": it.get("state") or "open",
+        "labels": [lbl.get("name") for lbl in (it.get("labels") or [])
+                   if isinstance(lbl, dict) and lbl.get("name")],
+        "updated_at": it.get("updated_at") or "",
+        "html_url": it.get("html_url") or "",
+        "comments": it.get("comments") or 0,
+    }
+
+
+def _do_dev_issues():
+    """(payload, status) — this repo's GitHub issues (open + closed), PRs filtered
+    out (the /issues endpoint returns PRs too — they carry a `pull_request` key).
+    No token → graceful „unavailable" (never 500); an upstream/network error is
+    caught and also degrades gracefully so the tab never crashes."""
+    token, repo = _gh_config()
+    if not token:
+        return {"ok": False, "available": False, "issues": [],
+                "error": "GitHub nedostupný — token nie je nastavený"}, 200
+    try:
+        issues = []
+        for page in range(1, GH_MAX_PAGES + 1):
+            r = requests.get(
+                f"{GITHUB_API}/repos/{repo}/issues",
+                params={"state": "all", "per_page": GH_LIST_PER_PAGE,
+                        "sort": "updated", "direction": "desc", "page": page},
+                headers=_gh_headers(token), timeout=GH_TIMEOUT)
+            if r.status_code != 200:
+                log.warning("gh issues: HTTP %s for %s (page %d)", r.status_code, repo, page)
+                if page == 1:
+                    return {"ok": False, "available": False, "issues": [],
+                            "error": f"GitHub API vrátil {r.status_code}"}, 200
+                break                            # keep the pages already collected
+            batch = r.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            issues.extend(_slim_issue(it) for it in batch
+                          if isinstance(it, dict) and "pull_request" not in it)
+            if len(batch) < GH_LIST_PER_PAGE:    # last page reached
+                break
+        return {"ok": True, "available": True, "issues": issues}, 200
+    except Exception as e:  # noqa: BLE001 — the tab must never crash on GitHub trouble
+        log.warning("gh issues fetch failed: %r", e)
+        return {"ok": False, "available": False, "issues": [],
+                "error": "GitHub nedostupný"}, 200
+
+
+def _do_create_idea(title: str, description: str, author: str = ""):
+    """(payload, status) — create a GitHub issue from a manager idea. No token →
+    graceful „unavailable"; an upstream/network error is caught (never 500)."""
+    token, repo = _gh_config()
+    if not token:
+        return {"ok": False, "available": False,
+                "error": "GitHub nedostupný — token nie je nastavený"}, 200
+    body = description
+    if author:
+        body = (body + "\n\n" if body else "") + f"_Nápad cez appku (Vývoj) — {author}_"
+    try:
+        r = requests.post(
+            f"{GITHUB_API}/repos/{repo}/issues",
+            json={"title": title, "body": body},
+            headers=_gh_headers(token), timeout=GH_TIMEOUT)
+        if r.status_code not in (200, 201):
+            log.warning("gh create idea: HTTP %s for %s", r.status_code, repo)
+            return {"ok": False, "error": f"GitHub API vrátil {r.status_code}"}, 200
+        log.info("gh idea created by %s: %r", author or "?", title)
+        return {"ok": True, "issue": _slim_issue(r.json())}, 201
+    except Exception as e:  # noqa: BLE001 — never crash on GitHub trouble
+        log.warning("gh create idea failed: %r", e)
+        return {"ok": False, "error": "GitHub nedostupný"}, 200
+
+
+def _idea_rate_limited(key: str) -> bool:
+    """Coarse anti-spam guard on idea creation (per user). Records this attempt."""
+    now = time.time()
+    times = [t for t in _idea_times.get(key, []) if now - t < IDEA_RATE_WINDOW]
+    if len(times) >= IDEA_RATE_MAX:
+        _idea_times[key] = times
+        return True
+    times.append(now)
+    _idea_times[key] = times
+    return False
+
+
+@app.route("/api/dev/issues")
+def api_dev_issues():
+    """List this repo's GitHub issues (open + closed) for the „Vývoj" tab."""
+    payload, status = _do_dev_issues()
+    return jsonify(payload), status
+
+
+@app.route("/api/dev/idea", methods=["POST"])
+def api_dev_idea():
+    """Create a GitHub issue from a manager idea (the lightbulb). Validates the
+    title (required, capped); the token is used server-side only."""
+    body = request.get_json(force=True, silent=True) or {}
+    title = str(body.get("title") or "").strip()
+    if not title:
+        return jsonify({"ok": False, "error": "názov nápadu je povinný"}), 400
+    if len(title) > IDEA_TITLE_MAX:
+        return jsonify({"ok": False,
+                        "error": f"názov môže mať najviac {IDEA_TITLE_MAX} znakov"}), 400
+    desc = str(body.get("description") or "").strip()
+    if len(desc) > IDEA_BODY_MAX:
+        return jsonify({"ok": False,
+                        "error": f"popis môže mať najviac {IDEA_BODY_MAX} znakov"}), 400
+    u = _current_user()
+    email = u["email"] if u else ""
+    if _idea_rate_limited(email):
+        return jsonify({"ok": False,
+                        "error": "priveľa nápadov za krátky čas — skús o chvíľu"}), 429
+    payload, status = _do_create_idea(title, desc, email)
+    return jsonify(payload), status
 
 
 @app.route("/api/order-pair", methods=["POST"])

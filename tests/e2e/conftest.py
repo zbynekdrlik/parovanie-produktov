@@ -59,7 +59,7 @@ def _admin_session_cookie(base: str) -> str:
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
-                    "automations_server", "imgfail_server", "imgflood_server")
+                    "automations_server", "imgfail_server", "imgflood_server", "dev_server")
 
 
 @pytest.fixture(autouse=True)
@@ -187,6 +187,99 @@ def live_server(tmp_path_factory):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+
+class _GHStub:
+    """A tiny in-memory GitHub REST stub so the „Vývoj" tab E2E (#115) is hermetic —
+    no real GitHub, no token. GET /repos/*/issues returns canned issues (open +
+    closed + one PR to be filtered out); POST /repos/*/issues appends a new issue
+    and echoes it (so a created idea shows up on the next list)."""
+    def __init__(self):
+        self.issues = [
+            {"number": 7, "title": "E2E otvorena uloha", "state": "open",
+             "labels": [{"name": "enhancement"}], "updated_at": "2026-07-21T10:00:00Z",
+             "html_url": "https://example.test/issues/7", "comments": 1},
+            {"number": 6, "title": "E2E hotova uloha", "state": "closed", "labels": [],
+             "updated_at": "2026-07-20T10:00:00Z",
+             "html_url": "https://example.test/issues/6", "comments": 0},
+            {"number": 5, "title": "E2E toto je pull request", "state": "open", "labels": [],
+             "updated_at": "2026-07-19T10:00:00Z",
+             "html_url": "https://example.test/pull/5", "comments": 0,
+             "pull_request": {"url": "https://example.test/api/pulls/5"}},
+        ]
+        self.next_num = 8
+
+
+def _start_gh_stub():
+    state = _GHStub()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if "/issues" in self.path:
+                self._send(200, state.issues)
+            else:
+                self._send(404, {"message": "not found"})
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(length) or b"{}")
+            issue = {"number": state.next_num, "title": data.get("title", ""),
+                     "state": "open", "labels": [], "updated_at": "2026-07-22T12:00:00Z",
+                     "html_url": f"https://example.test/issues/{state.next_num}",
+                     "comments": 0}
+            state.next_num += 1
+            state.issues.insert(0, issue)
+            self._send(201, issue)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+@pytest.fixture(scope="function")
+def dev_server(tmp_path_factory):
+    """Isolated webreview instance for the „Vývoj" tab E2E (#115): the app is
+    pointed at a local GitHub stub (GITHUB_API_BASE) with a dummy token, so the
+    tab lists canned issues and the lightbulb creates one — fully hermetic."""
+    out = tmp_path_factory.mktemp("wr_dev_out")
+    (out / "review_data.json").write_text("[]", encoding="utf-8")
+    stub = _start_gh_stub()
+    stub_port = stub.server_address[1]
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "GITHUB_TOKEN": "e2e-token",
+        "GITHUB_REPO": "e2e/repo",
+        "GITHUB_API_BASE": f"http://127.0.0.1:{stub_port}",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        stub.shutdown()
 
 
 @pytest.fixture(scope="function")
