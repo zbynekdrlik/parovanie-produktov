@@ -58,7 +58,9 @@ for i, p in enumerate(products):
     else:
         reason = f"Kód {code} má na LUKO {len(cands)} produktov — nejednoznačné, bez odkazu."
     records.append(candidates_io.record(p, [code] if code else [], cands))
-    verdicts.append({"idx": i, "chosen_i": ci, "reason": reason})
+    # pair_key is the join key consumers use (candidates_io.join_verdicts, #43) —
+    # idx stays only as a display/order aid, never the join itself.
+    verdicts.append({"idx": i, "pair_key": p.pair_key, "chosen_i": ci, "reason": reason})
     flag = "OK " if ci != -1 else ">> "
     print(f"{flag}[{i}] code={code} -> chosen_i={ci} ({len(cands)} cand) | {p.name[:55]}")
 

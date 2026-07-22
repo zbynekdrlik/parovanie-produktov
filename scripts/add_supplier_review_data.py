@@ -17,6 +17,7 @@ import sys
 
 import requests
 
+from parovanie import candidates_io
 from parovanie.export_helpers import current_of, row_images
 from parovanie.url_resolver import assign_urls
 
@@ -28,7 +29,9 @@ BASE = "https://www.forestshop.sk"
 
 sup_dir = sys.argv[1]
 recs = json.load(open(f"{sup_dir}/candidates.json", encoding="utf-8"))
-verds = {v["idx"]: v for v in json.load(open(f"{sup_dir}/ai_verdicts.json", encoding="utf-8"))}
+verdicts = json.load(open(f"{sup_dir}/ai_verdicts.json", encoding="utf-8"))
+# keyed by pair_key, never by array position — see candidates_io.join_verdicts (#43)
+verds_by_rec = candidates_io.join_verdicts(recs, verdicts)
 supplier = recs[0]["supplier"] if recs else "?"
 
 # product-side fields from the current export
@@ -57,7 +60,7 @@ for i, r in enumerate(recs):
                 our_imgs.append(u)
         if our_imgs:
             break
-    v = verds.get(i)
+    v = verds_by_rec[i]
     ci = v["chosen_i"] if v else -1
     cands = r["candidates"]
     matched = isinstance(ci, int) and 0 <= ci < len(cands)

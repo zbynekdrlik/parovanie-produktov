@@ -63,8 +63,8 @@ Hunting & Fishing (49 produktov) **vynechaný — nemá verejný eshop** (gmail 
 Po recon+parser+config (vyššie) sa nový dodávateľ pridá do bežiacej appky bez narušenia existujúcich produktov ani rozhodnutí pracovníkov (decisions kľúčujú `supplier|pairCode`):
 
 1. **Gather** do oddeleného out-dir: `scripts/gather_supplier.py ODIMON data/out_odimon` → `candidates.json` (top-8, kód-first). ~20 min / 300 produktov. Neprepíše živý `data/out/candidates.json`.
-2. **Verify-input:** `scripts/build_verify_input.py data/out_odimon/candidates.json data/out_odimon/verify_input.json`; pre Workflow sprav SLIM (bez url) `verify_slim.json`.
-3. **AI-overenie = Workflow** (ultracode): dávky ~20, agent ČÍTA `verify_slim.json` (idx-rozsah sa nepasuje cez args — len rozsah!), pre každý produkt vyberie `chosen_i` (0–7) alebo `-1`, **prísne** (kód musí sedieť, -1 radšej než zlý guess — kŕmi auto-objednávku). Výstup zapíš do `data/out_odimon/ai_verdicts.json` (`{idx,chosen_i,reason}`). ODIMON: **248/295 matched (84 %)**.
+2. **Verify-input:** `scripts/build_verify_input.py data/out_odimon/candidates.json data/out_odimon/verify_input.json` — každý záznam nesie `pair_key` (a `idx` len ako poradie-pomôcka). Pre Workflow sprav SLIM (bez url) `verify_slim.json` — **`pair_key` neodstraňuj**, je to neutrálny kľúč, agent ho len echoje späť.
+3. **AI-overenie = Workflow** (ultracode): dávky ~20, agent ČÍTA `verify_slim.json` (idx-rozsah sa nepasuje cez args — len rozsah!), pre každý produkt vyberie `chosen_i` (0–7) alebo `-1`, **prísne** (kód musí sedieť, -1 radšej než zlý guess — kŕmi auto-objednávku). Výstup zapíš do `data/out_odimon/ai_verdicts.json` (`{pair_key,idx,chosen_i,reason}` — **`pair_key` je POVINNÝ**, echo z `verify_slim.json`; merge naň páruje, nie na `idx`/pozíciu — #43). ODIMON: **248/295 matched (84 %)**.
 4. **Merge do appky:** `scripts/add_supplier_review_data.py data/out_odimon` → pripojí ODIMON produkty do živého `data/out/review_data.json` (idempotentné, kľúč=`pair_key`), forestshop URL cez sitemap. Reindexuje `idx` (decisions kľúčujú `key`, nie idx).
 5. `systemctl --user restart parovanie-web` → over cez `/api/products` (počet + `ai_chosen_url`).
 

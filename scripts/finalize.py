@@ -10,6 +10,7 @@ Writes:
 """
 import csv
 import json
+from parovanie import candidates_io
 from parovanie.models import Product, Candidate, Match
 from parovanie.csv_loader import load_code2pair
 from parovanie.writer import write_unmatched, shoptet_writer
@@ -19,7 +20,9 @@ csv.field_size_limit(10**9)
 OUT = "data/out"
 SOURCE = "data/products.csv"
 recs = json.load(open(f"{OUT}/candidates.json", encoding="utf-8"))
-verds = {v["idx"]: v for v in json.load(open(f"{OUT}/ai_verdicts.json", encoding="utf-8"))}
+verdicts = json.load(open(f"{OUT}/ai_verdicts.json", encoding="utf-8"))
+# keyed by pair_key, never by array position — see candidates_io.join_verdicts (#43)
+verds_by_rec = candidates_io.join_verdicts(recs, verdicts)
 
 # code -> pairCode from the source export, so the import is the minimal safe set
 # (code;pairCode;internalNote — reorder URL in the private field).
@@ -29,7 +32,7 @@ matches, report_rows = [], []
 n_ok = 0
 for i, r in enumerate(recs):
     cands = r["candidates"]
-    v = verds.get(i)
+    v = verds_by_rec[i]
     ci = v["chosen_i"] if v else -1
     reason = (v["reason"] if v else "bez verdiktu")[:200]
     chosen = None
