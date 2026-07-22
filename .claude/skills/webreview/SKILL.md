@@ -130,10 +130,13 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
   vyradil takmer VŠETKY reálne Pošta zásielky. Pri filtrovaní dopravcu z exportu vždy over
   reálne `itemName` hodnoty na živom `data/out/orders_cache.csv` PRED písaním filtra — text v
   zadaní/issue môže byť len predpoklad, nie skutočný string z exportu.
-- **„BCC vždy" (#105/#126) je teraz vynútené v kóde, nie len konvenciou v docs**:
-  `_send_mail_html(...)` (webreview/app.py) automaticky doplní `bcc=` z `MAIL_BCC`
-  (`data/.mail_env`), keď volajúci `bcc` neuvedie explicitne (`bcc=""` explicitne vypne).
-  Nová automatizácia s vlastným e-mailom → stačí NEuvádzať `bcc=` a konvencia platí sama.
+- **„BCC vždy" (#105/#126/#127) je teraz vynútené v kóde v OBOCH mail cestách, nie len
+  konvenciou v docs**: `_send_mail_html(...)` (automatizácie) automaticky doplní `bcc=`
+  z `MAIL_BCC` (`data/.mail_env`), keď volajúci `bcc` neuvedie explicitne (`bcc=""`
+  explicitne vypne). `_send_mail(...)` (reset hesla, `/forgot` flow) rovnako VŽDY pridá
+  `MAIL_BCC` do príjemcov, keď je nastavené — nemá `bcc=` parameter, takže sa nedá
+  per-call vypnúť (jediný volajúci ho ani nechce vypínať). Nová automatizácia s
+  vlastným e-mailom → stačí NEuvádzať `bcc=` a konvencia platí sama.
 - E2E gotcha: `.pill` má CSS `text-transform:uppercase` → `inner_text()` vráti „ZASTAVENÉ";
   porovnávaj `evaluate("el => el.textContent")` (CSS transform nemení DOM text).
 
