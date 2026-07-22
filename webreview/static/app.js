@@ -253,8 +253,8 @@ function renderFilters() {
 // The accessible name stays the plain label ("Na objednanie", "Hľadať / opraviť"),
 // which the E2E tests match on, so an added count badge doesn't break them.
 // Order = usage frequency (#117): 'Kontrola párovania' became the least-used
-// page once the review backlog stabilized, so it sits LAST — before the
-// 'Čoskoro'/automations section, never first.
+// page once the review backlog stabilized, so it sits LAST inside the 'Eshop'
+// folder — before the 'Automatizácie' section, never first.
 const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
   ['notes', 'Poznámky'], ['review', 'Kontrola párovania']];
 
