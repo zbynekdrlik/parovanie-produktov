@@ -160,26 +160,47 @@ def new_order_pairing_keys(order_pairings, uploaded):
     return out
 
 
-def link_rows(products, decisions, code2pair):
+def link_rows(products, decisions, code2pair, variant_links=None):
     """Reorder-link rows → `internalNote` = URL, one per variant, for good/manual
     decisions with a URL. Only code;pairCode;internalNote (no state columns → the
     eshop's stock/visibility is left untouched). Each `code` appears ONCE — Shoptet
     aborts the whole import on a duplicate code, and the catalog has duplicate
     products that share variant codes (first pairing wins).
 
+    A `split` decision (#174 — a product whose supplier lists a DIFFERENT product
+    URL per size, e.g. TRIGONA THERMOPAD S/M/L/XL/XXL) writes a per-variant link:
+    for each variant code the URL is `variant_links[code]` (keyed by the STABLE
+    variant code, never array position). A variant with NO stored link is SKIPPED —
+    never an empty internalNote cell (an empty cell would WIPE the existing link).
+    `variant_links` defaults to {} (so a plain good/manual call is unchanged).
+
     GRUBE-only: a GRUBE product's URL is rebuilt to the canonical grube.de detail
     URL (productId-rebuild via `to_grube_de`, strips mangled slug/query/single-size
     #itemId); a non-grube product's URL is written verbatim. Fallback to the raw URL
     if `to_grube_de` can't parse a productId."""
+    variant_links = variant_links or {}
     rows = []
     seen = set()
     for p in products:
         d = decisions.get(p.get("key"))
         if not d:
             continue
-        if d.get("status") in ("good", "manual") and (d.get("url") or "").strip():
+        st = d.get("status")
+        is_grube = p.get("supplier") == "GRUBE"
+        if st == "split":
+            for c in p["variant_codes"]:
+                if c in seen:
+                    continue
+                vurl = (variant_links.get(c) or "").strip()
+                if not vurl:
+                    continue   # variant not yet linked → no row (never wipe internalNote)
+                seen.add(c)
+                if is_grube:
+                    vurl = to_grube_de(vurl) or vurl
+                rows.append([c, code2pair.get(c, ""), vurl])
+        elif st in ("good", "manual") and (d.get("url") or "").strip():
             url = d["url"].strip()
-            if p.get("supplier") == "GRUBE":
+            if is_grube:
                 url = to_grube_de(url) or url
             for c in p["variant_codes"]:
                 if c in seen:

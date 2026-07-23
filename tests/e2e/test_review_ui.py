@@ -34,6 +34,63 @@ def test_approve_match_updates_progress_and_console_clean(page, live_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_split_into_sizes_per_variant_link_persists(page, matched_server):
+    """#174 — 'Rozdeliť na veľkosti' expands a multi-variant card into one link input
+    per size; a per-variant link saves, the split commits as a decision, and BOTH
+    survive a reload. Uses the isolated function-scoped matched_server (its BETALOV|p1
+    has 2 variant codes, 1/M + 1/L), so this test writes/keeps its own state cleanly."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+
+    page.goto(matched_server + "/?tab=review")
+    page.wait_for_selector(".card")
+
+    # The matched multi-variant card shows the split button.
+    page.get_by_role("button", name="✂ Rozdeliť na veľkosti").first.click()
+
+    # The editor loads one row per variant code (1/M, 1/L) — async from /api/variants.
+    page.wait_for_selector(".splitrow[data-code='1/M']")
+    assert page.locator(".splitrow").count() == 2
+
+    # Set a DIFFERENT supplier link on the 1/M size and save it.
+    m_row = page.locator(".splitrow[data-code='1/M']")
+    m_row.locator("input.spliturl").fill("https://trigona.sk/vel-m")
+    with page.expect_response(
+            lambda r: "/api/variant-link" in r.url and r.request.method == "POST"):
+        m_row.locator(".splitsave").click()
+    page.wait_for_selector(".splitrow[data-code='1/M'] .splitstate.has")
+
+    # Set a different link on the 1/L size too.
+    l_row = page.locator(".splitrow[data-code='1/L']")
+    l_row.locator("input.spliturl").fill("https://trigona.sk/vel-l")
+    with page.expect_response(
+            lambda r: "/api/variant-link" in r.url and r.request.method == "POST"):
+        l_row.locator(".splitsave").click()
+
+    # Commit the split → the card becomes a resolved 'split' decision (progress 1/1).
+    with page.expect_response(
+            lambda r: "/api/decision" in r.url and r.request.method == "POST"):
+        page.get_by_role("button", name="✓ Hotovo – rozdelené").click()
+    page.wait_for_function(
+        "() => document.getElementById('progressText').textContent.startsWith('1 / 1')")
+
+    # Reload: the split decision AND both per-variant links persist server-side.
+    # A split card is 'resolved' so it leaves the default 'Nezrevidované' filter —
+    # switch to 'Dobré/Vybrané' (which includes split) to see it again.
+    page.reload()
+    page.wait_for_selector("#filters button")
+    page.get_by_role("button", name="✓ Dobré/Vybrané").click()
+    page.wait_for_selector(".badge.split")
+    page.wait_for_selector(".splitrow[data-code='1/M']")
+    assert page.locator(".splitrow[data-code='1/M'] input.spliturl").input_value() \
+        == "https://trigona.sk/vel-m"
+    assert page.locator(".splitrow[data-code='1/L'] input.spliturl").input_value() \
+        == "https://trigona.sk/vel-l"
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_toorder_tab_lists_items_and_checkbox_persists(page, live_server):
     console = []
     page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")

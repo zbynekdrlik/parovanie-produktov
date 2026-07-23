@@ -2,6 +2,7 @@ let ME = null;              // {email, is_admin} — logged-in user (#91)
 let USERS_LIST = [];        // admin 'Užívatelia' tab
 let PRODUCTS = [];
 let DECISIONS = {};         // key -> {status, url}
+let VARIANT_LINKS = {};     // variant code -> supplier url (#174 per-size split links)
 let FILTER = 'unreviewed';
 let ORDERS = [];            // [{key, orderCode, itemCode, size, qty, supplier, name, supplierUrl, ordered, assignedSupplier}]
 let ORDERED = {};           // key -> true (ordered/objednané)
@@ -24,6 +25,7 @@ let UI_LABELS = {};         // /api/ui-labels — admin-set custom names {key: l
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'toorder';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
+const splitOpen = new Set(); // #174 — keys whose split-into-sizes editor is open (transient)
 
 // Session-expiry guard (#91): ANY api 401 → back to the login page. The server
 // gate protects the data; this just swaps a dead UI for the login form.
@@ -134,7 +136,7 @@ function matchesFilter(p) {
     case 'st1': return p.current && p.current.state === 1;
     case 'st2': return p.current && p.current.state === 2;
     case 'st3': return p.current && p.current.state === 3;
-    case 'good': return s === 'good' || s === 'manual';
+    case 'good': return s === 'good' || s === 'manual' || s === 'split';
     case 'unavailable': return s === 'unavailable' || s === 'discontinued';
     default: return true;
   }
@@ -144,7 +146,7 @@ function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.
 function fmtDate(iso) { const p = (iso || '').split('-'); return p.length === 3 ? `${p[2]}.${p[1]}.${p[0]}` : (iso || ''); }  // 2026-04-24 → 24.04.2026
 function escapeHtml(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function badge(s) {
-  const t = { good: '✓ Dobré', manual: '✓ Vybraný link',
+  const t = { good: '✓ Dobré', manual: '✓ Vybraný link', split: '✂ Rozdelené na veľkosti',
     unavailable: '📦 Nie je skladom', discontinued: '🚫 Nebude sa predávať' }[s];
   return t ? el('span', 'badge ' + s, t) : null;
 }
@@ -198,6 +200,94 @@ function resolutionPanel(p) {
   return wrap;
 }
 
+// #174 — save/clear one variant's supplier link (keyed by the stable variant code).
+async function saveVariantLink(code, url) {
+  const r = await fetch('/api/variant-link', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code, url: url || '' })
+  });
+  if (r.ok) { if (url) VARIANT_LINKS[code] = url; else delete VARIANT_LINKS[code]; }
+  return r.ok;
+}
+
+// #174 — a multi-variant product (>1 size) can be "split": a different supplier link
+// per size. Button opens the split editor for the card; single-variant → no button.
+function splitButton(p) {
+  if ((p.variant_codes || []).length <= 1) return null;
+  const b = el('button', 'btn ghost sm splitbtn', '✂ Rozdeliť na veľkosti');
+  b.title = 'Nastaviť iný dodávateľský link pre každú veľkosť';
+  b.onclick = () => { splitOpen.add(p.key); render(); };
+  return b;
+}
+
+// #174 — one editable row per variant (size): size label + code + candidate quick-picks
+// + a manual URL input, each saved independently by variant code.
+function splitRow(p, v) {
+  const row = el('div', 'splitrow'); row.dataset.code = v.code;
+  const head = el('div', 'splitrow-head');
+  head.appendChild(el('span', 'splitsize', escapeHtml(v.size || v.code)));
+  if (v.size) head.appendChild(el('span', 'splitcode', escapeHtml(v.code)));
+  row.appendChild(head);
+  const state = el('div', 'splitstate');
+  const inp = el('input'); inp.type = 'url'; inp.className = 'spliturl';
+  inp.placeholder = 'Link dodávateľa pre veľkosť ' + (v.size || v.code) + '…';
+  inp.value = VARIANT_LINKS[v.code] || v.link || '';
+  const mark = (val) => {
+    state.className = 'splitstate' + (val ? ' has' : '');
+    state.textContent = val ? '✓ link nastavený' : 'bez linku';
+  };
+  const commit = (val) => saveVariantLink(v.code, val).then(ok => { if (ok) mark(val); });
+  // whole-product candidates as quick-picks — the manager picks the right one per size
+  if (p.candidates && p.candidates.length) {
+    const cbox = el('div', 'splitcands');
+    for (const c of p.candidates) {
+      const pick = el('button', 'btn ghost sm', 'Vybrať: ' + escapeHtml(c.name || c.url));
+      pick.onclick = () => { inp.value = c.url; commit(c.url); };
+      cbox.appendChild(pick);
+    }
+    row.appendChild(cbox);
+  }
+  const mr = el('div', 'splitmanual');
+  const save = el('button', 'btn good sm splitsave', 'Uložiť');
+  save.onclick = () => { const val = inp.value.trim(); if (val && !val.startsWith('http')) return; commit(val); };
+  mr.appendChild(inp); mr.appendChild(save);
+  row.appendChild(mr);
+  mark(inp.value);
+  row.appendChild(state);
+  return row;
+}
+
+// #174 — the split-into-sizes editor for one product: hint + per-variant rows (loaded
+// from /api/variants) + a commit/undo footer. `split` decision marks the card resolved.
+function splitPanel(p) {
+  const wrap = el('div', 'splitpanel');
+  wrap.appendChild(el('div', 'splithint',
+    'Dodávateľ má inú stránku pre každú veľkosť? Nastav vlastný link pre KAŽDÚ veľkosť.'));
+  const rowsBox = el('div', 'splitrows loading', 'načítavam veľkosti…');
+  wrap.appendChild(rowsBox);
+  fetch('/api/variants?key=' + encodeURIComponent(p.key))
+    .then(r => r.json())
+    .then(j => {
+      rowsBox.classList.remove('loading'); rowsBox.innerHTML = '';
+      for (const v of (j.variants || [])) rowsBox.appendChild(splitRow(p, v));
+    })
+    .catch(() => { rowsBox.classList.remove('loading'); rowsBox.textContent = 'Nepodarilo sa načítať veľkosti.'; });
+  const foot = el('div', 'splitfoot');
+  if (statusOf(p) === 'split') {
+    const back = el('button', 'btn ghost sm', '↩ Zrušiť rozdelenie');
+    back.onclick = () => { splitOpen.delete(p.key); saveDecision(p, 'undo'); };
+    foot.appendChild(back);
+  } else {
+    const done = el('button', 'btn good sm', '✓ Hotovo – rozdelené');
+    done.onclick = () => { splitOpen.delete(p.key); saveDecision(p, 'split', ''); };
+    const cancel = el('button', 'btn ghost sm', '✗ Zrušiť');
+    cancel.onclick = () => { splitOpen.delete(p.key); render(); };
+    foot.appendChild(done); foot.appendChild(cancel);
+  }
+  wrap.appendChild(foot);
+  return wrap;
+}
+
 function renderCard(p) {
   const s = statusOf(p);
   const exp = expanded.has(p.key);
@@ -243,6 +333,13 @@ function renderCard(p) {
   right.appendChild(el('div', 'label', 'Dodávateľ'));
   const bg = badge(s); if (bg) right.appendChild(bg);
 
+  // #174 — split-into-sizes editor takes over the right side (while open OR committed).
+  if (splitOpen.has(p.key) || s === 'split') {
+    right.appendChild(splitPanel(p));
+    card.appendChild(right);
+    return card;
+  }
+
   if (s === 'unavailable' || s === 'discontinued') {
     right.appendChild(el('div', 'reason', s === 'unavailable'
       ? '📦 Nie je skladom → import: visible + Vypredané (stock 0). Ostáva na re-kontrolu.'
@@ -255,7 +352,9 @@ function renderCard(p) {
     const act = el('div', 'actions');
     const change = el('button', 'btn ghost sm', '✗ Zmeniť / iný link');
     change.onclick = () => { expanded.add(p.key); render(); };
-    act.appendChild(change); right.appendChild(act);
+    act.appendChild(change);
+    const sb = splitButton(p); if (sb) act.appendChild(sb);
+    right.appendChild(act);
     if (exp) right.appendChild(resolutionPanel(p));
   } else if (p.ai_status === 'matched' && !exp) {
     supplierBlock(right, p, p.ai_chosen_url, true);
@@ -273,9 +372,12 @@ function renderCard(p) {
     disc.title = 'detailOnly + Predaj výrobku skončil — link ostane pre Google';
     disc.onclick = () => saveDecision(p, 'discontinued', '');
     act.appendChild(g); act.appendChild(pick); act.appendChild(unav); act.appendChild(disc);
+    const sb = splitButton(p); if (sb) act.appendChild(sb);
     right.appendChild(act);
   } else {
     if (p.ai_status === 'unmatched' && p.ai_reason) right.appendChild(el('div', 'reason', '🤖 AI nenašla istú zhodu: ' + escapeHtml(p.ai_reason)));
+    const sb = splitButton(p);
+    if (sb) { const act = el('div', 'actions'); act.appendChild(sb); right.appendChild(act); }
     right.appendChild(resolutionPanel(p));
   }
   card.appendChild(right);
@@ -2614,6 +2716,7 @@ async function init() {
   const j = await (await fetch('/api/products')).json();
   PRODUCTS = j.products;
   DECISIONS = j.decisions || {};
+  VARIANT_LINKS = j.variant_links || {};   // #174 per-variant split links
   PRODUCTS.sort((a, b) =>
     ((a.ai_status === 'unmatched') ? 1 : 0) - ((b.ai_status === 'unmatched') ? 1 : 0) || a.idx - b.idx);
   FILTER = localStorage.getItem('filter') || 'unreviewed';

@@ -78,22 +78,39 @@ except FileNotFoundError:
 SRC = os.environ.get("WEBREVIEW_PRODUCTS") or os.path.join(ROOT, "data", "products.csv")
 
 
+def _variant_label(row, variant_cols):
+    """Human-readable variant label for one export row = the populated `variant:*`
+    axis value(s) joined (e.g. size 'M', or 'Červená · L' for a colour×size). Used
+    only for DISPLAY in the #174 split-into-sizes panel — the authoritative key is
+    always the variant CODE, never this label. Empty for a single-variant product."""
+    vals = [v for col in variant_cols if (v := (row.get(col) or "").strip())]
+    return " · ".join(vals)
+
+
 def _load_catalog(path, review_keys):
-    """Single cp1250 pass over the Shoptet export → (code2pair, catalog). Missing
-    export → ({}, {}) (the app already tolerates a dataless boot). `rows` is held only
-    for the duration of the build, then released."""
+    """Single cp1250 pass over the Shoptet export → (code2pair, code2variant, catalog).
+    Missing export → ({}, {}, {}) (the app already tolerates a dataless boot). `rows`
+    is held only for the duration of the build, then released. code2variant maps each
+    variant code → its `variant:*` axis label (size/colour), for the #174 split panel."""
     code2pair: dict = {}
+    code2variant: dict = {}
     rows: list = []
     if not os.path.exists(path):
-        return code2pair, {}
+        return code2pair, code2variant, {}
     csv.field_size_limit(10**9)
     with open(path, encoding="cp1250", errors="replace") as _f:
-        for _row in csv.DictReader(_f, delimiter=";"):
+        reader = csv.DictReader(_f, delimiter=";")
+        # the variant AXIS columns are `variant:<name>` (colon) — NOT `variantVisibility`.
+        variant_cols = [c for c in (reader.fieldnames or []) if c.startswith("variant:")]
+        for _row in reader:
             _c = (_row.get("code") or "").strip()
             if _c:
                 code2pair[_c] = (_row.get("pairCode") or "").strip()
+                _lbl = _variant_label(_row, variant_cols)
+                if _lbl:
+                    code2variant[_c] = _lbl
             rows.append(_row)
-    return code2pair, build_catalog_index(rows, review_keys)
+    return code2pair, code2variant, build_catalog_index(rows, review_keys)
 
 
 # review_keys is the COVERAGE set that marks a catalog entry in_review. The index is
@@ -105,8 +122,9 @@ def _load_catalog(path, review_keys):
 # (empty pairCode) still matches by its code.
 _review_cover = ({p.get("pairCode") for p in PRODUCTS if p.get("pairCode")}
                  | {c for p in PRODUCTS for c in (p.get("variant_codes") or [])})
-CODE2PAIR, CATALOG = _load_catalog(SRC, _review_cover)
-log.info("catalog: %d products indexed (%d codes) from %s", len(CATALOG), len(CODE2PAIR), SRC)
+CODE2PAIR, CODE2VARIANT, CATALOG = _load_catalog(SRC, _review_cover)
+log.info("catalog: %d products indexed (%d codes, %d variant labels) from %s",
+         len(CATALOG), len(CODE2PAIR), len(CODE2VARIANT), SRC)
 
 
 def _load_decisions() -> dict:
@@ -713,6 +731,29 @@ def _save_order_pairings(d: dict) -> None:
     os.replace(tmp, ORDER_PAIRINGS)
 
 
+# Per-variant reorder links (#174): {forestshop_variant_code: supplier_url}. A product
+# whose supplier lists a DIFFERENT product page per size (e.g. TRIGONA THERMOPAD
+# S/M/L/XL/XXL) is "split": the manager sets one link per size, keyed by the STABLE
+# variant code (never array position). import_builder.link_rows reads these for a
+# `split`-status decision → per-variant internalNote on the eshop. Same safe atomic
+# gitignored store; NEVER pruned → survives deploy.
+VARIANT_LINKS = os.path.join(OUT, "variant_links.json")
+
+
+def _load_variant_links() -> dict:
+    if os.path.exists(VARIANT_LINKS):
+        with open(VARIANT_LINKS, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_variant_links(d: dict) -> None:
+    tmp = VARIANT_LINKS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, VARIANT_LINKS)
+
+
 # Per-line "čaká sa" flag (key='<orderCode>|<itemCode>'): an ACTIVE order line that
 # can't be stocked yet — waiting on the supplier, batching more items, or deferred by
 # agreement with the customer. Independent of "objednané". Same safe gitignored store;
@@ -1146,7 +1187,9 @@ def api_products():
     # itself is never touched.
     cache = _load_image_health().get("cache") or {}
     cleaned, _dropped = image_health.clean_products(PRODUCTS, cache)
-    return jsonify(_grube_de_display(cleaned, _load_decisions()))
+    resp = _grube_de_display(cleaned, _load_decisions())
+    resp["variant_links"] = _load_variant_links()   # #174 per-variant split links
+    return jsonify(resp)
 
 
 @app.route("/api/images")
@@ -1239,7 +1282,10 @@ def api_import():
     # reviewed pairings (decisions) + inline pairings from the Na-objednanie tab.
     # A reviewed decision is authoritative, so inline rows skip any code it already
     # covers (Shoptet aborts on a duplicate code).
-    link = import_builder.link_rows(PRODUCTS, dec, CODE2PAIR)
+    # #174 — a `split`-status decision writes a DIFFERENT link per variant code from
+    # variant_links.json (the manager split the product into sizes); good/manual keep
+    # one link for the whole product. Both come out of link_rows in one pass.
+    link = import_builder.link_rows(PRODUCTS, dec, CODE2PAIR, _load_variant_links())
     link += import_builder.order_pairing_rows(
         _load_order_pairings(), CODE2PAIR, exclude_codes={r[0] for r in link})
     files = [
@@ -2253,6 +2299,53 @@ def api_order_pair():
     return jsonify({"ok": True})
 
 
+@app.route("/api/variants")
+def api_variants():
+    """#174 — the variants (sizes) of ONE review product for the split-into-sizes
+    panel: [{code, size, link}] for each variant code, in order. `size` is the
+    export's `variant:*` axis label (from CODE2VARIANT, DISPLAY only); `link` is the
+    manager's stored per-variant reorder URL (variant_links.json). Unknown key → 404."""
+    key = request.args.get("key", "")
+    p = next((x for x in PRODUCTS if x.get("key") == key), None)
+    if p is None:
+        return jsonify({"ok": False, "error": "unknown key"}), 404
+    vlinks = _load_variant_links()
+    variants = [{"code": c, "size": CODE2VARIANT.get(c, ""), "link": vlinks.get(c, "")}
+                for c in (p.get("variant_codes") or [])]
+    return jsonify({"ok": True, "key": key, "variants": variants})
+
+
+@app.route("/api/variant-link", methods=["POST"])
+def api_variant_link():
+    """#174 — save/clear the per-variant reorder URL for one forestshop variant code
+    (keyed by the STABLE variant code). Mirrors /api/order-pair: empty url clears the
+    link; a leading formula char in the code and a non-http(s) URL are rejected at the
+    source (the URL reaches a CSV internalNote cell). The link is written to the eshop
+    per variant by import_builder.link_rows for a `split`-status decision."""
+    body = request.get_json(force=True)
+    code = str(body.get("code") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "missing code"}), 400
+    # forestshop codes always start alphanumeric — a leading formula char (=,+,-,@,…)
+    # is malformed or a CSV-injection attempt; reject it at the source.
+    if code[:1] in _FORMULA_LEAD:
+        return jsonify({"ok": False, "error": "invalid code"}), 400
+    # authoritative URL guard (matches /api/order-pair) — only real http(s) links reach
+    # the import's internalNote; blocks javascript:/data: and malformed 'httpfoo'.
+    if url and not re.match(r"^https?://", url):
+        return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+    with _lock:
+        d = _load_variant_links()
+        if url:
+            d[code] = url
+        else:
+            d.pop(code, None)
+        _save_variant_links(d)
+    log.info("variant-link code=%s url=%s", code, url)
+    return jsonify({"ok": True})
+
+
 @app.route("/api/order-supplier", methods=["POST"])
 def api_order_supplier():
     """Assign/clear a supplier name for a forestshop order code (keyed by itemCode).
@@ -3014,7 +3107,7 @@ def run_shoptet_sync() -> dict:
     try/except (automation_runner._execute) records the error and the app keeps
     serving the previous cache/catalog/review data untouched — degrade, never
     crash, never a half-written file."""
-    global CODE2PAIR, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
+    global CODE2PAIR, CODE2VARIANT, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
 
     orders_bytes = _fetch_orders_csv()
     tmp = ORDERS_CACHE + ".tmp"
@@ -3033,7 +3126,7 @@ def run_shoptet_sync() -> dict:
     with _lock:
         review_keys = ({p.get("pairCode") for p in PRODUCTS if p.get("pairCode")}
                        | {c for p in PRODUCTS for c in (p.get("variant_codes") or [])})
-        CODE2PAIR, CATALOG = _load_catalog(SRC, review_keys)
+        CODE2PAIR, CODE2VARIANT, CATALOG = _load_catalog(SRC, review_keys)
         # the fresh export can change names/alternatives → drop the lazy caches so the
         # nedostupné resolver rebuilds them from the new products.csv on next tab open.
         _NEDOSTUPNE_CAT = None

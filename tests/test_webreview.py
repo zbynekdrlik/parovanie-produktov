@@ -209,6 +209,94 @@ def test_order_pair_requires_code(monkeypatch, tmp_path):
     assert r.status_code == 400
 
 
+# --- #174: split a product into per-size links -------------------------------- #
+def test_variant_link_endpoint_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))
+    c = _client()
+    r = c.post("/api/variant-link", json={"code": "62059/S", "url": "https://trigona.sk/vel-s"})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert webapp._load_variant_links()["62059/S"] == "https://trigona.sk/vel-s"
+    # a second size gets its OWN link (per variant code, independent)
+    c.post("/api/variant-link", json={"code": "62059/M", "url": "https://trigona.sk/vel-m"})
+    assert webapp._load_variant_links() == {
+        "62059/S": "https://trigona.sk/vel-s", "62059/M": "https://trigona.sk/vel-m"}
+    # clearing (empty url) removes ONLY that variant's link
+    c.post("/api/variant-link", json={"code": "62059/S", "url": ""})
+    assert "62059/S" not in webapp._load_variant_links()
+    assert "62059/M" in webapp._load_variant_links()
+
+
+def test_variant_link_rejects_non_http_url(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))
+    for bad in ("javascript:alert(1)", "data:text/html,x", "httpfoo://x", "http", "ftp://x"):
+        r = _client().post("/api/variant-link", json={"code": "X", "url": bad})
+        assert r.status_code == 400, f"should reject {bad!r}"
+    assert webapp._load_variant_links() == {}
+
+
+def test_variant_link_rejects_formula_code(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))
+    for bad in ('=HYPERLINK("http://evil","x")', "+1", "-cmd", "@SUM"):
+        r = _client().post("/api/variant-link", json={"code": bad, "url": "https://s/x"})
+        assert r.status_code == 400, f"should reject code {bad!r}"
+    assert webapp._load_variant_links() == {}
+
+
+def test_variant_link_requires_code(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))
+    assert _client().post("/api/variant-link", json={"code": "", "url": "https://x"}).status_code == 400
+
+
+def test_variants_endpoint_returns_sizes_and_links(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "PRODUCTS",
+                        [{"key": "TRIGONA|156", "variant_codes": ["62059/S", "62059/M"]}])
+    monkeypatch.setattr(webapp, "CODE2VARIANT", {"62059/S": "S", "62059/M": "M"})
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))
+    webapp._save_variant_links({"62059/S": "https://trigona.sk/vel-s"})
+    r = _client().get("/api/variants?key=TRIGONA|156")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["variants"] == [
+        {"code": "62059/S", "size": "S", "link": "https://trigona.sk/vel-s"},
+        {"code": "62059/M", "size": "M", "link": ""},
+    ]
+
+
+def test_variants_endpoint_unknown_key_404(monkeypatch):
+    monkeypatch.setattr(webapp, "PRODUCTS", [{"key": "A|1", "variant_codes": ["x"]}])
+    assert _client().get("/api/variants?key=NOPE").status_code == 404
+
+
+def test_products_route_includes_variant_links(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))
+    webapp._save_variant_links({"62059/S": "https://trigona.sk/vel-s"})
+    j = _client().get("/api/products").get_json()
+    assert j.get("variant_links") == {"62059/S": "https://trigona.sk/vel-s"}
+
+
+def test_import_zip_writes_per_variant_split_link(monkeypatch, tmp_path):
+    # end-to-end: a `split` decision + per-variant links → the import zip's
+    # import_links.csv carries a DIFFERENT internalNote per variant code.
+    import zipfile
+    monkeypatch.setattr(webapp, "PRODUCTS",
+                        [{"key": "TRIGONA|156", "supplier": "TRIGONA",
+                          "variant_codes": ["62059/S", "62059/M"]}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"62059/S": "156", "62059/M": "156"})
+    monkeypatch.setattr(webapp, "_load_decisions",
+                        lambda: {"TRIGONA|156": {"status": "split", "url": ""}})
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    monkeypatch.setattr(webapp, "GRUBE_CODES", str(tmp_path / "gc.json"))
+    webapp._save_variant_links({"62059/S": "https://trigona.sk/vel-s",
+                                "62059/M": "https://trigona.sk/vel-m"})
+    data = _client().get("/api/import").data
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        links = z.read("import_links.csv").decode("utf-8-sig")
+    assert "62059/S;156;https://trigona.sk/vel-s" in links
+    assert "62059/M;156;https://trigona.sk/vel-m" in links
+
+
 # --- Poznámky tab (#83) --------------------------------------------------------- #
 def test_notes_add_persists_and_newest_first(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "NOTES", str(tmp_path / "notes.json"))
