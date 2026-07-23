@@ -359,6 +359,35 @@ dict-e (napr. `automations_server` v `tests/e2e/conftest.py`) vynúti determinis
 not-configured vetvu na KAŽDOM stroji vrátane CI. Zistené live behom #153 (worker si na svojom
 dev boxe omylom poslal test-mail na fixture adresu cez reálny SMTP relay).
 
+### VALIDÁCIA + serve-time filter automatizácia (žiadny zápis do review_data.json) — vzor `image_health` (#135)
+
+Automatizácia, čo periodicky OVERUJE (nie scrapuje/klasifikuje) niečo o dátach, čo appka UŽ má —
+tu HTTP HEAD na každú `our_images` URL (naše vlastné cdn.myshoptet.com fotky) — a výsledok sa
+NEZAPISUJE do `review_data.json` (na rozdiel od `resync_current`/WRITE-JOIN vzorov vyššie). Namiesto
+toho automatizácia udržiava LEN vlastný per-URL cache store (`data/out/image_health.json`,
+`{url: {ok, fails, checked_at}}`) a **existujúci serve endpoint** (`/api/products`) ho aplikuje AŽ
+PRI REQUESTE (`image_health.clean_products` — shallow-copy len produktov, čo naozaj strácajú
+obrázok; storage netknuté). Dôvod: obrázok, čo dnes zomrel, môže o týždeň znova žiť (dodávateľ/CDN
+sa opraví) — zápis do `review_data.json` by vyžadoval ĎALŠÍ resync krok na obnovenie; serve-time
+filter sa automaticky "opraví" na ĎALŠOM requeste, len čo cache záznam zastarne a ďalší beh ho
+znova nájde živý. Tento vzor sa hodí pre KAŽDÚ "over či X ešte platí" automatizáciu, kde X sa môže
+samo vrátiť do dobrého stavu — na rozdiel od JOIN/WRITE-JOIN vzorov, ktoré menia TRVALÝ stav
+(eshop/review_data).
+
+- **Anti-flap (transient blip ≠ mŕtve)**: až N (2) PO SEBE IDÚCICH zlyhaní → dead; úspech OKAMŽITE
+  vynuluje streak. Bez tohto by jeden dočasný CDN výpadok vymazal dobrý obrázok z karty na celý
+  deň (do ďalšieho behu). Kopíruj `needs_check`/`record_result`/`is_dead` vzor (fresh-window na
+  potvrdené-OK URL, ale VŽDY re-check na URL, čo naposledy zlyhala — rýchle potvrdenie/vyčistenie).
+- **HEAD s GET-Range fallback** (405/501 = host nepodporuje HEAD) — `stream=True` + `Range:
+  bytes=0-1`, aby sa pri neúctivom serveri (ignoruje Range, vráti 200+celé telo) nesťahoval celý
+  obrázok len na kontrolu živosti.
+- **GOTCHA — `automations_server` e2e fixtúra NEMÁ `review_data.json`** (0 produktov) → pre TÚTO
+  KONKRÉTNU automatizáciu (na rozdiel od VŠETKÝCH ostatných network/write automatizácií, čo v e2e
+  NIKDY neklikajú „Spustiť teraz") je klik bezpečný a hermetický — beh nájde 0 URL, 0 sieťových
+  volaní, dokončí sa okamžite s `checked=0`. Over si to najprv (`total_urls==0` scenár) predtým než
+  napíšeš podobný "safe run-now" e2e test pre inú automatizáciu — inak riskuješ skutočný sieťový
+  beh v CI.
+
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
 Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
