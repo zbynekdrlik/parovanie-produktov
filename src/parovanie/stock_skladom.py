@@ -75,6 +75,12 @@ def compute_candidates(csv_text: str | None) -> list[dict]:
         # (state 3, conscious off decision), NOT already Skladom (state 1 →
         # idempotent skip). state_of is the shared 3-state classifier (never
         # re-implemented — see .claude/skills/shoptet).
+        # A discontinued signal ("skončil") in EITHER availability field marks a
+        # conscious-off product. state_of only inspects one field (ais or aos), so a
+        # "skončil" hiding in the other would slip through and wrongly re-list a
+        # discontinued item as sellable on the live eshop (#98 review Finding 1).
+        if "skon" in ais.lower() or "skon" in aos.lower():
+            continue
         if vis != "visible" or state_of(vis, ais or aos) != 2:
             continue
         seen.add(code)
