@@ -373,6 +373,14 @@ function renderCard(p) {
     const back = el('button', 'btn ghost sm', '↩ Vrátiť');
     back.onclick = () => saveDecision(p, 'undo');
     right.appendChild(back);
+    // #97 — 'Vrátiť' only clears this decision locally; it does NOT push an immediate
+    // re-enable to the eshop. The real re-enable (Vypredané → Skladom) is done by the
+    // nightly restock automation once the product is back in stock at the supplier.
+    // Shown only for 'unavailable' (Vypredané) — 'discontinued' is not auto-re-enabled.
+    if (s === 'unavailable')
+      right.appendChild(el('div', 'reenote',
+        '↩ Vrátiť len zruší toto označenie tu. Reálne zapnutie v eshope spraví '
+        + 'nočná automatika, keď je produkt späť skladom.'));
   } else if (s === 'good' || s === 'manual') {
     supplierBlock(right, p, s === 'good' ? p.ai_chosen_url : decUrl(p), s === 'good');
     const act = el('div', 'actions');

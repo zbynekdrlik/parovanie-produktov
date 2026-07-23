@@ -148,3 +148,62 @@ def test_urledit_buttons_unwrapped_on_desktop(page, longcontent_matched_server):
         f"manual row wrapped on desktop: input={input_box} button={save_box}"
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_reenable_note_next_to_undo(page, matched_server):
+    """#97 — after marking a product '📦 Nie je skladom' (unavailable) the review card
+    shows an unobtrusive note next to '↩ Vrátiť': the real eshop re-enable is done by
+    the nightly restock automation once the product is back in stock. 'Vrátiť' itself
+    only clears the decision locally — it never pushes an import to the eshop. The note
+    is scoped to 'unavailable' (Vypredané); 'discontinued' (Už sa nebude predávať) is
+    NOT auto-re-enabled, so no note appears there (would be a lie)."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+    # Capture any eshop-write request — proves 'Vrátiť' triggers none. The decision
+    # buttons only ever POST /api/decision; a write to the eshop would be /api/import
+    # (manual zip) or /api/n8n/* (nightly). Neither must fire from this flow.
+    writes = []
+    page.on("request", lambda r: writes.append(r.url)
+            if ("/api/import" in r.url or "/api/n8n/" in r.url) else None)
+
+    page.goto(matched_server + "/?tab=review")
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".card")
+    # 'Všetky' keeps a decided card visible so we can watch the in-place re-render.
+    page.get_by_role("button", name="Všetky", exact=True).click()
+
+    def click_and_assert_status(button_name, expected_status):
+        """Click a mutating button, consume its /api/decision POST, assert the status."""
+        with page.expect_response(
+                lambda r: "/api/decision" in r.url
+                and r.request.method == "POST") as resp:
+            page.get_by_role("button", name=button_name, exact=True).click()
+        assert json.loads(resp.value.request.post_data)["status"] == expected_status
+
+    # 'unavailable' → the note appears, inside the SAME card side as '↩ Vrátiť'.
+    click_and_assert_status("📦 Nie je skladom", "unavailable")
+    page.wait_for_selector("button:has-text('↩ Vrátiť')")
+    note = page.locator(
+        ".card .side.right:has(button:has-text('↩ Vrátiť')) .reenote")
+    assert note.count() == 1
+    note.wait_for(state="visible")
+    txt = note.inner_text()
+    assert "nočná automatika" in txt and "späť skladom" in txt, txt
+
+    # Undo → back to the matched buttons, the note is gone (decision cleared).
+    click_and_assert_status("↩ Vrátiť", "undo")
+    page.wait_for_selector("button:has-text('vyber url')")
+    assert page.locator(".card .reenote").count() == 0
+
+    # 'discontinued' shows '↩ Vrátiť' but NO note (not auto-re-enabled).
+    click_and_assert_status("🚫 Už sa nebude predávať", "discontinued")
+    page.wait_for_selector("button:has-text('↩ Vrátiť')")
+    assert page.locator(".card .reenote").count() == 0
+    click_and_assert_status("↩ Vrátiť", "undo")
+    page.wait_for_selector("button:has-text('vyber url')")
+
+    # 'Vrátiť' cleared the decision locally and NEVER pushed to the eshop.
+    assert page.evaluate("() => Object.keys(DECISIONS).length") == 0
+    assert writes == [], f"'Vrátiť' unexpectedly triggered eshop write(s): {writes}"
+    assert console == [], f"console not clean: {console}"
