@@ -169,3 +169,25 @@ def test_automations_all_carry_description(iso):
     assert len(autos) == len(webapp.AUTOMATIONS_REG)
     for a in autos:
         assert isinstance(a.get("description"), str) and a["description"], a["key"]
+
+
+# --------------------------------------------------------------------------- #
+# Drift guard (#173 review, Minor #1): NAV_KEYS is hand-maintained in three
+# places (app.js TABS/AUTOMATION_TABS, server NAV_KEYS, the tests). A tab added
+# to app.js but forgotten in NAV_KEYS renders a rename pencil whose POST silently
+# 400s. Parse app.js and assert the nav-key set matches the server's.
+# --------------------------------------------------------------------------- #
+def test_nav_keys_match_appjs():
+    import re
+    appjs_path = os.path.join(os.path.dirname(__file__), "..", "webreview", "static", "app.js")
+    appjs = open(appjs_path, encoding="utf-8").read()
+
+    def _keys(var):
+        m = re.search(var + r"\s*=\s*\[(.*?)\];", appjs, re.S)
+        assert m, f"{var} not found in app.js"
+        return set(re.findall(r"\[\s*'([a-z_]+)'\s*,", m.group(1)))
+
+    appjs_keys = _keys("const TABS") | _keys("const AUTOMATION_TABS") | {"users", "dev"}
+    assert appjs_keys == webapp.NAV_KEYS, (
+        f"app.js nav keys vs server NAV_KEYS drift — only in app.js: "
+        f"{appjs_keys - webapp.NAV_KEYS}; only in server: {webapp.NAV_KEYS - appjs_keys}")
