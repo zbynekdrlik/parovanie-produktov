@@ -607,6 +607,20 @@ e-mailov — VŽDY za náhľadom, nikdy auto.
 - **GOTCHA — nový TAB v TABS rozbije `test_shell.py::test_nav_order_has_review_last`** (hard-koduje
   celý zoznam label-ov `#tabs .tlabel`). Pridaj nový label na správnu pozíciu. Server-side pridaj
   kľúč aj do `NAV_KEYS` (inak #173 premenovanie tabu → 400).
+- **Email text = ŠÉFOVO PRESNÉ znenie (#183, v0.76.0)**: `build_unavailable_email` je šéfovo verbatim
+  telo („veľmi sa ospravedlňujeme … momentálne nedostupný … nevieme kedy bude naskladnený …") + jeho
+  podpis „S pozdravom … Drlík, Forestshop.sk" (NIE „Tím Forestshop.sk"). `build_alternative_email`
+  ostáva na house-style „Tím" podpise. **`_shell(name_h, inner, sign=_SIGN_DEFAULT)` je ZDIEĽANÝ oboma**
+  — keď meníš text/podpis JEDNÉHO e-mailu, parametrizuj (default arg) nech DRUHÝ ostane byte-identický;
+  NEmeň `_shell` telo natvrdo. Personalizované oslovenie menom rieši shell (`Dobrý deň, <strong>Meno</strong>,`),
+  takže šéfovo telo NEmá vlastné „Dobrý deň" (žiadne dvojité oslovenie/podpis).
+- **GOTCHA — test čo asertuje kľúčovú frázu e-mailu ako plain substring**: NEobaľuj časť frázy do
+  `<strong>` (napr. `momentálne <strong>nedostupný</strong>`) — rozbije to substring `momentálne
+  nedostupný`. Šéfovo verbatim znenie píš bez inline tagov vnútri kľúčových fráz.
+- **Zoradenie tabu (#185, v0.76.0)**: `build_view` vracia HORE produkty s OTVORENOU objednávkou
+  zoradené podľa MAX(date) objednávok zostupne (najnovšia hore), potom bez objednávky (name/code).
+  Dátum objednávky parsuj cez `_order_date_key` (export „YYYY-MM-DD HH:MM:SS", `[:10]`+`strptime`;
+  prázdny/nevalidný → '' = najstarší, nespadne). Stabilný dvojkľúčový sort (name/code base → date desc).
 
 ## Rozdeliť produkt na veľkosti — per-veľkosť dodávateľský link (#174, v0.72.0)
 
