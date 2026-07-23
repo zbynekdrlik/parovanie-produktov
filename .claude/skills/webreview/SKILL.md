@@ -327,6 +327,38 @@ OpenAI + `_send_mail_html` + store.
   `"..."` reťazca predčasne UKONČIA reťazec (`SyntaxError: invalid character '„'`). Dlhý SK prompt
   s ukážkovými `"kľúčovými slovami"` píš ako **triple-quoted** `f"""..."""` (ASCII `"` je tam OK).
 
+### Ručný per-riadkový OVERRIDE nad AI/automatizáciou (#153) — reuse existujúci store, nie nový
+
+Keď manažér potrebuje priamo v tabe opraviť/obísť rozhodnutie automatizácie (napr. AI zle
+vyhodnotilo, alebo riadok ešte nemá klasifikáciu) — vzor `orders_reminder` override
+(`/api/orders-reminder/override`, akcie `contact`/`send`): **NEPRIDÁVAJ nový store súbor** —
+display dáta v `red`/`orange`/`skipped` snapshote UŽ nesú všetky polia, čo override potrebuje
+(meno, email, poznámka); endpoint ich len prečíta cez malý `_find_current_row(st, code)` helper
+a zapíše do TOHO ISTÉHO per-code dedup store (`orders_reminder.json["orders"]`), presne ako
+automatizovaný beh. Terminálny status (`emailed`/`skipped_contacted`) v tom istom slovníku
+prirodzene dedupuje — override je len ĎALŠÍ spôsob, ako sa doň zapíše.
+
+**GOTCHA — sieťové/SMTP volanie NIKDY pod globálnym `_lock`.** `_lock` (app.py:56) je JEDEN
+zdieľaný zámok pre VŠETKY stores v appke — držať ho cez `_send_mail_html`/OpenAI call (až ~20s
+SMTP timeout) by zmrazilo KAŽDÚ inú admin akciu na webe na tú dobu. `run_orders_reminder()` už
+sieťové volania robí MIMO zámku (len zápis súboru je locknutý) — nový endpoint, čo volá von
+(mail/AI), musí ROBIŤ TO ISTÉ: (1) krátky `with _lock:` na kontrolu stavu, (2) sieťové volanie
+BEZ zámku, (3) krátky `with _lock:` na finálny zápis + **re-check stavu** (concurrentný
+double-click medzitým mohol už zapísať terminálny status — re-check zabráni duplicitnému zápisu/
+mailu). Nájdené vlastnou review-passou v #153 (žiaden subagent-dispatch tool v tomto prostredí —
+review robil worker sám priamo nad diffom).
+
+**GOTCHA — e2e fixtúra, čo klikne skutočnú `_send_mail_html`/`_send_mail` cestu, MUSÍ pripnúť
+`MAIL_HOST=""` do `env`.** `_load_env_file()` číta `data/.mail_env` podľa ABSOLÚTNEJ repo cesty
+(`ROOT` z `__file__`), NIE podľa izolovaného `WEBREVIEW_OUT` fixtúry — takže na dev boxe, čo má
+reálny `data/.mail_env` (produkčné SMTP heslá) checked out, by neopatrený e2e klik na tlačidlo
+posielajúce mail poslal SKUTOČNÝ mail cez reálne credentials (na CI bez súboru sa to prejaví len
+ako `502` — nekonzistentné správanie medzi CI a dev boxom, kým sa nepripne). `os.environ.
+setdefault()` nikdy neprebije UŽ nastavený kľúč, takže `"MAIL_HOST": ""` v subprocess `env`
+dict-e (napr. `automations_server` v `tests/e2e/conftest.py`) vynúti deterministickú
+not-configured vetvu na KAŽDOM stroji vrátane CI. Zistené live behom #153 (worker si na svojom
+dev boxe omylom poslal test-mail na fixture adresu cez reálny SMTP relay).
+
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
 Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
