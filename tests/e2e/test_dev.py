@@ -21,9 +21,11 @@ def test_vyvoj_tab_lists_issues_open_and_closed(page, dev_server):
     page.wait_for_selector(".sidebar #tabs button")
 
     # 'Vývoj' is a standalone nav at the very bottom (like 'Užívatelia'). Scope to
-    # #devNav — the label substring also matches the lightbulb's aria-label.
-    assert page.locator(".sidebar #devNav button").count() == 1
-    page.locator("#devNav button").click()
+    # #devNav .tab — a bare "button" also matches the lightbulb's aria-label
+    # substring AND (admin, #173) the ✏️ rename icon sitting beside the nav
+    # button; .tab is the real nav-button class, always exactly one per key.
+    assert page.locator(".sidebar #devNav .tab").count() == 1
+    page.locator("#devNav .tab").click()
 
     # default filter is 'Otvorené' → the open issue is shown.
     page.wait_for_selector("#tab-dev .dev-row")
@@ -60,7 +62,7 @@ def test_lightbulb_creates_idea_that_appears_in_list(page, dev_server):
     page.locator("#ideaModal").wait_for(state="hidden")
 
     # the new issue shows up in the Vývoj list (created issues are 'open').
-    page.locator("#devNav button").click()
+    page.locator("#devNav .tab").click()
     page.wait_for_function(
         "() => [...document.querySelectorAll('#tab-dev .dev-row')]"
         ".some(r => r.textContent.includes('Napad z e2e testu'))")
@@ -74,7 +76,7 @@ def test_issue_title_does_not_link_to_github(page, dev_server):
     console = _console(page)
     page.goto(dev_server)
     page.wait_for_selector(".sidebar #tabs button")
-    page.locator("#devNav button").click()
+    page.locator("#devNav .tab").click()
     page.wait_for_selector("#tab-dev .dev-row")
 
     # no anchor pointing at GitHub anywhere in the list
@@ -98,7 +100,7 @@ def test_priority_soon_moves_issue_to_top_group(page, dev_server):
     console = _console(page)
     page.goto(dev_server)
     page.wait_for_selector(".sidebar #tabs button")
-    page.locator("#devNav button").click()
+    page.locator("#devNav .tab").click()
     page.wait_for_selector("#tab-dev .dev-row")
 
     # the open issue (#7) has a „🔴 Čoskoro" button; click it → POST priority
@@ -123,7 +125,7 @@ def test_detail_shows_zadanie_and_existing_comments(page, dev_server):
     console = _console(page)
     page.goto(dev_server)
     page.wait_for_selector(".sidebar #tabs button")
-    page.locator("#devNav button").click()
+    page.locator("#devNav .tab").click()
     page.wait_for_selector("#tab-dev .dev-row")
 
     row = page.locator("#tab-dev .dev-row").first          # #7, has 1 existing comment
@@ -145,7 +147,7 @@ def test_add_detail_note_appears_immediately(page, dev_server):
     console = _console(page)
     page.goto(dev_server)
     page.wait_for_selector(".sidebar #tabs button")
-    page.locator("#devNav button").click()
+    page.locator("#devNav .tab").click()
     page.wait_for_selector("#tab-dev .dev-row")
 
     row = page.locator("#tab-dev .dev-row").first

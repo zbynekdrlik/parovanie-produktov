@@ -18,6 +18,7 @@ let RESTOCK = null;         // /api/restock-skladom — last restock run (#108)
 let ORDERS_REMINDER = null; // /api/orders-reminder — last orders-reminder run (#105)
 let DEV = null;             // /api/dev/issues — {available, issues:[...]} or null (#115)
 let DEV_FILTER = 'open';    // 'Vývoj' tab filter: open | closed | all
+let UI_LABELS = {};         // /api/ui-labels — admin-set custom names {key: label} (#173)
 let ORDER_SUPPLIER = 'all';
 let ACTIVE_TAB = localStorage.getItem('tab') || 'toorder';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
@@ -363,7 +364,18 @@ function navError(key) {
   return !!(a && a.last_status === 'error');
 }
 
-function _navButton(key, lbl) {
+// `defaultLbl` = the built-in name; an admin-set override in UI_LABELS (#173)
+// wins for DISPLAY (button text + accessible name + page title), but the prompt
+// dialog for renaming always shows the built-in default too (so "vrátiť pôvodný"
+// is meaningful). Returns a wrapper <div class="navrow"> — a bare tab button for
+// a non-admin, tab button + ✏️ rename icon for an admin. The wrapper keeps
+// `.tabs .tab` / `.tabs .tab .tlabel` selectors matching at any depth (existing
+// E2E), and admin-only adds a SECOND button with a generic aria-label
+// ("Premenovať", never the tab's own name) so it can never collide with an
+// existing `get_by_role("button", name=<tab label>)` lookup (the #115 lightbulb
+// substring-collision gotcha, avoided the same way here).
+function _navButton(key, defaultLbl) {
+  const lbl = UI_LABELS[key] || defaultLbl;
   const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
   const n = navCount(key);
   const err = navError(key);
@@ -372,7 +384,17 @@ function _navButton(key, lbl) {
     + (err ? '<span class="navwarn" title="posledný beh zlyhal">⚠</span>' : '')
     + (n > 0 ? `<span class="navcount">${n}</span>` : '');
   bt.onclick = () => switchTab(key);
-  return bt;
+  const row = el('div', 'navrow');
+  row.appendChild(bt);
+  if (isAdmin()) {
+    const edit = el('button', 'navedit', '✏️');
+    edit.title = 'Premenovať';
+    edit.setAttribute('aria-label', 'Premenovať');
+    edit.dataset.testid = 'navedit-' + key;
+    edit.onclick = (e) => { e.stopPropagation(); renameNavItem(key, defaultLbl); };
+    row.appendChild(edit);
+  }
+  return row;
 }
 
 function renderTabs() {
@@ -406,11 +428,12 @@ const PAGE_TITLES = {
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
   parovania_eshop: 'Párovania → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
   riziko_vypadku: 'Riziko výpadku', restock_skladom: 'Vypredané → Skladom',
+  orders_reminder: 'Pripomienky objednávok',
   image_health: 'Kontrola obrázkov', dev: 'Vývoj',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
-  if (h) h.textContent = PAGE_TITLES[ACTIVE_TAB] || '';
+  if (h) h.textContent = UI_LABELS[ACTIVE_TAB] || PAGE_TITLES[ACTIVE_TAB] || '';
   const s = document.getElementById('pageSub'); if (!s) return;
   if (ACTIVE_TAB === 'review') {
     const un = PRODUCTS.filter(p => !statusOf(p)).length;
@@ -1386,6 +1409,35 @@ async function loadAutomations() {
   catch (_) { AUTOMATIONS = []; }
 }
 
+// Admin-set custom nav/automation names (#173) — GET is open to every logged-in
+// user, so a renamed tab shows its new name for everyone, not just the admin.
+async function loadUiLabels() {
+  try { UI_LABELS = (await (await fetch('/api/ui-labels')).json()).labels || {}; }
+  catch (_) { UI_LABELS = {}; }
+}
+
+// Admin-only rename of one nav tab / automation (pencil next to its nav button).
+// Empty input clears the override (reverts to the built-in default name).
+async function renameNavItem(key, defaultLbl) {
+  const current = UI_LABELS[key] || defaultLbl;
+  const next = prompt(
+    `Nový názov záložky (pôvodný: "${defaultLbl}"). Prázdne pole = vrátiť pôvodný názov.`,
+    current);
+  if (next === null) return;   // cancelled
+  const label = next.trim();
+  const r = await fetch('/api/ui-label', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, label }),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    alert(j.error || 'Nepodarilo sa premenovať.');
+    return;
+  }
+  if (label) UI_LABELS[key] = label; else delete UI_LABELS[key];
+  render();
+}
+
 async function loadPosta() {
   await loadAutomations();
   try { POSTA = await (await fetch('/api/posta-uncollected')).json(); }
@@ -1488,6 +1540,7 @@ function renderPosta() {
     run.onclick = () => runAutomation('posta_uncollected');
     head.appendChild(run);
     st.appendChild(head);
+    if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
     const meta = el('div', 'autometa');
     const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -1608,6 +1661,7 @@ function renderShoptetSync() {
   run.onclick = () => runAutomation('shoptet_sync', 'shoptet_sync');
   head.appendChild(run);
   st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -1662,6 +1716,7 @@ function renderImageHealth() {
   run.onclick = () => runAutomation('image_health', 'image_health');
   head.appendChild(run);
   st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -1718,6 +1773,7 @@ function renderParovaniaEshop() {
   run.onclick = () => runAutomation('parovania_eshop', 'parovania_eshop');
   head.appendChild(run);
   st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -1812,6 +1868,7 @@ function renderDodavatelskySklad() {
   run.onclick = () => runAutomation('dodavatelsky_sklad', 'dodavatelsky_sklad');
   head.appendChild(run);
   st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -1929,6 +1986,7 @@ function renderRizikoVypadku() {
   run.onclick = () => runAutomation('riziko_vypadku', 'riziko_vypadku');
   head.appendChild(run);
   st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -2016,6 +2074,7 @@ function renderRestockSkladom() {
   run.onclick = () => runAutomation('restock_skladom', 'restock_skladom');
   head.appendChild(run);
   st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -2110,6 +2169,7 @@ function renderOrdersReminder() {
   run.onclick = () => runAutomation('orders_reminder', 'orders_reminder');
   head.appendChild(run);
   st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
@@ -2371,7 +2431,9 @@ async function init() {
   // can't crash init() or spam the console. loadAutomations() (#153) is prefetched
   // the SAME way — the ⚠ failed-run nav badge must show from ANY page, not only
   // after the manager happens to open that specific automation's tab.
-  await Promise.all([loadOrders(), loadNotes(), loadAutomations()]);
+  // loadUiLabels() (#173) is prefetched too — renderTabs()'s first paint must
+  // already show admin-set custom names, not the default flashing first.
+  await Promise.all([loadOrders(), loadNotes(), loadAutomations(), loadUiLabels()]);
   if (ACTIVE_TAB === 'users') await loadUsers();
   if (ACTIVE_TAB === 'posta') await loadPosta();
   if (ACTIVE_TAB === 'dev') await loadDevIssues();

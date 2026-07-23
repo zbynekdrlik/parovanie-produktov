@@ -775,6 +775,34 @@ def _save_unavailable(d: dict) -> None:
     os.replace(tmp, UNAVAIL)
 
 
+# Admin-set custom display names for nav tabs + automations (#173): {key: label}.
+# Key = the nav/automation key (TABS/AUTOMATION_TABS keys == Automation.key, plus
+# 'users'/'dev' — one flat namespace, validated against NAV_KEYS at write time).
+# Renaming an automation IS renaming its tab — the panel never renders a.name
+# anywhere on its own (grepped: only the nav label + page title show it), so this
+# single map covers both #173 asks (rename automations / rename every tab) with no
+# separate name-override plumbing in automation_runner.py. Same safe gitignored
+# atomic store as ordered/waiting; survives deploy.
+UI_LABELS = os.path.join(OUT, "ui_labels.json")
+UI_LABEL_MAX = 60
+
+
+def _load_ui_labels() -> dict:
+    try:
+        with open(UI_LABELS, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_ui_labels(d: dict) -> None:
+    tmp = UI_LABELS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, UI_LABELS)
+
+
 # Free-form notes for the "📝 Poznámky" tab — a Discord replacement for ad-hoc
 # reminders ("objednať na výmenu betelavo", "pridať spreje do roy"). A plain list of
 # {id, text, done, ts}, newest-first. Same safe gitignored store, atomic save, tolerant
@@ -3473,6 +3501,41 @@ def run_image_health() -> dict:
     return stats
 
 
+# Plain-language "what it does + when it runs" for each automation (#173) — shown
+# in its tab so the manager doesn't have to guess from the name alone. Written from
+# the actual run_<key>() behavior (docstrings above), not from the name/schedule —
+# keep this in sync when a run_<key>() behavior changes.
+AUTOMATION_DESCRIPTIONS = {
+    "posta_uncollected":
+        "Denne o 9:00 skontroluje sledovacie čísla zásielok na Pošte SK, nájde "
+        "nevyzdvihnuté balíky a postupne posiela zákazníkom upozorňovacie e-maily.",
+    "shoptet_sync":
+        "Každú hodinu stiahne objednávky (posledných 90 dní) a celý katalóg zo "
+        "Shoptetu a podľa toho prestaví vyhľadávací index aj naše ceny/sklad na "
+        "review kartách. Nemení žiadne manažérove rozhodnutia, len obnovuje dáta.",
+    "parovania_eshop":
+        "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
+        "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
+    "dodavatelsky_sklad":
+        "Denne o 5:00 prejde weby dodávateľov (pri nejasnej dostupnosti pomôže AI) "
+        "a zistí, čo majú skladom a za akú cenu.",
+    "riziko_vypadku":
+        "Denne o 6:15 porovná náš sklad s dodávateľským skladom (dáta z "
+        "automatizácie „Dodávateľský sklad“) a upozorní na produkty, ktoré máme "
+        "skladom, ale dodávateľ ich už nemá — hrozí výpadok.",
+    "restock_skladom":
+        "Denne o 6:00 nájde produkty, ktoré máme označené ako Vypredané, ale "
+        "dodávateľ ich má opäť skladom, a rovno ich naskladní naspäť v eshope.",
+    "orders_reminder":
+        "Denne o 8:00 skontroluje objednávky vo vybavovaní dlhšie ako 4 dni — bez "
+        "poznámky len upozorní (žiadny mail), s poznámkou AI vyhodnotí, či bol "
+        "zákazník kontaktovaný, a ak nie, pošle mu pripomienkový e-mail (max. raz "
+        "na objednávku).",
+    "image_health":
+        "Pravidelne overí, či produktové fotky na našich kartách ešte fungujú, a "
+        "mŕtve odkazy skryje z karty (samo sa opraví, keď fotka zase ožije).",
+}
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
@@ -3541,12 +3604,70 @@ AUTOMATIONS_REG = [
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
+# Valid /api/ui-label rename keys (#173): every NAV key the frontend actually
+# renders a button for — mirrors app.js's TABS + AUTOMATION_TABS arrays + the
+# two standalone admin/dev tabs, verbatim. Deliberately NOT derived from
+# AUTOMATIONS_REG's Automation.key set: the "Nevyzdvihnuté zásielky" tab's nav
+# key is the legacy "posta" while its Automation.key is "posta_uncollected" —
+# those are two different strings for the one automation, and only the NAV key
+# is ever looked up by UI_LABELS on the frontend (_navButton/PAGE_TITLES key on
+# the nav key). Keep this set in sync with app.js's TABS/AUTOMATION_TABS keys
+# whenever a nav tab is added/renamed-in-code.
+NAV_KEYS = {
+    "toorder", "search", "notes", "review",                              # TABS
+    "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
+    "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom",
+    "image_health",                                                      # AUTOMATION_TABS
+    "users", "dev",
+}
+
 
 @app.route("/api/automations")
 def api_automations():
-    """Status of every registered automation (sidebar + tab header). Session-
-    gated by the default-deny before_request like every other endpoint."""
-    return jsonify({"automations": RUNNER.status()})
+    """Status of every registered automation (sidebar + tab header), plus its
+    plain-language description (#173). Session-gated by the default-deny
+    before_request like every other endpoint."""
+    out = []
+    for a in RUNNER.status():
+        a["description"] = AUTOMATION_DESCRIPTIONS.get(a["key"], "")
+        out.append(a)
+    return jsonify({"automations": out})
+
+
+@app.route("/api/ui-labels")
+def api_ui_labels():
+    """Admin-set custom display names for nav tabs + automations (#173). GET is
+    open to every logged-in user (a renamed tab must show its new name for
+    everyone, not just the admin who renamed it) — only the POST below that
+    changes a label is admin-gated."""
+    return jsonify({"labels": _load_ui_labels()})
+
+
+@app.route("/api/ui-label", methods=["POST"])
+def api_ui_label():
+    """Set or clear a custom display name for one nav tab / automation. Admin-
+    only (like /api/users). Empty label clears the override (reverts to the
+    built-in default name)."""
+    me = _admin_or_none()
+    if not me:
+        return _forbidden()
+    body = request.get_json(silent=True) or {}
+    key = str(body.get("key") or "").strip()
+    if key not in NAV_KEYS:
+        return jsonify({"ok": False, "error": "neznáma položka"}), 400
+    label = str(body.get("label") or "").strip()
+    if len(label) > UI_LABEL_MAX:
+        return jsonify({"ok": False,
+                        "error": f"názov môže mať najviac {UI_LABEL_MAX} znakov"}), 400
+    with _lock:
+        d = _load_ui_labels()
+        if label:
+            d[key] = label
+        else:
+            d.pop(key, None)
+        _save_ui_labels(d)
+    log.info("ui-label: %s set %s -> %r", me["email"], key, label)
+    return jsonify({"ok": True, "label": label})
 
 
 @app.route("/api/automations/<key>/toggle", methods=["POST"])
