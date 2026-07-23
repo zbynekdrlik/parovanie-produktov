@@ -45,6 +45,40 @@ def test_cards_render_grouped_with_action_buttons(page, vystavy_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_automation_panel_renders_and_toggles(page, vystavy_server):
+    """The tab header hosts the „Automatické spracovanie" panel with all 3 výstavy
+    chains + their Štart/Stop + Spustiť teraz controls (#198 FIX 1 — „všetko v appke").
+    Toggles one chain on→off (fixture is function-scoped, but leave it clean anyway)."""
+    console = _console(page)
+    _open_tab(page, vystavy_server)
+
+    panel = page.locator('[data-testid="vy-autopanel"]')
+    assert panel.is_visible()
+    # all 3 chains render a row with a Štart toggle + a Spustiť-teraz button
+    for key in ("vystavy_otazka", "vystavy_odpoved_otazka", "vystavy_odpoved_prihlaska"):
+        assert page.locator(f'[data-testid="vy-auto-{key}"]').is_visible()
+        assert page.locator(f'[data-testid="vy-auto-toggle-{key}"]').is_visible()
+        assert page.locator(f'[data-testid="vy-auto-run-{key}"]').is_visible()
+
+    # starts Zastavené; toggling ▶ Štart flips the pill to Beží, then ⏹ Stop restores it
+    status = page.locator('[data-testid="vy-auto-status-vystavy_otazka"]')
+    assert status.evaluate("el => el.textContent") == "Zastavené"
+    toggle = page.locator('[data-testid="vy-auto-toggle-vystavy_otazka"]')
+    with page.expect_response(lambda r: "/toggle" in r.url and r.request.method == "POST"):
+        toggle.click()
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=\"vy-auto-status-vystavy_otazka\"]')"
+        ".textContent === 'Beží'")
+    # leave the shared automation state clean (on→off)
+    with page.expect_response(lambda r: "/toggle" in r.url and r.request.method == "POST"):
+        page.locator('[data-testid="vy-auto-toggle-vystavy_otazka"]').click()
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=\"vy-auto-status-vystavy_otazka\"]')"
+        ".textContent === 'Zastavené'")
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_add_edit_delete_roundtrip(page, vystavy_server):
     console = _console(page)
     page.on("dialog", lambda d: d.accept())   # accept the delete-confirm dialog

@@ -1470,9 +1470,69 @@ const VY_FIELDS = [
 ];
 
 async function loadVystavy() {
+  await loadAutomations();   // the tab header hosts the 3 výstavy automation controls
   try {
     VYSTAVY = (await (await fetch('/api/vystavy')).json()).vystavy || [];
   } catch (_) { VYSTAVY = []; }
+}
+
+// The 3 background chains (#111) — no nav tab of their own; the manager toggles/runs
+// them from the „Poľovnícke výstavy" tab header (requirement „všetko v appke"). Keys
+// mirror AUTOMATIONS_REG; NOT added to AUTOMATION_TABS (no extra sidebar tabs wanted).
+const VY_AUTO_KEYS = ['vystavy_otazka', 'vystavy_odpoved_otazka', 'vystavy_odpoved_prihlaska'];
+
+function vyAutoRow(key) {
+  const row = el('div', 'vy-auto-row');
+  row.dataset.testid = 'vy-auto-' + key;
+  const a = autoByKey(key);
+  if (!a) {
+    row.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    return row;
+  }
+  const info = el('div', 'vy-auto-info');
+  const name = el('div', 'vy-auto-name'); name.textContent = a.name || key;   // XSS-safe
+  info.appendChild(name);
+  if (a.description) {
+    const d = el('div', 'vy-auto-desc'); d.textContent = a.description;        // XSS-safe
+    info.appendChild(d);
+  }
+  const bits = [];
+  bits.push('Posledný beh: ' + (a.last_run
+    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}` : 'zatiaľ nikdy'));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  const meta = el('div', 'vy-auto-meta'); meta.textContent = bits.join(' · ');
+  info.appendChild(meta);
+  row.appendChild(info);
+
+  const ctrl = el('div', 'vy-auto-ctrl');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'vy-auto-status-' + key;
+  ctrl.appendChild(pill);
+  if (a.running) ctrl.appendChild(el('span', 'runningdot', '⏳'));
+  const tgl = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'), a.enabled ? '⏹ Stop' : '▶ Štart');
+  tgl.dataset.testid = 'vy-auto-toggle-' + key;
+  tgl.onclick = () => toggleAutomation(key, !a.enabled);
+  ctrl.appendChild(tgl);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'vy-auto-run-' + key;
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation(key, 'vystavy');
+  ctrl.appendChild(run);
+  row.appendChild(ctrl);
+  return row;
+}
+
+// Compact „Automatické spracovanie" panel for the Výstavy tab header — the 3 chains'
+// Štart/Stop + „Spustiť teraz", so the manager controls everything from this one tab.
+function vyAutoPanel() {
+  const panel = el('div', 'vy-autopanel');
+  panel.dataset.testid = 'vy-autopanel';
+  panel.appendChild(el('div', 'vy-autopanel-h', '⚙️ Automatické spracovanie'));
+  const hint = el('div', 'vy-autopanel-hint');
+  hint.textContent = 'Tri automatické kroky pre výstavy — zapni/vypni ich alebo ručne spusti priamo tu.';
+  panel.appendChild(hint);
+  for (const key of VY_AUTO_KEYS) panel.appendChild(vyAutoRow(key));
+  return panel;
 }
 
 function vyStatus(v) { return VY_STATUS[v.status || ''] || VY_STATUS['']; }
@@ -1682,6 +1742,7 @@ function renderVystavy() {
   addBtn.onclick = () => { VY_ADD_OPEN = !VY_ADD_OPEN; renderVystavy(); };
   top.appendChild(addBtn);
   sec.appendChild(top);
+  sec.appendChild(vyAutoPanel());          // automation controls live in this tab header
   if (VY_ADD_OPEN) sec.appendChild(vyAddForm());
   const list = VYSTAVY || [];
   if (!list.length && !VY_ADD_OPEN) {
@@ -2168,6 +2229,7 @@ async function loadOrdersReminder() {
 // Reload AUTOMATIONS + the active tab's display data (used by toggle + run poll,
 // so a live run refreshes whichever automation tab is open).
 async function _reloadAuto(tab) {
+  if (tab === 'vystavy') { await loadVystavy(); return; }   // reloads výstavy + AUTOMATIONS
   if (tab === 'dodavatelsky_sklad') { await loadSupplierStock(); return; }
   if (tab === 'riziko_vypadku') { await loadRiziko(); return; }
   if (tab === 'restock_skladom') { await loadRestock(); return; }
