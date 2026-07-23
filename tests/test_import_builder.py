@@ -175,6 +175,80 @@ def test_link_rows_skip_link_without_url_and_non_links():
     assert link_rows(products, dec, {"A": "1", "B": "2"}) == []
 
 
+def test_link_rows_split_writes_a_different_url_per_variant():
+    # #174 — a 'split' decision writes a DIFFERENT reorder URL per variant code
+    # (TRIGONA THERMOPAD: each size has its own supplier product page).
+    products = [{"key": "TRIGONA|156", "supplier": "TRIGONA",
+                 "variant_codes": ["62059/S", "62059/M", "62059/L"]}]
+    dec = {"TRIGONA|156": {"status": "split", "url": ""}}
+    vlinks = {"62059/S": "https://trigona.sk/vel-s",
+              "62059/M": "https://trigona.sk/vel-m",
+              "62059/L": "https://trigona.sk/vel-l"}
+    rows = link_rows(products, dec, {"62059/S": "156", "62059/M": "156", "62059/L": "156"},
+                     vlinks)
+    assert rows == [
+        ["62059/S", "156", "https://trigona.sk/vel-s"],
+        ["62059/M", "156", "https://trigona.sk/vel-m"],
+        ["62059/L", "156", "https://trigona.sk/vel-l"],
+    ]
+
+
+def test_link_rows_split_skips_variant_without_a_link_never_wipes():
+    # A split variant with NO stored link produces NO row — an empty internalNote
+    # cell would WIPE the existing eshop link, so an un-linked size is left untouched.
+    products = [{"key": "k", "supplier": "TRIGONA",
+                 "variant_codes": ["A/S", "A/M", "A/L"]}]
+    dec = {"k": {"status": "split", "url": ""}}
+    vlinks = {"A/S": "https://s/vel-s", "A/L": ""}   # M missing, L empty
+    rows = link_rows(products, dec, {}, vlinks)
+    assert rows == [["A/S", "", "https://s/vel-s"]]
+
+
+def test_link_rows_split_keys_by_stable_variant_code_not_position():
+    # The per-variant link is keyed by the STABLE variant code, so re-ordering the
+    # product's variant_codes list cannot mis-assign a link to the wrong size.
+    dec = {"k": {"status": "split", "url": ""}}
+    vlinks = {"X/S": "https://s/S", "X/XL": "https://s/XL"}
+    rows_a = link_rows([{"key": "k", "supplier": "T", "variant_codes": ["X/S", "X/XL"]}],
+                       dec, {}, vlinks)
+    rows_b = link_rows([{"key": "k", "supplier": "T", "variant_codes": ["X/XL", "X/S"]}],
+                       dec, {}, vlinks)
+    assert {r[0]: r[2] for r in rows_a} == {r[0]: r[2] for r in rows_b} == {
+        "X/S": "https://s/S", "X/XL": "https://s/XL"}
+
+
+def test_link_rows_split_grube_url_normalized_to_de():
+    # A split GRUBE product's per-variant URL is still rebuilt to the canonical .de
+    # detail page (same normalization as the single-link path).
+    products = [{"key": "GRUBE|9", "supplier": "GRUBE", "variant_codes": ["g/S"]}]
+    dec = {"GRUBE|9": {"status": "split", "url": ""}}
+    vlinks = {"g/S": "https://www.grube.sk/p/x/268279/?q=morakiv#itemId=2682798474"}
+    rows = link_rows(products, dec, {"g/S": "9"}, vlinks)
+    assert rows == [["g/S", "9", "https://www.grube.de/p/x/268279/"]]
+
+
+def test_link_rows_split_dedupes_shared_variant_code():
+    # Duplicate products sharing a variant code: the code is emitted ONCE (Shoptet
+    # aborts on a duplicate code) even across split products.
+    products = [
+        {"key": "k1", "supplier": "T", "variant_codes": ["DUP/S", "DUP/M"]},
+        {"key": "k2", "supplier": "T", "variant_codes": ["DUP/S"]},
+    ]
+    dec = {"k1": {"status": "split", "url": ""}, "k2": {"status": "split", "url": ""}}
+    vlinks = {"DUP/S": "https://s/first", "DUP/M": "https://s/m"}
+    rows = link_rows(products, dec, {}, vlinks)
+    codes = [r[0] for r in rows]
+    assert len(codes) == len(set(codes)), f"duplicate codes emitted: {codes}"
+    assert sorted(codes) == ["DUP/M", "DUP/S"]
+
+
+def test_link_rows_default_variant_links_is_empty_backcompat():
+    # Existing 3-arg callers keep working: variant_links defaults to {} and a split
+    # decision with no variant_links produces nothing.
+    products = [{"key": "k", "supplier": "T", "variant_codes": ["A"]}]
+    assert link_rows(products, {"k": {"status": "split", "url": ""}}, {"A": "1"}) == []
+
+
 def test_state_rows_unavailable_is_visible_vypredane():
     products = [{"key": "k2", "variant_codes": ["B"]}]
     rows = state_rows(products, {"k2": {"status": "unavailable"}}, {"B": "200"})
