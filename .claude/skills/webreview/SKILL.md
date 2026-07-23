@@ -673,9 +673,21 @@ manažér nastaví VLASTNÝ link pre KAŽDÚ veľkosť.
   `variant_links[code]` (preskočí variant BEZ linku — NIKDY prázdna internalNote bunka, tá by
   zmazala existujúci link), GRUBE→.de normalizácia zachovaná; good/manual = 1 link na všetky
   varianty (bez zmeny, default `variant_links={}` → back-compat 3-arg callers).
-- **Doprava = LEN ručný zip `/api/import`** (mirror GRUBE per-size externalCode cesty — nočný
-  `_do_upload_pairings` NEzmenený, split upload odložený na follow-up ako GRUBE #62). Nepridávaj
-  split do nočnej cesty bez per-`vlink:<code>` incremental trackingu.
+- **Doprava = ručný zip `/api/import` AJ nočná automatizácia „Veľkostné linky → eshop" (#192,
+  v0.81.0).** `_do_upload_pairings` (párovania) je NEzmenený — split decision nemá decision URL,
+  takže párovací push ho nikdy nechytí. Split-linky idú VLASTNOU default-disabled automatizáciou
+  `split_links` (denne 03:45), presne ako GRUBE `grube_externalcode` #62, ale pre iné pole
+  (`internalNote` per variant, NIE `externalCode`). Sub-vzor oproti supplier/externalcode (tie majú
+  1:1 `*_rows`): split **REUSuje `link_rows`** (ten istý builder ako zip — GRUBE→.de + skip-empty),
+  obmedzený na `split` decisions (`{k:d for k,d in dec if d.status=='split'}`) + na variant_links
+  len NOVÝCH kódov (`{c:vlinks[c] for c in new_codes}`); good/manual sa tým vyfiltrujú. Inkrementálny
+  tracking je per-VARIANT `data/out/uploaded_variant_links.json` `{code: url}` (vlastný store, mirror
+  `uploaded_externalcodes.json`; NIE `vlink:<code>` namespace v zdieľanom `uploaded_pairings.json` —
+  vlastný store nekoliduje, netreba prefix). `new_variant_link_keys(variant_links, split_codes,
+  uploaded)` gate-uje na split_codes (kód, ktorého produkt už NIE je split, sa nepushne) + zahodí
+  non-http URL (fail-safe, nikdy do živého internalNote). **Idempotencia trackuje ZDROJOVÚ .sk URL**
+  (`uploaded[c]=vlinks[c]`), nie .de ktorú `link_rows` zapíše — porovnáva sa proti variant_links, tam
+  je .sk. csv_safe=True (nočný sink nesmie byť slabší než zip, aj keď http-URL sa nikdy nepreprefixne).
 - **`CODE2VARIANT` (veľkostné labely) sa stavia v `_load_catalog`** — ten teraz vracia **3-tuple**
   `(code2pair, code2variant, catalog)`. DVAJA volajúci (štart + `run_shoptet_sync` global) MUSIA
   unpacknúť 3. Label = populated `variant:*` stĺpce (colon prefix, NIE `variantVisibility`) joinnuté;

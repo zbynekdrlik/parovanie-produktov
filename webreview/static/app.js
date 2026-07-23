@@ -441,6 +441,7 @@ const TABS = [['toorder', 'Na objednanie'], ['nedostupne', 'Nedostupné tovary']
 const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['orders_reminder', 'Pripomienky objednávok'],
   ['shoptet_sync', 'Sync zo Shoptetu'],
   ['parovania_eshop', 'Párovania → eshop'], ['grube_externalcode', 'GRUBE kódy → eshop'],
+  ['split_links', 'Veľkostné linky → eshop'],
   ['dodavatelsky_sklad', 'Dodávateľský sklad'],
   ['riziko_vypadku', 'Riziko výpadku'], ['restock_skladom', 'Vypredané → Skladom'],
   ['stock_skladom', 'Máme skladom → Skladom'],
@@ -564,7 +565,7 @@ const PAGE_TITLES = {
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
   parovania_eshop: 'Párovania → eshop', grube_externalcode: 'GRUBE kódy → eshop',
-  dodavatelsky_sklad: 'Dodávateľský sklad',
+  split_links: 'Veľkostné linky → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
   riziko_vypadku: 'Riziko výpadku', restock_skladom: 'Vypredané → Skladom',
   stock_skladom: 'Máme skladom → Skladom',
   orders_reminder: 'Pripomienky objednávok',
@@ -2310,6 +2311,72 @@ function renderGrubeExternalcode() {
   wrap.appendChild(st);
 }
 
+// ---- Automatizácie (#192): tab „Veľkostné linky → eshop" ------------------ //
+// Nočný upload per-veľkosť split-linkov (#174 „✂ Rozdeliť na veľkosti") do eshopu
+// internalNote, per variant. PÍŠE do eshopu → štartuje Zastavené (#93). Samostatná
+// od „Párovania → eshop" (split decision nemá decision URL, linky sú vo variant_links
+// per kód) — zapnutie je explicitný opt-in.
+function renderSplitLinks() {
+  const wrap = document.getElementById('tab-split_links');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('split_links');
+  if (!a) {
+    wrap.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    return;
+  }
+  const st = el('div', 'autostatus');
+  const head = el('div', 'autohead');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'splitlinks-status';
+  head.appendChild(pill);
+  if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha nahrávanie…'));
+  const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+    a.enabled ? '⏹ Stop' : '▶ Štart');
+  btn.dataset.testid = 'splitlinks-toggle';
+  btn.onclick = () => toggleAutomation('split_links', !a.enabled);
+  head.appendChild(btn);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'splitlinks-run';
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation('split_links', 'split_links');
+  head.appendChild(run);
+  st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
+
+  const meta = el('div', 'autometa');
+  const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+  bits.push('Posledný beh: ' + (a.last_run
+    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+    : 'zatiaľ nikdy'));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+  st.appendChild(meta);
+  if (a.last_status === 'error' && a.last_error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+  }
+  const lr = a.last_result || {};
+  if (a.last_run && a.last_status === 'ok' && lr.status) {
+    const e = lr.variantlinks || {};
+    const [label, cls] = _PAROVANIA_STATUS[lr.status] || [lr.status, 'ok'];
+    const box = el('div', 'autoresult ' + cls);
+    box.appendChild(el('div', 'autoresult-head', label));
+    box.appendChild(el('div', '',
+      `🔗 Veľkostné linky: +${e.count ?? 0} nových`
+      + (e.blocked ? ` · ${e.blocked} zablokovaných (chýbajú kódy)` : '')
+      + ` · spolu ${e.total_uploaded ?? 0} / ${e.total_codes ?? 0} nahraných`
+      + ` · chýba ${e.remaining ?? 0}`));
+    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
+    // successful chunks ARE saved → the next run only retries the rest)
+    if (e.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(e.error)));
+    st.appendChild(box);
+  } else if (!a.last_run) {
+    st.appendChild(el('div', 'muted',
+      'Zatiaľ neprebehol žiadny beh — spusti automatizáciu (▶ Štart) alebo klikni ⚡ Spustiť teraz.'));
+  }
+  wrap.appendChild(st);
+}
+
 // ---- Automatizácie (#106): tab „Dodávateľský sklad" ----------------------- //
 // Per-item table tab (like posta): status controls + filters + a table of every
 // supplier link's availability / price / source / last-checked / error.
@@ -2893,6 +2960,7 @@ function render() {
   const shoptetSync = ACTIVE_TAB === 'shoptet_sync';
   const parovaniaEshop = ACTIVE_TAB === 'parovania_eshop';
   const grubeExternalcode = ACTIVE_TAB === 'grube_externalcode';
+  const splitLinks = ACTIVE_TAB === 'split_links';
   const dodavatelskySklad = ACTIVE_TAB === 'dodavatelsky_sklad';
   const rizikoVypadku = ACTIVE_TAB === 'riziko_vypadku';
   const restockSkladom = ACTIVE_TAB === 'restock_skladom';
@@ -2900,7 +2968,7 @@ function render() {
   const ordersReminder = ACTIVE_TAB === 'orders_reminder';
   const imageHealth = ACTIVE_TAB === 'image_health';
   const dev = ACTIVE_TAB === 'dev';
-  const auto = posta || shoptetSync || parovaniaEshop || grubeExternalcode || dodavatelskySklad || rizikoVypadku || restockSkladom || stockSkladom || ordersReminder || imageHealth;  // any automation tab
+  const auto = posta || shoptetSync || parovaniaEshop || grubeExternalcode || splitLinks || dodavatelskySklad || rizikoVypadku || restockSkladom || stockSkladom || ordersReminder || imageHealth;  // any automation tab
   const plain = nedostupne || search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
@@ -2914,6 +2982,7 @@ function render() {
   const secShoptetSync = document.getElementById('tab-shoptet_sync'); if (secShoptetSync) secShoptetSync.hidden = !shoptetSync;
   const secParovania = document.getElementById('tab-parovania_eshop'); if (secParovania) secParovania.hidden = !parovaniaEshop;
   const secGrubeExt = document.getElementById('tab-grube_externalcode'); if (secGrubeExt) secGrubeExt.hidden = !grubeExternalcode;
+  const secSplitLinks = document.getElementById('tab-split_links'); if (secSplitLinks) secSplitLinks.hidden = !splitLinks;
   const secSklad = document.getElementById('tab-dodavatelsky_sklad'); if (secSklad) secSklad.hidden = !dodavatelskySklad;
   const secRiziko = document.getElementById('tab-riziko_vypadku'); if (secRiziko) secRiziko.hidden = !rizikoVypadku;
   const secRestock = document.getElementById('tab-restock_skladom'); if (secRestock) secRestock.hidden = !restockSkladom;
@@ -2932,6 +3001,7 @@ function render() {
   if (dodavatelskySklad) { document.getElementById('empty').hidden = true; renderDodavatelskySklad(); return; }
   if (parovaniaEshop) { document.getElementById('empty').hidden = true; renderParovaniaEshop(); return; }
   if (grubeExternalcode) { document.getElementById('empty').hidden = true; renderGrubeExternalcode(); return; }
+  if (splitLinks) { document.getElementById('empty').hidden = true; renderSplitLinks(); return; }
   if (shoptetSync) { document.getElementById('empty').hidden = true; renderShoptetSync(); return; }
   if (posta) { document.getElementById('empty').hidden = true; renderPosta(); return; }
   if (users) { document.getElementById('empty').hidden = true; renderUsers(); return; }

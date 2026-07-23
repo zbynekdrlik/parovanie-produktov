@@ -195,6 +195,31 @@ def new_externalcode_keys(grube_codes, uploaded):
     return out
 
 
+def new_variant_link_keys(variant_links, split_codes, uploaded):
+    """Variant codes ready for the nightly per-size split-link upload (#192): a
+    split-decision variant (its code belongs to a product carrying a `split` decision
+    — the caller passes that set as `split_codes`) whose stored reorder URL is a real
+    http(s) link that was NOT yet uploaded (new code) or changed since the last upload.
+    `variant_links` is {variant_code: url} (variant_links.json, #174); `uploaded` is
+    {variant_code: url} of past uploads (uploaded_variant_links.json). A non-http(s)
+    URL is skipped — it must never reach the live-eshop internalNote (fail-safe,
+    matching the /api/variant-link source guard); a code outside `split_codes` (its
+    product is no longer split) is skipped too. Keeps the upload incremental — only
+    genuinely new/changed split links go up. Mirrors new_supplier_keys /
+    new_externalcode_keys, keyed by the STABLE variant code (never array position)."""
+    out = []
+    for code, url in variant_links.items():
+        c = (code or "").strip()
+        u = (url or "").strip()
+        if not c or c not in split_codes:
+            continue
+        if not u.startswith(("http://", "https://")):
+            continue
+        if uploaded.get(c) != u:
+            out.append(code)   # original key (callers index variant_links[c] with it)
+    return out
+
+
 def new_order_pairing_keys(order_pairings, uploaded):
     """Forestshop codes from the inline pairings entered on the 'Na objednanie' tab
     (order_pairings.json -- codes OUTSIDE the review set, #38) ready for the nightly
