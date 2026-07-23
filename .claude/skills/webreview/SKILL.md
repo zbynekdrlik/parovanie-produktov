@@ -642,3 +642,27 @@ manažér nastaví VLASTNÝ link pre KAŽDÚ veľkosť.
   izolovaný — split decision NEpolutuje session-scoped `live_server`, rovnaká pointa ako matched-buttons).
   Po reloade je split karta „vyriešená" → default `unreviewed` filter ju NEukáže; test klikne filter
   „✓ Dobré/Vybrané" (zahŕňa split) a čaká na `.badge.split`.
+- **#180 — varovanie pri commite splitu keď VEĽKOSŤ ostane bez linku**: split-commit skip-empty
+  NEzmaže starú celo-produktovú URL pri veľkosti bez linku (zámerne), takže tá si ticho ponechá
+  STARÝ link. `splitPanel` `done.onclick` teraz volá pure helper `variantsWithoutLink(loadedVariants)`
+  → ak nejaké → `confirm()` ich vymenuje (singular/plural), zrušenie = ostane v edit móde (`return`
+  pred `saveDecision`). Helper zrkadlí PRESNE `splitRow` display rule: bez linku = prázdny AJ
+  `VARIANT_LINKS[code]` AJ `v.link`; label `size || code`. `splitRow` commit MUTUJE `v.link` (aj na
+  clear) nech `loadedVariants` nesie aktuálny uložený stav (nie len load-time). Všetky veľkosti s
+  linkom → žiadne `confirm()`, priamy commit (pre-#180 správanie).
+
+## E2E gotcha — natívny `confirm()` / `prompt()` dialóg + unit-test pure JS helpera v prehliadači
+
+- **`confirm()` (a `prompt()` #173 rename) sa v Playwrighte chytá cez `page.on("dialog", handler)`** —
+  handler MUSÍ zavolať `d.accept()` / `d.dismiss()` (registrovaný listener vypne auto-dismiss). Klik
+  na tlačidlo, čo spustí SYNCHRÓNNY `confirm()`, sa resolvne AŽ PO odpovedi handlera, takže hneď po
+  `.click()` smieš assertnúť na zozbierané `dialogs`. Vzor: `dialogs=[]; page.on("dialog", lambda d:
+  (dialogs.append(d.message), d.accept()))`. Assertni `len(dialogs)` + obsah správy (názvy veľkostí).
+  Test „zrušené" = `d.dismiss()` → over že sa akcia NEvykonala (editor otvorený, žiadny `.badge.split`).
+  Test „bez dialógu" = `dialogs == []`. (Pri `prompt()` rename je zaužívaný `page.once("dialog", d =>
+  d.accept("text"))` — jednorazový; `confirm()` warning s viac klikmi radšej `page.on`.)
+- **Pure JS helper sa dá unit-testnúť v prehliadačovom realme cez `page.evaluate` — žiadny JS toolchain
+  netreba.** `app.js` je plain `<script>` (nie module), takže top-level `function foo(){}` sú GLOBÁLNE
+  (na `window`) a `let` globály (`VARIANT_LINKS`, …) sú dosiahnuteľné/priraditeľné holým menom v
+  `page.evaluate`. Vzor: `page.evaluate("() => { VARIANT_LINKS={...}; return variantsWithoutLink([...]); }")`
+  s viacerými vstupmi (mixed / from-link / fallback / empty / null) — testuje čistú logiku bez DOM/siete.
