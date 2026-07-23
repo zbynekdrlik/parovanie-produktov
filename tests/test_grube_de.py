@@ -14,7 +14,7 @@ from parovanie.grube_de import (
 
 FIX = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_154773.html"
 # Single-size knife (#60 class 1): NO 'Größe' Offer list; one own itemId in the
-# `itemId=` anchor (2540316117 = 254031+4). The page ALSO carries 17 cross-sell
+# `itemId=` anchor (2540316117 = 254031+4). The page ALSO carries 8 cross-sell
 # anchors with OTHER productIds — real proof the prefix+len filter excludes them.
 FIX_SINGLE = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_254031_ocielka.html"
 
@@ -87,7 +87,7 @@ def test_parse_variants_single_size_knife_real_page():
 
 
 def test_parse_variants_single_size_excludes_cross_sell():
-    # the real page carries 17 foreign cross-sell itemId anchors (other productIds);
+    # the real page carries 8 foreign cross-sell itemId anchors (other productIds);
     # only the own 254031+4 id survives the prefix+len filter.
     html = FIX_SINGLE.read_text(encoding="utf-8")
     got = parse_variants(html, "254031")

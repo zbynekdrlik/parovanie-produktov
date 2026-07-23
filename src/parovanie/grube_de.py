@@ -46,9 +46,11 @@ def parse_variants(html: str, product_id: str) -> dict[str, str]:
     text = html.replace('\\"', '"')          # unescape JSON-in-JSON
     want_len = len(product_id) + 4
     size2ids: dict[str, set] = {}
+    saw_own_offer = False                                 # any own Offer at all (sized or not)
     for name, sku in _OFFER.findall(text):
         if not (sku.startswith(product_id) and len(sku) == want_len):
             continue
+        saw_own_offer = True
         m = _GROESSE.search(name)
         if not m:
             continue
@@ -57,7 +59,12 @@ def parse_variants(html: str, product_id: str) -> dict[str, str]:
         return {}
     if size2ids:                                          # multi-size product (unchanged)
         return {size: next(iter(ids)) for size, ids in size2ids.items()}
-    # --- single-size fallback: no sized Offer list on the page ---
+    # --- single-size fallback: ONLY when the page has NO own Offer at all (a true
+    # single-variant knife). If own Offers existed but none carried a 'Größe' (a
+    # COLOR-only product), the lone anchor is the DEFAULT colour's itemId — writing it
+    # would auto-order the wrong colour, so stay link-only (#60 review Finding 1). ---
+    if saw_own_offer:
+        return {}                                         # own offers, no size axis -> fail-closed
     own = {iid for iid in _ITEMID_ANCHOR.findall(text)
            if iid.startswith(product_id) and len(iid) == want_len}
     if len(own) == 1:
