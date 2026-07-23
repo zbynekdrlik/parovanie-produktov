@@ -68,8 +68,12 @@ body[data-theme=dark] .tabs .tab .navwarn{color:#fca5a5}
    otherwise the tab button would claim the whole row and push ✏️ off-width. */
 .navrow{display:flex;align-items:center;gap:2px}
 .navrow .tab{flex:1;min-width:0;width:auto}
-.navedit{flex:0 0 auto;background:none;border:0;cursor:pointer;font-size:13px;
+/* #176 — the pencils used to show on EVERY nav item all the time, covering half
+   the dashboard names. Now HIDDEN by default; the sidebar-footer 'Upraviť názvy'
+   toggle adds body.edit-labels to reveal them (admin edit mode). */
+.navedit{display:none;flex:0 0 auto;background:none;border:0;cursor:pointer;font-size:13px;
   line-height:1;padding:7px 8px;border-radius:7px;color:var(--soft);opacity:.6}
+body.edit-labels .navedit{display:block}
 .navedit:hover{background:var(--bg);color:var(--text);opacity:1}
 /* Admin 'Užívatelia' — standalone nav at the sidebar bottom, OUTSIDE the folder
    (#118 refinement). Separated from the folder above; collapses when empty
@@ -99,6 +103,13 @@ body[data-theme=dark] .tabs .tab .navwarn{color:#fca5a5}
 .themebtn svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.7;
   stroke-linecap:round;stroke-linejoin:round}
 .themebtn:hover{background:var(--bg);color:var(--text)}
+/* #176 — admin-only edit-mode toggle (reveals the per-tab ✏️ rename pencils). */
+.editbtn{display:flex;align-items:center;gap:10px;padding:9px 11px;border-radius:9px;
+  color:var(--muted);font-size:14px;font-weight:500;cursor:pointer;background:none;border:0;
+  width:100%;text-align:left;font-family:inherit}
+.editbtn .editico{width:19px;flex:0 0 19px;text-align:center;font-size:14px;line-height:1}
+.editbtn:hover{background:var(--bg);color:var(--text)}
+.editbtn[aria-pressed=true]{background:var(--accent-soft);color:var(--accent);font-weight:600}
 .ver{font-size:11px;color:var(--soft);padding:6px 11px 2px}
 
 /* ---------------- MAIN + TOPBAR ---------------- */

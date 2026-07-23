@@ -193,6 +193,27 @@ def test_users_standalone_at_bottom_and_no_soon_section(page, live_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_favicon_present_and_generic_title(page, live_server):
+    """#175 — the browser tab now carries a favicon (inline SVG data-URI from the
+    brand shield) and a GENERIC title 'Forestshop' (not the per-view 'Kontrola
+    párovania …') — the tool grew into a whole system, not just the pairing view."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    # A favicon <link rel=icon> exists in the head, as an inline SVG data-URI.
+    icon_href = page.evaluate(
+        "() => { const l = document.querySelector(\"link[rel~='icon']\");"
+        " return l ? l.getAttribute('href') : null; }")
+    assert icon_href, "no <link rel='icon'> favicon in the head"
+    assert icon_href.startswith("data:image/svg+xml"), icon_href
+
+    # Browser-tab title is the generic app name, not the old per-view title.
+    assert page.title() == "Forestshop", page.title()
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_hidden_tab_sections_are_display_none_on_review(page, live_server):
     """[hidden] must actually hide: #tab-search/#tab-notes carry display:flex in
     CSS, and an author display rule OVERRIDES the UA [hidden]{display:none} —

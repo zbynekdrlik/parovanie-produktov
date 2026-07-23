@@ -29,6 +29,43 @@ def _unexpected(console):
     return [m for m in console if not _PROVOKED.search(m)]
 
 
+def _enable_edit_mode(page):
+    """#176 — the ✏️ rename pencils are hidden until the admin turns on the
+    'Upraviť názvy' toggle in the sidebar footer. Every test that clicks a pencil
+    must enable edit mode first (otherwise the pencil is display:none and the
+    click times out)."""
+    page.locator("#editLabelsBtn").click()
+    page.locator(".navedit").first.wait_for(state="visible")
+
+
+def test_pencils_hidden_until_edit_mode_enabled(page, automations_server):
+    """#176 — the ✏️ rename pencils used to show on EVERY nav item all the time,
+    covering half the dashboard names. Now they are HIDDEN by default (full names
+    visible) and appear only after the admin clicks the 'Upraviť názvy' toggle in
+    the sidebar footer; toggling it off hides them again."""
+    console = _console(page)
+    page.goto(automations_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.wait_for_selector(".sidebar #tabs button")
+
+    pencil = page.locator('[data-testid="navedit-notes"]')
+    assert pencil.count() == 1            # present in the DOM (admin)…
+    assert not pencil.is_visible()        # …but hidden by default (names fully visible)
+
+    toggle = page.locator("#editLabelsBtn")
+    assert toggle.is_visible()            # admin sees the edit-mode toggle
+
+    toggle.click()
+    pencil.wait_for(state="visible")      # edit mode on → pencils appear
+    assert pencil.is_visible()
+
+    toggle.click()
+    pencil.wait_for(state="hidden")       # edit mode off → pencils gone again
+    assert not pencil.is_visible()
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_automation_description_visible_in_panel(page, automations_server):
     """#173 part 1 — a clear, accurate description of what the automation does
     and when it runs is shown right in its own tab."""
@@ -53,9 +90,10 @@ def test_admin_renames_a_tab_and_it_persists_across_reload(page, automations_ser
     page.goto(automations_server)
     page.wait_for_selector('[data-testid="version"]')
     page.wait_for_selector(".sidebar #tabs button")
+    _enable_edit_mode(page)   # #176 — pencils are hidden until edit mode is on
 
     edit = page.locator('[data-testid="navedit-notes"]')
-    assert edit.count() == 1   # admin sees the rename pencil
+    assert edit.count() == 1   # admin sees the rename pencil (in edit mode)
 
     def accept_new_name(dialog):
         assert dialog.type == "prompt"
@@ -92,6 +130,7 @@ def test_clearing_the_label_reverts_to_default(page, automations_server):
     page.goto(automations_server)
     page.wait_for_selector('[data-testid="version"]')
     page.wait_for_selector(".sidebar #tabs button")
+    _enable_edit_mode(page)   # #176 — pencils are hidden until edit mode is on
 
     page.once("dialog", lambda d: d.accept("Dočasný názov"))
     with page.expect_response("**/api/ui-label"):
@@ -119,6 +158,7 @@ def test_renames_the_posta_automation_tab(page, automations_server):
     page.goto(automations_server)
     page.wait_for_selector('[data-testid="version"]')
     page.wait_for_selector(".sidebar #autoTabs button")
+    _enable_edit_mode(page)   # #176 — pencils are hidden until edit mode is on
 
     page.once("dialog", lambda d: d.accept("Balíky na pošte"))
     with page.expect_response("**/api/ui-label") as resp:
@@ -157,6 +197,9 @@ def test_nonadmin_does_not_see_rename_pencil(page, live_server, admin_api):
         page.wait_for_selector(".sidebar #tabs button")
 
         assert page.locator(".navedit").count() == 0
+        # #176 — the 'Upraviť názvy' edit-mode toggle is admin-only too: a
+        # non-admin never sees it (so pencils can never be revealed).
+        assert not page.locator("#editLabelsBtn").is_visible()
         # the admin-gated endpoint still refuses it server-side too
         status = page.evaluate(
             "async () => (await fetch('/api/ui-label', {method: 'POST', "
