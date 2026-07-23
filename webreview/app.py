@@ -36,7 +36,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
     __version__, config, image_health, import_builder, orders_reminder,
-    posta_uncollected, restock_skladom, riziko_vypadku, supplier_stock)
+    posta_uncollected, restock_skladom, riziko_vypadku, supplier_stock, writer)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -1169,7 +1169,7 @@ def _csv_safe(value):
 
 def _csv_response(header, rows, filename):
     buf = io.StringIO()
-    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    w = writer.shoptet_writer(buf)
     w.writerow(header)
     w.writerows(rows)
     # UTF-8 with BOM — universal, avoids the cp1250 'č'→'è' mojibake. Import into
@@ -1208,7 +1208,7 @@ def api_import():
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name, header, rows in files:
             s = io.StringIO()
-            w = csv.writer(s, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+            w = writer.shoptet_writer(s)
             w.writerow(header)
             w.writerows([_csv_safe(c) for c in row] for row in rows)   # formula-injection guard
             z.writestr(name, s.getvalue().encode("utf-8-sig"))
@@ -1972,11 +1972,10 @@ def _write_import_csv(header, rows, prefix, csv_safe=False):
     """Write ONE import CSV in the canonical Shoptet dialect (utf-8-sig BOM, ';',
     CRLF) and return its path. csv_safe applies the per-cell formula-injection guard
     (_csv_safe) used by the supplier write-back sink. Caller owns unlinking."""
-    from parovanie.writer import shoptet_writer
     os.makedirs(OUT, exist_ok=True)
     out_fd, out_path = tempfile.mkstemp(prefix=prefix, suffix=".csv", dir=OUT)
     with os.fdopen(out_fd, "w", encoding="utf-8-sig", newline="") as f:
-        w = shoptet_writer(f)
+        w = writer.shoptet_writer(f)
         w.writerow(header)
         if csv_safe:
             w.writerows([_csv_safe(c) for c in row] for row in rows)
