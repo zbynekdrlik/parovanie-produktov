@@ -356,6 +356,59 @@ def test_dev_priority_none_clears_both_and_adds_nothing(monkeypatch):
     assert not [c for c in calls if c[0] == "POST"]
 
 
+def test_dev_priority_delete_failure_reported_not_silent(monkeypatch):
+    """A failed opposite-label DELETE (403 secondary rate-limit / 5xx) must be
+    surfaced as ok:False — never reported as success with the label still on the
+    issue. And the add-label POST must NOT run after a failed delete."""
+    _configure(monkeypatch)
+
+    def fake_delete(url, headers=None, timeout=None):
+        return _Resp(403, {"message": "secondary rate limit"})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        raise AssertionError("add-label must not run after a failed delete")
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    monkeypatch.setattr(webapp.requests, "post", fake_post)
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "soon"})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["ok"] is False                       # failure surfaced, NOT silent ok
+    assert "403" in (j.get("error") or "")
+
+
+def test_dev_priority_delete_404_is_ok(monkeypatch):
+    """DELETE 404 means the opposite label simply wasn't set — that is success,
+    not a failure; the chosen label still gets added."""
+    _configure(monkeypatch)
+
+    def fake_delete(url, headers=None, timeout=None):
+        return _Resp(404, {"message": "Label does not exist"})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return _Resp(200, [{"name": "prio:soon"}])
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    monkeypatch.setattr(webapp.requests, "post", fake_post)
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "soon"})
+    assert r.get_json() == {"ok": True, "priority": "soon"}
+
+
+def test_dev_priority_none_delete_failure_reported(monkeypatch):
+    """Clearing to 'none' with a failing DELETE must NOT report ok unconditionally
+    — the pre-fix bug returned ok:True even when the labels weren't removed."""
+    _configure(monkeypatch)
+
+    def fake_delete(url, headers=None, timeout=None):
+        return _Resp(500, {"message": "server error"})
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    # requests.post stays the raising guard — 'none' must not POST anything
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "none"})
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is False
+
+
 def test_dev_priority_invalid_rejected_before_github(monkeypatch):
     _configure(monkeypatch)
     # requests.* are raising guards → a 400 must come BEFORE any GitHub call
