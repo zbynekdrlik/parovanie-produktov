@@ -1822,9 +1822,16 @@ def _do_set_priority(number: int, priority: str):
     remove = [n for k, n in PRIO_LABELS.items() if n != keep]
     try:
         for name in remove:                               # drop the opposite label(s)
-            requests.delete(                              # 404 (not present) is fine
+            dr = requests.delete(
                 f"{GITHUB_API}/repos/{repo}/issues/{number}/labels/{quote(name, safe='')}",
                 headers=_gh_headers(token), timeout=GH_TIMEOUT)
+            # 200 = removed, 404 = label wasn't set (both fine); anything else
+            # (403 secondary rate-limit, 5xx) is a REAL failure — surface it, don't
+            # report success for a label that is still on the issue.
+            if dr.status_code not in (200, 404):
+                log.warning("gh set prio delete %s: HTTP %s for %s#%s",
+                            name, dr.status_code, repo, number)
+                return {"ok": False, "error": f"GitHub API vrátil {dr.status_code}"}, 200
         if keep:
             _ensure_label(token, repo, keep, PRIO_COLORS[priority])
             r = requests.post(
