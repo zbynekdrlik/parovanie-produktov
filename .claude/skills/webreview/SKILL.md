@@ -468,6 +468,23 @@ odfiltruj cez `pull_request` kľúč). Fixná žiarovka vpravo dole (`#ideaBtn` 
 - Rename = natívny `prompt()` (nie inline input) — MVP, žiadny nový modal/CSS. E2E: `page.once("dialog",
   d => d.accept("text"))` PRED klikom na `.navedit`; prázdny string = clear/revert.
 
+## Favicon + edit-mód pre ceruzky (#175/#176, v0.77.0)
+
+- **#175 branding**: `<title>` je GENERICKÉ `Forestshop` (nie per-view „Kontrola párovania…"; JS
+  title NEprepisuje — statický `<title>`). Favicon = inline SVG data-URI (`<link rel="icon" ...>`
+  v `<head>` — biely štít na brand-zelenom `#356B32` štvorci, ten istý mark ako `.brand .logo`).
+  `.brandtxt small` subline = „Firemný systém" (bol „Párovač & dashboard"). **`test_branding.py`
+  je LOCK na `<title>` + `.brandtxt` — pri zmene brandingu ho updatni (asertuje presný `<title>`).**
+- **#176 edit-mód**: `.navedit` ceruzky sú DEFAULT `display:none`; admin ich odkryje cez `body.edit-labels`
+  CSS switch, ktorý toggluje footer tlačidlo `#editLabelsBtn` („Upraviť názvy", `.editbtn` v `.sidefoot`).
+  Stav v `localStorage('editLabels')`, default OFF. **Vzor pre admin-only globálny UI mód** = `initEditLabels()`
+  (unhide tlačidlo + wire toggle) sa volá v `init()` AŽ PO `ME` fetchi (potrebuje `isAdmin()`), presne
+  ako by mal každý admin-gated init — NIE v `initTheme`/`initFolders` bloku (tam ešte `ME` nie je).
+- **E2E gotcha — ceruzka už NIE je default viditeľná**: každý test čo klika `.navedit`/`[data-testid=navedit-*]`
+  MUSÍ najprv zapnúť edit-mód (`page.locator("#editLabelsBtn").click()` + počkať `.navedit` visible) —
+  inak Playwright `.click()` timeoutne na `display:none`. Non-admin: ceruzky (count 0) AJ `#editLabelsBtn`
+  (hidden) neviditeľné. Folder expand/collapse (`initFolder`) #176 NEmení — ostáva funkčné.
+
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.
