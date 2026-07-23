@@ -587,3 +587,58 @@ body[data-theme=dark] .idea-msg.err{background:#2a0f0f;color:#fca5a5;border-colo
 .nd-msg{font-size:13px;font-weight:600;border-radius:8px;padding:7px 10px;background:var(--accent-soft);color:var(--accent)}
 .nd-acts{display:flex;justify-content:flex-end;gap:8px;margin-top:2px}
 @media(max-width:820px){#tab-nedostupne{padding-left:16px;padding-right:16px}.nd-types{flex-direction:column}}
+
+/* ── Poľovnícke výstavy (#111) — karty ──────────────────────────────────── */
+#tab-vystavy{padding:14px 22px 40px;display:flex;flex-direction:column;gap:8px;max-width:900px}
+.vy-top{display:flex;gap:8px;margin-bottom:2px}
+.vy-autopanel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  padding:12px 14px;margin:10px 0 4px;display:flex;flex-direction:column;gap:8px}
+.vy-autopanel-h{font-size:13px;font-weight:700;color:var(--text)}
+.vy-autopanel-hint{font-size:12.5px;color:var(--muted);line-height:1.4}
+.vy-auto-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  border-top:1px solid var(--border);padding-top:8px}
+.vy-auto-info{flex:1;min-width:200px;display:flex;flex-direction:column;gap:2px}
+.vy-auto-name{font-size:13.5px;font-weight:600;color:var(--text)}
+.vy-auto-desc{font-size:12.5px;color:var(--text);line-height:1.4}
+.vy-auto-meta{font-size:12px;color:var(--muted)}
+.vy-auto-ctrl{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.vy-empty{color:var(--muted);font-size:14px;padding:16px 2px}
+.vy-group{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;
+  color:var(--muted);margin:14px 0 2px;padding-left:2px}
+.vy-card{border:1px solid var(--border);border-left:4px solid var(--soft);border-radius:10px;
+  background:var(--panel);padding:12px 14px;display:flex;flex-direction:column;gap:4px}
+.vy-card.nova{border-left-color:#9aa1ac}
+.vy-card.otazka{border-left-color:#3b82f6}
+.vy-card.akcia{border-left-color:#e08a1e}
+.vy-card.poziadane{border-left-color:#8b5cf6}
+.vy-card.hotovo{border-left-color:var(--accent)}
+.vy-head{display:flex;align-items:center;gap:10px;cursor:pointer;min-width:0}
+.vy-title{font-size:16px;font-weight:700;color:var(--text);flex:1;min-width:0}
+.vy-badge{font-size:11px;font-weight:700;border-radius:20px;padding:3px 9px;white-space:nowrap;
+  color:#fff;background:var(--soft)}
+.vy-badge.nova{background:#9aa1ac} .vy-badge.otazka{background:#3b82f6}
+.vy-badge.akcia{background:#e08a1e} .vy-badge.poziadane{background:#8b5cf6}
+.vy-badge.hotovo{background:var(--accent-hov)}
+.vy-meta{font-size:14px;color:var(--text)} .vy-meta2{font-size:13px;color:var(--muted)}
+.vy-pdf{font-size:12px;color:#92400e;background:#fef3c7;border-radius:6px;padding:3px 8px;align-self:flex-start}
+body[data-theme=dark] .vy-pdf{color:#fcd34d;background:#3a2e12}
+.vy-act{align-self:flex-start;margin-top:6px;border-radius:8px;padding:7px 13px;font-size:13px;
+  font-weight:600;cursor:pointer;border:1px solid transparent}
+.vy-act.primary{background:var(--accent-soft);color:var(--accent)}
+.vy-act.primary:hover{background:var(--accent);color:#fff}
+.vy-act.go{background:#e08a1e;color:#fff}.vy-act.go:hover{filter:brightness(.9)}
+.vy-detail{margin-top:8px;padding-top:10px;border-top:1px dashed var(--border);
+  display:flex;flex-direction:column;gap:10px}
+.vy-form{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px}
+.vy-field{display:flex;flex-direction:column;gap:3px;min-width:0}
+.vy-flabel{font-size:12px;color:var(--muted);font-weight:600}
+.vy-field input,.vy-field select,.vy-status-reset select{border:1px solid var(--border);
+  border-radius:7px;padding:6px 8px;font-size:13px;background:var(--bg);color:var(--text);min-width:0}
+.vy-detail-acts{display:flex;gap:8px}
+.vy-status-reset{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted)}
+.vy-feed{border-top:1px solid var(--border);padding-top:8px;display:flex;flex-direction:column;gap:5px}
+.vy-feed-h{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase}
+.vy-feed-item{display:flex;gap:8px;font-size:13px;align-items:baseline}
+.vy-feed-ts{color:var(--soft);font-size:12px;white-space:nowrap;flex:0 0 auto}
+.vy-feed-tx{color:var(--text)}
+@media(max-width:820px){#tab-vystavy{padding-left:16px;padding-right:16px}.vy-form{grid-template-columns:1fr}}

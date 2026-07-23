@@ -25,8 +25,9 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
-from email.utils import formataddr
+from email.utils import formataddr, make_msgid
 from urllib.parse import quote, urljoin
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -37,7 +38,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from parovanie import (
     __version__, config, image_health, import_builder, nedostupne, orders_reminder,
     posta_uncollected, restock_skladom, riziko_vypadku, stock_skladom,
-    supplier_stock, writer)
+    supplier_stock, vystavy_imap, writer)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -491,6 +492,49 @@ def _send_mail_html(to, subject, html_body, bcc=None) -> bool:
         log.error("mail: send '%s' to %s via %s:%s failed: %r",
                   subject, to, host, os.environ.get("MAIL_PORT", "587"), e)
         return False
+
+
+def _send_vystava_mail(to, subject, text_body):
+    """Plain-text mail with an EXPLICIT Message-ID (returned) so the „Poľovnícke
+    výstavy" IMAP reply-detection (#111) can thread on it — _send_mail_html only
+    returns a bool. Reuses the same SMTP config as _send_mail_html (host/port/user/
+    pass/from) and the same „BCC vždy" default (MAIL_BCC). From is „Forestshop.sk"
+    <MAIL_FROM>. Returns the generated Message-ID on success, None on failure (the
+    caller then leaves the výstava's state unchanged and can retry)."""
+    bcc = os.environ.get("MAIL_BCC") or None
+    host = os.environ.get("MAIL_HOST")
+    if not host:
+        log.error("vystavy mail: SMTP not configured (data/.mail_env) — '%s' to %s NOT sent",
+                  subject, to)
+        return None
+    try:
+        port = int(os.environ.get("MAIL_PORT", "587"))
+        user = os.environ.get("MAIL_USER", "")
+        pw = os.environ.get("MAIL_PASS", "")
+        sender = os.environ.get("MAIL_FROM") or user
+        msgid = make_msgid(domain="forestshop.sk")
+        msg = MIMEText(text_body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = formataddr(("Forestshop.sk", sender))
+        msg["To"] = to
+        msg["Message-ID"] = msgid
+        rcpt = [to] + ([bcc] if bcc else [])
+        if port == 465:
+            smtp = smtplib.SMTP_SSL(host, port, timeout=20)
+        else:
+            smtp = smtplib.SMTP(host, port, timeout=20)
+            smtp.starttls()
+        if user:
+            smtp.login(user, pw)
+        smtp.sendmail(sender, rcpt, msg.as_string())
+        smtp.quit()
+        log.info("vystavy mail: sent '%s' to %s (msgid %s, bcc %s) via %s:%s",
+                 subject, to, msgid, bcc or "-", host, port)
+        return msgid
+    except Exception as e:  # noqa: BLE001 — log full context + degrade, never crash
+        log.error("vystavy mail: send '%s' to %s via %s:%s failed: %r",
+                  subject, to, host, os.environ.get("MAIL_PORT", "587"), e)
+        return None
 
 
 def _base_url() -> str:
@@ -1941,6 +1985,302 @@ def api_nedostupne_send():
     ok = failed == 0
     return jsonify({"ok": ok, "sent": sent_ok, "failed": failed, "skipped": skipped}), (
         200 if ok else 502)
+
+
+# --------------------------------------------------------------------------- #
+# Poľovnícke výstavy (#111) — migrated from the n8n „Polovnicke vystavy" workflow.
+# Store (data/out/vystavy.json, atomic, gitignored — survives deploy), CRUD, the
+# two manual send buttons (Pošli otázku / Ideme na túto výstavu) and the plain-text
+# mail templates. The 3 background chains (rozposlať otázky / kontrola odpovedí)
+# live as default-OFF automations further down (run_vystavy_*).
+# --------------------------------------------------------------------------- #
+VYSTAVY = os.path.join(OUT, "vystavy.json")
+
+# Canonical state-machine values (kept 1:1 with the original n8n `email_status`).
+VY_NEW = ""                                    # Nová
+VY_OTAZKA = "otazka"                            # Otázka poslaná
+VY_AKCIA = "akcia bude"                          # Odpovedali — čaká na rozhodnutie
+VY_POZIADANE = "poziadane"                        # Prihláška poslaná
+VY_HOTOVO = "odpovedane od organizatora"          # Potvrdené (konečný)
+VY_STATUSES = {VY_NEW, VY_OTAZKA, VY_AKCIA, VY_POZIADANE, VY_HOTOVO}
+
+# Fields the manager may edit in the app (all others are state, set only by the
+# send buttons / automations). These go into the mail, so they are formula-guarded.
+VY_EDIT_FIELDS = ("nazov", "datum", "miesto", "kontakt_osoba", "tel", "email",
+                  "velkost_stanku", "kedy_riesit", "sposob")
+# …except tel + kontakt_osoba: a phone like „+421 905 …" legitimately leads with '+',
+# and neither reaches any CSV/formula sink (the mails interpolate only nazov/datum/
+# velkost_stanku), so guarding them just blocks valid data (the edit form posts every
+# field, so one '+' phone made the whole výstava unsavable). #198 FIX 2.
+VY_NO_FORMULA_GUARD = ("tel", "kontakt_osoba")
+VY_FIELD_MAX = 500                              # length cap per editable field
+VY_FEED_MAX = 100                               # feed entries kept per výstava
+
+# SK monthLong names (sk-SK) — the „kedy_riesit" filter for chain A matches the
+# current month name (lowercased), exactly like the old n8n sk-SK monthLong compare.
+_SK_MONTHS = ("", "január", "február", "marec", "apríl", "máj", "jún", "júl",
+              "august", "september", "október", "november", "december")
+
+# Mail texts — VERBATIM from the n8n workflow (data/out/vystavy_workflow_digest.md).
+VY_OTAZKA_SUBJECT = "Otázka ohľadom: {nazov} dňa {datum}"
+VY_OTAZKA_BODY = """Dobrý deň,
+
+obraciam sa na Vás s otázkou, či aj tento rok plánujete organizovať podujatie {nazov} v termíne {datum}.
+
+Ak áno, prosím Vás o krátke potvrdenie. Následne Vám pošlem ďalší email so všetkými potrebnými detailmi a informáciami k prihláseniu.
+
+Vopred ďakujem za odpoveď.
+
+S pozdravom,
+Štepán Drlík
+ForestShop.sk"""
+
+VY_PRIHLASKA_SUBJECT = "Žiadosť o účasť: {nazov} dňa {datum}"
+VY_PRIHLASKA_BODY = """Dobrý deň,
+
+ďakujem za potvrdenie, že podujatie {nazov} sa bude konať aj tento rok dňa {datum}.
+
+Týmto sa záväzne prihlasujem ako vystavovateľ za spoločnosť ForestShop.sk. Predbežne mám záujem o stánok veľkosti {velkost_stanku}.
+
+Prosím o potvrdenie prijatia prihlášky.
+
+V prípade akýchkoľvek otázok ma kedykoľvek kontaktujte.
+
+Vopred ďakujem a teším sa na spoluprácu.
+
+S pozdravom,
+Štepán Drlík
+ForestShop.sk"""
+
+
+def _load_vystavy() -> list:
+    try:
+        with open(VYSTAVY, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+    return d if isinstance(d, list) else []
+
+
+def _save_vystavy(d: list) -> None:
+    tmp = VYSTAVY + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, VYSTAVY)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def _sk_month_now() -> str:
+    """Current month's sk-SK long name, lowercased (the chain-A filter key)."""
+    return _SK_MONTHS[datetime.now(ZoneInfo("Europe/Bratislava")).month]
+
+
+def _vy_find(vystavy: list, vid: str):
+    return next((v for v in vystavy if v.get("id") == vid), None)
+
+
+def _vy_feed(v: dict, typ: str, text: str) -> None:
+    """Prepend a newest-first feed entry (the in-app replacement for the Discord
+    notifications), capped to VY_FEED_MAX."""
+    entry = {"ts": _now_iso(), "typ": typ, "text": text}
+    v["feed"] = ([entry] + (v.get("feed") or []))[:VY_FEED_MAX]
+
+
+def _vy_otazka_mail(v: dict):
+    """(subject, plain-text body) of the intro-question mail for one výstava."""
+    nazov, datum = v.get("nazov", ""), v.get("datum", "")
+    return (VY_OTAZKA_SUBJECT.format(nazov=nazov, datum=datum),
+            VY_OTAZKA_BODY.format(nazov=nazov, datum=datum))
+
+
+def _vy_prihlaska_mail(v: dict):
+    """(subject, plain-text body) of the formal application mail for one výstava."""
+    nazov, datum = v.get("nazov", ""), v.get("datum", "")
+    return (VY_PRIHLASKA_SUBJECT.format(nazov=nazov, datum=datum),
+            VY_PRIHLASKA_BODY.format(nazov=nazov, datum=datum,
+                                    velkost_stanku=v.get("velkost_stanku", "")))
+
+
+def _vy_clean_fields(raw: dict):
+    """Whitelist + validate editable fields from a request body. Returns (fields, error):
+    a formula-injection lead (=,+,-,@,tab,cr) on any field is rejected (they go into the
+    mail); over-long values are rejected. Only VY_EDIT_FIELDS are kept."""
+    fields = {}
+    for k in VY_EDIT_FIELDS:
+        if k not in raw:
+            continue
+        val = str(raw.get(k) or "").strip()
+        if len(val) > VY_FIELD_MAX:
+            return None, f"pole '{k}' je príliš dlhé"
+        if k not in VY_NO_FORMULA_GUARD and val[:1] in _FORMULA_LEAD:
+            return None, f"pole '{k}' nesmie začínať znakom = + - @"
+        fields[k] = val
+    return fields, None
+
+
+def _vy_sort_key(v: dict):
+    """Display order: action-needed first, then new, then in-flight, then done;
+    within a bucket by name."""
+    order = {VY_AKCIA: 0, VY_NEW: 1, VY_OTAZKA: 2, VY_POZIADANE: 3, VY_HOTOVO: 4}
+    return (order.get(v.get("status", VY_NEW), 9), (v.get("nazov") or "").lower())
+
+
+@app.route("/api/vystavy", methods=["GET", "POST"])
+def api_vystavy():
+    """GET → {vystavy:[...]} (sorted by state then name). POST adds a new výstava:
+    a whitelisted+formula-guarded field set, a fresh uuid, status Nová, empty feed."""
+    if request.method == "GET":
+        return jsonify({"vystavy": sorted(_load_vystavy(), key=_vy_sort_key)})
+    raw = request.get_json(silent=True) or {}
+    raw = raw.get("fields") if isinstance(raw.get("fields"), dict) else raw
+    fields, err = _vy_clean_fields(raw)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    if not (fields.get("nazov") or "").strip():
+        return jsonify({"ok": False, "error": "názov výstavy je povinný"}), 400
+    v = {"id": uuid.uuid4().hex, "nazov": "", "datum": "", "miesto": "",
+         "kontakt_osoba": "", "tel": "", "email": "", "velkost_stanku": "",
+         "kedy_riesit": "", "sposob": "email", "status": VY_NEW,
+         "email_datum": "", "email_otazka_msgid": "", "email_ziadost_msgid": "",
+         "feed": []}
+    v.update(fields)
+    if v["sposob"] not in ("email", "pdf"):
+        v["sposob"] = "email"
+    with _lock:
+        vystavy = _load_vystavy()
+        vystavy.append(v)
+        _save_vystavy(vystavy)
+    log.info("vystavy: added %s (%s) user=%s", v["id"], v["nazov"], session.get("user"))
+    return jsonify({"ok": True, "vystava": v})
+
+
+@app.route("/api/vystava", methods=["POST"])
+def api_vystava():
+    """Edit / delete / manual status-reset of one výstava (vzor api_note).
+    - {id, delete:true}         → remove it
+    - {id, fields:{...}}        → overwrite the whitelisted editable fields
+    - {id, status:"<hodnota>"}  → manual state reset (reset to Nová clears the msgids
+                                   so a fresh cycle starts)."""
+    body = request.get_json(silent=True) or {}
+    vid = str(body.get("id") or "").strip()
+    with _lock:
+        vystavy = _load_vystavy()
+        v = _vy_find(vystavy, vid)
+        if not v:
+            return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
+        if body.get("delete"):
+            vystavy = [x for x in vystavy if x.get("id") != vid]
+            _save_vystavy(vystavy)
+            log.info("vystavy: deleted %s user=%s", vid, session.get("user"))
+            return jsonify({"ok": True})
+        if "status" in body:
+            new_status = str(body.get("status") or "")
+            if new_status not in VY_STATUSES:
+                return jsonify({"ok": False, "error": "neplatný stav"}), 400
+            v["status"] = new_status
+            if new_status == VY_NEW:
+                v["email_otazka_msgid"] = ""
+                v["email_ziadost_msgid"] = ""
+            _vy_feed(v, "manual", f"Manažér ručne nastavil stav: {new_status or 'Nová'}")
+            _save_vystavy(vystavy)
+            return jsonify({"ok": True, "vystava": v})
+        raw = body.get("fields") if isinstance(body.get("fields"), dict) else {}
+        fields, err = _vy_clean_fields(raw)
+        if err:
+            return jsonify({"ok": False, "error": err}), 400
+        if "nazov" in fields and not fields["nazov"]:
+            return jsonify({"ok": False, "error": "názov výstavy je povinný"}), 400
+        if fields.get("sposob") and fields["sposob"] not in ("email", "pdf"):
+            return jsonify({"ok": False, "error": "neplatný spôsob"}), 400
+        v.update(fields)
+        _save_vystavy(vystavy)
+    log.info("vystavy: edited %s fields=%s user=%s", vid, list(fields), session.get("user"))
+    return jsonify({"ok": True, "vystava": v})
+
+
+@app.route("/api/vystava/posli-otazku", methods=["POST"])
+def api_vystava_posli_otazku():
+    """Manual send of the intro-question mail for ONE výstava (chain A, off-schedule).
+    Allowed ONLY from the Nová (empty) state — like /ideme guards VY_AKCIA — so re-sending
+    on an in-flight výstava can't reset it to Otázka poslaná and re-mail the organizer;
+    wrong state → 409. The SMTP round-trip runs OUTSIDE the global _lock; on success
+    status→Otázka poslaná, the msgid is stored (for IMAP threading) and the feed records
+    it. Mail failure → 502, state unchanged (retryable). #198 FIX 3."""
+    body = request.get_json(silent=True) or {}
+    vid = str(body.get("id") or "").strip()
+    with _lock:
+        v = _vy_find(_load_vystavy(), vid)
+        if not v:
+            return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
+        if v.get("status") != VY_NEW:
+            return jsonify({"ok": False,
+                            "error": "otázku možno poslať len z novej výstavy"}), 409
+        snapshot = dict(v)
+    email = (snapshot.get("email") or "").strip()
+    if not email:
+        return jsonify({"ok": False, "error": "výstava nemá e-mail"}), 400
+    subject, mbody = _vy_otazka_mail(snapshot)
+    msgid = _send_vystava_mail(email, subject, mbody)       # outside the lock
+    if not msgid:
+        return jsonify({"ok": False, "error": "e-mail sa nepodarilo odoslať"}), 502
+    with _lock:
+        vystavy = _load_vystavy()
+        v = _vy_find(vystavy, vid)
+        if not v:
+            return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
+        if v.get("status") != VY_NEW:                       # changed meanwhile → don't double
+            return jsonify({"ok": False, "error": "stav sa medzičasom zmenil"}), 409
+        v["status"] = VY_OTAZKA
+        v["email_otazka_msgid"] = msgid
+        v["email_datum"] = _now_iso()
+        _vy_feed(v, "otazka_poslana", f"Poslaná otázka organizátorovi ({email}).")
+        _save_vystavy(vystavy)
+        result = dict(v)
+    log.info("vystavy: posli-otazku %s → %s user=%s", vid, email, session.get("user"))
+    return jsonify({"ok": True, "vystava": result})
+
+
+@app.route("/api/vystava/ideme", methods=["POST"])
+def api_vystava_ideme():
+    """In-app approval (chain C, replaces the Discord ✅): the manager decides to attend →
+    send the formal application mail. Only valid from state 'akcia bude'; on success
+    status→Prihláška poslaná + msgid stored. Wrong state → 409; mail failure → 502
+    (state unchanged). The SMTP round-trip runs OUTSIDE the global _lock."""
+    body = request.get_json(silent=True) or {}
+    vid = str(body.get("id") or "").strip()
+    with _lock:
+        v = _vy_find(_load_vystavy(), vid)
+        if not v:
+            return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
+        if v.get("status") != VY_AKCIA:
+            return jsonify({"ok": False,
+                            "error": "prihlášku možno poslať len keď organizátor odpovedal"}), 409
+        snapshot = dict(v)
+    email = (snapshot.get("email") or "").strip()
+    if not email:
+        return jsonify({"ok": False, "error": "výstava nemá e-mail"}), 400
+    subject, mbody = _vy_prihlaska_mail(snapshot)
+    msgid = _send_vystava_mail(email, subject, mbody)       # outside the lock
+    if not msgid:
+        return jsonify({"ok": False, "error": "e-mail sa nepodarilo odoslať"}), 502
+    with _lock:
+        vystavy = _load_vystavy()
+        v = _vy_find(vystavy, vid)
+        if not v:
+            return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
+        if v.get("status") != VY_AKCIA:                     # changed meanwhile → don't double
+            return jsonify({"ok": False, "error": "stav sa medzičasom zmenil"}), 409
+        v["status"] = VY_POZIADANE
+        v["email_ziadost_msgid"] = msgid
+        v["email_datum"] = _now_iso()
+        _vy_feed(v, "prihlaska_poslana", f"Poslaná prihláška organizátorovi ({email}).")
+        _save_vystavy(vystavy)
+        result = dict(v)
+    log.info("vystavy: ideme %s → %s user=%s", vid, email, session.get("user"))
+    return jsonify({"ok": True, "vystava": result})
 
 
 @app.route("/api/notes", methods=["GET", "POST"])
@@ -4369,6 +4709,93 @@ def run_image_health() -> dict:
     return stats
 
 
+# --------------------------------------------------------------------------- #
+# „Poľovnícke výstavy" (#111) — the 3 background chains, migrated from n8n. All
+# default-OFF (#93). Chain A rozposiela otázky (SEND), chains B/D čítajú IMAP a
+# posúvajú stav. Chain C (Ideme) is the manual /api/vystava/ideme button, not here.
+# --------------------------------------------------------------------------- #
+def run_vystavy_otazka() -> dict:
+    """Chain A (daily 06:00, default OFF): send the intro question to every výstava
+    that is Nová (status ""), sposob=email, has an e-mail, and whose kedy_riesit ==
+    the current sk-SK month name. Advances status→otazka + stores the msgid + feed.
+    SMTP runs OUTSIDE the store lock; each result is persisted under the lock with a
+    re-check (a manual edit meanwhile must not be clobbered)."""
+    month = _sk_month_now()
+    with _lock:
+        all_vystavy = _load_vystavy()
+        snapshots = [dict(v) for v in all_vystavy
+                     if v.get("status") == VY_NEW and v.get("sposob") == "email"
+                     and (v.get("email") or "").strip()
+                     and (v.get("kedy_riesit") or "").strip().casefold() == month]
+    # výstavy skipped this run (wrong month / not-new / pdf / no e-mail) — the spec
+    # summary shape is {poslane, preskocene} (design.md:145); the rest is a superset.
+    preskocene = len(all_vystavy) - len(snapshots)
+    poslane = zlyhane = 0
+    for snap in snapshots:
+        subject, mbody = _vy_otazka_mail(snap)
+        msgid = _send_vystava_mail(snap["email"].strip(), subject, mbody)   # outside lock
+        if not msgid:
+            zlyhane += 1
+            continue
+        with _lock:
+            vystavy = _load_vystavy()
+            v = _vy_find(vystavy, snap["id"])
+            if not v or v.get("status") != VY_NEW:
+                continue                              # changed meanwhile → skip
+            v["status"] = VY_OTAZKA
+            v["email_otazka_msgid"] = msgid
+            v["email_datum"] = _now_iso()
+            _vy_feed(v, "otazka_poslana",
+                     f"Automaticky poslaná otázka organizátorovi ({snap['email'].strip()}).")
+            _save_vystavy(vystavy)
+            poslane += 1
+    result = {"poslane": poslane, "preskocene": preskocene, "zlyhane": zlyhane,
+              "mesiac": month, "kandidati": len(snapshots)}
+    log.info("vystavy_otazka: %s", result)
+    return result
+
+
+def _vystavy_check_replies(awaited_status: str, msgid_field: str,
+                           new_status: str, feed_typ: str) -> int:
+    """Shared body of chains B/D: fetch the inbox (OUTSIDE the lock — it is I/O), match
+    replies to výstavy waiting in `awaited_status`, advance each to `new_status` and feed
+    the trimmed reply excerpt. Returns the number of state advances."""
+    msgs = vystavy_imap.fetch_inbox()          # outside the lock (network)
+    najdene = 0
+    with _lock:
+        vystavy = _load_vystavy()
+        for vid, excerpt in vystavy_imap.match_reply(msgs, vystavy, awaited_status, msgid_field):
+            v = _vy_find(vystavy, vid)
+            if not v or v.get("status") != awaited_status:
+                continue
+            v["status"] = new_status
+            v["email_datum"] = _now_iso()
+            _vy_feed(v, feed_typ,
+                     f"Prišla odpoveď: {excerpt}" if excerpt else "Prišla odpoveď od organizátora.")
+            najdene += 1
+        if najdene:
+            _save_vystavy(vystavy)
+    return najdene
+
+
+def run_vystavy_odpoved_otazka() -> dict:
+    """Chain B (daily 09:00, default OFF): IMAP-check replies to the sent question. A
+    reply threaded on a výstava's email_otazka_msgid advances it otazka → akcia bude."""
+    result = {"najdene": _vystavy_check_replies(
+        VY_OTAZKA, "email_otazka_msgid", VY_AKCIA, "odpoved_otazka")}
+    log.info("vystavy_odpoved_otazka: %s", result)
+    return result
+
+
+def run_vystavy_odpoved_prihlaska() -> dict:
+    """Chain D (daily 09:30, default OFF): IMAP-check replies to the sent application. A
+    reply threaded on email_ziadost_msgid advances poziadane → odpovedane od organizatora."""
+    result = {"najdene": _vystavy_check_replies(
+        VY_POZIADANE, "email_ziadost_msgid", VY_HOTOVO, "odpoved_prihlaska")}
+    log.info("vystavy_odpoved_prihlaska: %s", result)
+    return result
+
+
 # Plain-language "what it does + when it runs" for each automation (#173) — shown
 # in its tab so the manager doesn't have to guess from the name alone. Written from
 # the actual run_<key>() behavior (docstrings above), not from the name/schedule —
@@ -4414,6 +4841,15 @@ AUTOMATION_DESCRIPTIONS = {
     "image_health":
         "Pravidelne overí, či produktové fotky na našich kartách ešte fungujú, a "
         "mŕtve odkazy skryje z karty (samo sa opraví, keď fotka zase ožije).",
+    "vystavy_otazka":
+        "Denne o 6:00 rozpošle úvodnú otázku organizátorom výstav, ktorých mesiac "
+        "riešenia je práve teraz — spýta sa, či sa podujatie tento rok koná.",
+    "vystavy_odpoved_otazka":
+        "Denne o 9:00 skontroluje e-mailovú schránku, či organizátor odpovedal na "
+        "úvodnú otázku, a ak áno, posunie výstavu do stavu „čaká na rozhodnutie“.",
+    "vystavy_odpoved_prihlaska":
+        "Denne o 9:30 skontroluje e-mailovú schránku, či organizátor potvrdil "
+        "prihlášku, a ak áno, označí výstavu ako potvrdenú.",
 }
 
 AUTOMATIONS_REG = [
@@ -4516,6 +4952,24 @@ AUTOMATIONS_REG = [
                name="Kontrola obrázkov",
                schedule={"daily_at": "04:30", "tz": "Europe/Bratislava"},
                run_fn=run_image_health),
+    # #111 — „Poľovnícke výstavy": the 3 background chains migrated from n8n. SAFETY
+    # (#93 contract): all start DISABLED — chain A SENDS real e-mails to organizers,
+    # chains B/D read the live IMAP mailbox and advance state, so they run ONLY after
+    # the manager opts in; a deploy never e-mails or reads mail on its own. These have
+    # NO nav tab (per spec) — their effect shows on the „Poľovnícke výstavy" work tab;
+    # the manager's primary controls are the per-výstava manual buttons.
+    Automation(key="vystavy_otazka",
+               name="Výstavy: rozposlať otázky",
+               schedule={"daily_at": "06:00", "tz": "Europe/Bratislava"},
+               run_fn=run_vystavy_otazka),
+    Automation(key="vystavy_odpoved_otazka",
+               name="Výstavy: kontrola odpovedí na otázku",
+               schedule={"daily_at": "09:00", "tz": "Europe/Bratislava"},
+               run_fn=run_vystavy_odpoved_otazka),
+    Automation(key="vystavy_odpoved_prihlaska",
+               name="Výstavy: kontrola odpovedí na prihlášku",
+               schedule={"daily_at": "09:30", "tz": "Europe/Bratislava"},
+               run_fn=run_vystavy_odpoved_prihlaska),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
@@ -4529,7 +4983,7 @@ RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 # the nav key). Keep this set in sync with app.js's TABS/AUTOMATION_TABS keys
 # whenever a nav tab is added/renamed-in-code.
 NAV_KEYS = {
-    "toorder", "nedostupne", "search", "notes", "review",                # TABS
+    "toorder", "nedostupne", "vystavy", "search", "notes", "review",     # TABS
     "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
     "grube_externalcode", "split_links",
     "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom", "stock_skladom",

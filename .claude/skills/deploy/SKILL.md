@@ -37,6 +37,13 @@ Cloudflare account `<ACCOUNT_ID>`, zóna `newlevel.media`. Meta-token
 4. **DNS**: POST `/zones/{zid}/dns_records` `{"type":"CNAME","name":"<host>","content":"{id}.cfargotunnel.com","proxied":true}`.
 5. **Run**: `cloudflared tunnel run --token <tunnel-token>` (systemd --user, Restart=always).
 
+## Jednorazové migrácie stavu po deployi (gitignored `data/out/*` stores)
+
+Manažérove ŽIVÉ stores v `data/out/` sú gitignored (viď webreview skill „Per-riadkové stavy" + „MUSIA prežiť každý deploy") — deploy ich NEprináša. Nový store, ktorý na prode ešte neexistuje, treba raz naplniť migráciou. Po deployi over a spusti (idempotentné — druhý beh nič nerobí):
+
+- **Poľovnícke výstavy (#111)** — ak `data/out/vystavy.json` NEexistuje, spusti raz:
+  `PYTHONPATH=src python scripts/migrate_vystavy.py` (číta `data/out/vystavy_import.csv` = Sheet export; `--force` prepíše, čo NErob na prode — clobol by manažérove živé úpravy). Keď `vystavy.json` už je, tab „Poľovnícke výstavy" ho servíruje sám — migráciu vynechaj. Detail store/tabu → webreview skill (sekcia „Pridanie plnej WORK záložky").
+
 ## Pravidlá
 
 - **Secrety NIKDY do gitu** — tokeny v `data/.cf_*` / `data/.cf_env` (gitignored, `chmod 600`). Skill/CLAUDE.md sú v gite.

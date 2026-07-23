@@ -54,8 +54,8 @@ def test_nav_order_has_review_last(page, live_server):
     # was moved OUT to a standalone item at the bottom (#118 refinement), so
     # 'Kontrola párovania' is the LAST item inside the folder.
     labels = page.locator(".sidebar #tabs button .tlabel").all_inner_texts()
-    assert labels == ["Na objednanie", "Nedostupné tovary", "Hľadať / opraviť", "Poznámky",
-                       "Kontrola párovania"], labels
+    assert labels == ["Na objednanie", "Nedostupné tovary", "Poľovnícke výstavy",
+                       "Hľadať / opraviť", "Poznámky", "Kontrola párovania"], labels
 
     assert console == [], f"console not clean: {console}"
 

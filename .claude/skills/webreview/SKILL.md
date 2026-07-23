@@ -415,6 +415,74 @@ samo vrátiť do dobrého stavu — na rozdiel od JOIN/WRITE-JOIN vzorov, ktoré
   napíšeš podobný "safe run-now" e2e test pre inú automatizáciu — inak riskuješ skutočný sieťový
   beh v CI.
 
+## Pridanie plnej WORK záložky (nie automatizácia) — vzor `nedostupne`/`vystavy` (#100/#111)
+
+Nová pracovná záložka s vlastným obsahom (nie per-riadkový flag, nie automatizácia). Checklist —
+**vynechaný krok = tichý bug** (tab sa neprepne / nezobrazí / drift test padne):
+
+1. **app.js**: `TABS += ['<key>', '<Label>']`, `NAV_ICONS.<key>`, `PAGE_TITLES.<key>`, vetva v
+   `setPageHead` (pageSub), `navCount('<key>')`, `switchTab` (`if tab===key await load<Key>()`),
+   `render()`: pridaj `const <key> = ACTIVE_TAB===key`, zahrň do `plain`, `#tab-<key>` hidden toggle,
+   a **dispatch riadok** `if (<key>) { ...; render<Key>(); return; }` (PRED review/toorder blokom).
+   `load<Key>`/`render<Key>` (globál `let <KEY> = null`).
+2. **app.py**: `NAV_KEYS += "<key>"` (inak #173 rename → 400). Store + endpointy podľa potreby.
+3. **index.html**: `<section id="tab-<key>" hidden></section>` + bumpni cache-bust `?v=` na app.js AJ style.css.
+4. **GOTCHA — nový TAB rozbije DVE veci, oprav OBE:**
+   - `tests/e2e/test_shell.py::test_nav_order_has_review_last` hard-koduje CELÝ zoznam `#tabs .tlabel`
+     — pridaj nový label na správnu pozíciu (poradie = poradie v `TABS`).
+   - `init()` má **whitelist `?tab=` deep-linku** (`qTab==='toorder'||'review'||...`) ktorý NOVÝ kľúč
+     NEobsahuje → `/?tab=<key>` sa NEprepne. E2E preto naviguj KLIKOM na nav button
+     (`get_by_role("button", name="<Label>")`), nie cez `?tab=` (ako `nedostupne`/`vystavy` e2e). Ak
+     chceš deep-link, dopln kľúč do whitelistu.
+5. **E2E fixture**: vlastný function-scoped server (vzor `nedostupne_server`/`vystavy_server`) +
+   pridaj ho do `_SERVER_FIXTURES` (auth cookie). `MAIL_HOST=""` ak tab vie kliknúť send-cestu.
+6. Karty (nie tabuľka) sú preferovaný layout pre manažérske taby (šéfova požiadavka #111) — grupuj
+   podľa stavu, farebný `border-left`+badge, per-stav akčné tlačidlo, klik-na-hlavičku → inline
+   detail/edit (`VY_OPEN` Set prežije re-render, takže po save ostane detail otvorený).
+
+## Automatizácia BEZ nav tabu (background-only) — vzor `vystavy_otazka/_odpoved_*` (#111)
+
+Keď automatizácia beží len na pozadí a NEMÁ mať vlastnú záložku (jej efekt vidno v inom WORK tabe):
+registruj ju do `AUTOMATIONS_REG` + **`AUTOMATION_DESCRIPTIONS`** (description-completeness test
+`test_ui_labels.py` iteruje VŠETKY `/api/automations` a vyžaduje neprázdny popis), ale **NEpridávaj**
+kľúč do `AUTOMATION_TABS` (app.js) ani do `NAV_KEYS` (app.py) — `test_nav_keys_match_appjs` odvodzuje
+`NAV_KEYS` z `TABS|AUTOMATION_TABS`, takže background kľúč v `NAV_KEYS` = drift fail.
+
+**Ovládanie takej automatizácie patrí do HLAVIČKY jej WORK tabu (#198 FIX 1), NIE „len ručne v
+`automations.json`".** Vzor `vyAutoPanel()`/`vyAutoRow(key)` v renderVystavy: kompaktný panel so
+zoznamom kľúčov, každý riadok `autoByKey(key)` → názov+popis+stav+`next_run` + `toggleAutomation(key,
+!a.enabled)` (Štart/Stop) + `runAutomation(key, '<tab>')` (⚡ Spustiť teraz). DVA drôty nutné, inak sa
+panel po toggli neobnoví: (1) `load<Tab>()` musí volať `await loadAutomations()` (naplní `AUTOMATIONS`),
+(2) `_reloadAuto(tab)` potrebuje vetvu pre ten tab (`if (tab==='<tab>') { await load<Tab>(); return; }`)
+— `toggle/run` volajú `_reloadAuto(ACTIVE_TAB)`+`render()`, bez vetvy padnú do default `loadPosta`.
+Reusuje sa existujúca `.pill on/off` + `.btn sm good/warn/ghost`. E2E: toggle on→off (fixture zdieľaný).
+
+## „Poľovnícke výstavy" (#111) — IMAP reply-detekcia + Message-ID threading
+
+- **Reply detekcia = ulož Message-ID pri odoslaní, matchni pri prijatí.** `_send_vystava_mail`
+  (app.py) posiela s explicitným `msg["Message-ID"]=make_msgid(domain="forestshop.sk")` a VRÁTI ho
+  (`_send_mail_html` vracia len `bool` → nestačí). Uloží sa do `email_*_msgid`; `vystavy_imap.match_reply`
+  matchne `from==vystava.email` AND stored-msgid v `In-Reply-To`/`References` odpovede (msgid rozlíši
+  keď 1 organizátor má viac výstav). `trim_quote` odreže reply-chain (SK „Dňa … napísal:" má meno PRED
+  `:` → marker `D[ňn][ae] .*nap[íi]?sal.*:`, nie len `napísal:`).
+- **IMAP creds z `data/.mail_env`**: `IMAP_HOST` (default `mbox.myshoptet.com`), `IMAP_PORT` (993),
+  reuse `MAIL_USER`/`MAIL_PASS`; self-signed → `ssl.CERT_NONE`. `fetch_inbox` degrade→`[]` (automat nespadne).
+- **Migračný store**: `scripts/migrate_vystavy.py` → gitignored `data/out/vystavy.json` (jednorazovo pri
+  deployi, `--force` na re-migráciu; app toleruje chýbajúci súbor = 0 výstav). Pri deployi ho MUSÍŠ spustiť.
+- **Formula-guard LEN na polia, čo idú do CSV/formula sinku (#198 FIX 2)**: `_vy_clean_fields` strážila
+  formula-lead (`= + - @`) na VŠETKÝCH edit poliach — lenže `tel` (`+421 …` legitímne začína `+`) ani
+  `kontakt_osoba` nejdú do žiadneho CSV (maily interpolujú len `nazov/datum/velkost_stanku`), takže guard
+  blokoval platné dáta (edit form posiela VŠETKY polia → jeden `+` telefón znemožnil uložiť celú výstavu).
+  `VY_NO_FORMULA_GUARD=("tel","kontakt_osoba")` ich vyníma; ostatné polia ostávajú strážené. Pravidlo:
+  formula-guard patrí len na pole, čo naozaj tečie do CSV/formula sinku, nie na plain-text kontaktné pole.
+- **Send tlačidlá STRÁŽIA vstupný stav (#198 FIX 3)**: `posli-otazku` smie ísť LEN z `VY_NEW` (inak 409,
+  re-check aj po maili — ako `ideme` stráži `VY_AKCIA`), inak by priamy API na výstavu v „poziadane"/
+  „odpovedane" resetol stav→otazka a re-mailoval organizátora. Každé nové send tlačidlo pridaj s
+  rovnakým vstupno-stavovým guardom.
+- **Chain-A summary shape (#198 FIX 4)**: `run_vystavy_otazka` vracia `{poslane, preskocene, …}`
+  (`preskocene` = `len(all_vystavy)-len(candidates)`, výstavy preskočené kvôli mesiacu/stavu/pdf/mailu) —
+  spec `design.md:145` predpisuje `{poslane, preskocene}`, zvyšok je superset.
+
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
 Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
