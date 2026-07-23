@@ -309,6 +309,15 @@ keď sa export obnoví); netreba osobitný „flipped codes" store.
   **busy lock**, no-supplier-data → nič neflipne, both-availability-fields na import riadku,
   manager-store izolácia; e2e = `automations_server` s pred-vypočítaným `restock_skladom.json`.
 
+- **Review „↩ Vrátiť" (undo) NEROBÍ re-enable do eshopu — to robí LEN táto nočná automatika (#97).**
+  Review karta pri stave `unavailable` (Vypredané, stock 0) má pod „↩ Vrátiť" nenápadnú `.reenote`
+  poznámku: reálne zapnutie (Vypredané→Skladom) spraví nočný `restock_skladom`, keď je produkt späť
+  skladom. „↩ Vrátiť" (`saveDecision(p,'undo')` → `/api/decision` status=undo → `d.pop(key)`) len zmaže
+  rozhodnutie lokálne, žiadny import/CSV/eshop zápis. **Poznámka je SCOPED len na `unavailable`** — NIE
+  na `discontinued` („Už sa nebude predávať", detailOnly), lebo ten sa nočnou automatikou nezapína
+  (poznámka by tam klamala). Pri zmene review-decision statusov over túto väzbu na automatiku, nech UI
+  netvrdí re-enable, ktorý sa nestane.
+
 ### AI-EMAIL automatizácia (klasifikuj + pošli zákazníkovi mail) — vzor `orders_reminder` (#105)
 
 Automatizácia, ktorá číta OBJEDNÁVKY (nie katalóg), LLM-klasifikuje voľný text a podľa výsledku
