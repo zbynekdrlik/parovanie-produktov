@@ -154,16 +154,28 @@ def plan_sends(order_rows, sent_map, type_key: str) -> list:
 # Customer e-mail templates — the same HTML style as orders_reminder.build_reminder_email
 # (boss: „pekný, v ROVNAKOM formáte ako ostatné automatizácie"). Free text is HTML-escaped.
 # --------------------------------------------------------------------------- #
-def _shell(name_h: str, inner: str) -> str:
+# Signature blocks (rendered inside the shell's closing <p style="margin-top: 30px;"> … </p>).
+# The house default (Tím Forestshop.sk) is unchanged; build_unavailable_email passes the boss's own
+# signoff „S pozdravom … Drlík, Forestshop.sk" (#183) so no second signature is appended.
+_SIGN_DEFAULT = (
+    'S pozdravom,<br>\n'
+    '      <strong>Tím Forestshop.sk</strong><br>\n'
+    '      <a href="https://www.forestshop.sk" target="_blank">www.forestshop.sk</a>\n'
+)
+_SIGN_DRLIK = (
+    'S pozdravom,<br>\n'
+    '      <strong>Drlík, Forestshop.sk</strong><br>\n'
+    '      <a href="https://www.forestshop.sk" target="_blank">www.forestshop.sk</a>\n'
+)
+
+
+def _shell(name_h: str, inner: str, sign: str = _SIGN_DEFAULT) -> str:
     return (
         '<!DOCTYPE html>\n<html>\n'
         '  <body style="font-family: Arial, sans-serif; font-size: 16px; color: #333;">\n'
         f'    <p>Dobrý deň, <strong>{name_h}</strong>,</p>\n\n'
         f'{inner}'
-        '    <p style="margin-top: 30px;">S pozdravom,<br>\n'
-        '      <strong>Tím Forestshop.sk</strong><br>\n'
-        '      <a href="https://www.forestshop.sk" target="_blank">www.forestshop.sk</a>\n'
-        '    </p>\n'
+        f'    <p style="margin-top: 30px;">{sign}    </p>\n'
         '  </body>\n</html>'
     )
 
@@ -176,20 +188,21 @@ def _contact_line() -> str:
     )
 
 
-def build_unavailable_email(bill_full_name: str, item_name: str) -> tuple:
-    """(subject, html_body) — the ordered product is currently unavailable. Free text escaped."""
+def build_unavailable_email(bill_full_name: str, item_name: str = "") -> tuple:
+    """(subject, html_body) — the EXACT wording the boss gave for the unavailable-product e-mail
+    (#183, Discord 2026-07-23): the shell's personalized greeting by name + his verbatim body +
+    his „S pozdravom … Drlík, Forestshop.sk" signoff. No double greeting / no double signature.
+
+    ``item_name`` is accepted for call-site symmetry with build_alternative_email but is intentionally
+    NOT woven in — the boss's wording is deliberately generic („tovar ktorý ste si objednali"). The
+    free customer name (in the greeting) is HTML-escaped."""
     name_h = escape((bill_full_name or "").strip() or "zákazník")
-    prod_h = escape((item_name or "").strip() or "objednaný tovar")
     inner = (
-        f'    <p>Radi by sme vás informovali, že produkt <strong>{prod_h}</strong> z vašej '
-        'objednávky je momentálne <strong>nedostupný</strong>. Mrzí nás to a rozumieme, '
-        'že ste sa na svoju výbavu tešili.</p>\n\n'
-        '    <p>Situáciu aktívne riešime a v prípade potreby vás budeme osobne kontaktovať '
-        'ohľadom ďalšieho postupu (náhradný termín dodania alebo iné riešenie).</p>\n\n'
-        + _contact_line()
-        + '    <p>Ďakujeme vám za trpezlivosť a dôveru.</p>\n\n'
+        '    <p>veľmi sa ospravedlňujeme, ale tovar ktorý ste si objednali je momentálne '
+        'nedostupný a nevieme kedy bude naskladnený. Z toho dôvodu nevieme Vašu objednávku '
+        'úspešne vybaviť.</p>\n\n'
     )
-    return UNAVAILABLE_SUBJECT, _shell(name_h, inner)
+    return UNAVAILABLE_SUBJECT, _shell(name_h, inner, _SIGN_DRLIK)
 
 
 def build_alternative_email(bill_full_name: str, item_name: str, alternatives) -> tuple:

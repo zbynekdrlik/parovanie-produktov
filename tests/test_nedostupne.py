@@ -117,19 +117,27 @@ def test_plan_sends_all_eligible():
     assert [r["email"] for r in plan] == ["ada@example.com", "bob@example.com"]
 
 
-def test_build_unavailable_email_escapes_and_names_product():
+def test_build_unavailable_email_uses_boss_exact_wording():
+    # #183 — the exact text the boss gave; product name is NOT woven in (generic wording).
     subj, html = N.build_unavailable_email("Ada <b>Nová</b>", "Nohavice & spol")
     assert subj == N.UNAVAILABLE_SUBJECT
-    assert "Ada &lt;b&gt;Nová&lt;/b&gt;" in html          # name escaped
-    assert "Nohavice &amp; spol" in html                  # product escaped
-    assert "nedostupný" in html
-    assert "Tím Forestshop.sk" in html
+    assert "Ada &lt;b&gt;Nová&lt;/b&gt;" in html          # greeting name escaped
+    assert "veľmi sa ospravedlňujeme" in html
+    assert "momentálne nedostupný" in html
+    assert "nevieme kedy bude naskladnený" in html
+    assert "Vašu objednávku úspešne vybaviť" in html
+    assert "S pozdravom" in html
+    assert "Drlík, Forestshop.sk" in html                 # boss's signoff
+    # no generic house text, no product name, and the shell's default signature is NOT appended too
+    assert "Nohavice" not in html
+    assert "Mrzí nás to" not in html
+    assert "Tím Forestshop.sk" not in html
 
 
 def test_build_unavailable_email_blank_name_falls_back():
     _subj, html = N.build_unavailable_email("", "")
-    assert "zákazník" in html
-    assert "objednaný tovar" in html
+    assert "zákazník" in html                             # greeting fallback
+    assert "veľmi sa ospravedlňujeme" in html             # boss body present regardless of name
 
 
 def test_build_alternative_email_lists_links_and_escapes():
