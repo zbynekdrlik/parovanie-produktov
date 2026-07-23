@@ -1807,7 +1807,10 @@ def api_nedostupne_send():
     customer with an open order for this product. Dedup per order+type (never double-send). The
     SMTP round-trip runs OUTSIDE the global store lock (like run_orders_reminder) and each success
     is persisted immediately (a crash mid-batch must not re-send). A per-recipient re-check under
-    lock closes the concurrent-click window."""
+    lock NARROWS (does not fully close) the concurrent-send window — the frontend disabling the
+    button covers the single-user double-click; two truly simultaneous senders could still both
+    pass the re-check, the same accepted trade-off as run_orders_reminder (a claim-before-send lock
+    is deferred)."""
     body = request.get_json(silent=True) or {}
     code = str(body.get("code") or "").strip()
     type_key = str(body.get("type") or "").strip()
@@ -1838,10 +1841,18 @@ def api_nedostupne_send():
             subject, html = nedostupne.build_alternative_email(r["billFullName"], name, alts)
         if _send_mail_html(r["email"], subject, html):
             sent_ok += 1
+            low = (r["email"] or "").strip().lower()
             with _lock:
                 d = _load_nedostupne()
-                d.setdefault(code, {}).setdefault("sent", {})[sk] = {
-                    "at": now_iso, "email": r["email"]}
+                smap = d.setdefault(code, {}).setdefault("sent", {})
+                # Record EVERY open order sharing this customer's e-mail + type — not
+                # just the winning order. plan_sends dedups per e-mail, so a repeat
+                # buyer with the SAME product in two open orders is planned once; if we
+                # marked only that one order, the sibling would stay unrecorded and the
+                # next send would re-e-mail the same customer (#100 review, Finding 1).
+                for o in orders:
+                    if (o.get("email") or "").strip().lower() == low:
+                        smap[f"{o['orderCode']}|{type_key}"] = {"at": now_iso, "email": r["email"]}
                 _save_nedostupne(d)
         else:
             failed += 1
