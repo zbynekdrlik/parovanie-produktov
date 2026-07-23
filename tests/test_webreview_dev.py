@@ -40,6 +40,7 @@ def _no_real_github(monkeypatch):
 
     monkeypatch.setattr(webapp.requests, "get", _boom)
     monkeypatch.setattr(webapp.requests, "post", _boom)
+    monkeypatch.setattr(webapp.requests, "delete", _boom)
 
 
 def _configure(monkeypatch):
@@ -217,3 +218,155 @@ def test_dev_idea_token_missing_degrades_gracefully(monkeypatch):
     j = r.get_json()
     assert j["ok"] is False and j["available"] is False
     assert j["error"]
+
+
+# --------------------------------------------------------------------------- #
+# /api/dev/issues — priority label is lifted into `priority` + stripped from view
+# --------------------------------------------------------------------------- #
+def test_dev_issues_priority_label_lifted_and_hidden(monkeypatch):
+    _configure(monkeypatch)
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        return _Resp(200, [
+            {"number": 7, "title": "Súrne", "state": "open",
+             "labels": [{"name": "bug"}, {"name": "prio:soon"}],
+             "updated_at": "2026-07-22T10:00:00Z",
+             "html_url": "https://github.com/owner/repo/issues/7", "comments": 1},
+            {"number": 6, "title": "Počká", "state": "open",
+             "labels": [{"name": "prio:later"}],
+             "updated_at": "2026-07-21T10:00:00Z",
+             "html_url": "https://github.com/owner/repo/issues/6", "comments": 0},
+        ])
+
+    monkeypatch.setattr(webapp.requests, "get", fake_get)
+    j = _client().get("/api/dev/issues").get_json()
+    a, b = j["issues"]
+    assert a["priority"] == "soon" and a["labels"] == ["bug"]   # prio label hidden
+    assert b["priority"] == "later" and b["labels"] == []
+    assert "prio:soon" not in a["labels"] and "prio:later" not in b["labels"]
+
+
+# --------------------------------------------------------------------------- #
+# /api/dev/issue/<n>/note — append a detail as a GitHub comment
+# --------------------------------------------------------------------------- #
+def test_dev_note_requires_login():
+    c = webapp.app.test_client()
+    r = c.post("/api/dev/issue/5/note", json={"text": "detail"})
+    assert r.status_code == 401
+
+
+def test_dev_note_posts_comment(monkeypatch):
+    _configure(monkeypatch)
+    sent = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        sent["url"] = url
+        sent["json"] = json
+        sent["headers"] = headers
+        return _Resp(201, {"id": 111})
+
+    monkeypatch.setattr(webapp.requests, "post", fake_post)
+    r = _client().post("/api/dev/issue/5/note", json={"text": "šéfov detail k úlohe"})
+    assert r.status_code == 201
+    assert r.get_json()["ok"] is True
+    # posted to the issue's COMMENTS endpoint — the body is never overwritten
+    assert sent["url"].endswith("/repos/owner/repo/issues/5/comments")
+    assert "šéfov detail k úlohe" in sent["json"]["body"]
+    assert "test-token" not in sent["url"]
+    assert sent["headers"]["Authorization"] == "Bearer test-token"
+
+
+def test_dev_note_empty_rejected_before_github(monkeypatch):
+    _configure(monkeypatch)
+    # requests.post is still the raising guard → 400 must come BEFORE any call
+    r = _client().post("/api/dev/issue/5/note", json={"text": "   "})
+    assert r.status_code == 400
+    assert r.get_json()["ok"] is False
+
+
+def test_dev_note_too_long_rejected(monkeypatch):
+    _configure(monkeypatch)
+    r = _client().post("/api/dev/issue/5/note", json={"text": "x" * (webapp.NOTE_MAX + 1)})
+    assert r.status_code == 400
+
+
+def test_dev_note_token_missing_degrades_gracefully(monkeypatch):
+    # no token; requests.post is the raising guard → must NOT be called
+    r = _client().post("/api/dev/issue/5/note", json={"text": "detail bez tokenu"})
+    assert r.status_code != 500
+    j = r.get_json()
+    assert j["ok"] is False and j["available"] is False
+
+
+# --------------------------------------------------------------------------- #
+# /api/dev/issue/<n>/priority — manage hidden prio labels
+# --------------------------------------------------------------------------- #
+def test_dev_priority_requires_login():
+    c = webapp.app.test_client()
+    r = c.post("/api/dev/issue/5/priority", json={"priority": "soon"})
+    assert r.status_code == 401
+
+
+def test_dev_priority_soon_adds_label_and_removes_opposite(monkeypatch):
+    _configure(monkeypatch)
+    calls = []
+
+    def fake_delete(url, headers=None, timeout=None):
+        calls.append(("DELETE", url))
+        return _Resp(200, [])
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append(("POST", url, json))
+        return _Resp(200, [{"name": "prio:soon"}])
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    monkeypatch.setattr(webapp.requests, "post", fake_post)
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "soon"})
+    assert r.status_code == 200
+    assert r.get_json() == {"ok": True, "priority": "soon"}
+    # the opposite label was deleted from the issue (name URL-encoded)
+    deletes = [c[1] for c in calls if c[0] == "DELETE"]
+    assert any(u.endswith("/issues/5/labels/prio%3Alater") for u in deletes)
+    # the chosen label was added to the issue (labels endpoint, token in header only)
+    add = [c for c in calls if c[0] == "POST" and c[1].endswith("/issues/5/labels")]
+    assert add and add[0][2] == {"labels": ["prio:soon"]}
+
+
+def test_dev_priority_none_clears_both_and_adds_nothing(monkeypatch):
+    _configure(monkeypatch)
+    calls = []
+
+    def fake_delete(url, headers=None, timeout=None):
+        calls.append(("DELETE", url))
+        return _Resp(200, [])
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append(("POST", url, json))
+        return _Resp(201, {})
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    monkeypatch.setattr(webapp.requests, "post", fake_post)
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "none"})
+    assert r.status_code == 200
+    assert r.get_json() == {"ok": True, "priority": ""}
+    # both prio labels removed, NO label-add / label-create POST
+    deletes = [u for m, u in calls if m == "DELETE"]
+    assert any("prio%3Asoon" in u for u in deletes)
+    assert any("prio%3Alater" in u for u in deletes)
+    assert not [c for c in calls if c[0] == "POST"]
+
+
+def test_dev_priority_invalid_rejected_before_github(monkeypatch):
+    _configure(monkeypatch)
+    # requests.* are raising guards → a 400 must come BEFORE any GitHub call
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "urgent"})
+    assert r.status_code == 400
+    assert r.get_json()["ok"] is False
+
+
+def test_dev_priority_token_missing_degrades_gracefully(monkeypatch):
+    # no token; requests.* are raising guards → must NOT be called
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "soon"})
+    assert r.status_code != 500
+    j = r.get_json()
+    assert j["ok"] is False and j["available"] is False

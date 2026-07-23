@@ -68,6 +68,55 @@ def test_lightbulb_creates_idea_that_appears_in_list(page, dev_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_priority_soon_moves_issue_to_top_group(page, dev_server):
+    """Boss marks an open issue „Čoskoro" → it lands in the „Riešiť čoskoro" group.
+    GitHub stays hidden; the split is driven by the in-app priority."""
+    console = _console(page)
+    page.goto(dev_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.locator("#devNav button").click()
+    page.wait_for_selector("#tab-dev .dev-row")
+
+    # the open issue (#7) has a „🔴 Čoskoro" button; click it → POST priority
+    row = page.locator("#tab-dev .dev-row").first
+    with page.expect_response("**/api/dev/issue/7/priority") as resp:
+        row.get_by_role("button", name="🔴 Čoskoro").click()
+    assert resp.value.status == 200
+
+    # after refresh the issue is under the „Riešiť čoskoro" group + carries prio-soon
+    page.wait_for_selector("#tab-dev .dev-group.soon")
+    page.wait_for_selector("#tab-dev .dev-row.prio-soon")
+    # the raw label name is NEVER shown to the boss
+    joined = "\n".join(page.locator("#tab-dev .dev-row").all_inner_texts())
+    assert "prio:soon" not in joined
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_add_detail_note_saves_to_issue(page, dev_server):
+    """Boss writes a detail under an issue → it's saved (GitHub comment) and the
+    confirmation shows, without ever leaving the app or seeing GitHub."""
+    console = _console(page)
+    page.goto(dev_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.locator("#devNav button").click()
+    page.wait_for_selector("#tab-dev .dev-row")
+
+    row = page.locator("#tab-dev .dev-row").first
+    row.get_by_role("button", name="➕ Doplniť detail").click()
+    box = row.locator(".dev-note-box")
+    box.wait_for(state="visible")
+    box.locator(".dev-note-ta").fill("Šéfov detail: toto treba spraviť takto.")
+    with page.expect_response("**/api/dev/issue/7/note") as resp:
+        box.get_by_role("button", name="Uložiť detail").click()
+    assert resp.value.status == 201
+    # inline confirmation, no navigation to GitHub
+    page.wait_for_selector("#tab-dev .dev-note-msg.ok")
+    assert "github" not in page.url.lower()
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_empty_title_shows_inline_error_no_issue(page, dev_server):
     console = _console(page)
     page.goto(dev_server)

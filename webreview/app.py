@@ -1662,6 +1662,14 @@ IDEA_RATE_MAX = 20              # ideas per user per window (anti-spam / runaway
 IDEA_RATE_WINDOW = 300          # 5 min
 _idea_times: dict = {}          # user email -> [timestamps]
 
+NOTE_MAX = 5000                 # chars per in-app „doplniť detail" note (→ GitHub comment)
+# In-app priority — the boss never sees GitHub: two hidden labels drive the
+# „čoskoro / neskôr" split in the Vývoj tab. The frontend maps them to Slovak and
+# never shows the raw label names. Colours come from the soft palette (#143).
+PRIO_LABELS = {"soon": "prio:soon", "later": "prio:later"}
+PRIO_LABEL_SET = set(PRIO_LABELS.values())
+PRIO_COLORS = {"soon": "d14d3b", "later": "e0b341"}   # 6-hex, no '#'
+
 
 def _gh_config():
     """(token, repo) from data/.gh_env — or (None, None) when unconfigured, so the
@@ -1682,13 +1690,20 @@ def _gh_headers(token):
 
 
 def _slim_issue(it: dict) -> dict:
-    """GitHub issue JSON → the slim shape the frontend renders (no token, no PII)."""
+    """GitHub issue JSON → the slim shape the frontend renders (no token, no PII).
+
+    The hidden priority labels (`prio:soon`/`prio:later`) are lifted into a plain
+    `priority` field ('', 'soon' or 'later') and STRIPPED from the visible labels,
+    so the boss sees „čoskoro/neskôr" in the UI, never the raw GitHub label."""
+    all_labels = [lbl.get("name") for lbl in (it.get("labels") or [])
+                  if isinstance(lbl, dict) and lbl.get("name")]
+    priority = next((k for k, n in PRIO_LABELS.items() if n in all_labels), "")
     return {
         "number": it.get("number"),
         "title": it.get("title") or "",
         "state": it.get("state") or "open",
-        "labels": [lbl.get("name") for lbl in (it.get("labels") or [])
-                   if isinstance(lbl, dict) and lbl.get("name")],
+        "labels": [nm for nm in all_labels if nm not in PRIO_LABEL_SET],
+        "priority": priority,
         "updated_at": it.get("updated_at") or "",
         "html_url": it.get("html_url") or "",
         "comments": it.get("comments") or 0,
@@ -1757,6 +1772,75 @@ def _do_create_idea(title: str, description: str, author: str = ""):
         return {"ok": False, "error": "GitHub nedostupný"}, 200
 
 
+def _do_add_note(number: int, text: str, author: str = ""):
+    """(payload, status) — append the boss's detail as a GitHub issue COMMENT
+    (non-destructive; the issue body is never overwritten). The boss never sees
+    GitHub — the token is used server-side only. No token → graceful „unavailable";
+    upstream/network errors are caught (never 500)."""
+    token, repo = _gh_config()
+    if not token:
+        return {"ok": False, "available": False,
+                "error": "GitHub nedostupný — token nie je nastavený"}, 200
+    body = text
+    if author:
+        body = body + f"\n\n_Doplnené cez appku (Vývoj) — {author}_"
+    try:
+        r = requests.post(
+            f"{GITHUB_API}/repos/{repo}/issues/{number}/comments",
+            json={"body": body},
+            headers=_gh_headers(token), timeout=GH_TIMEOUT)
+        if r.status_code not in (200, 201):
+            log.warning("gh add note: HTTP %s for %s#%s", r.status_code, repo, number)
+            return {"ok": False, "error": f"GitHub API vrátil {r.status_code}"}, 200
+        log.info("gh note added by %s on #%s (%d chars)", author or "?", number, len(text))
+        return {"ok": True}, 201
+    except Exception as e:  # noqa: BLE001 — never crash on GitHub trouble
+        log.warning("gh add note failed: %r", e)
+        return {"ok": False, "error": "GitHub nedostupný"}, 200
+
+
+def _ensure_label(token, repo, name, color):
+    """Create the label if it doesn't exist yet (idempotent — an „already_exists"
+    422 is fine). Best-effort: a failure here never blocks the priority set."""
+    try:
+        requests.post(f"{GITHUB_API}/repos/{repo}/labels",
+                      json={"name": name, "color": color},
+                      headers=_gh_headers(token), timeout=GH_TIMEOUT)
+    except Exception as e:  # noqa: BLE001 — never crash on GitHub trouble
+        log.warning("gh ensure label %s failed: %r", name, e)
+
+
+def _do_set_priority(number: int, priority: str):
+    """(payload, status) — set the boss's in-app priority by managing the hidden
+    prio labels: add the chosen one, remove the other. `priority` is 'soon',
+    'later' or 'none' (clear). Graceful on no-token / upstream / network error."""
+    token, repo = _gh_config()
+    if not token:
+        return {"ok": False, "available": False,
+                "error": "GitHub nedostupný — token nie je nastavený"}, 200
+    keep = PRIO_LABELS.get(priority)                       # None for 'none' (clear)
+    remove = [n for k, n in PRIO_LABELS.items() if n != keep]
+    try:
+        for name in remove:                               # drop the opposite label(s)
+            requests.delete(                              # 404 (not present) is fine
+                f"{GITHUB_API}/repos/{repo}/issues/{number}/labels/{quote(name, safe='')}",
+                headers=_gh_headers(token), timeout=GH_TIMEOUT)
+        if keep:
+            _ensure_label(token, repo, keep, PRIO_COLORS[priority])
+            r = requests.post(
+                f"{GITHUB_API}/repos/{repo}/issues/{number}/labels",
+                json={"labels": [keep]},
+                headers=_gh_headers(token), timeout=GH_TIMEOUT)
+            if r.status_code not in (200, 201):
+                log.warning("gh set prio: HTTP %s for %s#%s", r.status_code, repo, number)
+                return {"ok": False, "error": f"GitHub API vrátil {r.status_code}"}, 200
+        log.info("gh priority %s set on #%s", priority, number)
+        return {"ok": True, "priority": priority if keep else ""}, 200
+    except Exception as e:  # noqa: BLE001 — never crash on GitHub trouble
+        log.warning("gh set priority failed: %r", e)
+        return {"ok": False, "error": "GitHub nedostupný"}, 200
+
+
 def _idea_rate_limited(key: str) -> bool:
     """Coarse anti-spam guard on idea creation (per user). Records this attempt."""
     now = time.time()
@@ -1797,6 +1881,39 @@ def api_dev_idea():
         return jsonify({"ok": False,
                         "error": "priveľa nápadov za krátky čas — skús o chvíľu"}), 429
     payload, status = _do_create_idea(title, desc, email)
+    return jsonify(payload), status
+
+
+@app.route("/api/dev/issue/<int:number>/note", methods=["POST"])
+def api_dev_note(number):
+    """Append the boss's detail to an existing issue as a GitHub comment. The boss
+    writes it in the app; GitHub stays hidden (token server-side only). Validated
+    (non-empty, capped) and rate-limited (shared idea/note anti-spam counter)."""
+    body = request.get_json(force=True, silent=True) or {}
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return jsonify({"ok": False, "error": "text detailu je povinný"}), 400
+    if len(text) > NOTE_MAX:
+        return jsonify({"ok": False,
+                        "error": f"detail môže mať najviac {NOTE_MAX} znakov"}), 400
+    u = _current_user()
+    email = u["email"] if u else ""
+    if _idea_rate_limited(email):
+        return jsonify({"ok": False,
+                        "error": "priveľa zápisov za krátky čas — skús o chvíľu"}), 429
+    payload, status = _do_add_note(number, text, email)
+    return jsonify(payload), status
+
+
+@app.route("/api/dev/issue/<int:number>/priority", methods=["POST"])
+def api_dev_priority(number):
+    """Set the boss's in-app priority for an issue ('soon'/'later'/'none'). Drives
+    the „čoskoro/neskôr" split via hidden labels — the boss never sees GitHub."""
+    body = request.get_json(force=True, silent=True) or {}
+    prio = str(body.get("priority") or "").strip().lower()
+    if prio not in ("soon", "later", "none"):
+        return jsonify({"ok": False, "error": "neplatná priorita"}), 400
+    payload, status = _do_set_priority(number, prio)
     return jsonify(payload), status
 
 

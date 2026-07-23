@@ -1172,13 +1172,24 @@ function renderDev() {
     wrap.appendChild(el('div', 'srch-empty', 'Žiadne úlohy v tomto filtri.'));
     return;
   }
+  // Split by the boss's priority: „Riešiť čoskoro" on top, unprioritised in the
+  // middle, „Riešiť neskôr" at the bottom (#Vývoj priority).
+  const byPrio = { soon: [], '': [], later: [] };
+  for (const it of shown) (byPrio[it.priority] || byPrio['']).push(it);
+  const groups = [['soon', '🔴 Riešiť čoskoro'], ['', ''], ['later', '🟡 Riešiť neskôr']];
   const list = el('div', 'dev-list');
-  for (const it of shown) list.appendChild(renderDevRow(it));
+  for (const [key, label] of groups) {
+    const items = byPrio[key];
+    if (!items.length) continue;
+    if (label) list.appendChild(el('div', 'dev-group ' + key, label));
+    for (const it of items) list.appendChild(renderDevRow(it));
+  }
   wrap.appendChild(list);
 }
 
 function renderDevRow(it) {
-  const row = el('div', 'dev-row' + (it.state === 'closed' ? ' closed' : ''));
+  const row = el('div', 'dev-row' + (it.state === 'closed' ? ' closed' : '')
+                 + (it.priority ? ' prio-' + it.priority : ''));
   const head = el('div', 'dev-head');
   head.appendChild(el('span', 'dev-num', '#' + it.number));
   const title = el('a', 'dev-title', escapeHtml(it.title || '(bez názvu)'));
@@ -1189,10 +1200,75 @@ function renderDevRow(it) {
   row.appendChild(head);
   const meta = el('div', 'dev-meta');
   for (const lbl of (it.labels || [])) meta.appendChild(el('span', 'dev-label', escapeHtml(lbl)));
+  if (it.comments) meta.appendChild(el('span', 'dev-cmt', '💬 ' + it.comments));
   const upd = _devDate(it.updated_at);
   if (upd) meta.appendChild(el('span', 'dev-upd', 'upravené ' + upd));
-  if ((it.labels || []).length || upd) row.appendChild(meta);
+  if ((it.labels || []).length || it.comments || upd) row.appendChild(meta);
+  // Boss controls — open issues only (closed ones are read-only history):
+  // set priority (čoskoro/neskôr) + add a detail note. GitHub stays hidden.
+  if (it.state !== 'closed') {
+    const act = el('div', 'dev-actions');
+    const cur = it.priority || 'none';
+    for (const [key, lbl] of [['soon', '🔴 Čoskoro'], ['later', '🟡 Neskôr'], ['none', '— Bez priority']]) {
+      const b = el('button', 'dev-prio' + (key === cur ? ' active' : ''), lbl);
+      b.onclick = () => _devSetPriority(it.number, key === cur ? 'none' : key);
+      act.appendChild(b);
+    }
+    const noteBtn = el('button', 'dev-note-btn', '➕ Doplniť detail');
+    noteBtn.onclick = () => _devToggleNote(row, it.number);
+    act.appendChild(noteBtn);
+    row.appendChild(act);
+  }
   return row;
+}
+
+// Set the boss's priority for an issue, then refresh the split. GitHub hidden.
+async function _devSetPriority(number, priority) {
+  let ok = false, err = '';
+  try {
+    const r = await fetch(`/api/dev/issue/${number}/priority`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ priority }),
+    });
+    const j = await r.json(); ok = j.ok; err = j.error || '';
+  } catch (_) { err = 'sieť'; }
+  if (!ok) { window.alert('Nepodarilo sa nastaviť prioritu: ' + err); return; }
+  await loadDevIssues();
+  renderDev();
+}
+
+// Toggle an inline „doplniť detail" editor under a row; save → GitHub comment.
+function _devToggleNote(row, number) {
+  const existing = row.querySelector('.dev-note-box');
+  if (existing) { existing.remove(); return; }
+  const box = el('div', 'dev-note-box');
+  const ta = el('textarea', 'dev-note-ta');
+  ta.placeholder = 'Napíš detail k tejto úlohe…';
+  ta.maxLength = 5000;
+  const bar = el('div', 'dev-note-bar');
+  const save = el('button', 'dev-note-save', 'Uložiť detail');
+  const msg = el('span', 'dev-note-msg', '');
+  save.onclick = async () => {
+    const text = ta.value.trim();
+    if (!text) { msg.textContent = 'Napíš aspoň nejaký text.'; msg.className = 'dev-note-msg err'; return; }
+    save.disabled = true; msg.textContent = 'Ukladám…'; msg.className = 'dev-note-msg';
+    let ok = false, err = '';
+    try {
+      const r = await fetch(`/api/dev/issue/${number}/note`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const j = await r.json(); ok = j.ok; err = j.error || '';
+    } catch (_) { err = 'sieť'; }
+    save.disabled = false;
+    if (!ok) { msg.textContent = 'Nepodarilo sa: ' + err; msg.className = 'dev-note-msg err'; return; }
+    msg.textContent = 'Detail uložený ✓'; msg.className = 'dev-note-msg ok';
+    ta.value = '';
+  };
+  bar.appendChild(save); bar.appendChild(msg);
+  box.appendChild(ta); box.appendChild(bar);
+  row.appendChild(box);
+  ta.focus();
 }
 
 // Idea lightbulb — any logged-in user writes an idea → POST /api/dev/idea creates a
