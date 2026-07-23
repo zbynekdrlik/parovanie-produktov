@@ -221,3 +221,4 @@
 - Testy: e2e `test_shell.py::test_favicon_present_and_generic_title` (favicon link + title=Forestshop, čistá konzola); `test_ui_labels.py::test_pencils_hidden_until_edit_mode_enabled` (default hidden → toggle → visible → toggle → hidden) + existujúce rename testy updatnuté (zapnúť edit-mód pred klikom na ceruzku) + non-admin nevidí `#editLabelsBtn`. Cache-bust `?v=50` style.css + `?v=58` app.js. 816 backend green, 84 e2e green, ruff clean.
 - Base <BASE> / head <PUSH>. PR <PR> — ZASTAVENÉ na zelenom mergeable PR (autorita FULL, ale dispatch = STOP-at-green-PR; supervízor reviewne + merguje + nasadí).
 - #175+#176 favicon+nazov Forestshop + ceruzky v edit-mode -> PR #188 merged efe72b4, v0.77.0 (self-review SHIP, frontend). 2026-07-23 16:22
+- #101 komentare k objednavkam (nasa strana + read-only shopRemark) -> PR #190 merged 30611f9, v0.78.0 (Opus review SHIP; KROK 3 Shoptet zapis -> #189). 2026-07-23 17:13
