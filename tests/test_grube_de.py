@@ -218,3 +218,17 @@ def test_normalize_size_letter_and_numeric():
     assert normalize_size("XXXXXL") == "5XL"
     assert normalize_size("46") == "46"           # numeric kept as-is
     assert normalize_size("") == ""
+
+
+def test_parse_variants_color_only_no_size_is_link_only():
+    """#60 review Finding 1: a color-only product (own Offers EXIST but carry only
+    Farbe, no 'Größe') must be link-only — NOT the default colour's itemId from the
+    anchor. The single-size anchor fallback may run ONLY when the page has zero own
+    Offers (a true single-variant knife); own offers with no size axis = fail-closed."""
+    html = (
+        '{"name":"Morakniv Companion Farbe oliv","price":"12","priceCurrency":"EUR","sku":"2540316117"}'
+        '{"name":"Morakniv Companion Farbe braun","price":"12","priceCurrency":"EUR","sku":"2540319999"}'
+        '<a href="/p/morakniv/254031/#itemId=2540316117">Erinnerung</a>'
+    )
+    # own offers 2540316117 + 2540319999 (prefix 254031, len 10) but NO Größe → color-only.
+    assert parse_variants(html, "254031") == {}
