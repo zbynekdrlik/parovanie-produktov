@@ -236,7 +236,9 @@ function splitRow(p, v) {
     state.className = 'splitstate' + (val ? ' has' : '');
     state.textContent = val ? '✓ link nastavený' : 'bez linku';
   };
-  const commit = (val) => saveVariantLink(v.code, val).then(ok => { if (ok) mark(val); });
+  // Keep the variant object in sync (v.link) so the #180 missing-link check sees the
+  // current saved state — including a CLEAR (v.link back to '' when the manager empties it).
+  const commit = (val) => saveVariantLink(v.code, val).then(ok => { if (ok) { v.link = val || ''; mark(val); } });
   // whole-product candidates as quick-picks — the manager picks the right one per size
   if (p.candidates && p.candidates.length) {
     const cbox = el('div', 'splitcands');
@@ -257,6 +259,16 @@ function splitRow(p, v) {
   return row;
 }
 
+// #180 — which sizes still have NO own supplier link. Split-commit does NOT delete an
+// existing whole-product URL for those variants (skip-empty on purpose), so they silently
+// keep the OLD link. Returns the size labels (or codes) of variants whose effective link is
+// empty — mirrors the exact rule splitRow displays (VARIANT_LINKS override, else v.link).
+function variantsWithoutLink(variants) {
+  return (variants || [])
+    .filter(v => !((VARIANT_LINKS[v.code] || '').trim() || (v.link || '').trim()))
+    .map(v => v.size || v.code);
+}
+
 // #174 — the split-into-sizes editor for one product: hint + per-variant rows (loaded
 // from /api/variants) + a commit/undo footer. `split` decision marks the card resolved.
 function splitPanel(p) {
@@ -265,11 +277,13 @@ function splitPanel(p) {
     'Dodávateľ má inú stránku pre každú veľkosť? Nastav vlastný link pre KAŽDÚ veľkosť.'));
   const rowsBox = el('div', 'splitrows loading', 'načítavam veľkosti…');
   wrap.appendChild(rowsBox);
+  let loadedVariants = [];   // #180 — variant rows for the missing-link warning on commit
   fetch('/api/variants?key=' + encodeURIComponent(p.key))
     .then(r => r.json())
     .then(j => {
+      loadedVariants = j.variants || [];
       rowsBox.classList.remove('loading'); rowsBox.innerHTML = '';
-      for (const v of (j.variants || [])) rowsBox.appendChild(splitRow(p, v));
+      for (const v of loadedVariants) rowsBox.appendChild(splitRow(p, v));
     })
     .catch(() => { rowsBox.classList.remove('loading'); rowsBox.textContent = 'Nepodarilo sa načítať veľkosti.'; });
   const foot = el('div', 'splitfoot');
@@ -279,7 +293,17 @@ function splitPanel(p) {
     foot.appendChild(back);
   } else {
     const done = el('button', 'btn good sm', '✓ Hotovo – rozdelené');
-    done.onclick = () => { splitOpen.delete(p.key); saveDecision(p, 'split', ''); };
+    done.onclick = () => {
+      // #180 — warn if some sizes have no own link: they'd keep the OLD whole-product URL.
+      const missing = variantsWithoutLink(loadedVariants);
+      if (missing.length) {
+        const msg = missing.length === 1
+          ? 'Veľkosť ' + missing[0] + ' nemá vlastný link — ostane jej pôvodný link produktu. Pokračovať?'
+          : 'Veľkosti ' + missing.join(', ') + ' nemajú vlastný link — ostane im pôvodný link produktu. Pokračovať?';
+        if (!confirm(msg)) return;   // cancel → stay in the split editor
+      }
+      splitOpen.delete(p.key); saveDecision(p, 'split', '');
+    };
     const cancel = el('button', 'btn ghost sm', '✗ Zrušiť');
     cancel.onclick = () => { splitOpen.delete(p.key); render(); };
     foot.appendChild(done); foot.appendChild(cancel);
