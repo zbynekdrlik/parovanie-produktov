@@ -91,6 +91,133 @@ def test_split_into_sizes_per_variant_link_persists(page, matched_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_variants_without_link_helper(page, matched_server):
+    """#180 — the pure `variantsWithoutLink` helper (unit-tested in the browser realm):
+    a variant is 'without a link' only if BOTH its VARIANT_LINKS override AND its v.link
+    are empty; the returned label is `size || code`. Mirrors exactly what splitRow shows."""
+    page.goto(matched_server + "/?tab=review")
+    page.wait_for_selector(".card")
+    result = page.evaluate(
+        """() => {
+            VARIANT_LINKS = { a: 'https://x.sk', b: '' };
+            return {
+              mixed: variantsWithoutLink([
+                { code: 'a', size: 'M',  link: '' },
+                { code: 'b', size: 'L',  link: '' },
+                { code: 'c', size: 'XL', link: '' }]),
+              from_link: variantsWithoutLink([{ code: 'd', size: '', link: 'https://y.sk' }]),
+              fallback_code: variantsWithoutLink([{ code: 'e', size: '', link: '' }]),
+              empty: variantsWithoutLink([]),
+              nullish: variantsWithoutLink(null),
+            };
+        }""")
+    # a has a saved link (skip); b empty-string override + no link (missing → 'L');
+    # c not in VARIANT_LINKS + no link (missing → 'XL').
+    assert result["mixed"] == ["L", "XL"]
+    # d has an existing v.link → not missing.
+    assert result["from_link"] == []
+    # no size label → falls back to the code.
+    assert result["fallback_code"] == ["e"]
+    assert result["empty"] == []
+    assert result["nullish"] == []
+
+
+def test_split_commit_warns_when_a_size_lacks_link_and_confirm_proceeds(page, matched_server):
+    """#180 — committing a split with SOME sizes still un-linked pops a confirm() naming
+    those sizes (they'd keep the old whole-product URL). Accepting → the split commits as
+    a decision (progress 1/1), exactly as before. Isolated function-scoped matched_server."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+    dialogs = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+
+    page.goto(matched_server + "/?tab=review")
+    page.wait_for_selector(".card")
+    page.get_by_role("button", name="✂ Rozdeliť na veľkosti").first.click()
+    page.wait_for_selector(".splitrow[data-code='1/M']")
+    assert page.locator(".splitrow").count() == 2
+
+    # Link ONLY the 1/M size; leave 1/L WITHOUT a link.
+    m_row = page.locator(".splitrow[data-code='1/M']")
+    m_row.locator("input.spliturl").fill("https://trigona.sk/vel-m")
+    with page.expect_response(
+            lambda r: "/api/variant-link" in r.url and r.request.method == "POST"):
+        m_row.locator(".splitsave").click()
+    page.wait_for_selector(".splitrow[data-code='1/M'] .splitstate.has")
+
+    # Commit → warning fires (1/L is un-linked); accept → the split commits.
+    with page.expect_response(
+            lambda r: "/api/decision" in r.url and r.request.method == "POST"):
+        page.get_by_role("button", name="✓ Hotovo – rozdelené").click()
+    page.wait_for_function(
+        "() => document.getElementById('progressText').textContent.startsWith('1 / 1')")
+
+    assert len(dialogs) == 1, f"expected exactly one confirm dialog, got {dialogs}"
+    assert "1/L" in dialogs[0], f"warning must name the un-linked size: {dialogs[0]}"
+    assert console == [], f"console not clean: {console}"
+
+
+def test_split_commit_warning_cancel_keeps_edit_mode(page, matched_server):
+    """#180 — dismissing the missing-link confirm() aborts the commit: no decision is
+    written and the split editor stays open (Hotovo button still there, no split badge)."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+    dialogs = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.dismiss()))
+
+    page.goto(matched_server + "/?tab=review")
+    page.wait_for_selector(".card")
+    page.get_by_role("button", name="✂ Rozdeliť na veľkosti").first.click()
+    page.wait_for_selector(".splitrow[data-code='1/M']")
+
+    # Leave BOTH sizes un-linked, commit → warning → dismiss (cancel).
+    page.get_by_role("button", name="✓ Hotovo – rozdelené").click()
+
+    assert len(dialogs) == 1, f"expected exactly one confirm dialog, got {dialogs}"
+    assert "1/M" in dialogs[0] and "1/L" in dialogs[0], \
+        f"warning must name both un-linked sizes: {dialogs[0]}"
+    # The commit was aborted: editor still open, no 'split' decision was recorded.
+    page.wait_for_selector("button:has-text('✓ Hotovo – rozdelené')")
+    assert page.locator(".splitrow[data-code='1/M']").count() == 1
+    assert page.locator(".badge.split").count() == 0
+    assert console == [], f"console not clean: {console}"
+
+
+def test_split_commit_no_warning_when_all_sizes_have_link(page, matched_server):
+    """#180 — when EVERY size has its own link, committing the split shows NO confirm()
+    and commits straight through (the pre-#180 behavior, guarded so it can't regress)."""
+    console = []
+    page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
+            if m.type in ("error", "warning") else None)
+    dialogs = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+
+    page.goto(matched_server + "/?tab=review")
+    page.wait_for_selector(".card")
+    page.get_by_role("button", name="✂ Rozdeliť na veľkosti").first.click()
+    page.wait_for_selector(".splitrow[data-code='1/M']")
+
+    for code, url in (("1/M", "https://trigona.sk/vel-m"), ("1/L", "https://trigona.sk/vel-l")):
+        row = page.locator(f".splitrow[data-code='{code}']")
+        row.locator("input.spliturl").fill(url)
+        with page.expect_response(
+                lambda r: "/api/variant-link" in r.url and r.request.method == "POST"):
+            row.locator(".splitsave").click()
+        page.wait_for_selector(f".splitrow[data-code='{code}'] .splitstate.has")
+
+    # All linked → no dialog, straight commit.
+    with page.expect_response(
+            lambda r: "/api/decision" in r.url and r.request.method == "POST"):
+        page.get_by_role("button", name="✓ Hotovo – rozdelené").click()
+    page.wait_for_function(
+        "() => document.getElementById('progressText').textContent.startsWith('1 / 1')")
+
+    assert dialogs == [], f"no confirm expected when all sizes are linked: {dialogs}"
+    assert console == [], f"console not clean: {console}"
+
+
 def test_toorder_tab_lists_items_and_checkbox_persists(page, live_server):
     console = []
     page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
