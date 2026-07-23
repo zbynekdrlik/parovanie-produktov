@@ -423,3 +423,50 @@ def test_dev_priority_token_missing_degrades_gracefully(monkeypatch):
     assert r.status_code != 500
     j = r.get_json()
     assert j["ok"] is False and j["available"] is False
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/dev/issue/<n> — issue body + all comments (the boss reads everything)
+# --------------------------------------------------------------------------- #
+def test_dev_issue_detail_requires_login():
+    c = webapp.app.test_client()
+    r = c.get("/api/dev/issue/5")
+    assert r.status_code == 401
+
+
+def test_dev_issue_detail_returns_body_and_comments(monkeypatch):
+    _configure(monkeypatch)
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("/issues/5/comments"):
+            return _Resp(200, [
+                {"body": "prvý detail", "created_at": "2026-07-22T10:00:00Z"},
+                {"body": "druhý detail", "created_at": "2026-07-22T11:00:00Z"},
+            ])
+        if url.endswith("/issues/5"):
+            return _Resp(200, {"number": 5, "body": "zadanie úlohy"})
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(webapp.requests, "get", fake_get)
+    j = _client().get("/api/dev/issue/5").get_json()
+    assert j["ok"] is True
+    assert j["body"] == "zadanie úlohy"
+    assert [c["body"] for c in j["comments"]] == ["prvý detail", "druhý detail"]
+    assert "test-token" not in "".join([j["body"], j["comments"][0]["body"]])
+
+
+def test_dev_issue_detail_upstream_error_degrades_gracefully(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(webapp.requests, "get",
+                        lambda *a, **k: _Resp(404, {"message": "Not Found"}))
+    r = _client().get("/api/dev/issue/5")
+    assert r.status_code == 200                      # never 500
+    assert r.get_json()["ok"] is False
+
+
+def test_dev_issue_detail_token_missing_degrades_gracefully():
+    # no token; requests.get is the raising guard → must NOT be called
+    r = _client().get("/api/dev/issue/5")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["ok"] is False and j["available"] is False

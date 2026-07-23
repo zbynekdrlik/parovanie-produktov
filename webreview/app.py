@@ -1799,6 +1799,35 @@ def _do_add_note(number: int, text: str, author: str = ""):
         return {"ok": False, "error": "GitHub nedostupný"}, 200
 
 
+def _do_issue_detail(number: int):
+    """(payload, status) — one issue's full text (body) + ALL its comments, so the
+    boss reads everything IN the app (GitHub stays hidden). No token → graceful
+    „unavailable"; upstream/network errors are caught (never 500)."""
+    token, repo = _gh_config()
+    if not token:
+        return {"ok": False, "available": False,
+                "error": "GitHub nedostupný — token nie je nastavený"}, 200
+    try:
+        ri = requests.get(f"{GITHUB_API}/repos/{repo}/issues/{number}",
+                          headers=_gh_headers(token), timeout=GH_TIMEOUT)
+        if ri.status_code != 200:
+            log.warning("gh issue detail: HTTP %s for %s#%s", ri.status_code, repo, number)
+            return {"ok": False, "error": f"GitHub API vrátil {ri.status_code}"}, 200
+        it = ri.json() if isinstance(ri.json(), dict) else {}
+        comments = []
+        rc = requests.get(f"{GITHUB_API}/repos/{repo}/issues/{number}/comments",
+                          params={"per_page": GH_LIST_PER_PAGE},
+                          headers=_gh_headers(token), timeout=GH_TIMEOUT)
+        if rc.status_code == 200 and isinstance(rc.json(), list):
+            comments = [{"body": c.get("body") or "",
+                         "created_at": c.get("created_at") or ""}
+                        for c in rc.json() if isinstance(c, dict)]
+        return {"ok": True, "body": it.get("body") or "", "comments": comments}, 200
+    except Exception as e:  # noqa: BLE001 — never crash on GitHub trouble
+        log.warning("gh issue detail failed: %r", e)
+        return {"ok": False, "error": "GitHub nedostupný"}, 200
+
+
 def _ensure_label(token, repo, name, color):
     """Create the label if it doesn't exist yet (idempotent — an „already_exists"
     422 is fine). Best-effort: a failure here never blocks the priority set."""
@@ -1888,6 +1917,14 @@ def api_dev_idea():
         return jsonify({"ok": False,
                         "error": "priveľa nápadov za krátky čas — skús o chvíľu"}), 429
     payload, status = _do_create_idea(title, desc, email)
+    return jsonify(payload), status
+
+
+@app.route("/api/dev/issue/<int:number>")
+def api_dev_issue_detail(number):
+    """One issue's full text + all its details/comments, so the boss reads
+    everything in the app (GitHub stays hidden)."""
+    payload, status = _do_issue_detail(number)
     return jsonify(payload), status
 
 
