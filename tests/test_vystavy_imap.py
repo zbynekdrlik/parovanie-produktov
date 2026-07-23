@@ -56,6 +56,54 @@ def test_trim_quote_empty():
     assert vi.trim_quote(None) == ""
 
 
+def test_trim_quote_sk_od_header():
+    """SK/CZ „Od:" quoted-header block (marker 4) — everything from it is the quote."""
+    body = ("Áno, potvrdzujem účasť.\n\n"
+            "Od: ForestShop.sk <info@forestshop.sk>\n"
+            "Odoslané: 3. júna 2026 9:00\n"
+            "Komu: org@vystava.sk\n> obraciam sa na Vás...")
+    assert vi.trim_quote(body) == "Áno, potvrdzujem účasť."
+
+
+def test_trim_quote_povodna_sprava_divider():
+    """„---Pôvodná správa---" divider (marker 5) cuts the quoted original."""
+    body = "Prihláška prijatá.\n\n---Pôvodná správa---\nOd: info@forestshop.sk\n> text"
+    assert vi.trim_quote(body) == "Prihláška prijatá."
+
+
+def test_trim_quote_outlook_underscore_divider():
+    """Outlook „______" underscore divider (marker 6, `_{5,}`) cuts the quote."""
+    body = ("Ďakujeme, tešíme sa.\n\n"
+            "______________________________\n"
+            "From: info@forestshop.sk\nSent: ...\n> original")
+    assert vi.trim_quote(body) == "Ďakujeme, tešíme sa."
+
+
+# ── _body_text via parse_inbox: multipart/alternative + attachment ──────────────
+def test_parse_inbox_multipart_alternative_uses_text_plain():
+    """A real client reply is multipart/alternative (text/plain + text/html) with an
+    attachment. parse_inbox must extract the text/plain part (not html, not the
+    attachment) and trim_quote must still strip the quoted chain. #198 FIX 6."""
+    m = EmailMessage()
+    m["From"] = "org@vystava.sk"
+    m["Subject"] = "Re: Otázka"
+    m["In-Reply-To"] = "<q1@forestshop.sk>"
+    m.set_content("Áno, výstava bude.\n\n"
+                  "Dňa 3. 6. 2026 napísal Štepán Drlík:\n> pôvodná otázka")
+    m.add_alternative("<html><body><p>Áno, výstava bude.</p></body></html>",
+                      subtype="html")
+    m.add_attachment(b"%PDF-1.4 fake", maintype="application", subtype="pdf",
+                     filename="prihlaska.pdf")
+    assert m.is_multipart()
+
+    (p,) = vi.parse_inbox([m])
+    # text/plain part chosen (html markup + attachment bytes excluded)
+    assert "Áno, výstava bude." in p["body_text"]
+    assert "<html>" not in p["body_text"] and "%PDF" not in p["body_text"]
+    # and the quoted chain is trimmed off for the feed excerpt
+    assert vi.trim_quote(p["body_text"]) == "Áno, výstava bude."
+
+
 # ── parse_inbox ───────────────────────────────────────────────────────────────
 def test_parse_inbox_extracts_fields():
     m = _msg('"Organizátor" <org@vystava.sk>', "Re: Otázka", "Telo odpovede.",
