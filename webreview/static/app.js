@@ -309,7 +309,8 @@ const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
 const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['orders_reminder', 'Pripomienky objednávok'],
   ['shoptet_sync', 'Sync zo Shoptetu'],
   ['parovania_eshop', 'Párovania → eshop'], ['dodavatelsky_sklad', 'Dodávateľský sklad'],
-  ['riziko_vypadku', 'Riziko výpadku'], ['restock_skladom', 'Vypredané → Skladom']];
+  ['riziko_vypadku', 'Riziko výpadku'], ['restock_skladom', 'Vypredané → Skladom'],
+  ['image_health', 'Kontrola obrázkov']];
 
 const NAV_ICONS = {
   review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
@@ -328,6 +329,8 @@ const NAV_ICONS = {
   restock_skladom: '<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M9 12l3-3 3 3"/><path d="M12 9v7"/>',
   orders_reminder: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/>'
     + '<path d="M8 2v4M16 2v4"/><path d="M12 12v3"/><path d="M12 17.5v.01"/>',
+  image_health: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2"/>'
+    + '<path d="M21 16l-5.5-5.5L11 15"/>',
   dev: '<path d="M8 9l-4 3 4 3"/><path d="M16 9l4 3-4 3"/><path d="M13 5l-2 14"/>',
 };
 
@@ -402,7 +405,8 @@ const PAGE_TITLES = {
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
   parovania_eshop: 'Párovania → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
-  riziko_vypadku: 'Riziko výpadku', restock_skladom: 'Vypredané → Skladom', dev: 'Vývoj',
+  riziko_vypadku: 'Riziko výpadku', restock_skladom: 'Vypredané → Skladom',
+  image_health: 'Kontrola obrázkov', dev: 'Vývoj',
 };
 function setPageHead() {
   const h = document.getElementById('pageTitle');
@@ -435,6 +439,8 @@ function setPageHead() {
   } else if (ACTIVE_TAB === 'restock_skladom') {
     const n = RESTOCK ? (RESTOCK.candidates || []).length : 0;
     s.textContent = `${n} produktov na naskladnenie · máme vypredané, dodávateľ má opäť skladom`;
+  } else if (ACTIVE_TAB === 'image_health') {
+    s.textContent = 'Periodická kontrola vlastných obrázkov produktov (mŕtve odkazy sa z karty odstránia)';
   } else if (ACTIVE_TAB === 'dev') {
     if (DEV && DEV.available) {
       const iss = DEV.issues || [];
@@ -502,6 +508,7 @@ async function switchTab(tab) {
   if (tab === 'riziko_vypadku') await loadRiziko();   // always fresh — status can change
   if (tab === 'restock_skladom') await loadRestock();   // always fresh — status can change
   if (tab === 'orders_reminder') await loadOrdersReminder();   // always fresh — status can change
+  if (tab === 'image_health') await loadAutomations();   // always fresh — status can change
   if (tab === 'dev') await loadDevIssues();   // always fresh — issues change on GitHub
   render();
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
@@ -1494,6 +1501,59 @@ function renderShoptetSync() {
   wrap.appendChild(st);
 }
 
+// ---- Automatizácie (#135): tab „Kontrola obrázkov" -------------------------- //
+// Plain status-only tab (like Sync zo Shoptetu) — periodic HEAD-check of our own
+// review-card image URLs (our_images). Nothing to browse per-item; just counts +
+// last-run. The actual fix (dead URL never served) happens in /api/products —
+// this tab only shows what the background check found.
+function renderImageHealth() {
+  const wrap = document.getElementById('tab-image_health');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('image_health');
+  if (!a) {
+    wrap.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    return;
+  }
+  const st = el('div', 'autostatus');
+  const head = el('div', 'autohead');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'image-health-status';
+  head.appendChild(pill);
+  if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha kontrola…'));
+  const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+    a.enabled ? '⏹ Stop' : '▶ Štart');
+  btn.dataset.testid = 'image-health-toggle';
+  btn.onclick = () => toggleAutomation('image_health', !a.enabled);
+  head.appendChild(btn);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'image-health-run';
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation('image_health', 'image_health');
+  head.appendChild(run);
+  st.appendChild(head);
+
+  const meta = el('div', 'autometa');
+  const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+  bits.push('Posledný beh: ' + (a.last_run
+    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+    : 'zatiaľ nikdy'));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+  st.appendChild(meta);
+  if (a.last_status === 'error' && a.last_error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+  }
+  const lr = a.last_result || {};
+  if (a.last_run && a.last_status === 'ok') {
+    st.appendChild(el('div', 'muted',
+      `Skontrolovaných: ${lr.checked ?? 0} (preskočených ako čerstvé: ${lr.skipped ?? 0})`
+      + ` · živé: ${lr.ok ?? 0} · zlyhalo: ${lr.failed ?? 0}`
+      + ` · mŕtvych odkazov: ${lr.dead_urls ?? 0} (odstránených z kariet: ${lr.cleaned_images ?? 0})`));
+  }
+  wrap.appendChild(st);
+}
+
 // ---- Automatizácie (#109): tab „Párovania → eshop" ------------------------- //
 // Status-only tab (like Sync zo Shoptetu): the nightly push of new pairings +
 // assigned suppliers to the eshop. WRITES to the live shop → default Zastavené;
@@ -2070,8 +2130,9 @@ function render() {
   const rizikoVypadku = ACTIVE_TAB === 'riziko_vypadku';
   const restockSkladom = ACTIVE_TAB === 'restock_skladom';
   const ordersReminder = ACTIVE_TAB === 'orders_reminder';
+  const imageHealth = ACTIVE_TAB === 'image_health';
   const dev = ACTIVE_TAB === 'dev';
-  const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad || rizikoVypadku || restockSkladom || ordersReminder;  // any automation tab
+  const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad || rizikoVypadku || restockSkladom || ordersReminder || imageHealth;  // any automation tab
   const plain = search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
@@ -2087,9 +2148,11 @@ function render() {
   const secRiziko = document.getElementById('tab-riziko_vypadku'); if (secRiziko) secRiziko.hidden = !rizikoVypadku;
   const secRestock = document.getElementById('tab-restock_skladom'); if (secRestock) secRestock.hidden = !restockSkladom;
   const secOrdRem = document.getElementById('tab-orders_reminder'); if (secOrdRem) secOrdRem.hidden = !ordersReminder;
+  const secImgHealth = document.getElementById('tab-image_health'); if (secImgHealth) secImgHealth.hidden = !imageHealth;
   const secDev = document.getElementById('tab-dev'); if (secDev) secDev.hidden = !dev;
   const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = plain ? 'none' : '';
   if (dev) { document.getElementById('empty').hidden = true; renderDev(); return; }
+  if (imageHealth) { document.getElementById('empty').hidden = true; renderImageHealth(); return; }
   if (ordersReminder) { document.getElementById('empty').hidden = true; renderOrdersReminder(); return; }
   if (restockSkladom) { document.getElementById('empty').hidden = true; renderRestockSkladom(); return; }
   if (rizikoVypadku) { document.getElementById('empty').hidden = true; renderRizikoVypadku(); return; }
