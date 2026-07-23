@@ -607,3 +607,38 @@ e-mailov — VŽDY za náhľadom, nikdy auto.
 - **GOTCHA — nový TAB v TABS rozbije `test_shell.py::test_nav_order_has_review_last`** (hard-koduje
   celý zoznam label-ov `#tabs .tlabel`). Pridaj nový label na správnu pozíciu. Server-side pridaj
   kľúč aj do `NAV_KEYS` (inak #173 premenovanie tabu → 400).
+
+## Rozdeliť produkt na veľkosti — per-veľkosť dodávateľský link (#174, v0.72.0)
+
+Produkt s viacerými veľkosťami, kde dodávateľ má INÚ produktovú stránku PRE KAŽDÚ veľkosť
+(napr. TRIGONA THERMOPAD S/M/L/XL/XXL, každá vlastný `p-XXXXX.xhtml`). Review karta má tlačidlo
+**„✂ Rozdeliť na veľkosti"** (len pri `variant_codes.length > 1`) → rozbalí per-veľkosť riadky,
+manažér nastaví VLASTNÝ link pre KAŽDÚ veľkosť.
+
+- **Store `data/out/variant_links.json` `{variant_code: url}`** (vzor `order_pairings`, per-KÓD,
+  NEVER-pruned, atomický). Kľúč = STABILNÝ variant kód, NIE array idx.
+- **Nový decision status `"split"`** (`decisions.json`, `{status:"split", url:""}`) = marker že
+  produkt je vyriešený per-veľkosť + BRÁNA pre zápis. `matchesFilter` 'good' zahŕňa split;
+  `badge` má split; `navCount('review')` (unreviewed) ho nepočíta (má decision). **Zápis do eshopu
+  cez `import_builder.link_rows` — dostal 4. param `variant_links`**: pre `split` píše per-variant
+  `variant_links[code]` (preskočí variant BEZ linku — NIKDY prázdna internalNote bunka, tá by
+  zmazala existujúci link), GRUBE→.de normalizácia zachovaná; good/manual = 1 link na všetky
+  varianty (bez zmeny, default `variant_links={}` → back-compat 3-arg callers).
+- **Doprava = LEN ručný zip `/api/import`** (mirror GRUBE per-size externalCode cesty — nočný
+  `_do_upload_pairings` NEzmenený, split upload odložený na follow-up ako GRUBE #62). Nepridávaj
+  split do nočnej cesty bez per-`vlink:<code>` incremental trackingu.
+- **`CODE2VARIANT` (veľkostné labely) sa stavia v `_load_catalog`** — ten teraz vracia **3-tuple**
+  `(code2pair, code2variant, catalog)`. DVAJA volajúci (štart + `run_shoptet_sync` global) MUSIA
+  unpacknúť 3. Label = populated `variant:*` stĺpce (colon prefix, NIE `variantVisibility`) joinnuté;
+  LEN pre DISPLAY (autoritatívny kľúč = kód).
+- **Endpointy**: `POST /api/variant-link {code,url}` (set/clear, formula-lead + `^https?://` guard,
+  mirror `/api/order-pair`), `GET /api/variants?key=` (per-produkt `[{code,size,link}]`); `variant_links`
+  mapa doplnená do `/api/products` (klient ju načíta ako `DECISIONS`).
+- **Frontend**: `splitPanel(p)` async-fetchne `/api/variants` → `splitRow` per variant (size label +
+  kód + whole-product kandidáti ako per-veľkosť „Vybrať" + manuálny URL input, save per kód cez
+  `saveVariantLink`). `splitOpen` Set (transient). Split UI preberá pravú stranu karty keď
+  `splitOpen.has(key) || status==='split'`. Cache-bust `?v=` bump.
+- **E2E**: `test_review_ui::test_split_into_sizes_...` používa **`matched_server`** (function-scoped,
+  izolovaný — split decision NEpolutuje session-scoped `live_server`, rovnaká pointa ako matched-buttons).
+  Po reloade je split karta „vyriešená" → default `unreviewed` filter ju NEukáže; test klikne filter
+  „✓ Dobré/Vybrané" (zahŕňa split) a čaká na `.badge.split`.
