@@ -225,15 +225,48 @@ def _start_gh_stub():
             self.end_headers()
             self.wfile.write(body)
 
+        def _issue_by_num(self, n):
+            return next((it for it in state.issues if it.get("number") == n), None)
+
+        def _read(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(length) or b"{}")
+
         def do_GET(self):
-            if "/issues" in self.path:
+            # the app only ever GETs the issues LIST (…/issues?params); it never
+            # GETs comments/labels sub-resources.
+            if "/issues" in self.path and "/comments" not in self.path \
+                    and "/labels" not in self.path:
                 self._send(200, state.issues)
             else:
                 self._send(404, {"message": "not found"})
 
         def do_POST(self):
-            length = int(self.headers.get("Content-Length") or 0)
-            data = json.loads(self.rfile.read(length) or b"{}")
+            data = self._read()
+            m = re.search(r"/issues/(\d+)/comments", self.path)
+            if m:                                   # add a note (comment)
+                it = self._issue_by_num(int(m.group(1)))
+                if it is not None:
+                    it["comments"] = (it.get("comments") or 0) + 1
+                self._send(201, {"id": 1, "body": data.get("body", "")})
+                return
+            m = re.search(r"/issues/(\d+)/labels", self.path)
+            if m:                                   # add label(s) to an issue
+                it = self._issue_by_num(int(m.group(1)))
+                names = data.get("labels") or []
+                if it is not None:
+                    have = {lbl.get("name") for lbl in it["labels"]}
+                    for nm in names:
+                        if nm not in have:
+                            it["labels"].append({"name": nm})
+                    self._send(200, it["labels"])
+                else:
+                    self._send(200, [{"name": nm} for nm in names])
+                return
+            if self.path.rstrip("/").endswith("/labels"):   # ensure-label (create)
+                self._send(201, {"name": data.get("name", ""), "color": data.get("color", "")})
+                return
+            # else: create an issue (the lightbulb)
             issue = {"number": state.next_num, "title": data.get("title", ""),
                      "state": "open", "labels": [], "updated_at": "2026-07-22T12:00:00Z",
                      "html_url": f"https://example.test/issues/{state.next_num}",
@@ -241,6 +274,19 @@ def _start_gh_stub():
             state.next_num += 1
             state.issues.insert(0, issue)
             self._send(201, issue)
+
+        def do_DELETE(self):
+            m = re.search(r"/issues/(\d+)/labels/(.+)$", self.path)
+            if m:                                   # remove a label from an issue
+                name = urllib.parse.unquote(m.group(2))
+                it = self._issue_by_num(int(m.group(1)))
+                if it is not None:
+                    it["labels"] = [lbl for lbl in it["labels"] if lbl.get("name") != name]
+                    self._send(200, it["labels"])
+                else:
+                    self._send(200, [])
+                return
+            self._send(404, {"message": "not found"})
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
