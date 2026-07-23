@@ -35,8 +35,8 @@ from flask import (Flask, Response, jsonify, redirect, render_template, request,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
-    __version__, config, import_builder, orders_reminder, posta_uncollected,
-    restock_skladom, riziko_vypadku, supplier_stock)
+    __version__, config, image_health, import_builder, orders_reminder,
+    posta_uncollected, restock_skladom, riziko_vypadku, supplier_stock)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -1089,7 +1089,13 @@ def _grube_de_display(products, decisions):
 
 @app.route("/api/products")
 def api_products():
-    return jsonify(_grube_de_display(PRODUCTS, _load_decisions()))
+    # #135 — never hand the browser a genuinely dead our_images URL (Chrome logs
+    # "Failed to load resource" regardless of the #50/#74 onerror placeholder).
+    # image_health only MAINTAINS the cache; this is where it's applied — review_data.json
+    # itself is never touched.
+    cache = _load_image_health().get("cache") or {}
+    cleaned, _dropped = image_health.clean_products(PRODUCTS, cache)
+    return jsonify(_grube_de_display(cleaned, _load_decisions()))
 
 
 @app.route("/api/images")
@@ -3208,6 +3214,105 @@ def run_orders_reminder() -> dict:
     return stats
 
 
+# --------------------------------------------------------------------------- #
+# #135 — "our_images: periodicky validovať/čistiť mŕtve forestshop-CDN URL":
+# periodic HTTP validation of OUR OWN review-card image URLs (our_images —
+# cdn.myshoptet.com product photos). A genuinely dead URL handed straight to
+# the browser makes Chrome log "Failed to load resource" to the console
+# regardless of the #50/#74 onerror placeholder (that handler hides the
+# broken image visually but can't suppress the browser's own network-error
+# log). The only real fix is to never SERVE a dead URL in the first place —
+# this automation only MAINTAINS the persistent per-URL health cache
+# (data/out/image_health.json); /api/products applies it at REQUEST time
+# (image_health.clean_products) so a review card never renders a URL
+# confirmed dead. review_data.json itself is never rewritten by this run.
+# --------------------------------------------------------------------------- #
+IMAGE_HEALTH_STATE = os.path.join(OUT, "image_health.json")
+# Short timeout (mirrors /api/images' 8s fast-fail #74) — a hung supplier/CDN
+# must not tie up the whole run; it's simply recorded as a failed check.
+IMAGE_HEALTH_TIMEOUT = 8
+
+
+def _load_image_health() -> dict:
+    try:
+        with open(IMAGE_HEALTH_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_image_health(d: dict) -> None:
+    tmp = IMAGE_HEALTH_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, IMAGE_HEALTH_STATE)
+
+
+def _check_image_url(url: str) -> bool:
+    """Is `url` still a live image? HEAD first (cheap, no body transfer); a
+    host that doesn't support HEAD (405/501 — some CDNs) gets a byte-range
+    GET fallback instead of being marked dead on a technicality. ANY
+    exception (timeout, DNS failure, connection reset, TLS error, …) is
+    treated as NOT ok — a failed check IS the dead-image signal, never a
+    crash (mirrors the try/except-degrade shape of every other automation's
+    per-item network call)."""
+    try:
+        r = requests.head(url, headers={"User-Agent": UA},
+                          timeout=IMAGE_HEALTH_TIMEOUT, allow_redirects=True)
+        if r.status_code in (405, 501):
+            r = requests.get(url, headers={"User-Agent": UA, "Range": "bytes=0-0"},
+                             timeout=IMAGE_HEALTH_TIMEOUT, stream=True, allow_redirects=True)
+        return r.ok
+    except Exception as e:  # noqa: BLE001 — per-URL error is the dead signal; run continues
+        log.warning("image_health: check failed url=%s: %r", url, e)
+        return False
+
+
+def run_image_health() -> dict:
+    """One validation run (daily or "Spustiť teraz"): collect every
+    our_images URL currently in review_data.json (PRODUCTS), HEAD-check the
+    ones due (image_health.needs_check skips a URL confirmed healthy within
+    the freshness window, but ALWAYS retries one whose last result was a
+    failure), and update the persistent per-URL cache — 2 CONSECUTIVE
+    failures before an image is treated as dead (image_health.DEAD_AFTER_FAILS),
+    so a transient CDN blip never wipes a genuinely-good image. Cache entries
+    for URLs no longer referenced by any product are pruned (catalog drift)
+    so the store doesn't grow forever. WRITES NOTHING to review_data.json or
+    any manager decision store — /api/products is what filters, at request
+    time, from this cache alone."""
+    with _lock:
+        products_snapshot = list(PRODUCTS)
+    urls = image_health.collect_image_urls(products_snapshot)
+    cache = dict(_load_image_health().get("cache") or {})
+    now = datetime.now(timezone.utc).astimezone()
+    checked = skipped = ok_n = fail_n = 0
+    for url in urls:
+        if not image_health.needs_check(url, cache, now):
+            skipped += 1
+            continue
+        ok = _check_image_url(url)
+        image_health.record_result(cache, url, ok, now)
+        checked += 1
+        if ok:
+            ok_n += 1
+        else:
+            fail_n += 1
+    live = set(urls)
+    cache = {u: e for u, e in cache.items() if u in live}
+    _, cleaned_images = image_health.clean_products(products_snapshot, cache)
+    dead_urls = sum(1 for e in cache.values() if image_health.is_dead(e))
+    stats = {"total_urls": len(urls), "checked": checked, "skipped": skipped,
+             "ok": ok_n, "failed": fail_n, "dead_urls": dead_urls,
+             "cleaned_images": cleaned_images}
+    with _lock:
+        _save_image_health({"cache": cache, "stats": stats,
+                            "last_check": now.isoformat(timespec="seconds")})
+    log.info("image_health: run done %s", stats)
+    return stats
+
+
 AUTOMATIONS_REG = [
     Automation(key="posta_uncollected",
                name="Nevyzdvihnuté zásielky — Pošta SK",
@@ -3264,6 +3369,15 @@ AUTOMATIONS_REG = [
                name="Pripomienky objednávok",
                schedule={"daily_at": "08:00", "tz": "Europe/Bratislava"},
                run_fn=run_orders_reminder),
+    # #135 — periodic our_images (our own product photo) HEAD validation. SAFETY
+    # (#93 contract): starts DISABLED for consistency with every other automation
+    # (like riziko_vypadku/shoptet_sync it is READ-ONLY / advisory — it makes
+    # external HTTP HEAD calls against our own forestshop CDN but writes nothing
+    # to the eshop or any manager store), so it runs only after ▶ Štart.
+    Automation(key="image_health",
+               name="Kontrola obrázkov",
+               schedule={"daily_at": "04:30", "tz": "Europe/Bratislava"},
+               run_fn=run_image_health),
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
