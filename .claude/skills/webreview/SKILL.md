@@ -432,6 +432,42 @@ odfiltruj cez `pull_request` kľúč). Fixná žiarovka vpravo dole (`#ideaBtn` 
 - **E2E stub musí vedieť aj comments/labels/delete** (`_GHStub` v `tests/e2e/conftest.py`): `do_POST` vetvi na `/issues/<n>/comments` (bump count), `/issues/<n>/labels` (mutuj `it["labels"]`), `/labels` (ensure), inak create-issue; `do_DELETE` na `/issues/<n>/labels/<encoded>` (odstráň z issue). Tak e2e overí prioritný split naživo. Backend testy: guard mockuj aj `webapp.requests.delete` (nielen get/post).
 - **Post-deploy overenie bez špiny**: prioritu nastav→vyčisti (`none` zmaže label, GitHub čistý); detail-komentár je trvalý → píš ho len na VLASTNÝ tracking issue („overené naživo"), nie na cudzí. Reálne over cez `gh issue view <n> --json labels,comments`.
 
+## Admin premenovanie záložiek + popis automatizácií (#173, v0.70.0)
+
+Šéf chcel (1) jasný SK popis čo/kedy automatizácia robí a (2) vedieť premenovať KAŽDÚ záložku
+(pracovnú aj automatizačnú aj Užívatelia/Vývoj) — nie len automatizácie.
+
+- **Popis = samostatný `AUTOMATION_DESCRIPTIONS` dict** (kľúč=`Automation.key`, hodnota=SK text
+  „čo + kedy"), merge-nutý do `/api/automations` (`a["description"] = AUTOMATION_DESCRIPTIONS.get(...)`).
+  **NIE pole na `Automation` dataclass** — panel nikdy nerenderuje `a.name` (len nav label + page title),
+  takže žiadna zmena v `automation_runner.py` netreba. Frontend: `.autodesc` div hneď za `st.appendChild(head)`
+  vo VŠETKÝCH 8 render*() automatizačných funkciách (identický 2-riadkový vzor, `replace_all` Edit).
+- **Premenovanie = JEDEN generický store `data/out/ui_labels.json`** (`{nav_key: label}`), endpointy
+  `GET /api/ui-labels` (hocikto prihlásený — inak by renamed label nevidel non-admin používateľ)
+  + `POST /api/ui-label` (admin-only, `_admin_or_none`/`_forbidden` ako `/api/users`; prázdny label = clear).
+  Renaming automatizácie JE renaming jej záložky — žiadna samostatná "name override" logika netreba,
+  lebo `Automation.name` sa nikde nerenderuje.
+- **GOTCHA — nav kľúč ≠ `Automation.key` pre „Pošta" tab!** `AUTOMATION_TABS` v app.js má `['posta', …]`
+  (nav/page-title kľúč = `posta`), ale `Automation(key="posta_uncollected", …)` v app.py — DVA rôzne
+  stringy pre TÚ ISTÚ automatizáciu (legacy). Server-side `NAV_KEYS` validácia MUSÍ byť explicitný
+  literál set kopírujúci `app.js`'s `TABS`+`AUTOMATION_TABS` (vrátane `"posta"`), **NIE**
+  `{a.key for a in AUTOMATIONS_REG}` — to by odmietlo `"posta"` (chýba v registry) a prijalo
+  `"posta_uncollected"` (nikto ho nikdy nepošle). Test na to: `test_automation_registry_key_rejected_for_posta`.
+- **Admin-only ✏️ vedľa nav buttonu — `.navrow` wrapper, NIE úprava existujúceho `.tab` markupu.**
+  `_navButton()` teraz vracia `<div class="navrow">` (tab button + voliteľný `.navedit` button, len keď
+  `isAdmin()`). `.navrow .tab{flex:1;width:auto}` MUSÍ prísť ZA `.tabs .tab{width:100%}` v CSS (rovnaká
+  špecificita, cascade poradie rozhoduje). Edit button má VŽDY generický `aria-label="Premenovať"`
+  (NIKDY meno záložky) — inak by kolidoval s `get_by_role("button", name=<label>)` presne ako
+  žiarovka/„Vývoj" gotcha vyššie. Cielenie z testov: `[data-testid="navedit-<key>"]`.
+- **GOTCHA — existujúce e2e `#devNav button` (bez `.tab` scope) sa POKAZILI**, lebo teraz `#devNav`
+  obsahuje 2 buttony pre admina (nav + ✏️) → `count()==1` padne a `.click()` na 2 elementoch hodí
+  strict-mode chybu. Fix: scope na `.tab` triedu (`#devNav .tab`), nie bare `button` — oprav VŠADE, kde
+  test klika/počíta nav button v kontajneri s NEZNÁMYM počtom detí (týka sa `#usersNav`/`#autoTabs`
+  rovnako, keby tam niekto pridal podobný unscoped selektor). Selektory s `.filter(has_text=…)` alebo
+  `get_by_role(name=…)` OSTÁVAJÚ bezpečné (✏️ button nemá zhodný text/name).
+- Rename = natívny `prompt()` (nie inline input) — MVP, žiadny nový modal/CSS. E2E: `page.once("dialog",
+  d => d.accept("text"))` PRED klikom na `.navedit`; prázdny string = clear/revert.
+
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.

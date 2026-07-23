@@ -61,6 +61,16 @@ a{color:inherit}
    alarm red — the tab's own .autoerr banner already carries the loud detail). */
 .tabs .tab .navwarn{color:#b91c1c;font-size:13px;line-height:1;flex:0 0 auto}
 body[data-theme=dark] .tabs .tab .navwarn{color:#fca5a5}
+/* Admin-only rename (#173): every nav item is wrapped in a .navrow so the ✏️
+   button can sit beside the tab button without disturbing it; non-admin sees
+   the SAME markup minus the ✏️ child, so the row is visually a no-op then.
+   .navrow .tab overrides .tab's own width:100% (must come AFTER it above) —
+   otherwise the tab button would claim the whole row and push ✏️ off-width. */
+.navrow{display:flex;align-items:center;gap:2px}
+.navrow .tab{flex:1;min-width:0;width:auto}
+.navedit{flex:0 0 auto;background:none;border:0;cursor:pointer;font-size:13px;
+  line-height:1;padding:7px 8px;border-radius:7px;color:var(--soft);opacity:.6}
+.navedit:hover{background:var(--bg);color:var(--text);opacity:1}
 /* Admin 'Užívatelia' — standalone nav at the sidebar bottom, OUTSIDE the folder
    (#118 refinement). Separated from the folder above; collapses when empty
    (non-admin: renderTabs leaves it childless). */
@@ -336,6 +346,10 @@ body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
 .pill.off{background:var(--chip-off-bg);color:var(--chip-off-tx)}
 body[data-theme=dark] .pill.on{background:#064e3b;color:#6ee7b7}
 .runningdot{font-size:13px;color:var(--muted)}
+/* Plain-language "what it does + when it runs" (#173) — regular text color
+   (not muted like .autometa's caption line) so it reads as real content, not
+   a footnote; sits between the Štart/Stop head and the Plán/Posledný beh line. */
+.autodesc{font-size:13.5px;color:var(--text);line-height:1.45}
 .autometa{font-size:13px;color:var(--muted);display:flex;gap:6px;flex-wrap:wrap}
 .autoerr{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
   border-radius:8px;padding:8px 10px;word-break:break-word}
