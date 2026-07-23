@@ -169,3 +169,17 @@ def test_skladom_rows_backfills_paircode_and_dedups():
 def test_skladom_rows_empty_candidates():
     assert ib.skladom_rows([]) == []
     assert ib.skladom_rows([{"code": ""}]) == []
+
+
+def test_discontinued_signal_in_either_availability_field_never_candidate():
+    """#98 review Finding 1: state_of() sees only ONE availability field (ais or aos),
+    so a 'skončil' (discontinued) hiding in the OTHER field must STILL exclude the
+    product — else a discontinued item with contradictory fields gets re-listed as
+    sellable on the live eshop. RED before the either-field guard."""
+    # skončil in availabilityOutOfStock, 'Vypredané' in availabilityInStock →
+    # state_of only reads ais='Vypredané' (state 2) and misses the skončil in aos.
+    masked = "9/X;P9;Ukončený;TESTSUP;visible;Vypredané;Predaj výrobku skončil;99.90;5;"
+    assert ss.compute_candidates(_csv(masked)) == []
+    # symmetric case (skončil in ais) is already caught by state_of == 3 — keep it green
+    other = "9/Y;P9;Ukončený;TESTSUP;visible;Predaj výrobku skončil;Vypredané;99.90;5;"
+    assert ss.compute_candidates(_csv(other)) == []
