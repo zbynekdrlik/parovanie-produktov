@@ -3034,6 +3034,138 @@ def n8n_upload_suppliers():
 
 
 # --------------------------------------------------------------------------- #
+# n8n → nightly upload of GRUBE per-size externalCodes (→ eshop `externalCode`
+# field). #62 — the nightly cron follow-up to the MVP manual zip. Mirrors the
+# supplier write-back exactly (own incremental store, own header, chunked import).
+# --------------------------------------------------------------------------- #
+EXTERNALCODES_STATE = os.path.join(OUT, "uploaded_externalcodes.json")
+
+
+def _load_uploaded_externalcodes():
+    """{code: itemId} already written back to the eshop — so the nightly job only
+    sends new or changed itemIds. Missing/corrupt → empty (everything is new).
+    Always a dict (a stray array could repeat a code and break the summary invariant)."""
+    try:
+        with open(EXTERNALCODES_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_uploaded_externalcodes(d):
+    tmp = EXTERNALCODES_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, EXTERNALCODES_STATE)
+
+
+def _externalcode_summary(uploaded, grube_codes):
+    """Totals for the tab/notification: GRUBE codes with a valid (numeric) itemId,
+    how many are already written back (uploaded value still matches the current
+    itemId), how many remain. A changed itemId counts as remaining (uploaded !=
+    current), matching new_externalcode_keys. Only numeric-itemId codes count — a
+    non-numeric one is never uploadable, so it must not inflate the total."""
+    valid = {c: str(i.get("itemId", "")).strip() for c, i in grube_codes.items()
+             if str(i.get("itemId", "")).strip().isdigit()}
+    total = len(valid)
+    up = sum(1 for c, iid in valid.items() if uploaded.get(c) == iid)
+    return {"total_codes": total, "total_uploaded": up,
+            "remaining": max(0, total - up), "review_url": PUBLIC_URL}
+
+
+def _do_upload_externalcodes(dry):
+    """Core of the nightly GRUBE externalCode write-back — the SINGLE place the logic
+    lives (NEkopíruj logiku). Reads the durable grube_codes.json store, builds
+    code;pairCode;externalCode for only the codes not yet uploaded (or whose itemId
+    changed), runs the careful chunked import, records what went up, and returns
+    (result, status). Shared by the n8n HTTP endpoint (below) and the in-app „GRUBE
+    kódy → eshop" automation (#62) — no auth / Flask request access here. Touches ONLY
+    the `externalCode` column (own file → a present-but-empty cell can't wipe
+    internalNote/state/prices). The externalCode is the grube per-size `itemId`, which
+    MUST be purely numeric — the numeric guard lives in both new_externalcode_keys and
+    externalcode_rows (a non-numeric cell is junk / a possible formula-injection lead,
+    dropped, never an empty cell that would WIPE the existing externalCode). GRUBE-only
+    is guaranteed by the source store (grube_codes.json is built only for GRUBE)."""
+    grube = _load_grube_codes()
+    uploaded = _load_uploaded_externalcodes()
+    new_codes = import_builder.new_externalcode_keys(grube, uploaded)
+    products = [{"code": c, "externalCode": str(grube[c].get("itemId", "")).strip()}
+                for c in new_codes]
+    if not new_codes:
+        log.info("n8n externalcode: 0 new codes")
+        return {"ok": True, "count": 0, "products": [],
+                **_externalcode_summary(uploaded, grube)}, 200
+
+    rows = import_builder.externalcode_rows({c: grube[c] for c in new_codes}, CODE2PAIR)
+    if not rows:
+        log.warning("n8n externalcode: %d new codes but 0 import rows", len(new_codes))
+        return {"ok": True, "count": 0, "products": products,
+                "message": "no import rows", "blocked": len(new_codes),
+                **_externalcode_summary(uploaded, grube)}, 200
+
+    # externalcode_rows is 1:1 with codes (no product→variant indirection) and applies
+    # the same numeric guard, so every new code that survived new_externalcode_keys has
+    # exactly one row — written_codes == set(new_codes).
+    written_codes = {r[0] for r in rows}
+
+    if not _import_lock.acquire(blocking=False):
+        log.warning("n8n externalcode: another import already running")
+        return {"ok": False, "error": "import already running"}, 409
+    log.info("n8n externalcode: %d codes, %d rows (chunks of %d), dry_run=%s",
+             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
+    try:
+        # #156: chunked import (formula-injection guard applied per cell — belt-and-
+        # braces alongside the numeric itemId guard). FIRST failing chunk stops the
+        # batch; success_codes are the codes imported by a successful chunk (partial
+        # progress → resumable).
+        res = _import_rows_chunked(rows, import_builder.EXTERNALCODE_HEADER, dry,
+                                   prefix="import_externalcode_", csv_safe=True, timeout=900)
+        ok = res["ok"]
+        success = res["success_codes"]
+        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
+        if not dry and uploaded_codes:       # record only codes that imported OK
+            for c in uploaded_codes:
+                uploaded[c] = str(grube[c].get("itemId", "")).strip()
+            _save_uploaded_externalcodes(uploaded)
+    finally:
+        _import_lock.release()
+
+    err_msg = ""
+    if not ok:
+        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
+                   f"(naimportované {res['rows_ok']} z {len(rows)} riadkov)")
+    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
+              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
+              "updated": res["updated"], "failed": res["failed"],
+              "error_detail": res["error_detail"], "error": err_msg,
+              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
+              "products": products, "stdout_tail": res["stdout_tail"],
+              **_externalcode_summary(uploaded, grube)}
+    log.info("n8n externalcode: rc=%s chunks=%d/%d processed=%s codes=%d",
+             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
+    if not ok:
+        log.error("n8n externalcode FAILED rc=%s chunks_ok=%d/%d stderr=%s",
+                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
+    return result, (200 if ok else 502)
+
+
+@app.route("/api/n8n/upload-externalcode", methods=["POST"])
+def n8n_upload_externalcode():
+    """n8n's nightly caller: Bearer-auth then delegate to _do_upload_externalcodes.
+    dry_run=1 reaches the import without changing anything."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {token}".encode() if token else b""
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n externalcode: unauthorized call from %s", _client_ip())
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    result, status = _do_upload_externalcodes(dry)
+    return jsonify(result), status
+
+
+# --------------------------------------------------------------------------- #
 # In-app automations (#93): generic runner + the Pošta SK uncollected-shipments
 # automation. New automations (#105-#111) register themselves in AUTOMATIONS_REG
 # below — the runner, endpoints and sidebar section are shared.
@@ -3282,6 +3414,51 @@ def run_parovania_eshop() -> dict:
     }
     log.info("parovania_eshop: run done status=%s pairings=%d suppliers=%d",
              status, result["pairings"]["count"], result["suppliers"]["count"])
+    return result
+
+
+def run_grube_externalcode() -> dict:
+    """Nightly push (daily 03:30) of the GRUBE per-size externalCodes (grube itemId
+    → the eshop `externalCode` field) — the in-app cron follow-up (#62) to the MVP
+    manual zip. Reuses the SAME careful chunked import path as the n8n endpoint
+    (_do_upload_externalcodes — no Shoptet logic reimplemented). The write stays
+    IDEMPOTENT: an already-uploaded itemId is skipped via uploaded_externalcodes.json,
+    so a re-run never re-pushes an unchanged itemId; only a NEW code or a CHANGED
+    itemId goes up. A step that completes with ok:false (import failed) or blocked is
+    surfaced in the returned `status` without crashing the run; a genuine exception
+    propagates to the runner (records last_status='error', keeps the app alive).
+
+    Reads ONLY the durable grube_codes.json store (built by scripts/build_grube_codes.py)
+    — never modifies it; its own progress lives in uploaded_externalcodes.json.
+
+    SEPARATE from „Párovania → eshop": that automation is ALREADY enabled on prod, and
+    externalCode is a distinct write field — folding it in would auto-activate on the
+    live eshop, breaking the #93 default-disabled-for-new-live-write contract. This one
+    starts DISABLED on its own."""
+    ext, _es = _do_upload_externalcodes(dry=False)
+    e_ok = bool(ext.get("ok"))
+    blocked = int(ext.get("blocked") or 0)
+    if not e_ok:
+        status = "failed"          # an import (or lock/timeout) failed → red row
+    elif blocked:
+        status = "blocked"         # numeric-itemId codes that produced no row → orange
+    else:
+        status = "ok"
+    result = {
+        "status": status,
+        "externalcodes": {
+            "count": ext.get("count", 0),
+            "total_uploaded": ext.get("total_uploaded", 0),
+            "total_codes": ext.get("total_codes", 0),
+            "remaining": ext.get("remaining", 0),
+            "blocked": blocked,
+            "ok": e_ok,
+            "error": ext.get("error", ""),
+        },
+        "review_url": PUBLIC_URL,
+    }
+    log.info("grube_externalcode: run done status=%s externalcodes=%d",
+             status, result["externalcodes"]["count"])
     return result
 
 
@@ -4006,6 +4183,10 @@ AUTOMATION_DESCRIPTIONS = {
     "parovania_eshop":
         "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
         "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
+    "grube_externalcode":
+        "Denne o 3:30 nahrá do Shoptet eshopu kódy dodávateľa GRUBE pre jednotlivé "
+        "veľkosti (do poľa externalCode). Nahrá len nové alebo zmenené kódy — čo už "
+        "raz nahrala, znova neposiela.",
     "dodavatelsky_sklad":
         "Denne o 5:00 prejde weby dodávateľov (pri nejasnej dostupnosti pomôže AI) "
         "a zistí, čo majú skladom a za akú cenu.",
@@ -4052,6 +4233,18 @@ AUTOMATIONS_REG = [
                name="Párovania → eshop",
                schedule={"daily_at": "21:00", "tz": "Europe/Bratislava"},
                run_fn=run_parovania_eshop),
+    # #62 — nightly push of GRUBE per-size externalCodes (grube itemId → eshop
+    # `externalCode`), the cron follow-up to the MVP manual zip. SAFETY (#93
+    # contract): starts DISABLED — this one WRITES to the live production eshop, so
+    # it runs ONLY after the manager clicks ▶ Štart; a deploy never auto-pushes on
+    # its own. DELIBERATELY a separate automation (not folded into „Párovania →
+    # eshop", which is already enabled on prod) so enabling the externalCode write
+    # stays an explicit opt-in. Scheduled 03:30, well clear of the 21:00 pairings
+    # push and the morning restock window.
+    Automation(key="grube_externalcode",
+               name="GRUBE kódy → eshop",
+               schedule={"daily_at": "03:30", "tz": "Europe/Bratislava"},
+               run_fn=run_grube_externalcode),
     # #106 — daily supplier availability/price scraper. SAFETY (#93 contract):
     # starts DISABLED — a run makes MANY external HTTP calls AND costs money via
     # OpenAI, so it runs ONLY after the manager clicks ▶ Štart; a deploy never
@@ -4119,6 +4312,7 @@ RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 NAV_KEYS = {
     "toorder", "nedostupne", "search", "notes", "review",                # TABS
     "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
+    "grube_externalcode",
     "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom", "stock_skladom",
     "image_health",                                                      # AUTOMATION_TABS
     "users", "dev",

@@ -176,6 +176,25 @@ def new_supplier_keys(assignments, uploaded):
     return out
 
 
+def new_externalcode_keys(grube_codes, uploaded):
+    """GRUBE codes ready for the nightly externalCode write-back: a purely-numeric
+    `itemId` that was NOT yet uploaded (new code) or whose itemId changed since the
+    last upload. `grube_codes` is {code: {itemId, ...}} (the durable grube_codes.json
+    store, GRUBE-only by construction); `uploaded` is {code: itemId} of past uploads.
+    An empty/non-numeric itemId is skipped (never a junk externalCode — same guard as
+    externalcode_rows). Keeps the upload incremental — only genuinely new/changed
+    itemIds go to the eshop. Mirrors new_supplier_keys."""
+    out = []
+    for code, info in grube_codes.items():
+        c = (code or "").strip()
+        iid = str(info.get("itemId", "")).strip()
+        if not c or not iid or not iid.isdigit():
+            continue
+        if uploaded.get(c) != iid:
+            out.append(code)   # original key (callers index grube_codes[c] with it)
+    return out
+
+
 def new_order_pairing_keys(order_pairings, uploaded):
     """Forestshop codes from the inline pairings entered on the 'Na objednanie' tab
     (order_pairings.json -- codes OUTSIDE the review set, #38) ready for the nightly

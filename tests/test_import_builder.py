@@ -11,6 +11,7 @@ from parovanie.import_builder import (
     SUPPLIER_HEADER,
     externalcode_rows,
     link_rows,
+    new_externalcode_keys,
     new_order_pairing_keys,
     new_pairing_keys,
     new_supplier_keys,
@@ -371,6 +372,28 @@ def test_externalcode_rows_all_numeric_guard():
     gc = {"60645/L": {"itemId": "1547734519"}}
     rows = externalcode_rows(gc, {"60645/L": "395"})
     assert all(len(r) == 3 and r[2].isdigit() for r in rows)
+
+
+# --- new_externalcode_keys: incremental diff for the nightly upload (#62) ----- #
+def test_new_externalcode_keys_new_and_changed_only():
+    gc = {"a": {"itemId": "111"}, "b": {"itemId": "222"}, "c": {"itemId": "333"}}
+    # a already uploaded with the SAME itemId → skip; b's itemId CHANGED → re-push;
+    # c never uploaded → new. Order preserved (dict iteration order).
+    uploaded = {"a": "111", "b": "999"}
+    assert new_externalcode_keys(gc, uploaded) == ["b", "c"]
+
+
+def test_new_externalcode_keys_skips_empty_and_nonnumeric():
+    # only a purely-numeric itemId is ever uploadable → a non-numeric / empty itemId
+    # is never "new" (it would be dropped by externalcode_rows anyway), so it must not
+    # appear as work to do.
+    gc = {"a": {"itemId": ""}, "b": {"itemId": "=EVIL"}, "c": {"itemId": "12"}}
+    assert new_externalcode_keys(gc, {}) == ["c"]
+
+
+def test_new_externalcode_keys_empty_when_all_uploaded():
+    gc = {"a": {"itemId": "111"}, "b": {"itemId": "222"}}
+    assert new_externalcode_keys(gc, {"a": "111", "b": "222"}) == []
 
 
 # --- link_rows GRUBE internalNote normalization (Task 9) --------------------- #
