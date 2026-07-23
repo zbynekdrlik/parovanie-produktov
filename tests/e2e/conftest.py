@@ -450,6 +450,19 @@ def automations_server(tmp_path_factory):
         ],
         "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
     }, ensure_ascii=False), encoding="utf-8")
+    # #98 — pre-existing „Máme skladom → Skladom" result (one product we physically
+    # have but that still shows Vypredané, flipped) so the tab's status + table +
+    # import-outcome render WITHOUT any network. The E2E never clicks Spustiť teraz
+    # (it WRITES to the live eshop) — same rationale as the restock fixture above.
+    (out / "stock_skladom.json").write_text(json.dumps({
+        "last_check": "2026-07-22T06:45:05+02:00",
+        "status": "ok",
+        "candidates": [
+            {"code": "9/M", "pairCode": "P9", "name": "Fotopasca Máme Skladom Test",
+             "ourPrice": "129.90", "stock": "5", "availabilityText": "Vypredané"},
+        ],
+        "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
+    }, ensure_ascii=False), encoding="utf-8")
     # #105 — pre-existing „Pripomienky objednávok" result (one red no-note order + one order
     # where a reminder WAS e-mailed) so the tab's status + both sections render WITHOUT any
     # network. The E2E never clicks Spustiť teraz (it SENDS real customer e-mails + costs OpenAI).
