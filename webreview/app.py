@@ -36,7 +36,8 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
     __version__, config, image_health, import_builder, nedostupne, orders_reminder,
-    posta_uncollected, restock_skladom, riziko_vypadku, supplier_stock, writer)
+    posta_uncollected, restock_skladom, riziko_vypadku, stock_skladom,
+    supplier_stock, writer)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
@@ -3562,6 +3563,101 @@ def run_restock_skladom() -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# #98 — „Máme skladom → Skladom": auto-restock from Shoptet's OWN physical stock.
+# Distinct from #108 restock_skladom (which triggers on a scraped SUPPLIER
+# confirmation): this finds OUR products that physically HAVE stock (stock>0 — the
+# green „máme" bars in the Shoptet admin) yet are still shown as Vypredané (state 2,
+# visible), and flips them back to Skladom by importing the rows to Shoptet. It
+# needs NO supplier data. Detection lives in parovanie.stock_skladom; the write is
+# import_builder.skladom_rows (visible + both availability Skladom; the real stock
+# is NEVER overwritten) through the SAME careful chunked import path.
+# --------------------------------------------------------------------------- #
+STOCK_SKLADOM_STATE = os.path.join(OUT, "stock_skladom.json")
+
+
+def _load_stock_skladom() -> dict:
+    try:
+        with open(STOCK_SKLADOM_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_stock_skladom(d: dict) -> None:
+    tmp = STOCK_SKLADOM_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STOCK_SKLADOM_STATE)
+
+
+def run_stock_skladom() -> dict:
+    """One auto-skladom run (daily or „Spustiť teraz"): read OUR catalog export and
+    flip back to Skladom every product that PHYSICALLY has stock (stock>0) but is
+    still shown as Vypredané (state 2, visible) — the manager's „máme skladom" bars
+    in Shoptet — by building the rows (both availability fields → Skladom, visible,
+    stock left untouched via import_builder.skladom_rows) and pushing them through
+    the SAME careful chunked Shoptet import path the n8n endpoints use
+    (_import_rows_chunked → run_import → #23-hardened read-back). WRITES to the live
+    eshop.
+
+    Needs no supplier data (unlike restock_skladom) — the trigger is Shoptet's own
+    stock. Safe by construction: a conscious-off product (detailOnly/discontinued/
+    hidden = state 3) or an already-Skladom one (state 1) is never a candidate, so a
+    residual unit on a discontinued product is never re-listed and a live product is
+    never re-flipped (idempotent). A failed import is detected via the #23-hardened
+    read-back and recorded status='error', not a silent success (the run never raises
+    on an import failure — it degrades to a red row, like parovania_eshop). Reads
+    ONLY its own store + the export; never touches the manager's decision stores."""
+    csv_text = _read_export_for_links()          # same cp1250 export reader as #106
+    now = datetime.now(timezone.utc).astimezone()
+    candidates = stock_skladom.compute_candidates(csv_text)
+    rows = import_builder.skladom_rows(candidates, CODE2PAIR)
+
+    status = "ok"
+    processed = updated = failed = None
+    error_detail = ""
+    if rows:
+        if not _import_lock.acquire(blocking=False):
+            log.warning("stock_skladom: iný import práve beží — beh preskočený")
+            status, error_detail = "busy", "iný import práve beží"
+        else:
+            try:
+                res = _import_rows_chunked(rows, import_builder.SKLADOM_COLS, False,
+                                           prefix="skladom_", timeout=900)
+            finally:
+                _import_lock.release()
+            processed, updated, failed = res["processed"], res["updated"], res["failed"]
+            if res["ok"]:
+                status = "ok"
+            else:
+                status = "error"
+                detail = res["error_detail"] or (res["err"] or "")[-300:]
+                error_detail = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
+                                f"(naimportované {res['rows_ok']} z {len(rows)} riadkov): {detail}")
+                log.error("stock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
+                          res["rc"], res["chunks_ok"], res["chunks_total"],
+                          (res["err"] or "")[-400:])
+
+    # `candidates` are always stored (what WOULD be flipped) so the tab shows them
+    # even on a failed import; on success they ARE what was flipped.
+    with _lock:
+        _save_stock_skladom({
+            "last_check": now.isoformat(timespec="seconds"),
+            "status": status,
+            "candidates": candidates,
+            "processed": processed, "updated": updated, "failed": failed,
+            "error_detail": error_detail,
+        })
+    stats = {"candidates": len(candidates), "imported_rows": len(rows),
+             "status": status, "processed": processed, "updated": updated,
+             "failed": failed}
+    log.info("stock_skladom: run done %s", stats)
+    return stats
+
+
+# --------------------------------------------------------------------------- #
 # #105 — „Pripomienky objednávok" (migrated from n8n „Forestshop orders",
 # MnskuiOdu3i5GKlF). Daily: „Vybavuje sa" orders older than 4 days →
 #   • NO internal note (shopRemark empty)  → RED „nikto sa jej nedotkol" alert
@@ -3856,6 +3952,10 @@ AUTOMATION_DESCRIPTIONS = {
     "restock_skladom":
         "Denne o 6:00 nájde produkty, ktoré máme označené ako Vypredané, ale "
         "dodávateľ ich má opäť skladom, a rovno ich naskladní naspäť v eshope.",
+    "stock_skladom":
+        "Denne o 6:45 nájde produkty, ktoré fyzicky máme na sklade (Shoptet ukazuje "
+        "kusy skladom), ale zákazníkom sa stále zobrazujú ako Vypredané, a rovno ich "
+        "prepne na Skladom. Nedotýka sa produktov, ktoré ste vedome ukončili.",
     "orders_reminder":
         "Denne o 8:00 skontroluje objednávky vo vybavovaní dlhšie ako 4 dni — bez "
         "poznámky len upozorní (žiadny mail), s poznámkou AI vyhodnotí, či bol "
@@ -3914,6 +4014,15 @@ AUTOMATIONS_REG = [
                name="Vypredané → Skladom",
                schedule={"daily_at": "06:00", "tz": "Europe/Bratislava"},
                run_fn=run_restock_skladom),
+    # #98 — daily auto-skladom from Shoptet's OWN physical stock (products we HAVE
+    # stock of but that still show Vypredané → flip to Skladom). SAFETY (#93
+    # contract): starts DISABLED — this one WRITES to the live production eshop, so
+    # it runs ONLY after the manager clicks ▶ Štart; a deploy never auto-restocks on
+    # its own. Scheduled 06:45, after the hourly export sync + the 06:00 restock.
+    Automation(key="stock_skladom",
+               name="Máme skladom → Skladom",
+               schedule={"daily_at": "06:45", "tz": "Europe/Bratislava"},
+               run_fn=run_stock_skladom),
     # #105 — daily „Vybavuje sa" >4d orders → red (no note) / AI-classified reminder e-mail
     # (with note). SAFETY (#93 contract): starts DISABLED — it SENDS real customer e-mails AND
     # costs money via OpenAI, so it runs ONLY after the manager clicks ▶ Štart; a deploy never
@@ -3946,7 +4055,7 @@ RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 NAV_KEYS = {
     "toorder", "nedostupne", "search", "notes", "review",                # TABS
     "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
-    "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom",
+    "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom", "stock_skladom",
     "image_health",                                                      # AUTOMATION_TABS
     "users", "dev",
 }
@@ -4208,6 +4317,24 @@ def api_restock_skladom():
         "last_check": st.get("last_check", ""),
         "has_supplier_data": bool(st.get("has_supplier_data")),
         "supplier_last_check": st.get("supplier_last_check", ""),
+        "status": st.get("status", ""),
+        "candidates": st.get("candidates") or [],
+        "processed": st.get("processed"),
+        "updated": st.get("updated"),
+        "failed": st.get("failed"),
+        "error_detail": st.get("error_detail", ""),
+    })
+
+
+@app.route("/api/stock-skladom")
+def api_stock_skladom():
+    """Display data for the „Máme skladom → Skladom" tab (#98) — the last run's
+    candidate products (kód, názov, naša cena, náš sklad, čo teraz zobrazujú), the
+    import outcome (spracované / naskladnené / zlyhania) and the run status."""
+    with _lock:
+        st = _load_stock_skladom()
+    return jsonify({
+        "last_check": st.get("last_check", ""),
         "status": st.get("status", ""),
         "candidates": st.get("candidates") or [],
         "processed": st.get("processed"),

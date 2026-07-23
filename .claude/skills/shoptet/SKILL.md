@@ -46,6 +46,20 @@ Preto sa import **rozdelí podľa polí** — každý súbor/riadok nesie LEN st
 - **Nie je skladom (stav 2):** `import_states.csv` → `visible`, `stock=0`, `Vypredané`.
 - **Už sa nebude predávať (stav 3):** `import_states.csv` → `detailOnly`, `stock=0`, `Predaj výrobku skončil`.
 
+## DVE „→ Skladom" automatizácie — RÔZNY spúšťač, RÔZNY zápis (nezameň)
+
+Máme DVE automatizácie, čo prepínajú produkt na Skladom. Nezlučuj ich a nepýtaj sa
+zdroj nanovo:
+
+| Automatizácia | Kľúč | Spúšťač (zdroj) | Zápis (import_builder) |
+|---|---|---|---|
+| „Vypredané → Skladom" (#108) | `restock_skladom` | DODÁVATEĽ má opäť skladom (scrape `supplier_stock.json`, čerstvé ≤48 h) | `restock_rows` → `RESTOCK_COLS` = OBE avail Skladom + visible + **fiktívny stock 5** (produkt mal 0 reálnych ks) |
+| „Máme skladom → Skladom" (#98) | `stock_skladom` | NÁŠ Shoptet sklad `stock > 0` (zelené pásy/„máme" v admine) | `skladom_rows` → `SKLADOM_COLS` = OBE avail Skladom + visible, **stock NEPÍŠE** (reálny sklad je autoritatívny, fiktívny by pretiekol) |
+
+- **`stock_skladom` (#98) NEPOTREBUJE dodávateľské dáta** — číta len export (`stock` stĺpec). `compute_candidates(csv_text)` v `src/parovanie/stock_skladom.py`: kandidát = `stock>0` AND `productVisibility=='visible'` AND `export_helpers.state_of==2` (zdieľaný klasifikátor). Ten filter automaticky preskočí stav 3 (`detailOnly`/discontinued/hidden = VEDOMÉ off rozhodnutie manažéra → nikdy neprepnúť, ani so zvyškovým skladom) aj stav 1 (idempotencia). Denne 06:45, default DISABLED (píše do eshopu, #93).
+- **VERIFY-FIRST dáta (2026-07-23, reálny export 14066 variantov):** `stock>0` = 730 variantov; z nich `state_of!=1` = 65 → **50 stav 3 (ukončené, NEPREPÍNAŤ)** + **15 stav 2 (visible+Vypredané+reálny sklad = jediné legitímne auto-skladom ciele)**. Pozor: `availabilityInStock=="Skladom"` NIE je použiteľný zdroj signálu — také produkty sú UŽ stav 1, niet čo prepínať; jediný zmysluplný signál nezrovnalosti je `stock>0`.
+- **`SKLADOM_COLS` zámerne VYNECHÁVA `stock`** (na rozdiel od `RESTOCK_COLS`): chýbajúci stĺpec Shoptet NEZMENÍ (nie ZMAŽE — mazanie je len pri PRÍTOMNOM prázdnom stĺpci), takže reálny kladný sklad ostane nedotknutý. Fiktívna hodnota by mohla predať viac než máme.
+
 ## productVisibility hodnoty
 
 `visible`, `detailOnly` (predajný cez priamy odkaz; so „Predaj skončil" = stav 3), `hidden`, `blocked`, `cashDeskOnly`, `blockUnregistered`. `detailOnly` samo o sebe NIE je „vypnutý".

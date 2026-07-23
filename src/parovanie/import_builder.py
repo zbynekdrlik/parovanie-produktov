@@ -41,6 +41,17 @@ SUPPLIER_HEADER = ["code", "pairCode", "supplier"]
 RESTOCK_COLS = ["code", "pairCode", "productVisibility",
                 "availabilityInStock", "availabilityOutOfStock", "stock"]
 
+# Auto-skladom (#98 — máme fyzicky skladom → Skladom): the ONLY columns this CSV
+# sets. UNLIKE RESTOCK_COLS, `stock` is DELIBERATELY absent: the candidate already
+# has a real positive stock (that IS the trigger) which Shoptet owns authoritatively
+# — writing a value (a fictional 5, or even the possibly-stale export count) could
+# oversell, so we leave the stock column out entirely (an absent column is left
+# untouched by Shoptet) and only fix the display. Both availability fields MUST be
+# set together (CEO 2026-07-14 — Shoptet shows availabilityOutOfStock once stock
+# hits 0), so a customer never keeps seeing the old „Vypredané".
+SKLADOM_COLS = ["code", "pairCode", "productVisibility",
+                "availabilityInStock", "availabilityOutOfStock"]
+
 # GRUBE per-size externalCode write-back: the ONLY columns this CSV sets. Own file
 # (own header) so a present-but-empty cell can't wipe internalNote/state/prices.
 # externalCode is variant-level importable (verified live, Task 1). GRUBE-only is
@@ -76,6 +87,31 @@ def restock_rows(candidates, code2pair=None):
         seen.add(code)
         pc = (c.get("pairCode") or "").strip() or code2pair.get(code, "")
         rows.append([code, pc, "visible", _SKLADOM, _SKLADOM, RESTOCK_STOCK])
+    return rows
+
+
+def skladom_rows(candidates, code2pair=None):
+    """Auto-skladom import rows (#98 — máme fyzicky skladom → Skladom): for products
+    we PHYSICALLY have (stock>0) but that still show as Vypredané, put them back on
+    sale. One row per unique variant `code` in SKLADOM_COLS order: visible,
+    availabilityInStock + availabilityOutOfStock BOTH 'Skladom'. Both availability
+    fields MUST be set together (CEO fix 2026-07-14). UNLIKE restock_rows, the stock
+    column is NOT written: the product already owns a real positive stock in Shoptet,
+    so we never overwrite it (which could oversell) — see SKLADOM_COLS. Each `code`
+    appears ONCE (Shoptet aborts the whole import on a duplicate code — the catalog
+    has duplicate products sharing variant codes; first wins). `candidates` are dicts
+    carrying `code` (+ optional `pairCode`); `code2pair` backfills a missing pairCode.
+    Pure → unit-testable."""
+    code2pair = code2pair or {}
+    rows = []
+    seen = set()
+    for c in candidates:
+        code = (c.get("code") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        pc = (c.get("pairCode") or "").strip() or code2pair.get(code, "")
+        rows.append([code, pc, "visible", _SKLADOM, _SKLADOM])
     return rows
 
 
