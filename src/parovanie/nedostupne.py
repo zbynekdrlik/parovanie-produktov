@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import datetime
 from html import escape
 
 ORDER_STATUS = "Vybavuje sa"          # only currently-processing orders have customers to notify
@@ -84,6 +85,29 @@ def affected_orders(orders_csv, item_codes, order_status: str = ORDER_STATUS) ->
     return out
 
 
+def _order_date_key(date_str) -> str:
+    """A safe 'YYYY-MM-DD' sort key from an order 'date' cell (export format
+    'YYYY-MM-DD HH:MM:SS'). Empty / unparseable → '' which sorts as the OLDEST (never crashes)."""
+    head = (date_str or "").strip()[:10]
+    if not head:
+        return ""
+    try:
+        datetime.strptime(head, "%Y-%m-%d")
+    except ValueError:
+        return ""
+    return head
+
+
+def _max_open_order_date(order_rows) -> str:
+    """MAX safe order-date key among a product's open orders; '' when it has none / all invalid."""
+    best = ""
+    for o in order_rows or []:
+        d = _order_date_key(o.get("date"))
+        if d > best:
+            best = d
+    return best
+
+
 def build_view(orders_csv, unavail_store, state_store, resolve,
                order_status: str = ORDER_STATUS) -> list:
     """The „Nedostupné tovary" tab data: one entry per flagged (unavailable) product.
@@ -92,7 +116,11 @@ def build_view(orders_csv, unavail_store, state_store, resolve,
     ``{"code","name","url"}`` (the Shoptet relatedProduct* alternatives resolved to name + link);
     it lets the app inject catalog access without this module reading any file. Each entry carries
     the two persisted checkbox states, the affected orders (with a per-order sent-flag for each
-    e-mail type) and the alternatives. Products are returned name-sorted for a stable UI."""
+    e-mail type) and the alternatives.
+
+    Ordering (#185, boss): products that have an OPEN order come FIRST, sorted by the date of their
+    NEWEST open order descending (the customer waiting longest to hear back is topmost); products
+    with no open order follow (name/code sorted). Equal newest-order dates fall back to name/code."""
     codes = unavailable_item_codes(unavail_store)
     by_code = affected_orders(orders_csv, codes, order_status)
     state_store = state_store or {}
@@ -122,8 +150,13 @@ def build_view(orders_csv, unavail_store, state_store, resolve,
             "unavailable_sent_count": sum(1 for o in order_rows if o["unavailable_sent"]),
             "alternative_sent_count": sum(1 for o in order_rows if o["alternative_sent"]),
         })
-    out.sort(key=lambda p: (p["itemName"].lower(), p["code"]))
-    return out
+    with_orders = [p for p in out if p["orders"]]
+    without_orders = [p for p in out if not p["orders"]]
+    # stable two-key sort: name/code base, then MAX open-order date descending (newest on top).
+    with_orders.sort(key=lambda p: (p["itemName"].lower(), p["code"]))
+    with_orders.sort(key=lambda p: _max_open_order_date(p["orders"]), reverse=True)
+    without_orders.sort(key=lambda p: (p["itemName"].lower(), p["code"]))
+    return with_orders + without_orders
 
 
 def plan_sends(order_rows, sent_map, type_key: str) -> list:
@@ -154,16 +187,28 @@ def plan_sends(order_rows, sent_map, type_key: str) -> list:
 # Customer e-mail templates — the same HTML style as orders_reminder.build_reminder_email
 # (boss: „pekný, v ROVNAKOM formáte ako ostatné automatizácie"). Free text is HTML-escaped.
 # --------------------------------------------------------------------------- #
-def _shell(name_h: str, inner: str) -> str:
+# Signature blocks (rendered inside the shell's closing <p style="margin-top: 30px;"> … </p>).
+# The house default (Tím Forestshop.sk) is unchanged; build_unavailable_email passes the boss's own
+# signoff „S pozdravom … Drlík, Forestshop.sk" (#183) so no second signature is appended.
+_SIGN_DEFAULT = (
+    'S pozdravom,<br>\n'
+    '      <strong>Tím Forestshop.sk</strong><br>\n'
+    '      <a href="https://www.forestshop.sk" target="_blank">www.forestshop.sk</a>\n'
+)
+_SIGN_DRLIK = (
+    'S pozdravom,<br>\n'
+    '      <strong>Drlík, Forestshop.sk</strong><br>\n'
+    '      <a href="https://www.forestshop.sk" target="_blank">www.forestshop.sk</a>\n'
+)
+
+
+def _shell(name_h: str, inner: str, sign: str = _SIGN_DEFAULT) -> str:
     return (
         '<!DOCTYPE html>\n<html>\n'
         '  <body style="font-family: Arial, sans-serif; font-size: 16px; color: #333;">\n'
         f'    <p>Dobrý deň, <strong>{name_h}</strong>,</p>\n\n'
         f'{inner}'
-        '    <p style="margin-top: 30px;">S pozdravom,<br>\n'
-        '      <strong>Tím Forestshop.sk</strong><br>\n'
-        '      <a href="https://www.forestshop.sk" target="_blank">www.forestshop.sk</a>\n'
-        '    </p>\n'
+        f'    <p style="margin-top: 30px;">{sign}    </p>\n'
         '  </body>\n</html>'
     )
 
@@ -176,20 +221,21 @@ def _contact_line() -> str:
     )
 
 
-def build_unavailable_email(bill_full_name: str, item_name: str) -> tuple:
-    """(subject, html_body) — the ordered product is currently unavailable. Free text escaped."""
+def build_unavailable_email(bill_full_name: str, item_name: str = "") -> tuple:
+    """(subject, html_body) — the EXACT wording the boss gave for the unavailable-product e-mail
+    (#183, Discord 2026-07-23): the shell's personalized greeting by name + his verbatim body +
+    his „S pozdravom … Drlík, Forestshop.sk" signoff. No double greeting / no double signature.
+
+    ``item_name`` is accepted for call-site symmetry with build_alternative_email but is intentionally
+    NOT woven in — the boss's wording is deliberately generic („tovar ktorý ste si objednali"). The
+    free customer name (in the greeting) is HTML-escaped."""
     name_h = escape((bill_full_name or "").strip() or "zákazník")
-    prod_h = escape((item_name or "").strip() or "objednaný tovar")
     inner = (
-        f'    <p>Radi by sme vás informovali, že produkt <strong>{prod_h}</strong> z vašej '
-        'objednávky je momentálne <strong>nedostupný</strong>. Mrzí nás to a rozumieme, '
-        'že ste sa na svoju výbavu tešili.</p>\n\n'
-        '    <p>Situáciu aktívne riešime a v prípade potreby vás budeme osobne kontaktovať '
-        'ohľadom ďalšieho postupu (náhradný termín dodania alebo iné riešenie).</p>\n\n'
-        + _contact_line()
-        + '    <p>Ďakujeme vám za trpezlivosť a dôveru.</p>\n\n'
+        '    <p>veľmi sa ospravedlňujeme, ale tovar ktorý ste si objednali je momentálne '
+        'nedostupný a nevieme kedy bude naskladnený. Z toho dôvodu nevieme Vašu objednávku '
+        'úspešne vybaviť.</p>\n\n'
     )
-    return UNAVAILABLE_SUBJECT, _shell(name_h, inner)
+    return UNAVAILABLE_SUBJECT, _shell(name_h, inner, _SIGN_DRLIK)
 
 
 def build_alternative_email(bill_full_name: str, item_name: str, alternatives) -> tuple:
