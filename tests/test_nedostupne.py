@@ -84,7 +84,8 @@ def test_build_view_flagged_code_without_open_order_still_listed():
     assert zzz["itemName"] == ""                       # unknown code → no name
 
 
-def test_build_view_sorted_by_name():
+def test_build_view_equal_dates_fall_back_to_name():
+    # both have an open order on the SAME date → name/code tiebreak (Alfa before Zebra)
     orders = (
         "code;date;statusName;email;billFullName;itemName;itemAmount;itemCode\r\n"
         "1;2026-07-10 10:00:00;Vybavuje sa;a@x.sk;A;Zebra;1;Z1\r\n"
@@ -93,6 +94,47 @@ def test_build_view_sorted_by_name():
     unavail = {"1|Z1": True, "2|A1": True}
     view = N.build_view(orders, unavail, {}, lambda c: ("", []))
     assert [p["itemName"] for p in view] == ["Alfa", "Zebra"]
+
+
+def test_build_view_open_order_products_first_newest_on_top():
+    # #185 — products WITH an open order come first (newest order on top); no-order product last
+    orders = (
+        "code;date;statusName;email;billFullName;itemName;itemAmount;itemCode\r\n"
+        "10;2026-07-01 08:00:00;Vybavuje sa;a@x.sk;A;AAA;1;A1\r\n"   # older open order
+        "11;2026-07-20 09:00:00;Vybavuje sa;b@x.sk;B;BBB;1;B1\r\n"   # newer open order
+    )
+    unavail = {"10|A1": True, "11|B1": True, "99|C1": True}          # C1 flagged, no open order
+    view = N.build_view(orders, unavail, {}, lambda c: ("CCC" if c == "C1" else "", []))
+    assert [p["code"] for p in view] == ["B1", "A1", "C1"]           # newest → older → no-order
+    assert view[-1]["order_count"] == 0
+
+
+def test_build_view_orders_by_max_open_order_date():
+    # #185 — a product with multiple open orders sorts by its NEWEST (max) order date
+    orders = (
+        "code;date;statusName;email;billFullName;itemName;itemAmount;itemCode\r\n"
+        "20;2026-07-05 08:00:00;Vybavuje sa;a@x.sk;A;P1;1;P1\r\n"
+        "21;2026-07-15 08:00:00;Vybavuje sa;a2@x.sk;A2;P1;1;P1\r\n"  # P1's newest = 07-15
+        "22;2026-07-10 08:00:00;Vybavuje sa;b@x.sk;B;P2;1;P2\r\n"    # P2's only = 07-10
+    )
+    unavail = {"20|P1": True, "22|P2": True}
+    view = N.build_view(orders, unavail, {}, lambda c: ("", []))
+    assert [p["code"] for p in view] == ["P1", "P2"]                 # 07-15 > 07-10
+
+
+def test_build_view_invalid_or_empty_order_date_does_not_crash():
+    # #185 — empty / unparseable dates are treated as oldest and never raise
+    orders = (
+        "code;date;statusName;email;billFullName;itemName;itemAmount;itemCode\r\n"
+        "30;2026-07-20 08:00:00;Vybavuje sa;a@x.sk;A;GOOD;1;G1\r\n"  # valid newest
+        "31;;Vybavuje sa;b@x.sk;B;EMPTY;1;E1\r\n"                    # empty date
+        "32;not-a-date;Vybavuje sa;c@x.sk;C;BADD;1;B1\r\n"           # garbage date
+    )
+    unavail = {"30|G1": True, "31|E1": True, "32|B1": True}
+    view = N.build_view(orders, unavail, {}, lambda c: ("", []))
+    codes = [p["code"] for p in view]
+    assert set(codes) == {"G1", "E1", "B1"}                         # no crash, all present
+    assert codes[0] == "G1"                                          # valid newest date on top
 
 
 def test_plan_sends_dedups_persistent_batch_and_missing_email():

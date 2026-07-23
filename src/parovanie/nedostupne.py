@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import io
+from datetime import datetime
 from html import escape
 
 ORDER_STATUS = "Vybavuje sa"          # only currently-processing orders have customers to notify
@@ -84,6 +85,29 @@ def affected_orders(orders_csv, item_codes, order_status: str = ORDER_STATUS) ->
     return out
 
 
+def _order_date_key(date_str) -> str:
+    """A safe 'YYYY-MM-DD' sort key from an order 'date' cell (export format
+    'YYYY-MM-DD HH:MM:SS'). Empty / unparseable → '' which sorts as the OLDEST (never crashes)."""
+    head = (date_str or "").strip()[:10]
+    if not head:
+        return ""
+    try:
+        datetime.strptime(head, "%Y-%m-%d")
+    except ValueError:
+        return ""
+    return head
+
+
+def _max_open_order_date(order_rows) -> str:
+    """MAX safe order-date key among a product's open orders; '' when it has none / all invalid."""
+    best = ""
+    for o in order_rows or []:
+        d = _order_date_key(o.get("date"))
+        if d > best:
+            best = d
+    return best
+
+
 def build_view(orders_csv, unavail_store, state_store, resolve,
                order_status: str = ORDER_STATUS) -> list:
     """The „Nedostupné tovary" tab data: one entry per flagged (unavailable) product.
@@ -92,7 +116,11 @@ def build_view(orders_csv, unavail_store, state_store, resolve,
     ``{"code","name","url"}`` (the Shoptet relatedProduct* alternatives resolved to name + link);
     it lets the app inject catalog access without this module reading any file. Each entry carries
     the two persisted checkbox states, the affected orders (with a per-order sent-flag for each
-    e-mail type) and the alternatives. Products are returned name-sorted for a stable UI."""
+    e-mail type) and the alternatives.
+
+    Ordering (#185, boss): products that have an OPEN order come FIRST, sorted by the date of their
+    NEWEST open order descending (the customer waiting longest to hear back is topmost); products
+    with no open order follow (name/code sorted). Equal newest-order dates fall back to name/code."""
     codes = unavailable_item_codes(unavail_store)
     by_code = affected_orders(orders_csv, codes, order_status)
     state_store = state_store or {}
@@ -122,8 +150,13 @@ def build_view(orders_csv, unavail_store, state_store, resolve,
             "unavailable_sent_count": sum(1 for o in order_rows if o["unavailable_sent"]),
             "alternative_sent_count": sum(1 for o in order_rows if o["alternative_sent"]),
         })
-    out.sort(key=lambda p: (p["itemName"].lower(), p["code"]))
-    return out
+    with_orders = [p for p in out if p["orders"]]
+    without_orders = [p for p in out if not p["orders"]]
+    # stable two-key sort: name/code base, then MAX open-order date descending (newest on top).
+    with_orders.sort(key=lambda p: (p["itemName"].lower(), p["code"]))
+    with_orders.sort(key=lambda p: _max_open_order_date(p["orders"]), reverse=True)
+    without_orders.sort(key=lambda p: (p["itemName"].lower(), p["code"]))
+    return with_orders + without_orders
 
 
 def plan_sends(order_rows, sent_map, type_key: str) -> list:
