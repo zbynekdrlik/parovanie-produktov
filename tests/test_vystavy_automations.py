@@ -61,6 +61,9 @@ def test_otazka_sends_only_matching(iso):
     result = webapp.run_vystavy_otazka()
     assert result["poslane"] == 1
     assert [m["to"] for m in iso["sent"]] == ["org@x.sk"]
+    # spec (design.md:145) summary shape is {poslane, preskocene}; preskocene counts the
+    # výstavy skipped (wrong month / not-new / pdf / no e-mail) — 4 of the 5 seeded (#198 FIX 4).
+    assert result["preskocene"] == 4
     store = {v["id"]: v for v in _store(iso)}
     assert store["match"]["status"] == "otazka"
     assert store["match"]["email_otazka_msgid"] == "<sent@forestshop.sk>"

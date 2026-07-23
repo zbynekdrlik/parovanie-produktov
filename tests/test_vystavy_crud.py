@@ -102,6 +102,41 @@ def test_edit_rejects_formula(iso):
     assert r.status_code == 400
 
 
+def test_add_allows_phone_in_tel(iso):
+    """A phone number like '+421 905 123 456' starts with '+' — it MUST be accepted:
+    tel is exempt from the formula-lead guard (it never reaches a CSV/formula sink;
+    the mails interpolate only nazov/datum/velkost_stanku). Regression for #198 FIX 2."""
+    c = authed_client()
+    j = _add(c, nazov="Deň X", email="org@x.sk", tel="+421 905 123 456")
+    assert j["ok"] is True
+    assert _store(iso)[0]["tel"] == "+421 905 123 456"
+
+
+def test_edit_allows_phone_in_tel_and_kontakt(iso):
+    """Edit form posts ALL fields, so a výstava carrying a '+'-leading phone must save.
+    tel AND kontakt_osoba are exempt from the formula-lead guard (#198 FIX 2)."""
+    c = authed_client()
+    v = _add(c, nazov="A", email="a@x.sk")["vystava"]
+    j = c.post("/api/vystava", json={"id": v["id"],
+               "fields": {"tel": "+421 905 123 456",
+                          "kontakt_osoba": "-Ing. Novák"}}).get_json()
+    assert j["ok"] is True
+    stored = _store(iso)[0]
+    assert stored["tel"] == "+421 905 123 456"
+    assert stored["kontakt_osoba"] == "-Ing. Novák"
+
+
+def test_edit_still_rejects_formula_in_other_fields(iso):
+    """The tel/kontakt exemption must NOT weaken the guard on the other editable fields
+    (miesto/nazov/velkost_stanku/kedy_riesit/sposob still go through the mail sinks)."""
+    c = authed_client()
+    v = _add(c, nazov="A", email="a@x.sk")["vystava"]
+    assert c.post("/api/vystava", json={"id": v["id"],
+                  "fields": {"velkost_stanku": "=9x3"}}).status_code == 400
+    assert c.post("/api/vystava", json={"id": v["id"],
+                  "fields": {"miesto": "+evil"}}).status_code == 400
+
+
 def test_delete(iso):
     c = authed_client()
     v = _add(c, nazov="Zmazať", email="a@x.sk")["vystava"]
@@ -143,6 +178,19 @@ def test_posli_otazku_sends_and_advances(iso):
     assert iso["sent"][0]["subject"] == "Otázka ohľadom: Deň X dňa 1.9."
     # feed records it (newest-first)
     assert _store(iso)[0]["feed"][0]["typ"] == "otazka_poslana"
+
+
+def test_posli_otazku_only_from_nova(iso):
+    """posli-otazku must be allowed ONLY from the Nová (empty) state — sending it again
+    on an in-flight výstava (poziadane/otazka/…) would reset status→otazka and re-mail
+    the organizer. Wrong state → 409, no mail sent, state unchanged. #198 FIX 3."""
+    c = authed_client()
+    v = _add(c, nazov="Deň X", email="org@x.sk")["vystava"]
+    c.post("/api/vystava", json={"id": v["id"], "status": "poziadane"})
+    r = c.post("/api/vystava/posli-otazku", json={"id": v["id"]})
+    assert r.status_code == 409
+    assert iso["sent"] == []                         # no mail
+    assert _store(iso)[0]["status"] == "poziadane"   # state unchanged
 
 
 def test_posli_otazku_no_email_400(iso):
