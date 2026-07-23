@@ -20,8 +20,10 @@ def test_index_brand_and_title_are_forestshop():
     assert '<span class="brandtxt">Forestshop' in html
     # …and the interim "Forestaci" brand is gone (locks the revert — reverting fails this).
     assert '<span class="brandtxt">Forestaci' not in html
-    # Page <title> carries the app name.
-    assert "<title>Kontrola párovania — Forestshop</title>" in html
+    # Page <title> is the GENERIC app name (#175) — the tool grew into a whole
+    # system, so the per-view "Kontrola párovania …" title was dropped.
+    assert "<title>Forestshop</title>" in html
+    assert "Kontrola párovania" not in html.split("</title>")[0]
 
 
 def test_login_shell_brand_is_forestshop():
