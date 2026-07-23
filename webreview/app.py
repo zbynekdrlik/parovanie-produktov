@@ -35,7 +35,7 @@ from flask import (Flask, Response, jsonify, redirect, render_template, request,
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
-    __version__, config, image_health, import_builder, orders_reminder,
+    __version__, config, image_health, import_builder, nedostupne, orders_reminder,
     posta_uncollected, restock_skladom, riziko_vypadku, supplier_stock, writer)
 from parovanie.automation_runner import Automation, AutomationRunner
 from parovanie.catalog_index import (
@@ -775,6 +775,29 @@ def _save_unavailable(d: dict) -> None:
     os.replace(tmp, UNAVAIL)
 
 
+# „Nedostupné tovary" (#100): per-PRODUCT (itemCode) e-mail state — the two checkbox
+# intents (nedostupne/alternativa) + a `sent` dedup map keyed '<orderCode>|<type>' so the
+# same customer/order never gets a duplicate of the same e-mail. Gitignored, NEVER pruned
+# → survives deploy, exactly like the other manager stores.
+NEDOSTUPNE = os.path.join(OUT, "nedostupne.json")
+
+
+def _load_nedostupne() -> dict:
+    try:
+        with open(NEDOSTUPNE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_nedostupne(d: dict) -> None:
+    tmp = NEDOSTUPNE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, NEDOSTUPNE)
+
+
 # Admin-set custom display names for nav tabs + automations (#173): {key: label}.
 # Key = the nav/automation key (TABS/AUTOMATION_TABS keys == Automation.key, plus
 # 'users'/'dev' — one flat namespace, validated against NAV_KEYS at write time).
@@ -1314,14 +1337,11 @@ def _current_for_entry(ce: dict) -> dict:
 _CODE2URL = None
 
 
-def _our_url_for_entry(ce: dict):
-    """Best-effort forestshop our_url for a promoted product, from the marketing XML's
-    ORIG_URL (the authoritative eshop URL) by exact variant code. Built once and cached.
-    ANY failure (missing XML, parse error, scripts not importable) -> None, which is an
-    acceptable result (the UI falls back to a search link)."""
+def _ensure_code2url() -> dict:
+    """Lazily build + cache {code: ORIG_URL} from the marketing XML (the authoritative eshop URL
+    by exact variant code). ANY failure (missing XML, parse error, scripts not importable) -> {},
+    which is an acceptable result (callers fall back to a search link)."""
     global _CODE2URL
-    if not ce or not ce.get("variant_codes"):
-        return None
     if _CODE2URL is None:
         _CODE2URL = {}
         try:
@@ -1335,13 +1355,81 @@ def _our_url_for_entry(ce: dict):
                 _spec.loader.exec_module(_mod)
                 _CODE2URL = _mod.build_code2url(mx)
                 log.info("our_url: marketing XML loaded (%d codes)", len(_CODE2URL))
-        except Exception as e:  # noqa: BLE001 — best-effort; our_url=None is acceptable
+        except Exception as e:  # noqa: BLE001 — best-effort; {} is acceptable
             log.warning("our_url marketing-XML resolve failed: %r", e)
             _CODE2URL = {}
+    return _CODE2URL
+
+
+def _our_url_for_entry(ce: dict):
+    """Best-effort forestshop our_url for a promoted product, from the marketing XML's ORIG_URL
+    by exact variant code. -> None when no variant code matches (acceptable — search-link fallback)."""
+    if not ce or not ce.get("variant_codes"):
+        return None
+    c2u = _ensure_code2url()
     for c in ce["variant_codes"]:
-        if c in _CODE2URL:
-            return _CODE2URL[c]
+        if c in c2u:
+            return c2u[c]
     return None
+
+
+# „Nedostupné tovary" alternatives (#100): {code|pairCode -> product name} and {code|pairCode ->
+# relatedProduct* codes}, built once from the SAME cp1250 export the search index uses (a one-off
+# scan on first tab open — a rarely-used tab, so lazy beats a bigger startup + RSS). Reset on
+# resync (fresh export). None = not yet attempted.
+_NEDOSTUPNE_CAT = None
+# The 8 assigned-alternative columns in the pattern-14 export: the FIRST is bare `relatedProduct`
+# (NOT relatedProduct1), then relatedProduct2..8 (boss: relatedProduct1..8 = the alternatives).
+_RELATED_COLS = ["relatedProduct"] + [f"relatedProduct{i}" for i in range(2, 9)]
+
+
+def _ensure_nedostupne_catalog():
+    """(code2name, code2related) for the alternatives resolver — keyed by BOTH the variant `code`
+    and the `pairCode` (a relatedProduct value can be either). Best-effort: a missing/unreadable
+    export -> ({}, {}) (the tab still renders, just without alternative names/links)."""
+    global _NEDOSTUPNE_CAT
+    if _NEDOSTUPNE_CAT is None:
+        code2name, code2related = {}, {}
+        if os.path.exists(SRC):
+            csv.field_size_limit(10**9)
+            try:
+                with open(SRC, encoding="cp1250", errors="replace") as f:
+                    for r in csv.DictReader(f, delimiter=";"):
+                        code = (r.get("code") or "").strip()
+                        pc = (r.get("pairCode") or "").strip()
+                        name = (r.get("name") or "").strip()
+                        if name:
+                            if code:
+                                code2name.setdefault(code, name)
+                            if pc:
+                                code2name.setdefault(pc, name)
+                        rel = [(r.get(c) or "").strip() for c in _RELATED_COLS]
+                        rel = [x for x in rel if x][:nedostupne.MAX_ALTERNATIVES]
+                        if rel:
+                            if code:
+                                code2related.setdefault(code, rel)
+                            if pc:
+                                code2related.setdefault(pc, rel)
+            except (OSError, csv.Error) as e:  # malformed row / unreadable → degrade to {}
+                log.warning("nedostupne catalog scan failed: %r", e)
+                code2name, code2related = {}, {}
+        _NEDOSTUPNE_CAT = (code2name, code2related)
+        log.info("nedostupne: catalog maps built (%d names, %d with alternatives)",
+                 len(code2name), len(code2related))
+    return _NEDOSTUPNE_CAT
+
+
+def _resolve_alternatives(code: str):
+    """(product_name, [{code,name,url}]) — the resolve() callback nedostupne.build_view expects.
+    Alternatives = the product's relatedProduct* codes resolved to a name (catalog) + a link
+    (marketing XML ORIG_URL, else a forestshop search-by-code link so it is ALWAYS clickable)."""
+    code2name, code2related = _ensure_nedostupne_catalog()
+    c2u = _ensure_code2url()
+    alts = []
+    for rc in code2related.get(code, []):
+        url = c2u.get(rc) or ("https://www.forestshop.sk/vyhladavanie/?string=" + quote(rc))
+        alts.append({"code": rc, "name": code2name.get(rc, rc), "url": url})
+    return code2name.get(code, ""), alts
 
 
 def _review_products_for(e: dict, by_paircode=None, by_code=None) -> list:
@@ -1628,6 +1716,151 @@ def api_unavailable():
         _save_unavailable(d)
     log.info("unavailable key=%s unavailable=%s", key, unavailable)
     return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------- #
+# Nedostupné tovary (#100): flagged-unavailable products collected in one place,
+# joined to open orders (customers) + relatedProduct alternatives, with two
+# preview-gated customer e-mails. SAFETY: no e-mail is EVER sent automatically —
+# a checkbox only persists intent; a send needs the explicit preview → Odoslať.
+# --------------------------------------------------------------------------- #
+@app.route("/api/nedostupne")
+def api_nedostupne():
+    """Tab data: flagged-unavailable products grouped per product, joined to open orders +
+    alternatives + the persisted e-mail state. Degrades to [] on orders fetch error."""
+    try:
+        csv_bytes = _orders_csv_cached()
+    except Exception as e:  # noqa: BLE001 — degrade to empty, log the cause
+        log.warning("nedostupne orders fetch failed: %r", e)
+        return jsonify({"products": [], "error": str(e)})
+    view = nedostupne.build_view(csv_bytes, _load_unavailable(),
+                                 _load_nedostupne(), _resolve_alternatives)
+    return jsonify({"products": view})
+
+
+@app.route("/api/nedostupne/state", methods=["POST"])
+def api_nedostupne_state():
+    """Persist ONE checkbox intent (field=nedostupne|alternativa) for a product. NO e-mail is
+    sent — this is only the manager's visual mark; sending is the separate preview-gated action."""
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    field = str(body.get("field") or "").strip()
+    value = bool(body.get("value"))
+    if not code or field not in nedostupne.EMAIL_TYPES:
+        return jsonify({"ok": False, "error": "neplatná požiadavka"}), 400
+    with _lock:
+        d = _load_nedostupne()
+        rec = d.setdefault(code, {})
+        if value:
+            rec[field] = True
+        else:
+            rec.pop(field, None)
+        # tidy: drop a record that carries no flag AND no sent history
+        if not any(rec.get(t) for t in nedostupne.EMAIL_TYPES) and not rec.get("sent"):
+            d.pop(code, None)
+        _save_nedostupne(d)
+    log.info("nedostupne state code=%s field=%s value=%s", code, field, value)
+    return jsonify({"ok": True})
+
+
+def _nedostupne_orders_alts(code: str):
+    """(product_name, order_rows, alternatives) for ONE flagged product from the cached orders +
+    catalog. Raises on orders-fetch failure (caller maps to 502)."""
+    csv_bytes = _orders_csv_cached()
+    orders = nedostupne.affected_orders(csv_bytes, {code}).get(code, [])
+    cat_name, alts = _resolve_alternatives(code)
+    name = (orders[0]["itemName"] if orders and orders[0].get("itemName") else "") or cat_name
+    return name, orders, alts
+
+
+@app.route("/api/nedostupne/preview", methods=["POST"])
+def api_nedostupne_preview():
+    """Preview a customer e-mail WITHOUT sending: the recipients still to notify (dedup applied)
+    and the rendered e-mail (personalised to the first recipient). SAFE — reads only."""
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    type_key = str(body.get("type") or "").strip()
+    if not code or type_key not in nedostupne.EMAIL_TYPES:
+        return jsonify({"ok": False, "error": "neplatná požiadavka"}), 400
+    try:
+        name, orders, alts = _nedostupne_orders_alts(code)
+    except Exception as e:  # noqa: BLE001 — orders fetch failed
+        log.warning("nedostupne preview fetch failed: %r", e)
+        return jsonify({"ok": False, "error": "objednávky sa nepodarilo načítať"}), 502
+    sent = (_load_nedostupne().get(code) or {}).get("sent") or {}
+    plan = nedostupne.plan_sends(orders, sent, type_key)
+    lead_name = plan[0]["billFullName"] if plan else ""
+    if type_key == nedostupne.TYPE_UNAVAILABLE:
+        subject, html = nedostupne.build_unavailable_email(lead_name, name)
+    else:
+        subject, html = nedostupne.build_alternative_email(lead_name, name, alts)
+    already = sum(1 for o in orders if sent.get(f"{o['orderCode']}|{type_key}"))
+    return jsonify({"ok": True, "product": name, "subject": subject, "html": html,
+                    "alternatives": alts, "already_sent": already,
+                    "recipients": [{"orderCode": r["orderCode"], "email": r["email"],
+                                    "name": r["billFullName"]} for r in plan]})
+
+
+@app.route("/api/nedostupne/send", methods=["POST"])
+def api_nedostupne_send():
+    """Send the chosen customer e-mail (type=nedostupne|alternativa) to every not-yet-notified
+    customer with an open order for this product. Dedup per order+type (never double-send). The
+    SMTP round-trip runs OUTSIDE the global store lock (like run_orders_reminder) and each success
+    is persisted immediately (a crash mid-batch must not re-send). A per-recipient re-check under
+    lock NARROWS (does not fully close) the concurrent-send window — the frontend disabling the
+    button covers the single-user double-click; two truly simultaneous senders could still both
+    pass the re-check, the same accepted trade-off as run_orders_reminder (a claim-before-send lock
+    is deferred)."""
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    type_key = str(body.get("type") or "").strip()
+    if not code or type_key not in nedostupne.EMAIL_TYPES:
+        return jsonify({"ok": False, "error": "neplatná požiadavka"}), 400
+    try:
+        name, orders, alts = _nedostupne_orders_alts(code)
+    except Exception as e:  # noqa: BLE001 — orders fetch failed
+        log.warning("nedostupne send fetch failed: %r", e)
+        return jsonify({"ok": False, "error": "objednávky sa nepodarilo načítať"}), 502
+    with _lock:
+        sent = dict((_load_nedostupne().get(code) or {}).get("sent") or {})
+    plan = nedostupne.plan_sends(orders, sent, type_key)
+    if not plan:
+        return jsonify({"ok": True, "sent": 0, "failed": 0, "skipped": 0,
+                        "note": "žiadni noví príjemcovia"})
+    sent_ok = failed = skipped = 0
+    now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    for r in plan:
+        sk = f"{r['orderCode']}|{type_key}"
+        with _lock:   # concurrent send for the same order+type already recorded → skip
+            if (_load_nedostupne().get(code) or {}).get("sent", {}).get(sk):
+                skipped += 1
+                continue
+        if type_key == nedostupne.TYPE_UNAVAILABLE:
+            subject, html = nedostupne.build_unavailable_email(r["billFullName"], name)
+        else:
+            subject, html = nedostupne.build_alternative_email(r["billFullName"], name, alts)
+        if _send_mail_html(r["email"], subject, html):
+            sent_ok += 1
+            low = (r["email"] or "").strip().lower()
+            with _lock:
+                d = _load_nedostupne()
+                smap = d.setdefault(code, {}).setdefault("sent", {})
+                # Record EVERY open order sharing this customer's e-mail + type — not
+                # just the winning order. plan_sends dedups per e-mail, so a repeat
+                # buyer with the SAME product in two open orders is planned once; if we
+                # marked only that one order, the sibling would stay unrecorded and the
+                # next send would re-e-mail the same customer (#100 review, Finding 1).
+                for o in orders:
+                    if (o.get("email") or "").strip().lower() == low:
+                        smap[f"{o['orderCode']}|{type_key}"] = {"at": now_iso, "email": r["email"]}
+                _save_nedostupne(d)
+        else:
+            failed += 1
+    log.info("nedostupne send code=%s type=%s sent=%d failed=%d skipped=%d user=%s",
+             code, type_key, sent_ok, failed, skipped, session.get("user"))
+    ok = failed == 0
+    return jsonify({"ok": ok, "sent": sent_ok, "failed": failed, "skipped": skipped}), (
+        200 if ok else 502)
 
 
 @app.route("/api/notes", methods=["GET", "POST"])
@@ -2781,7 +3014,7 @@ def run_shoptet_sync() -> dict:
     try/except (automation_runner._execute) records the error and the app keeps
     serving the previous cache/catalog/review data untouched — degrade, never
     crash, never a half-written file."""
-    global CODE2PAIR, CATALOG
+    global CODE2PAIR, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
 
     orders_bytes = _fetch_orders_csv()
     tmp = ORDERS_CACHE + ".tmp"
@@ -2801,6 +3034,10 @@ def run_shoptet_sync() -> dict:
         review_keys = ({p.get("pairCode") for p in PRODUCTS if p.get("pairCode")}
                        | {c for p in PRODUCTS for c in (p.get("variant_codes") or [])})
         CODE2PAIR, CATALOG = _load_catalog(SRC, review_keys)
+        # the fresh export can change names/alternatives → drop the lazy caches so the
+        # nedostupné resolver rebuilds them from the new products.csv on next tab open.
+        _NEDOSTUPNE_CAT = None
+        _CODE2URL = None
 
     rows = []
     with open(SRC, encoding="cp1250", errors="replace") as f:
@@ -3614,7 +3851,7 @@ RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 # the nav key). Keep this set in sync with app.js's TABS/AUTOMATION_TABS keys
 # whenever a nav tab is added/renamed-in-code.
 NAV_KEYS = {
-    "toorder", "search", "notes", "review",                              # TABS
+    "toorder", "nedostupne", "search", "notes", "review",                # TABS
     "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
     "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom",
     "image_health",                                                      # AUTOMATION_TABS

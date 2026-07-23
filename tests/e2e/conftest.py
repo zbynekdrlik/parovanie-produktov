@@ -59,7 +59,8 @@ def _admin_session_cookie(base: str) -> str:
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
-                    "automations_server", "imgfail_server", "imgflood_server", "dev_server")
+                    "automations_server", "imgfail_server", "imgflood_server", "dev_server",
+                    "nedostupne_server")
 
 
 @pytest.fixture(autouse=True)
@@ -488,6 +489,72 @@ def automations_server(tmp_path_factory):
         # ALREADY-SET key, so pinning MAIL_HOST="" here forces the deterministic
         # not-configured/no-network branch on every machine, CI included.
         "MAIL_HOST": "",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _write_nedostupne_catalog_csv(path):
+    """cp1250 export fixture for the „Nedostupné tovary" tab (#100): one flagged product with two
+    assigned alternatives (relatedProduct*), plus the two alternative products so their NAMES
+    resolve. marketing.xml is absent in the fixture out-dir → alternative links fall back to the
+    forestshop search-by-code URL (always clickable)."""
+    header = ["code", "pairCode", "name", "supplier", "productVisibility",
+              "availabilityInStock", "availabilityOutOfStock", "price", "standardPrice", "stock",
+              "defaultImage", "relatedProduct", "relatedProduct2"]
+    rows = [
+        ["ND1/M", "NDP1", "Nedostupný Kabát Test", "TESTSUP", "visible",
+         "Vypredané", "Vypredané", "129,00", "", "0", "", "ALT1", "ALT2"],
+        ["ALT1", "ALTP1", "Alternatíva Bunda Test", "TESTSUP", "visible",
+         "Skladom", "", "99,00", "", "4", "", "", ""],
+        ["ALT2", "ALTP2", "Alternatíva Vesta Test", "TESTSUP", "visible",
+         "Skladom", "", "59,00", "", "3", "", "", ""],
+    ]
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n")
+    w.writerow(header)
+    w.writerows(rows)
+    with open(path, "w", encoding="cp1250", newline="") as f:
+        f.write(buf.getvalue())
+
+
+@pytest.fixture(scope="function")
+def nedostupne_server(tmp_path_factory):
+    """Isolated webreview instance for the „Nedostupné tovary" tab E2E (#100). Seeded WITHOUT any
+    network: a FRESH orders_cache.csv with two open orders for the flagged product, an
+    unavailable_items.json flagging it (#84), and a products.csv with the product + its two
+    relatedProduct alternatives. MAIL_HOST="" is pinned so even an accidental send hits the
+    deterministic not-configured branch (never a real customer e-mail from a dev box)."""
+    out = tmp_path_factory.mktemp("wr_nd_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;email;billFullName;itemName;itemAmount;itemCode;itemVariantName\r\n"
+        "3001;2026-07-10 10:00:00;Vybavuje sa;ada@example.com;Ada Nová;Nedostupný Kabát Test;1;ND1/M;M\r\n"
+        "3002;2026-07-11 11:00:00;Vybavuje sa;bob@example.com;Bob Starý;Nedostupný Kabát Test;2;ND1/M;M\r\n",
+        encoding="cp1250")
+    (out / "unavailable_items.json").write_text(
+        json.dumps({"3001|ND1/M": True}), encoding="utf-8")
+    products_csv = out / "products.csv"
+    _write_nedostupne_catalog_csv(products_csv)
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(products_csv),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+        "MAIL_HOST": "",                              # never a real send from the fixture
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
