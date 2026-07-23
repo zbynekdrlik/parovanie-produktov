@@ -4,6 +4,7 @@ import pytest
 
 from parovanie.grube_de import (
     MULTI_AXIS,
+    ONE_SIZE,
     match_variant_codes,
     normalize_size,
     parse_variants,
@@ -12,6 +13,10 @@ from parovanie.grube_de import (
 )
 
 FIX = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_154773.html"
+# Single-size knife (#60 class 1): NO 'Größe' Offer list; one own itemId in the
+# `itemId=` anchor (2540316117 = 254031+4). The page ALSO carries 17 cross-sell
+# anchors with OTHER productIds — real proof the prefix+len filter excludes them.
+FIX_SINGLE = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_254031_ocielka.html"
 
 
 def test_to_grube_de_strips_query_and_fragment():
@@ -70,6 +75,37 @@ def test_parse_variants_multicolor_returns_empty():
     html = ('"name":"Farbe oliv. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547734524"'
             '"name":"Farbe braun. Größe L.","price":"1","priceCurrency":"EUR","sku":"1547739999"')
     assert parse_variants(html, "154773") == {}
+
+
+# --- single-size (#60 class 1) -------------------------------------------------
+
+def test_parse_variants_single_size_knife_real_page():
+    # real single-size ocieľka page: 0 sized Offers -> the ONE own itemId from the
+    # `itemId=` anchor, under the ONE_SIZE sentinel key.
+    html = FIX_SINGLE.read_text(encoding="utf-8")
+    assert parse_variants(html, "254031") == {ONE_SIZE: "2540316117"}
+
+
+def test_parse_variants_single_size_excludes_cross_sell():
+    # the real page carries 17 foreign cross-sell itemId anchors (other productIds);
+    # only the own 254031+4 id survives the prefix+len filter.
+    html = FIX_SINGLE.read_text(encoding="utf-8")
+    got = parse_variants(html, "254031")
+    assert list(got.values()) == ["2540316117"]
+    assert all(v.startswith("254031") and len(v) == 10 for v in got.values())
+
+
+def test_parse_variants_single_size_multicolor_link_only():
+    # no sized Offer list but >1 OWN itemId anchor (multi-color, no size axis) -> link-only
+    html = ('<a href="/ajax/reminder/add?itemId=2540316117">a</a>'
+            '<a href="/ajax/reminder/add?itemId=2540319999">b</a>')
+    assert parse_variants(html, "254031") == {}
+
+
+def test_parse_variants_single_size_no_own_itemid_link_only():
+    # no sized Offer AND no own itemId anchor (only foreign cross-sell) -> link-only
+    html = '<a href="/ajax/reminder/add?itemId=6165154086">foreign</a>'
+    assert parse_variants(html, "254031") == {}
 
 
 def _row(**kw):
@@ -148,6 +184,32 @@ def test_match_collision_guard_raises():
     rows = [_vrow("X/XXL", **{"variant:Veľkosť (všetko)": "XXL"})]
     with pytest.raises(ValueError):
         match_variant_codes(rows, g)
+
+
+# --- single-size matching (#60 class 1) ---------------------------------------
+
+def test_match_one_size_matches_single_grube():
+    # one-size forestshop knife (no size columns) + single-size grube -> the itemId
+    rows = [_vrow("MO14238")]                      # all size columns empty -> resolve_size None
+    assert match_variant_codes(rows, {ONE_SIZE: "2540316117"}) == {"MO14238": "2540316117"}
+
+
+def test_match_one_size_multiple_rows_link_only():
+    # 2 one-size codes but only 1 grube itemId -> never spread 1 itemId over N codes
+    rows = [_vrow("A"), _vrow("B")]
+    assert match_variant_codes(rows, {ONE_SIZE: "2540316117"}) == {}
+
+
+def test_match_one_size_row_against_multisize_grube_link_only():
+    # a one-size forestshop row must NOT grab a random size of a multi-size grube product
+    rows = [_vrow("MO14238")]
+    assert match_variant_codes(rows, GRUBE) == {}
+
+
+def test_match_sized_row_against_single_size_grube_link_only():
+    # a sized forestshop row must NOT match a single-size grube product
+    rows = [_vrow("X/L", **{"variant:Veľkosť (všetko)": "L"})]
+    assert match_variant_codes(rows, {ONE_SIZE: "2540316117"}) == {}
 
 
 def test_normalize_size_letter_and_numeric():
