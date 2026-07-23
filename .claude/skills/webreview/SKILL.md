@@ -517,3 +517,12 @@ gh api -X PATCH repos/zbynekdrlik/parovanie-produktov/pulls/<N> \
   -f title="…" -F body=@body.md --jq '.title'
 ```
 (READ cez `gh pr view --json …` funguje normálne; len edit mutácia padá.)
+
+## Gotcha — dva „zjavné DRY" ciele v tejto appke NEROB (#12) — over si skryté API/výkonové väzby PRED refaktorom
+
+Starý audit (#12) navrhoval ĎALŠIE dva dedup kroky nad tie, čo sú už hotové (`csv_loader.load_code2pair`, `writer.shoptet_writer`) — pri overení sa oba ukázali ako ZLÝ nápad, nie len „netreba":
+
+- **`scripts/shoptet_import.py`'s `print()` riadky NIE sú kozmetické logovanie — sú to load-bearing dáta.** `webreview/app.py::run_import()` spúšťa tento skript ako subprocess a **zachytáva jeho stdout** (`subprocess.PIPE`); `_import_rows_chunked()` volá `parse_import_log(out)`, ktorá REGEXOM z toho istého textu vyťahuje `spracované=/upravené=/zlyhania=` pre agregáciu chunkovaného importu (`restock_skladom`, `parovania_eshop`, `/api/n8n/shoptet-import`). Prerobenie na `logging` (default ide na stderr, iný formát) by ticho rozbilo tento parse. Ak niekedy treba tieto print() naozaj zlogovať, musí sa to spraviť tak, aby `run_import`/`_import_rows_chunked` dostali výsledok INAK (napr. štruktúrovaný návrat namiesto textového stdout parsovania) — nie holým s/print/log/.
+- **`webreview/app.py::_load_catalog()` zámerne robí JEDEN cp1250 prechod** cez `data/products.csv`, čo postaví AJ `CODE2PAIR` AJ `CATALOG` (vyhľadávací index #115) z tých istých načítaných riadkov. Presmerovanie `CODE2PAIR` cez zdieľaný `csv_loader.load_code2pair` (ten ho stavia sám, bez `rows`) by vyžadovalo DRUHÝ celý prechod súborom — zdvojenie I/O pri každom štarte appky aj pri `/api/resync`, nie čistý dedup.
+
+Overuj PRED refaktorom, či „duplicitný" kód v skutočnosti nenesie skrytú závislosť (parsovaný výstup, jednoprechodový výkon) — CLAUDE.md's „NEkopíruj logiku" pravidlo pre `csv_loader`/`writer` sa vzťahuje na NOVÝ kód, nie na tieto dve už-zámerne-oddelené miesta.
