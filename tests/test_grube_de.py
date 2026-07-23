@@ -17,6 +17,11 @@ FIX = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_154773.html"
 # `itemId=` anchor (2540316117 = 254031+4). The page ALSO carries 8 cross-sell
 # anchors with OTHER productIds — real proof the prefix+len filter excludes them.
 FIX_SINGLE = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_254031_ocielka.html"
+# Range-size shirt (#60 class 3): the grube.de Offer 'name' carries 'Größe <RANGE>.'
+# where <RANGE> is the SAME slash format as forestshop ("39/40"). Verified LIVE on
+# grube.de 2026-07-23 (pid 113567). Own itemId = 113567 + 4 digits; the page also
+# carries a foreign cross-sell offer (sku 6165695125) proving the prefix filter.
+FIX_RANGE = pathlib.Path(__file__).parent / "fixtures" / "grube_de_detail_113567_kosela.html"
 
 
 def test_to_grube_de_strips_query_and_fragment():
@@ -210,6 +215,75 @@ def test_match_sized_row_against_single_size_grube_link_only():
     # a sized forestshop row must NOT match a single-size grube product
     rows = [_vrow("X/L", **{"variant:Veľkosť (všetko)": "L"})]
     assert match_variant_codes(rows, {ONE_SIZE: "2540316117"}) == {}
+
+
+# --- range / single-number / cm sizes (#60 class 3) ---------------------------
+# LIVE verification (2026-07-23): grube.de emits the SAME size string as forestshop
+# for every "range/special" format — slash ranges ("39/40"), single numbers ("39",
+# shoe sizes) and cm kids sizes ("140"). The spec's assumption that grube would use a
+# DIFFERENT range notation (e.g. "Gr. 39-40") requiring normalization is false, so the
+# existing EXACT-string match already covers class 3. These tests LOCK that, and prove
+# the fail-closed guarantee: no fuzzy range-membership, no cross-format match.
+
+def test_parse_variants_range_sizes_real_page():
+    # real slim-fit shirt page (pid 113567): grube Offer 'Größe 39/40.' etc. -> the
+    # range label is the same slash format as forestshop.
+    html = FIX_RANGE.read_text(encoding="utf-8")
+    assert parse_variants(html, "113567") == {
+        "39/40": "1135678118", "41/42": "1135678134", "43/44": "1135678153",
+        "45/46": "1135678180", "47/48": "1135678192", "49/50": "1135678114",
+    }
+
+
+def test_parse_variants_range_excludes_cross_sell():
+    # the page carries a foreign cross-sell offer (sku 6165695125, other productId);
+    # only own 113567+4 ids survive the prefix+len filter.
+    html = FIX_RANGE.read_text(encoding="utf-8")
+    got = parse_variants(html, "113567")
+    assert "6165695125" not in got.values()
+    assert all(v.startswith("113567") and len(v) == 10 for v in got.values())
+
+
+def test_match_range_sizes_exact():
+    # forestshop range "39/40" ↔ grube range "39/40" — exact match (no normalization
+    # needed: grube uses the identical slash string). Verified LIVE on pid 113567.
+    grube = parse_variants(FIX_RANGE.read_text(encoding="utf-8"), "113567")
+    rows = [_vrow("62093/39/40", **{"variant:Veľkosť (všetko)": "39/40"}),
+            _vrow("62093/47/48", **{"variant:Veľkosť (všetko)": "47/48"})]
+    assert match_variant_codes(rows, grube) == {
+        "62093/39/40": "1135678118", "62093/47/48": "1135678192"}
+
+
+def test_match_single_numeric_shoe_sizes():
+    # boots (pid 134030) — grube 'Größe 39.'..'48.' single numbers == forestshop
+    # single numbers "37","39",... in the numeric column. Verified LIVE.
+    grube = {"37": "1340302316", "38": "1340302323", "39": "1340302332", "40": "1340302336"}
+    rows = [_vrow("B/37", **{"variant:Veľkosť číslo": "37"}),
+            _vrow("B/39", **{"variant:Veľkosť číslo": "39"})]
+    assert match_variant_codes(rows, grube) == {"B/37": "1340302316", "B/39": "1340302332"}
+
+
+def test_match_cm_kids_sizes():
+    # kids sweater (pid 115162) — grube 'Größe 140.' cm sizes == forestshop cm sizes.
+    grube = {"140": "1151629218", "152": "1151629296"}
+    rows = [_vrow("K/140", **{"variant:Veľkosť (všetko)": "140"}),
+            _vrow("K/152", **{"variant:Veľkosť (všetko)": "152"})]
+    assert match_variant_codes(rows, grube) == {"K/140": "1151629218", "K/152": "1151629296"}
+
+
+def test_match_single_number_never_snaps_to_range():
+    # FAIL-CLOSED: a forestshop single "39" must NEVER match a grube range "39/40"
+    # (range-membership is fuzzy and banned — "39" could be a shoe size, not a collar
+    # range). No exact string equality -> link-only.
+    rows = [_vrow("X/39", **{"variant:Veľkosť číslo": "39"})]
+    assert match_variant_codes(rows, {"39/40": "1135678118"}) == {}
+
+
+def test_match_range_never_snaps_to_different_grube_format():
+    # FAIL-CLOSED: if grube ever formatted the range differently (hyphen "39-40" vs
+    # forestshop slash "39/40"), exact match fails -> link-only, never a wrong code.
+    rows = [_vrow("X/39/40", **{"variant:Veľkosť (všetko)": "39/40"})]
+    assert match_variant_codes(rows, {"39-40": "1135678118"}) == {}
 
 
 def test_normalize_size_letter_and_numeric():

@@ -64,6 +64,38 @@ def test_build_single_size_multivariant_link_only():
     assert build_grube_codes(decisions, itemids, rows, review) == {}
 
 
+def test_build_range_sizes_join():
+    # #60 class 3: a range-size shirt (pid 113567) joins by pairCode exactly like
+    # letter/numeric sizes — grube uses the same "39/40" slash string as forestshop.
+    decisions = {"GRUBE|1380": {"status": "manual",
+                                "url": "https://www.grube.sk/p/kosela-slim-fit/113567/?q=x#itemId=1135678118"}}
+    itemids = {"113567": {"39/40": "1135678118", "41/42": "1135678134", "47/48": "1135678192"}}
+    rows = [_erow("62093/39/40", "1380", **{"variant:Veľkosť (všetko)": "39/40"}),
+            _erow("62093/47/48", "1380", **{"variant:Veľkosť (všetko)": "47/48"})]
+    out = build_grube_codes(decisions, itemids, rows)
+    assert out == {
+        "62093/39/40": {"itemId": "1135678118", "size": "39/40",
+                        "deUrl": "https://www.grube.de/p/x/113567/", "productId": "113567"},
+        "62093/47/48": {"itemId": "1135678192", "size": "47/48",
+                        "deUrl": "https://www.grube.de/p/x/113567/", "productId": "113567"},
+    }
+
+
+def test_build_dual_axis_komplet_link_only():
+    # #60 class 2: a jacket+trousers komplet has TWO size axes (Bunda + Nohavice).
+    # grube.de sells jacket & trousers as SEPARATE single-axis products (verified LIVE
+    # 2026-07-23) -> NO single itemId represents a (bunda × nohavice) pair, and
+    # externalCode is a single field. So a komplet variant stays LINK-ONLY: it produces
+    # NO grube_codes entry even when itemids carry sizes. Fail-closed, never a wrong code.
+    decisions = {"GRUBE|1234": {"status": "manual", "url": "https://www.grube.sk/p/x/154773/"}}
+    itemids = {"154773": {"S": "1547734523", "L": "1547734519", "46": "1547734500"}}
+    rows = [_erow("62X/3XL/46", "1234",
+                  **{"variant:Bunda veľkosť": "3XL", "variant:Nohavice veľkosť": "46"}),
+            _erow("62X/L/48", "1234",
+                  **{"variant:Bunda veľkosť": "L", "variant:Nohavice veľkosť": "48"})]
+    assert build_grube_codes(decisions, itemids, rows) == {}
+
+
 def test_build_grube_codes_fails_loud_on_nongrube_code_collision():
     import pytest
     decisions = {"GRUBE|395": {"status": "manual", "url": "https://www.grube.sk/p/x/154773/"}}
