@@ -15,6 +15,7 @@ from parovanie.import_builder import (
     new_order_pairing_keys,
     new_pairing_keys,
     new_supplier_keys,
+    new_variant_link_keys,
     order_pairing_rows,
     restock_rows,
     sanitize_csv,
@@ -394,6 +395,39 @@ def test_new_externalcode_keys_skips_empty_and_nonnumeric():
 def test_new_externalcode_keys_empty_when_all_uploaded():
     gc = {"a": {"itemId": "111"}, "b": {"itemId": "222"}}
     assert new_externalcode_keys(gc, {"a": "111", "b": "222"}) == []
+
+
+# --- new_variant_link_keys: incremental diff for the nightly split upload (#192) - #
+def test_new_variant_link_keys_new_and_changed_only():
+    vl = {"a/S": "https://x.sk/1", "a/M": "https://x.sk/2", "a/L": "https://x.sk/3"}
+    split = {"a/S", "a/M", "a/L"}
+    # a/S already uploaded with the SAME url → skip; a/M's url CHANGED → re-push;
+    # a/L never uploaded → new. Order preserved (dict iteration order).
+    uploaded = {"a/S": "https://x.sk/1", "a/M": "https://x.sk/OLD"}
+    assert new_variant_link_keys(vl, split, uploaded) == ["a/M", "a/L"]
+
+
+def test_new_variant_link_keys_skips_non_http():
+    # a non-http(s) URL must NEVER become work to do — it can't reach the live eshop
+    # internalNote (fail-safe, matching the /api/variant-link source guard).
+    vl = {"a/S": "javascript:evil", "a/M": "", "a/L": "https://x.sk/ok",
+          "a/X": "ftp://x.sk/no"}
+    split = {"a/S", "a/M", "a/L", "a/X"}
+    assert new_variant_link_keys(vl, split, {}) == ["a/L"]
+
+
+def test_new_variant_link_keys_skips_codes_not_in_split_set():
+    # a variant link stored for a product that is NO LONGER split (its code isn't in
+    # split_codes) is never pushed — only split variants go up.
+    vl = {"a/S": "https://x.sk/1", "b/M": "https://x.sk/2"}
+    split = {"a/S"}                                   # only a/S belongs to a split product
+    assert new_variant_link_keys(vl, split, {}) == ["a/S"]
+
+
+def test_new_variant_link_keys_empty_when_all_uploaded():
+    vl = {"a/S": "https://x.sk/1", "a/M": "https://x.sk/2"}
+    split = {"a/S", "a/M"}
+    assert new_variant_link_keys(vl, split, {"a/S": "https://x.sk/1", "a/M": "https://x.sk/2"}) == []
 
 
 # --- link_rows GRUBE internalNote normalization (Task 9) --------------------- #

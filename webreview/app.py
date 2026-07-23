@@ -3166,6 +3166,160 @@ def n8n_upload_externalcode():
 
 
 # --------------------------------------------------------------------------- #
+# n8n → nightly upload of per-size SPLIT links (→ eshop `internalNote` field, per
+# variant). #192 — the nightly cron follow-up to the MVP manual zip for the #174
+# „✂ Rozdeliť na veľkosti" per-size supplier links. DISTINCT write path from the
+# pairings push: a `split` decision carries NO decision URL (its links live in
+# variant_links.json, keyed per variant code), so the nightly pairings job never
+# picks it up. Mirrors the supplier/externalcode write-back (own incremental store,
+# reuses import_builder.link_rows for the rows — no duplicated logic).
+# --------------------------------------------------------------------------- #
+VARIANT_LINKS_STATE = os.path.join(OUT, "uploaded_variant_links.json")
+
+
+def _load_uploaded_variant_links():
+    """{variant_code: url} already written back to the eshop — so the nightly job only
+    sends new or changed split links. Missing/corrupt → empty (everything is new).
+    Always a dict (a stray array could repeat a code and break the summary invariant)."""
+    try:
+        with open(VARIANT_LINKS_STATE, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_uploaded_variant_links(d):
+    tmp = VARIANT_LINKS_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, VARIANT_LINKS_STATE)
+
+
+def _variant_link_summary(uploaded, vlinks, split_codes):
+    """Totals for the tab/notification: split-linked variant codes with a valid
+    http(s) URL, how many are already written back (uploaded url still matches the
+    current one), how many remain. A changed URL counts as remaining (uploaded !=
+    current), matching new_variant_link_keys. Only split + http(s) codes count — a
+    stale link on a no-longer-split product, or a non-http URL, is never uploadable so
+    it must not inflate the total."""
+    valid = {c: (u or "").strip() for c, u in vlinks.items()
+             if c in split_codes and (u or "").strip().startswith(("http://", "https://"))}
+    total = len(valid)
+    up = sum(1 for c, u in valid.items() if uploaded.get(c) == u)
+    return {"total_codes": total, "total_uploaded": up,
+            "remaining": max(0, total - up), "review_url": PUBLIC_URL}
+
+
+def _do_upload_variant_links(dry):
+    """Core of the nightly per-size split-link write-back (#192) — the SINGLE place
+    the logic lives (NEkopíruj logiku). Reads the durable variant_links.json store +
+    the live split decisions, builds code;pairCode;internalNote rows for only the split
+    variants not yet uploaded (or whose URL changed) via import_builder.link_rows (the
+    SAME row builder the manual zip uses — GRUBE .de normalization + per-variant
+    skip-empty included), runs the careful chunked import, records what went up, and
+    returns (result, status). Shared by the n8n HTTP endpoint (below) and the in-app
+    „Veľkostné linky → eshop" automation (#192) — no auth / Flask request access here.
+    Touches ONLY the `internalNote` column (LINK_HEADER → a present-but-empty cell
+    can't wipe state/prices; and a variant with no stored link is skipped by link_rows,
+    never an empty cell that would WIPE the existing link). A non-http(s) URL is dropped
+    in new_variant_link_keys (fail-safe — never reaches the live eshop). Only `split`
+    decisions are passed to link_rows, so good/manual links (already pushed by
+    „Párovania → eshop") are never re-written here."""
+    vlinks = _load_variant_links()
+    uploaded = _load_uploaded_variant_links()
+    dec = _load_decisions()
+    by_key = {p.get("key"): p for p in PRODUCTS}
+    split_dec = {k: d for k, d in dec.items() if d.get("status") == "split"}
+    split_codes = {c for k in split_dec
+                   for c in (by_key.get(k, {}).get("variant_codes") or [])}
+    new_codes = import_builder.new_variant_link_keys(vlinks, split_codes, uploaded)
+    products = [{"code": c, "url": (vlinks.get(c) or "").strip()} for c in new_codes]
+    if not new_codes:
+        log.info("n8n variant-links: 0 new split links")
+        return {"ok": True, "count": 0, "products": [],
+                **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
+
+    # Build rows via link_rows (the manual-zip builder). Passing ONLY split_dec keeps
+    # good/manual links out (they go via _do_upload_pairings); passing ONLY the new
+    # codes' variant_links keeps THIS run incremental (link_rows skips a variant with no
+    # link, so an unchanged/old code produces no row).
+    rows = import_builder.link_rows(PRODUCTS, split_dec, CODE2PAIR,
+                                    {c: vlinks[c] for c in new_codes})
+    if not rows:
+        log.warning("n8n variant-links: %d new codes but 0 import rows", len(new_codes))
+        return {"ok": True, "count": 0, "products": products,
+                "message": "no import rows", "blocked": len(new_codes),
+                **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
+
+    # A new code can miss a row: link_rows dedups per variant code (first-wins across
+    # duplicate-catalog products), so a code shared with an earlier split product is a
+    # "seen"-loser → blocked (surfaced, not silently dropped #49). uploadable == codes
+    # that actually got a row.
+    written_codes = {r[0] for r in rows}
+    blocked = [c for c in new_codes if c not in written_codes]
+    if blocked:
+        log.warning("n8n variant-links: %d of %d codes generated no row (deduped): %s",
+                    len(blocked), len(new_codes), blocked[:10])
+
+    if not _import_lock.acquire(blocking=False):
+        log.warning("n8n variant-links: another import already running")
+        return {"ok": False, "error": "import already running"}, 409
+    log.info("n8n variant-links: %d codes, %d rows (chunks of %d), dry_run=%s",
+             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
+    try:
+        # #156: chunked import. csv_safe per cell (belt-and-braces — the URL is already
+        # http(s)-guarded so the '-prefix never actually fires, but the nightly sink
+        # must not be weaker than the manual zip). FIRST failing chunk stops the batch;
+        # success_codes are the codes imported by a successful chunk (partial → resumable).
+        res = _import_rows_chunked(rows, import_builder.LINK_HEADER, dry,
+                                   prefix="import_variant_links_", csv_safe=True, timeout=900)
+        ok = res["ok"]
+        success = res["success_codes"]
+        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
+        if not dry and uploaded_codes:       # record only codes that imported OK
+            for c in uploaded_codes:
+                uploaded[c] = (vlinks[c] or "").strip()
+            _save_uploaded_variant_links(uploaded)
+    finally:
+        _import_lock.release()
+
+    err_msg = ""
+    if not ok:
+        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
+                   f"(naimportované {res['rows_ok']} z {len(rows)} riadkov)")
+    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
+              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
+              "updated": res["updated"], "failed": res["failed"],
+              "error_detail": res["error_detail"], "error": err_msg,
+              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
+              "products": products, "stdout_tail": res["stdout_tail"],
+              "blocked": len(blocked),
+              **_variant_link_summary(uploaded, vlinks, split_codes)}
+    log.info("n8n variant-links: rc=%s chunks=%d/%d processed=%s codes=%d",
+             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
+    if not ok:
+        log.error("n8n variant-links FAILED rc=%s chunks_ok=%d/%d stderr=%s",
+                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
+    return result, (200 if ok else 502)
+
+
+@app.route("/api/n8n/upload-variant-links", methods=["POST"])
+def n8n_upload_variant_links():
+    """n8n's nightly caller: Bearer-auth then delegate to _do_upload_variant_links.
+    dry_run=1 reaches the import without changing anything."""
+    token = _import_token()
+    auth = request.headers.get("Authorization", "")
+    expected = f"Bearer {token}".encode() if token else b""
+    if not token or not hmac.compare_digest(auth.encode("latin-1", "ignore"), expected):
+        log.warning("n8n variant-links: unauthorized call from %s", _client_ip())
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    dry = str(request.values.get("dry_run", "")).lower() in ("1", "true", "yes")
+    result, status = _do_upload_variant_links(dry)
+    return jsonify(result), status
+
+
+# --------------------------------------------------------------------------- #
 # In-app automations (#93): generic runner + the Pošta SK uncollected-shipments
 # automation. New automations (#105-#111) register themselves in AUTOMATIONS_REG
 # below — the runner, endpoints and sidebar section are shared.
@@ -3459,6 +3613,53 @@ def run_grube_externalcode() -> dict:
     }
     log.info("grube_externalcode: run done status=%s externalcodes=%d",
              status, result["externalcodes"]["count"])
+    return result
+
+
+def run_split_links() -> dict:
+    """Nightly push (daily 03:45) of the per-size SPLIT links (#174 „✂ Rozdeliť na
+    veľkosti") to the eshop `internalNote` field, per variant — the in-app cron
+    follow-up (#192) to the MVP manual zip. Reuses the SAME careful chunked import path
+    + row builder as the n8n endpoint (_do_upload_variant_links → link_rows — no Shoptet
+    logic reimplemented). The write stays IDEMPOTENT: an already-uploaded URL is skipped
+    via uploaded_variant_links.json, so a re-run never re-pushes an unchanged link; only
+    a NEW split variant or a CHANGED URL goes up. A step that completes with ok:false
+    (import failed) or blocked is surfaced in the returned `status` without crashing the
+    run; a genuine exception propagates to the runner (records last_status='error',
+    keeps the app alive).
+
+    Reads ONLY the durable variant_links.json store + the live split decisions — never
+    modifies them; its own progress lives in uploaded_variant_links.json.
+
+    SEPARATE from „Párovania → eshop" (which is already enabled on prod): a split link
+    is a distinct write (internalNote per variant via link_rows, keyed per variant
+    code) that the pairings push never handles — folding it in would auto-activate on
+    the live eshop, breaking the #93 default-disabled-for-new-live-write contract. This
+    one starts DISABLED on its own."""
+    vl, _vs = _do_upload_variant_links(dry=False)
+    v_ok = bool(vl.get("ok"))
+    blocked = int(vl.get("blocked") or 0)
+    if not v_ok:
+        status = "failed"          # an import (or lock/timeout) failed → red row
+    elif blocked:
+        status = "blocked"         # split codes that produced no row → orange
+    else:
+        status = "ok"
+    result = {
+        "status": status,
+        "variantlinks": {
+            "count": vl.get("count", 0),
+            "total_uploaded": vl.get("total_uploaded", 0),
+            "total_codes": vl.get("total_codes", 0),
+            "remaining": vl.get("remaining", 0),
+            "blocked": blocked,
+            "ok": v_ok,
+            "error": vl.get("error", ""),
+        },
+        "review_url": PUBLIC_URL,
+    }
+    log.info("split_links: run done status=%s variantlinks=%d",
+             status, result["variantlinks"]["count"])
     return result
 
 
@@ -4187,6 +4388,10 @@ AUTOMATION_DESCRIPTIONS = {
         "Denne o 3:30 nahrá do Shoptet eshopu kódy dodávateľa GRUBE pre jednotlivé "
         "veľkosti (do poľa externalCode). Nahrá len nové alebo zmenené kódy — čo už "
         "raz nahrala, znova neposiela.",
+    "split_links":
+        "Denne o 3:45 nahrá do Shoptet eshopu odkazy na jednotlivé veľkosti pri "
+        "produktoch rozdelených na veľkosti (do internej poznámky produktu). Nahrá "
+        "len nové alebo zmenené odkazy — čo už raz nahrala, znova neposiela.",
     "dodavatelsky_sklad":
         "Denne o 5:00 prejde weby dodávateľov (pri nejasnej dostupnosti pomôže AI) "
         "a zistí, čo majú skladom a za akú cenu.",
@@ -4245,6 +4450,20 @@ AUTOMATIONS_REG = [
                name="GRUBE kódy → eshop",
                schedule={"daily_at": "03:30", "tz": "Europe/Bratislava"},
                run_fn=run_grube_externalcode),
+    # #192 — nightly push of the per-size SPLIT links (#174 „✂ Rozdeliť na veľkosti":
+    # a product whose supplier lists a different URL per size) to the eshop
+    # internalNote, per variant. SAFETY (#93 contract): starts DISABLED — this one
+    # WRITES to the live production eshop, so it runs ONLY after the manager clicks
+    # ▶ Štart; a deploy never auto-pushes on its own. DELIBERATELY a separate
+    # automation (not folded into „Párovania → eshop", which is already enabled on
+    # prod) — a split decision carries no decision URL (its links live in
+    # variant_links.json per variant), so the pairings push never handles it; enabling
+    # the split-link write stays an explicit opt-in. Scheduled 03:45, just after the
+    # 03:30 GRUBE externalCode push.
+    Automation(key="split_links",
+               name="Veľkostné linky → eshop",
+               schedule={"daily_at": "03:45", "tz": "Europe/Bratislava"},
+               run_fn=run_split_links),
     # #106 — daily supplier availability/price scraper. SAFETY (#93 contract):
     # starts DISABLED — a run makes MANY external HTTP calls AND costs money via
     # OpenAI, so it runs ONLY after the manager clicks ▶ Štart; a deploy never
@@ -4312,7 +4531,7 @@ RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 NAV_KEYS = {
     "toorder", "nedostupne", "search", "notes", "review",                # TABS
     "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
-    "grube_externalcode",
+    "grube_externalcode", "split_links",
     "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom", "stock_skladom",
     "image_health",                                                      # AUTOMATION_TABS
     "users", "dev",
