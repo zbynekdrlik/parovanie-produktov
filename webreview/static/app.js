@@ -12,6 +12,9 @@ let UNAVAIL = {};           // key -> true (nedostupné — u dodávateľa)
 let ORDER_COMMENTS = {};    // orderCode -> comment (#101 per-order manager note)
 let NEDOSTUPNE = null;      // /api/nedostupne — flagged-unavailable products + customers (#100)
 let ND_PENDING = null;      // {code, type} — the send the preview modal is showing
+let VYSTAVY = null;         // /api/vystavy — poľovnícke výstavy (#111)
+let VY_OPEN = new Set();    // ids of výstavy whose detail/edit panel is expanded (transient)
+let VY_ADD_OPEN = false;    // the „+ Pridať výstavu" form is showing (transient)
 let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
 let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
 let POSTA = null;           // /api/posta-uncollected — last run's display data
@@ -441,6 +444,7 @@ function renderFilters() {
 // page once the review backlog stabilized, so it sits LAST inside the 'Eshop'
 // folder — before the 'Automatizácie' section, never first.
 const TABS = [['toorder', 'Na objednanie'], ['nedostupne', 'Nedostupné tovary'],
+  ['vystavy', 'Poľovnícke výstavy'],
   ['search', 'Hľadať / opraviť'],
   ['notes', 'Poznámky'], ['review', 'Kontrola párovania']];
 
@@ -459,6 +463,8 @@ const NAV_ICONS = {
   review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
   toorder: '<path d="M9 5h6M9 9h6M9 13h4"/><rect x="4" y="3" width="16" height="18" rx="2"/>',
   nedostupne: '<circle cx="12" cy="12" r="9"/><path d="M6 6l12 12"/>',
+  vystavy: '<path d="M3 21h18"/><path d="M5 21V10l7-5 7 5v11"/><path d="M12 5v16"/>'
+    + '<path d="M5 10l7 4 7-4"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/>',
   notes: '<path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4"/>',
   users: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6"/>',
@@ -489,6 +495,8 @@ function navCount(key) {
   if (key === 'review') return PRODUCTS.filter(p => !statusOf(p)).length;
   if (key === 'toorder') return ORDERS.length;
   if (key === 'nedostupne') return NEDOSTUPNE ? NEDOSTUPNE.length : 0;
+  // badge = výstavy waiting for the manager's decision ('akcia bude') — the actionable ones
+  if (key === 'vystavy') return VYSTAVY ? VYSTAVY.filter(v => (v.status || '') === 'akcia bude').length : 0;
   if (key === 'notes') return NOTES.length;
   if (key === 'users') return USERS_LIST.length;
   if (key === 'posta') return POSTA ? (POSTA.uncollected || []).length : 0;
@@ -570,6 +578,7 @@ function renderTabs() {
 // Top-bar per-page title + a plain-language subtitle (with live counts).
 const PAGE_TITLES = {
   review: 'Kontrola párovania', toorder: 'Na objednanie', nedostupne: 'Nedostupné tovary',
+  vystavy: 'Poľovnícke výstavy',
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
   parovania_eshop: 'Párovania → eshop', grube_externalcode: 'GRUBE kódy → eshop',
@@ -591,6 +600,10 @@ function setPageHead() {
   } else if (ACTIVE_TAB === 'nedostupne') {
     const n = NEDOSTUPNE ? NEDOSTUPNE.length : 0;
     s.textContent = `${n} nedostupných tovarov · upozornenie zákazníkom s otvorenou objednávkou`;
+  } else if (ACTIVE_TAB === 'vystavy') {
+    const n = VYSTAVY ? VYSTAVY.length : 0;
+    const akcia = VYSTAVY ? VYSTAVY.filter(v => (v.status || '') === 'akcia bude').length : 0;
+    s.textContent = `${n} výstav · ${akcia} čaká na rozhodnutie`;
   } else if (ACTIVE_TAB === 'search') {
     s.textContent = 'Prehľadá všetky polia všetkých produktov';
   } else if (ACTIVE_TAB === 'notes') {
@@ -702,6 +715,7 @@ async function switchTab(tab) {
   ACTIVE_TAB = tab; localStorage.setItem('tab', tab); window.scrollTo(0, 0);
   if (tab === 'toorder' && !ORDERS.length) await loadOrders();
   if (tab === 'nedostupne') await loadNedostupne();   // always fresh — orders/state change
+  if (tab === 'vystavy') await loadVystavy();   // always fresh — state advances via automations
   if (tab === 'notes' && !NOTES.length) await loadNotes();
   if (tab === 'users') await loadUsers();   // always fresh — small list
   if (tab === 'posta') await loadPosta();   // always fresh — status can change
@@ -1437,6 +1451,254 @@ function manualPairPanel(res, panel, badge, link) {
 }
 
 // ---- Poznámky (notes) tab — free-form reminders, Discord replacement ----- //
+// ── Poľovnícke výstavy (#111) — KARTY (nie tabuľka) ────────────────────────
+// Canonical state → SK label + colour class (matches app.py's VY_* states).
+const VY_STATUS = {
+  '': { label: 'Nová', cls: 'nova' },
+  'otazka': { label: 'Otázka poslaná', cls: 'otazka' },
+  'akcia bude': { label: 'Odpovedali — čaká na rozhodnutie', cls: 'akcia' },
+  'poziadane': { label: 'Prihláška poslaná', cls: 'poziadane' },
+  'odpovedane od organizatora': { label: 'Potvrdené', cls: 'hotovo' },
+};
+// Display group order: needs-decision first, then new, then in-flight, then done.
+const VY_ORDER = ['akcia bude', '', 'otazka', 'poziadane', 'odpovedane od organizatora'];
+// Editable fields (mirror app.py's VY_EDIT_FIELDS, minus sposob which is a select).
+const VY_FIELDS = [
+  ['nazov', 'Názov'], ['datum', 'Dátum'], ['miesto', 'Miesto'],
+  ['kontakt_osoba', 'Kontaktná osoba'], ['tel', 'Telefón'], ['email', 'E-mail'],
+  ['velkost_stanku', 'Veľkosť stánku'], ['kedy_riesit', 'Kedy riešiť (mesiac)'],
+];
+
+async function loadVystavy() {
+  try {
+    VYSTAVY = (await (await fetch('/api/vystavy')).json()).vystavy || [];
+  } catch (_) { VYSTAVY = []; }
+}
+
+function vyStatus(v) { return VY_STATUS[v.status || ''] || VY_STATUS['']; }
+
+function vyFmtTs(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso || '';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// ── network actions (each reloads + re-renders on success) ──────────────────
+async function vyReload() { await loadVystavy(); renderVystavy(); }
+
+async function vyPost(path, payload, failMsg) {
+  let j = {};
+  try {
+    const r = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.ok) { alert(j.error || failMsg); return false; }
+  } catch (_) { alert(failMsg); return false; }
+  return true;
+}
+
+async function vyAdd(fields) {
+  if (await vyPost('/api/vystavy', fields, 'Výstavu sa nepodarilo pridať.')) {
+    VY_ADD_OPEN = false; await vyReload();
+  }
+}
+async function vySave(id, fields) {
+  if (await vyPost('/api/vystava', { id, fields }, 'Zmeny sa nepodarilo uložiť.')) await vyReload();
+}
+async function vyDelete(id) {
+  if (!confirm('Naozaj zmazať túto výstavu?')) return;
+  if (await vyPost('/api/vystava', { id, delete: true }, 'Nepodarilo sa zmazať.')) {
+    VY_OPEN.delete(id); await vyReload();
+  }
+}
+async function vySetStatus(id, status) {
+  if (await vyPost('/api/vystava', { id, status }, 'Stav sa nepodarilo zmeniť.')) await vyReload();
+}
+async function vySend(id, path, failMsg) {
+  if (await vyPost(path, { id }, failMsg)) await vyReload();
+}
+
+// ── rendering ───────────────────────────────────────────────────────────────
+function vyFieldsForm(v, prefix) {
+  const form = el('div', 'vy-form');
+  const inputs = {};
+  for (const [key, label] of VY_FIELDS) {
+    const row = el('label', 'vy-field');
+    row.appendChild(el('span', 'vy-flabel', escapeHtml(label) + (key === 'nazov' ? ' *' : '')));
+    const inp = el('input');
+    inp.type = 'text';
+    inp.value = (v && v[key]) || '';
+    if (prefix) inp.dataset.testid = prefix + key;
+    inputs[key] = inp;
+    row.appendChild(inp);
+    form.appendChild(row);
+  }
+  // sposob = select (email = automat can mail, pdf = manual only)
+  const sRow = el('label', 'vy-field');
+  sRow.appendChild(el('span', 'vy-flabel', 'Spôsob prihlášky'));
+  const sel = document.createElement('select');
+  for (const [val, lbl] of [['email', 'E-mail (automat)'], ['pdf', 'PDF (ručne)']]) {
+    const o = document.createElement('option');
+    o.value = val; o.textContent = lbl;
+    if (((v && v.sposob) || 'email') === val) o.selected = true;
+    sel.appendChild(o);
+  }
+  if (prefix) sel.dataset.testid = prefix + 'sposob';
+  inputs.sposob = sel;
+  sRow.appendChild(sel);
+  form.appendChild(sRow);
+  return { form, inputs };
+}
+
+function vyCollect(inputs) {
+  const f = {};
+  for (const k in inputs) f[k] = inputs[k].value.trim();
+  return f;
+}
+
+function vyAddForm() {
+  const box = el('div', 'vy-detail vy-add');
+  const { form, inputs } = vyFieldsForm(null, 'vy-add-');
+  box.appendChild(form);
+  const acts = el('div', 'vy-detail-acts');
+  const create = el('button', 'btn good sm', '➕ Vytvoriť');
+  create.dataset.testid = 'vy-add-submit';
+  create.onclick = () => {
+    const f = vyCollect(inputs);
+    if (!f.nazov) { alert('Názov výstavy je povinný.'); return; }
+    vyAdd(f);
+  };
+  const cancel = el('button', 'btn ghost sm', 'Zrušiť');
+  cancel.onclick = () => { VY_ADD_OPEN = false; renderVystavy(); };
+  acts.appendChild(create); acts.appendChild(cancel);
+  box.appendChild(acts);
+  return box;
+}
+
+// per-state action button on the card (null when the state just waits on the organizer)
+function vyAction(v) {
+  const st = v.status || '';
+  if (st === '') {
+    const b = el('button', 'btn vy-act primary', '✉ Pošli otázku');
+    b.dataset.testid = 'vy-otazka-' + v.id;
+    b.onclick = (e) => { e.stopPropagation(); vySend(v.id, '/api/vystava/posli-otazku', 'E-mail sa nepodarilo odoslať.'); };
+    return b;
+  }
+  if (st === 'akcia bude') {
+    const b = el('button', 'btn vy-act go', '✅ Ideme na túto výstavu');
+    b.dataset.testid = 'vy-ideme-' + v.id;
+    b.onclick = (e) => { e.stopPropagation(); vySend(v.id, '/api/vystava/ideme', 'Prihlášku sa nepodarilo odoslať.'); };
+    return b;
+  }
+  return null;
+}
+
+function vyDetail(v) {
+  const d = el('div', 'vy-detail');
+  const { form, inputs } = vyFieldsForm(v, null);
+  d.appendChild(form);
+  const acts = el('div', 'vy-detail-acts');
+  const save = el('button', 'btn good sm', '💾 Uložiť');
+  save.onclick = () => vySave(v.id, vyCollect(inputs));
+  const del = el('button', 'btn warn sm', '🗑 Zmazať');
+  del.dataset.testid = 'vy-del-' + v.id;
+  del.onclick = () => vyDelete(v.id);
+  acts.appendChild(save); acts.appendChild(del);
+  d.appendChild(acts);
+  // manual status reset dropdown
+  const stRow = el('div', 'vy-status-reset');
+  stRow.appendChild(el('span', 'vy-flabel', 'Stav (ručne)'));
+  const stSel = document.createElement('select');
+  for (const st of VY_ORDER) {
+    const o = document.createElement('option');
+    o.value = st; o.textContent = VY_STATUS[st].label;
+    if ((v.status || '') === st) o.selected = true;
+    stSel.appendChild(o);
+  }
+  stSel.onchange = () => vySetStatus(v.id, stSel.value);
+  stRow.appendChild(stSel);
+  d.appendChild(stRow);
+  // info feed (chronology — newest first)
+  if (v.feed && v.feed.length) {
+    const feed = el('div', 'vy-feed');
+    feed.appendChild(el('div', 'vy-feed-h', 'História'));
+    for (const f of v.feed) {
+      const item = el('div', 'vy-feed-item');
+      const ts = el('span', 'vy-feed-ts'); ts.textContent = vyFmtTs(f.ts);
+      const tx = el('span', 'vy-feed-tx'); tx.textContent = f.text || '';   // .textContent → XSS-safe
+      item.appendChild(ts); item.appendChild(tx);
+      feed.appendChild(item);
+    }
+    d.appendChild(feed);
+  }
+  return d;
+}
+
+function vyCard(v) {
+  const st = vyStatus(v);
+  const card = el('div', 'vy-card ' + st.cls);
+  card.dataset.testid = 'vy-card-' + v.id;
+  const head = el('div', 'vy-head');
+  head.onclick = () => {
+    if (VY_OPEN.has(v.id)) VY_OPEN.delete(v.id); else VY_OPEN.add(v.id);
+    renderVystavy();
+  };
+  const title = el('div', 'vy-title');
+  title.textContent = v.nazov || '(bez názvu)';   // .textContent → XSS-safe
+  head.appendChild(title);
+  const badge = el('span', 'vy-badge ' + st.cls);
+  badge.textContent = st.label;
+  head.appendChild(badge);
+  card.appendChild(head);
+  // meta lines
+  const m1 = el('div', 'vy-meta');
+  m1.textContent = [v.datum, v.miesto].filter(Boolean).join(' · ') || '—';
+  card.appendChild(m1);
+  const contact = [v.kontakt_osoba, v.tel, v.email].filter(Boolean).join(' · ');
+  const m2 = el('div', 'vy-meta2');
+  m2.textContent = [contact, v.velkost_stanku ? 'stánok ' + v.velkost_stanku : '',
+    v.kedy_riesit ? 'riešiť: ' + v.kedy_riesit : ''].filter(Boolean).join(' · ') || '—';
+  card.appendChild(m2);
+  if (v.sposob === 'pdf') {
+    const flag = el('div', 'vy-pdf', '📄 Prihláška ručne (PDF) — automat mail neposiela');
+    card.appendChild(flag);
+  }
+  const act = vyAction(v);
+  if (act) card.appendChild(act);
+  if (VY_OPEN.has(v.id)) card.appendChild(vyDetail(v));
+  return card;
+}
+
+function renderVystavy() {
+  const sec = document.getElementById('tab-vystavy');
+  if (!sec) return;
+  sec.innerHTML = '';
+  const top = el('div', 'vy-top');
+  const addBtn = el('button', 'btn good', '➕ Pridať výstavu');
+  addBtn.dataset.testid = 'vy-add-btn';
+  addBtn.onclick = () => { VY_ADD_OPEN = !VY_ADD_OPEN; renderVystavy(); };
+  top.appendChild(addBtn);
+  sec.appendChild(top);
+  if (VY_ADD_OPEN) sec.appendChild(vyAddForm());
+  const list = VYSTAVY || [];
+  if (!list.length && !VY_ADD_OPEN) {
+    sec.appendChild(el('div', 'vy-empty',
+      'Žiadne výstavy. Pridaj prvú tlačidlom <strong>„➕ Pridať výstavu"</strong>.'));
+    return;
+  }
+  for (const st of VY_ORDER) {
+    const group = list.filter(v => (v.status || '') === st);
+    if (!group.length) continue;
+    const h = el('div', 'vy-group ' + VY_STATUS[st].cls);
+    h.textContent = `${VY_STATUS[st].label} (${group.length})`;
+    sec.appendChild(h);
+    for (const v of group) sec.appendChild(vyCard(v));
+  }
+}
+
 async function loadNotes() {
   try {
     NOTES = (await (await fetch('/api/notes')).json()).notes || [];
@@ -2961,6 +3223,7 @@ function render() {
   setPageHead();
   const toorder = ACTIVE_TAB === 'toorder';
   const nedostupne = ACTIVE_TAB === 'nedostupne';
+  const vystavy = ACTIVE_TAB === 'vystavy';
   const search = ACTIVE_TAB === 'search';
   const notes = ACTIVE_TAB === 'notes';
   const users = ACTIVE_TAB === 'users';
@@ -2977,12 +3240,13 @@ function render() {
   const imageHealth = ACTIVE_TAB === 'image_health';
   const dev = ACTIVE_TAB === 'dev';
   const auto = posta || shoptetSync || parovaniaEshop || grubeExternalcode || splitLinks || dodavatelskySklad || rizikoVypadku || restockSkladom || stockSkladom || ordersReminder || imageHealth;  // any automation tab
-  const plain = nedostupne || search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
+  const plain = nedostupne || vystavy || search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
   const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || plain) ? 'none' : '';
   const filt = document.getElementById('filters'); if (filt) filt.style.display = plain ? 'none' : '';
   const secNd = document.getElementById('tab-nedostupne'); if (secNd) secNd.hidden = !nedostupne;
+  const secVy = document.getElementById('tab-vystavy'); if (secVy) secVy.hidden = !vystavy;
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
   const secNotes = document.getElementById('tab-notes'); if (secNotes) secNotes.hidden = !notes;
   const secUsers = document.getElementById('tab-users'); if (secUsers) secUsers.hidden = !users;
@@ -3000,6 +3264,7 @@ function render() {
   const secDev = document.getElementById('tab-dev'); if (secDev) secDev.hidden = !dev;
   const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = plain ? 'none' : '';
   if (nedostupne) { document.getElementById('empty').hidden = true; renderNedostupne(); return; }
+  if (vystavy) { document.getElementById('empty').hidden = true; renderVystavy(); return; }
   if (dev) { document.getElementById('empty').hidden = true; renderDev(); return; }
   if (imageHealth) { document.getElementById('empty').hidden = true; renderImageHealth(); return; }
   if (ordersReminder) { document.getElementById('empty').hidden = true; renderOrdersReminder(); return; }

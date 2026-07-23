@@ -60,7 +60,7 @@ def _admin_session_cookie(base: str) -> str:
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
                     "automations_server", "imgfail_server", "imgflood_server", "dev_server",
-                    "nedostupne_server")
+                    "nedostupne_server", "vystavy_server")
 
 
 @pytest.fixture(autouse=True)
@@ -566,6 +566,53 @@ def nedostupne_server(tmp_path_factory):
         **_AUTH_ENV,
         "WEBREVIEW_OUT": str(out),
         "WEBREVIEW_PRODUCTS": str(products_csv),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+        "MAIL_HOST": "",                              # never a real send from the fixture
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def vystavy_server(tmp_path_factory):
+    """Isolated webreview instance for the „Poľovnícke výstavy" tab E2E (#111). Seeded
+    with two výstavy (one in 'akcia bude' with a feed entry, one Nová) via vystavy.json
+    — no network. MAIL_HOST="" is pinned so an accidental send-button click hits the
+    deterministic not-configured branch (never a real organizer e-mail from a dev box).
+    Function-scoped + own out-dir: the add/edit/delete the test performs stays contained."""
+    out = tmp_path_factory.mktemp("wr_vystavy_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "review_data.json").write_text("[]", encoding="utf-8")
+    (out / "vystavy.json").write_text(json.dumps([
+        {"id": "vy-akcia", "nazov": "Deň Sv. Huberta Test", "datum": "1.9.2026",
+         "miesto": "Svätý Anton", "kontakt_osoba": "p. Test", "tel": "0900 000 000",
+         "email": "org@test.sk", "velkost_stanku": "9x3", "kedy_riesit": "september",
+         "sposob": "email", "status": "akcia bude",
+         "email_datum": "2026-06-01T09:00:00+02:00",
+         "email_otazka_msgid": "<q@forestshop.sk>", "email_ziadost_msgid": "",
+         "feed": [{"ts": "2026-06-01T09:00:00+02:00", "typ": "odpoved_otazka",
+                   "text": "Prišla odpoveď: Áno, výstava bude aj tento rok."}]},
+        {"id": "vy-nova", "nazov": "Nová Výstava Test", "datum": "", "miesto": "Nitra",
+         "kontakt_osoba": "", "tel": "", "email": "nova@test.sk", "velkost_stanku": "",
+         "kedy_riesit": "október", "sposob": "email", "status": "",
+         "email_datum": "", "email_otazka_msgid": "", "email_ziadost_msgid": "", "feed": []},
+    ], ensure_ascii=False), encoding="utf-8")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
         "WEBREVIEW_PORT": str(port),
         "PYTHONPATH": os.path.join(ROOT, "src"),
         "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
