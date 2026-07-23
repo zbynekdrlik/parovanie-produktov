@@ -2,12 +2,22 @@ from __future__ import annotations
 import csv
 from parovanie.models import Match
 
+# Canonical Shoptet CSV dialect params (';' delimiter, minimal quoting, CRLF) —
+# shared by shoptet_writer/shoptet_dict_writer so the invariant can't drift
+# across the import producers.
+_DIALECT = {"delimiter": ";", "quoting": csv.QUOTE_MINIMAL, "lineterminator": "\r\n"}
+
 
 def shoptet_writer(f):
     """The canonical Shoptet CSV dialect (';' delimiter, minimal quoting, CRLF).
     One home so the invariant can't drift across the import producers."""
-    return csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL,
-                      lineterminator="\r\n")
+    return csv.writer(f, **_DIALECT)
+
+
+def shoptet_dict_writer(f, fieldnames, **kw):
+    """DictWriter variant of shoptet_writer — same canonical dialect, for
+    producers that write dict rows (e.g. report_io)."""
+    return csv.DictWriter(f, fieldnames=fieldnames, **_DIALECT, **kw)
 
 
 def write_import(matches: list[Match], path: str,

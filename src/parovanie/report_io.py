@@ -1,6 +1,6 @@
 from __future__ import annotations
 import csv
-from parovanie.writer import REPORT_COLS
+from parovanie.writer import REPORT_COLS, shoptet_dict_writer
 
 csv.field_size_limit(10**9)
 
@@ -12,8 +12,6 @@ def read_report(path: str) -> list[dict]:
 
 def write_report_rows(rows: list[dict], path: str) -> None:
     with open(path, "w", encoding="cp1250", errors="replace", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=REPORT_COLS, delimiter=";",
-                           quoting=csv.QUOTE_MINIMAL, lineterminator="\r\n",
-                           extrasaction="ignore")
+        w = shoptet_dict_writer(f, REPORT_COLS, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
