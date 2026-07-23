@@ -422,6 +422,16 @@ odfiltruj cez `pull_request` kľúč). Fixná žiarovka vpravo dole (`#ideaBtn` 
   reload (klik nav) o pár s ju už ukáže. Post-deploy: smieš vytvoriť 1 test issue cez
   živú žiarovku a hneď ju `gh issue close` (overené #149 pri v0.59.0).
 
+### Šéf riadi vývoj U NÁS — GitHub je ÚPLNE skrytý (#170, v0.69.0)
+
+Šéf GitHub „vôbec nezaujíma" — píše detaily a prioritizuje LEN v appke, backend to potichu premietne na GitHub. Vzor **write-behind** (nikdy neukazuj surové GitHub veci):
+
+- **Doplniť detail k issue** = GitHub **komentár** (`POST /repos/{repo}/issues/{n}/comments`), NIE prepis tela — non-destruktívne. Endpoint `/api/dev/issue/<int:n>/note` (text povinný/capnutý `NOTE_MAX`, rate-limited zdieľaným `_idea_rate_limited`, autor-suffix `_Doplnené cez appku (Vývoj) — <email>_`). Frontend: inline `.dev-note-box` (textarea + „Uložiť detail"), po úspechu „✓" bez reloadu.
+- **Priorita čoskoro/neskôr** = dva SKRYTÉ labely `prio:soon`/`prio:later` (`PRIO_LABELS`). `_slim_issue` label **dvihne** do poľa `priority` ('', 'soon', 'later') a **strhne** ho z `labels` (šéf nikdy nevidí `prio:*`). Endpoint `/api/dev/issue/<int:n>/priority` (soon|later|none): pridaj zvolený, zmaž opačný. `renderDev` grupuje zoznam: `🔴 Riešiť čoskoro` hore → bežné → `🟡 Riešiť neskôr` dole; per-riadok `.dev-prio` buttony (klik na aktívny = clear na none).
+- **GOTCHA — DELETE label musí URL-encodnúť meno**: `quote(name, safe='')` → `prio%3Asoon` (dvojbodka), inak 404/nezmaže. Pred add labelu ho **ensure-ni** (`POST /repos/{repo}/labels`, 422 already-exists je OK) nech existuje. 404 pri delete (label nebol) je OK — ignoruj.
+- **E2E stub musí vedieť aj comments/labels/delete** (`_GHStub` v `tests/e2e/conftest.py`): `do_POST` vetvi na `/issues/<n>/comments` (bump count), `/issues/<n>/labels` (mutuj `it["labels"]`), `/labels` (ensure), inak create-issue; `do_DELETE` na `/issues/<n>/labels/<encoded>` (odstráň z issue). Tak e2e overí prioritný split naživo. Backend testy: guard mockuj aj `webapp.requests.delete` (nielen get/post).
+- **Post-deploy overenie bez špiny**: prioritu nastav→vyčisti (`none` zmaže label, GitHub čistý); detail-komentár je trvalý → píš ho len na VLASTNÝ tracking issue („overené naživo"), nie na cudzí. Reálne over cez `gh issue view <n> --json labels,comments`.
+
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.

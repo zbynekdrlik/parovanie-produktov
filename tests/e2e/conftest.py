@@ -197,14 +197,17 @@ class _GHStub:
     def __init__(self):
         self.issues = [
             {"number": 7, "title": "E2E otvorena uloha", "state": "open",
+             "body": "Zadanie otvorenej úlohy — čo treba spraviť.",
              "labels": [{"name": "enhancement"}], "updated_at": "2026-07-21T10:00:00Z",
-             "html_url": "https://example.test/issues/7", "comments": 1},
+             "html_url": "https://example.test/issues/7", "comments": 1,
+             "_comments": [{"body": "Prvý existujúci detail.",
+                            "created_at": "2026-07-21T11:00:00Z"}]},
             {"number": 6, "title": "E2E hotova uloha", "state": "closed", "labels": [],
-             "updated_at": "2026-07-20T10:00:00Z",
-             "html_url": "https://example.test/issues/6", "comments": 0},
+             "body": "Zadanie hotovej úlohy.", "updated_at": "2026-07-20T10:00:00Z",
+             "html_url": "https://example.test/issues/6", "comments": 0, "_comments": []},
             {"number": 5, "title": "E2E toto je pull request", "state": "open", "labels": [],
-             "updated_at": "2026-07-19T10:00:00Z",
-             "html_url": "https://example.test/pull/5", "comments": 0,
+             "body": "", "updated_at": "2026-07-19T10:00:00Z",
+             "html_url": "https://example.test/pull/5", "comments": 0, "_comments": [],
              "pull_request": {"url": "https://example.test/api/pulls/5"}},
         ]
         self.next_num = 8
@@ -233,13 +236,20 @@ def _start_gh_stub():
             return json.loads(self.rfile.read(length) or b"{}")
 
         def do_GET(self):
-            # the app only ever GETs the issues LIST (…/issues?params); it never
-            # GETs comments/labels sub-resources.
-            if "/issues" in self.path and "/comments" not in self.path \
-                    and "/labels" not in self.path:
+            mc = re.search(r"/issues/(\d+)/comments", self.path)
+            if mc:                                  # one issue's comments (detail view)
+                it = self._issue_by_num(int(mc.group(1)))
+                self._send(200, (it or {}).get("_comments", []))
+                return
+            mi = re.search(r"/issues/(\d+)(\?|$)", self.path)
+            if mi:                                  # one issue (detail body)
+                it = self._issue_by_num(int(mi.group(1)))
+                self._send(200 if it else 404, it or {"message": "not found"})
+                return
+            if "/issues" in self.path and "/labels" not in self.path:   # the LIST
                 self._send(200, state.issues)
-            else:
-                self._send(404, {"message": "not found"})
+                return
+            self._send(404, {"message": "not found"})
 
         def do_POST(self):
             data = self._read()
@@ -248,6 +258,8 @@ def _start_gh_stub():
                 it = self._issue_by_num(int(m.group(1)))
                 if it is not None:
                     it["comments"] = (it.get("comments") or 0) + 1
+                    it.setdefault("_comments", []).append(
+                        {"body": data.get("body", ""), "created_at": "2026-07-23T09:00:00Z"})
                 self._send(201, {"id": 1, "body": data.get("body", "")})
                 return
             m = re.search(r"/issues/(\d+)/labels", self.path)

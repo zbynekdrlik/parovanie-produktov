@@ -1192,8 +1192,11 @@ function renderDevRow(it) {
                  + (it.priority ? ' prio-' + it.priority : ''));
   const head = el('div', 'dev-head');
   head.appendChild(el('span', 'dev-num', '#' + it.number));
-  const title = el('a', 'dev-title', escapeHtml(it.title || '(bez názvu)'));
-  if (it.html_url) { title.href = it.html_url; title.target = '_blank'; title.rel = 'noopener'; }
+  // GitHub is fully hidden — the title is NOT a link out. Clicking it opens the
+  // in-app detail (issue text + all details/comments); adding is open-only.
+  const canAdd = it.state !== 'closed';
+  const title = el('span', 'dev-title clickable', escapeHtml(it.title || '(bez názvu)'));
+  title.onclick = () => _devToggleDetail(row, it.number, canAdd);
   head.appendChild(title);
   head.appendChild(el('span', 'dev-state ' + (it.state === 'closed' ? 'done' : 'open'),
     it.state === 'closed' ? 'Hotové' : 'Otvorené'));
@@ -1214,8 +1217,8 @@ function renderDevRow(it) {
       b.onclick = () => _devSetPriority(it.number, key === cur ? 'none' : key);
       act.appendChild(b);
     }
-    const noteBtn = el('button', 'dev-note-btn', '➕ Doplniť detail');
-    noteBtn.onclick = () => _devToggleNote(row, it.number);
+    const noteBtn = el('button', 'dev-note-btn', '🔎 Detail / doplniť');
+    noteBtn.onclick = () => _devToggleDetail(row, it.number, true);
     act.appendChild(noteBtn);
     row.appendChild(act);
   }
@@ -1237,13 +1240,56 @@ async function _devSetPriority(number, priority) {
   renderDev();
 }
 
-// Toggle an inline „doplniť detail" editor under a row; save → GitHub comment.
-function _devToggleNote(row, number) {
-  const existing = row.querySelector('.dev-note-box');
+// Toggle the in-app DETAIL of an issue: its full text (zadanie) + ALL details/
+// comments + (open issues) an editor to add more. Everything shows IN the app —
+// GitHub stays hidden. `canAdd` gates the editor (closed issues are read-only).
+async function _devToggleDetail(row, number, canAdd) {
+  const existing = row.querySelector('.dev-detail-box');
   if (existing) { existing.remove(); return; }
-  const box = el('div', 'dev-note-box');
+  const box = el('div', 'dev-detail-box');
+  box.appendChild(el('div', 'dev-detail-load', 'Načítavam detail…'));
+  row.appendChild(box);
+  let data = null;
+  try { data = await (await fetch(`/api/dev/issue/${number}`)).json(); }
+  catch (_) { data = { ok: false, error: 'sieť' }; }
+  if (!data.ok) {
+    box.innerHTML = '';
+    box.appendChild(el('div', 'dev-detail-err',
+      'Nepodarilo sa načítať detail: ' + escapeHtml(data.error || '')));
+    return;
+  }
+  _renderDetail(box, number, data, canAdd);
+}
+
+// Render (or re-render) an issue's detail into `box`: zadanie + comments + editor.
+function _renderDetail(box, number, data, canAdd) {
+  box.innerHTML = '';
+  if (data.body && data.body.trim()) {
+    box.appendChild(el('div', 'dev-detail-h', 'Zadanie'));
+    const b = el('div', 'dev-detail-body');
+    b.textContent = data.body;                 // textContent → no XSS, no HTML render
+    box.appendChild(b);
+  }
+  const comments = data.comments || [];
+  box.appendChild(el('div', 'dev-detail-h',
+    'Detaily' + (comments.length ? ' (' + comments.length + ')' : '')));
+  if (!comments.length) {
+    box.appendChild(el('div', 'dev-detail-empty',
+      canAdd ? 'Zatiaľ žiadny detail. Napíš prvý nižšie.' : 'Zatiaľ žiadny detail.'));
+  } else {
+    for (const c of comments) {
+      const cm = el('div', 'dev-comment');
+      const d = _devDate(c.created_at);
+      if (d) cm.appendChild(el('div', 'dev-comment-date', d));
+      const body = el('div', 'dev-comment-body');
+      body.textContent = c.body || '';         // textContent → no XSS
+      cm.appendChild(body);
+      box.appendChild(cm);
+    }
+  }
+  if (!canAdd) return;                          // closed issue → read-only
   const ta = el('textarea', 'dev-note-ta');
-  ta.placeholder = 'Napíš detail k tejto úlohe…';
+  ta.placeholder = 'Napíš ďalší detail…';
   ta.maxLength = 5000;
   const bar = el('div', 'dev-note-bar');
   const save = el('button', 'dev-note-save', 'Uložiť detail');
@@ -1260,14 +1306,22 @@ function _devToggleNote(row, number) {
       });
       const j = await r.json(); ok = j.ok; err = j.error || '';
     } catch (_) { err = 'sieť'; }
-    save.disabled = false;
-    if (!ok) { msg.textContent = 'Nepodarilo sa: ' + err; msg.className = 'dev-note-msg err'; return; }
-    msg.textContent = 'Detail uložený ✓'; msg.className = 'dev-note-msg ok';
-    ta.value = '';
+    if (!ok) {
+      save.disabled = false;
+      msg.textContent = 'Nepodarilo sa: ' + err; msg.className = 'dev-note-msg err';
+      return;
+    }
+    // re-fetch so the just-added detail SHOWS in the list (no more „it vanished")
+    let fresh = null;
+    try { fresh = await (await fetch(`/api/dev/issue/${number}`)).json(); } catch (_) {}
+    if (fresh && fresh.ok) _renderDetail(box, number, fresh, canAdd);
+    else {                                       // fell back — at least confirm + clear
+      save.disabled = false; ta.value = '';
+      msg.textContent = 'Detail uložený ✓'; msg.className = 'dev-note-msg ok';
+    }
   };
   bar.appendChild(save); bar.appendChild(msg);
   box.appendChild(ta); box.appendChild(bar);
-  row.appendChild(box);
   ta.focus();
 }
 

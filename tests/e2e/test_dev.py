@@ -68,6 +68,30 @@ def test_lightbulb_creates_idea_that_appears_in_list(page, dev_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_issue_title_does_not_link_to_github(page, dev_server):
+    """The boss never wants GitHub — the issue title is NOT a link out; clicking it
+    opens the in-app detail box and stays on our app (no navigation to github.com)."""
+    console = _console(page)
+    page.goto(dev_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.locator("#devNav button").click()
+    page.wait_for_selector("#tab-dev .dev-row")
+
+    # no anchor pointing at GitHub anywhere in the list
+    assert page.locator('#tab-dev a[href*="github"]').count() == 0
+    # the title is a plain (non-anchor) clickable element
+    assert page.locator("#tab-dev .dev-row .dev-title").first.evaluate(
+        "el => el.tagName.toLowerCase()") == "span"
+
+    # clicking the open issue's title opens the in-app detail box, same URL
+    before = page.url
+    page.locator("#tab-dev .dev-row .dev-title.clickable").first.click()
+    page.locator("#tab-dev .dev-row .dev-detail-box").first.wait_for(state="visible")
+    assert page.url == before               # never navigated to GitHub
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_priority_soon_moves_issue_to_top_group(page, dev_server):
     """Boss marks an open issue „Čoskoro" → it lands in the „Riešiť čoskoro" group.
     GitHub stays hidden; the split is driven by the in-app priority."""
@@ -93,9 +117,31 @@ def test_priority_soon_moves_issue_to_top_group(page, dev_server):
     assert console == [], f"console not clean: {console}"
 
 
-def test_add_detail_note_saves_to_issue(page, dev_server):
-    """Boss writes a detail under an issue → it's saved (GitHub comment) and the
-    confirmation shows, without ever leaving the app or seeing GitHub."""
+def test_detail_shows_zadanie_and_existing_comments(page, dev_server):
+    """Opening an issue's detail shows its text (zadanie) + ALL existing details —
+    the boss reads everything in the app, GitHub hidden."""
+    console = _console(page)
+    page.goto(dev_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.locator("#devNav button").click()
+    page.wait_for_selector("#tab-dev .dev-row")
+
+    row = page.locator("#tab-dev .dev-row").first          # #7, has 1 existing comment
+    row.get_by_role("button", name="🔎 Detail / doplniť").click()
+    box = row.locator(".dev-detail-box")
+    box.wait_for(state="visible")
+    page.wait_for_function(
+        "() => document.querySelector('#tab-dev .dev-detail-box .dev-comment')")
+    txt = box.inner_text()
+    assert "Zadanie otvorenej úlohy" in txt                 # issue body shown
+    assert "Prvý existujúci detail" in txt                  # existing comment shown
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_add_detail_note_appears_immediately(page, dev_server):
+    """Boss writes a detail → it's saved (GitHub comment) AND immediately appears in
+    the detail list (no more „it just vanished"), without leaving the app."""
     console = _console(page)
     page.goto(dev_server)
     page.wait_for_selector(".sidebar #tabs button")
@@ -103,15 +149,17 @@ def test_add_detail_note_saves_to_issue(page, dev_server):
     page.wait_for_selector("#tab-dev .dev-row")
 
     row = page.locator("#tab-dev .dev-row").first
-    row.get_by_role("button", name="➕ Doplniť detail").click()
-    box = row.locator(".dev-note-box")
+    row.get_by_role("button", name="🔎 Detail / doplniť").click()
+    box = row.locator(".dev-detail-box")
     box.wait_for(state="visible")
     box.locator(".dev-note-ta").fill("Šéfov detail: toto treba spraviť takto.")
     with page.expect_response("**/api/dev/issue/7/note") as resp:
         box.get_by_role("button", name="Uložiť detail").click()
     assert resp.value.status == 201
-    # inline confirmation, no navigation to GitHub
-    page.wait_for_selector("#tab-dev .dev-note-msg.ok")
+    # the new detail SHOWS up in the list (re-fetched), not just a vanishing ✓
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('#tab-dev .dev-comment-body')]"
+        ".some(c => c.textContent.includes('toto treba spraviť takto'))")
     assert "github" not in page.url.lower()
 
     assert console == [], f"console not clean: {console}"

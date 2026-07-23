@@ -356,6 +356,59 @@ def test_dev_priority_none_clears_both_and_adds_nothing(monkeypatch):
     assert not [c for c in calls if c[0] == "POST"]
 
 
+def test_dev_priority_delete_failure_reported_not_silent(monkeypatch):
+    """A failed opposite-label DELETE (403 secondary rate-limit / 5xx) must be
+    surfaced as ok:False — never reported as success with the label still on the
+    issue. And the add-label POST must NOT run after a failed delete."""
+    _configure(monkeypatch)
+
+    def fake_delete(url, headers=None, timeout=None):
+        return _Resp(403, {"message": "secondary rate limit"})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        raise AssertionError("add-label must not run after a failed delete")
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    monkeypatch.setattr(webapp.requests, "post", fake_post)
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "soon"})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["ok"] is False                       # failure surfaced, NOT silent ok
+    assert "403" in (j.get("error") or "")
+
+
+def test_dev_priority_delete_404_is_ok(monkeypatch):
+    """DELETE 404 means the opposite label simply wasn't set — that is success,
+    not a failure; the chosen label still gets added."""
+    _configure(monkeypatch)
+
+    def fake_delete(url, headers=None, timeout=None):
+        return _Resp(404, {"message": "Label does not exist"})
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return _Resp(200, [{"name": "prio:soon"}])
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    monkeypatch.setattr(webapp.requests, "post", fake_post)
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "soon"})
+    assert r.get_json() == {"ok": True, "priority": "soon"}
+
+
+def test_dev_priority_none_delete_failure_reported(monkeypatch):
+    """Clearing to 'none' with a failing DELETE must NOT report ok unconditionally
+    — the pre-fix bug returned ok:True even when the labels weren't removed."""
+    _configure(monkeypatch)
+
+    def fake_delete(url, headers=None, timeout=None):
+        return _Resp(500, {"message": "server error"})
+
+    monkeypatch.setattr(webapp.requests, "delete", fake_delete)
+    # requests.post stays the raising guard — 'none' must not POST anything
+    r = _client().post("/api/dev/issue/5/priority", json={"priority": "none"})
+    assert r.status_code == 200
+    assert r.get_json()["ok"] is False
+
+
 def test_dev_priority_invalid_rejected_before_github(monkeypatch):
     _configure(monkeypatch)
     # requests.* are raising guards → a 400 must come BEFORE any GitHub call
@@ -368,5 +421,52 @@ def test_dev_priority_token_missing_degrades_gracefully(monkeypatch):
     # no token; requests.* are raising guards → must NOT be called
     r = _client().post("/api/dev/issue/5/priority", json={"priority": "soon"})
     assert r.status_code != 500
+    j = r.get_json()
+    assert j["ok"] is False and j["available"] is False
+
+
+# --------------------------------------------------------------------------- #
+# GET /api/dev/issue/<n> — issue body + all comments (the boss reads everything)
+# --------------------------------------------------------------------------- #
+def test_dev_issue_detail_requires_login():
+    c = webapp.app.test_client()
+    r = c.get("/api/dev/issue/5")
+    assert r.status_code == 401
+
+
+def test_dev_issue_detail_returns_body_and_comments(monkeypatch):
+    _configure(monkeypatch)
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        if url.endswith("/issues/5/comments"):
+            return _Resp(200, [
+                {"body": "prvý detail", "created_at": "2026-07-22T10:00:00Z"},
+                {"body": "druhý detail", "created_at": "2026-07-22T11:00:00Z"},
+            ])
+        if url.endswith("/issues/5"):
+            return _Resp(200, {"number": 5, "body": "zadanie úlohy"})
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(webapp.requests, "get", fake_get)
+    j = _client().get("/api/dev/issue/5").get_json()
+    assert j["ok"] is True
+    assert j["body"] == "zadanie úlohy"
+    assert [c["body"] for c in j["comments"]] == ["prvý detail", "druhý detail"]
+    assert "test-token" not in "".join([j["body"], j["comments"][0]["body"]])
+
+
+def test_dev_issue_detail_upstream_error_degrades_gracefully(monkeypatch):
+    _configure(monkeypatch)
+    monkeypatch.setattr(webapp.requests, "get",
+                        lambda *a, **k: _Resp(404, {"message": "Not Found"}))
+    r = _client().get("/api/dev/issue/5")
+    assert r.status_code == 200                      # never 500
+    assert r.get_json()["ok"] is False
+
+
+def test_dev_issue_detail_token_missing_degrades_gracefully():
+    # no token; requests.get is the raising guard → must NOT be called
+    r = _client().get("/api/dev/issue/5")
+    assert r.status_code == 200
     j = r.get_json()
     assert j["ok"] is False and j["available"] is False
