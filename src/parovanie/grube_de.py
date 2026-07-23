@@ -20,6 +20,14 @@ def to_grube_de(url: str) -> str | None:
 # schema.org Offer: "name":"[Farbe X. ]Größe <SIZE>.","price":"…","priceCurrency":"EUR","sku":"<itemId>"
 _OFFER = re.compile(r'"name":"([^"]*?)","price":"[^"]*","priceCurrency":"EUR","sku":"(\d+)"')
 _GROESSE = re.compile(r"Größe\s*([^.\"]+)")
+# The displayed variant's itemId anchor on the page (reminder-list link + canonical
+# fragment). Own itemIds are filtered by prefix==productId AND len==len(productId)+4
+# exactly as the offer skus are — cross-sell products carry a DIFFERENT productId.
+_ITEMID_ANCHOR = re.compile(r"itemId=(\d+)")
+
+# Sentinel size key for a SINGLE-SIZE grube product (a knife has no Größe axis).
+# "" never collides with a real Größe label (the regex requires ≥1 non-dot char).
+ONE_SIZE = ""
 
 
 def parse_variants(html: str, product_id: str) -> dict[str, str]:
@@ -27,20 +35,41 @@ def parse_variants(html: str, product_id: str) -> dict[str, str]:
     page's own schema.org Offer objects (name carries 'Größe <SIZE>', sku is the itemId).
     Own offers only (sku prefix==productId AND len==len(productId)+4) — cross-sell
     associatedProduct itemIds are excluded by the prefix. Returns {} (link-only) when
-    a size maps to >1 itemId (multi-color / multi-axis — ambiguous) or no own offer."""
+    a size maps to >1 itemId (multi-color / multi-axis — ambiguous) or no own offer.
+
+    Single-size fallback (knives — issue #60 class 1): a single-size product has NO
+    'Größe' Offer list; its one itemId lives only in the page's `itemId=<id>` anchor
+    (reminder link + canonical fragment). When no sized Offer is found, extract the own
+    itemId(s) from those anchors: EXACTLY one own itemId -> {ONE_SIZE: itemId}; zero (not
+    found) or more than one (multi-color, no size axis) -> {} (link-only, fail-closed —
+    never a wrong externalCode)."""
     text = html.replace('\\"', '"')          # unescape JSON-in-JSON
     want_len = len(product_id) + 4
     size2ids: dict[str, set] = {}
+    saw_own_offer = False                                 # any own Offer at all (sized or not)
     for name, sku in _OFFER.findall(text):
         if not (sku.startswith(product_id) and len(sku) == want_len):
             continue
+        saw_own_offer = True
         m = _GROESSE.search(name)
         if not m:
             continue
         size2ids.setdefault(m.group(1).strip(), set()).add(sku)
     if any(len(ids) > 1 for ids in size2ids.values()):   # color/length axis -> ambiguous
         return {}
-    return {size: next(iter(ids)) for size, ids in size2ids.items()}
+    if size2ids:                                          # multi-size product (unchanged)
+        return {size: next(iter(ids)) for size, ids in size2ids.items()}
+    # --- single-size fallback: ONLY when the page has NO own Offer at all (a true
+    # single-variant knife). If own Offers existed but none carried a 'Größe' (a
+    # COLOR-only product), the lone anchor is the DEFAULT colour's itemId — writing it
+    # would auto-order the wrong colour, so stay link-only (#60 review Finding 1). ---
+    if saw_own_offer:
+        return {}                                         # own offers, no size axis -> fail-closed
+    own = {iid for iid in _ITEMID_ANCHOR.findall(text)
+           if iid.startswith(product_id) and len(iid) == want_len}
+    if len(own) == 1:
+        return {ONE_SIZE: next(iter(own))}
+    return {}                                             # 0 (not found) or >1 (multi-color)
 
 
 class _MultiAxis:
@@ -90,8 +119,15 @@ def normalize_size(label: str) -> str:
 
 def match_variant_codes(rows: list[dict], grube_sizes: dict[str, str]) -> dict[str, str]:
     """{forestshop code: grube itemId} for EXACT-matched sizes only.
-    Excludes multi-axis, one-size, and any size with no exact grube label.
-    Raises ValueError if two grube labels normalize to one (silent-fold guard)."""
+    Excludes multi-axis and any size with no exact grube label.
+    Raises ValueError if two grube labels normalize to one (silent-fold guard).
+
+    Single-size (issue #60 class 1): when the grube product is single-size
+    (grube_sizes == {ONE_SIZE: itemId}), a ONE-SIZE forestshop variant
+    (resolve_size -> None) matches that single itemId — but ONLY when there is
+    exactly ONE one-size row, so a single grube itemId is never spread across N
+    forestshop codes (N:1 stays link-only, fail-closed). Sized forestshop rows
+    never match a single-size grube product (and vice-versa)."""
     norm_grube: dict[str, str] = {}
     for lbl, iid in grube_sizes.items():
         n = normalize_size(lbl)
@@ -99,12 +135,23 @@ def match_variant_codes(rows: list[dict], grube_sizes: dict[str, str]) -> dict[s
             raise ValueError(f"grube size collision: {lbl!r} folds onto existing {n!r}")
         norm_grube[n] = iid
 
+    single_size = list(norm_grube) == [ONE_SIZE]         # grube product has no size axis
+    one_size_rows = [r for r in rows if resolve_size(r) is None]
+
     out: dict[str, str] = {}
     for row in rows:
         size = resolve_size(row)
-        if size is None or size is MULTI_AXIS:
+        if size is MULTI_AXIS:
             continue
-        iid = norm_grube.get(normalize_size(size))
+        if size is None:
+            # one-size forestshop variant: match a single-size grube product only,
+            # and only when unambiguous (never 1 itemId -> many codes).
+            if single_size and len(one_size_rows) == 1:
+                iid = norm_grube[ONE_SIZE]
+            else:
+                continue
+        else:
+            iid = norm_grube.get(normalize_size(size))
         if iid:
             out[row["code"]] = iid
     return out
