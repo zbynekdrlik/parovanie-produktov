@@ -415,6 +415,53 @@ samo vrátiť do dobrého stavu — na rozdiel od JOIN/WRITE-JOIN vzorov, ktoré
   napíšeš podobný "safe run-now" e2e test pre inú automatizáciu — inak riskuješ skutočný sieťový
   beh v CI.
 
+## Pridanie plnej WORK záložky (nie automatizácia) — vzor `nedostupne`/`vystavy` (#100/#111)
+
+Nová pracovná záložka s vlastným obsahom (nie per-riadkový flag, nie automatizácia). Checklist —
+**vynechaný krok = tichý bug** (tab sa neprepne / nezobrazí / drift test padne):
+
+1. **app.js**: `TABS += ['<key>', '<Label>']`, `NAV_ICONS.<key>`, `PAGE_TITLES.<key>`, vetva v
+   `setPageHead` (pageSub), `navCount('<key>')`, `switchTab` (`if tab===key await load<Key>()`),
+   `render()`: pridaj `const <key> = ACTIVE_TAB===key`, zahrň do `plain`, `#tab-<key>` hidden toggle,
+   a **dispatch riadok** `if (<key>) { ...; render<Key>(); return; }` (PRED review/toorder blokom).
+   `load<Key>`/`render<Key>` (globál `let <KEY> = null`).
+2. **app.py**: `NAV_KEYS += "<key>"` (inak #173 rename → 400). Store + endpointy podľa potreby.
+3. **index.html**: `<section id="tab-<key>" hidden></section>` + bumpni cache-bust `?v=` na app.js AJ style.css.
+4. **GOTCHA — nový TAB rozbije DVE veci, oprav OBE:**
+   - `tests/e2e/test_shell.py::test_nav_order_has_review_last` hard-koduje CELÝ zoznam `#tabs .tlabel`
+     — pridaj nový label na správnu pozíciu (poradie = poradie v `TABS`).
+   - `init()` má **whitelist `?tab=` deep-linku** (`qTab==='toorder'||'review'||...`) ktorý NOVÝ kľúč
+     NEobsahuje → `/?tab=<key>` sa NEprepne. E2E preto naviguj KLIKOM na nav button
+     (`get_by_role("button", name="<Label>")`), nie cez `?tab=` (ako `nedostupne`/`vystavy` e2e). Ak
+     chceš deep-link, dopln kľúč do whitelistu.
+5. **E2E fixture**: vlastný function-scoped server (vzor `nedostupne_server`/`vystavy_server`) +
+   pridaj ho do `_SERVER_FIXTURES` (auth cookie). `MAIL_HOST=""` ak tab vie kliknúť send-cestu.
+6. Karty (nie tabuľka) sú preferovaný layout pre manažérske taby (šéfova požiadavka #111) — grupuj
+   podľa stavu, farebný `border-left`+badge, per-stav akčné tlačidlo, klik-na-hlavičku → inline
+   detail/edit (`VY_OPEN` Set prežije re-render, takže po save ostane detail otvorený).
+
+## Automatizácia BEZ nav tabu (background-only) — vzor `vystavy_otazka/_odpoved_*` (#111)
+
+Keď automatizácia beží len na pozadí a NEMÁ mať vlastnú záložku (jej efekt vidno v inom WORK tabe):
+registruj ju do `AUTOMATIONS_REG` + **`AUTOMATION_DESCRIPTIONS`** (description-completeness test
+`test_ui_labels.py` iteruje VŠETKY `/api/automations` a vyžaduje neprázdny popis), ale **NEpridávaj**
+kľúč do `AUTOMATION_TABS` (app.js) ani do `NAV_KEYS` (app.py) — `test_nav_keys_match_appjs` odvodzuje
+`NAV_KEYS` z `TABS|AUTOMATION_TABS`, takže background kľúč v `NAV_KEYS` = drift fail. Dôsledok: taká
+automatizácia NEMÁ UI toggle (zapína sa len ručnou úpravou `automations.json`) — vedomý trade-off, nie bug.
+
+## „Poľovnícke výstavy" (#111) — IMAP reply-detekcia + Message-ID threading
+
+- **Reply detekcia = ulož Message-ID pri odoslaní, matchni pri prijatí.** `_send_vystava_mail`
+  (app.py) posiela s explicitným `msg["Message-ID"]=make_msgid(domain="forestshop.sk")` a VRÁTI ho
+  (`_send_mail_html` vracia len `bool` → nestačí). Uloží sa do `email_*_msgid`; `vystavy_imap.match_reply`
+  matchne `from==vystava.email` AND stored-msgid v `In-Reply-To`/`References` odpovede (msgid rozlíši
+  keď 1 organizátor má viac výstav). `trim_quote` odreže reply-chain (SK „Dňa … napísal:" má meno PRED
+  `:` → marker `D[ňn][ae] .*nap[íi]?sal.*:`, nie len `napísal:`).
+- **IMAP creds z `data/.mail_env`**: `IMAP_HOST` (default `mbox.myshoptet.com`), `IMAP_PORT` (993),
+  reuse `MAIL_USER`/`MAIL_PASS`; self-signed → `ssl.CERT_NONE`. `fetch_inbox` degrade→`[]` (automat nespadne).
+- **Migračný store**: `scripts/migrate_vystavy.py` → gitignored `data/out/vystavy.json` (jednorazovo pri
+  deployi, `--force` na re-migráciu; app toleruje chýbajúci súbor = 0 výstav). Pri deployi ho MUSÍŠ spustiť.
+
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
 Samostatná nav „Vývoj" DOLE (`#devNav`, mimo priečinka, pre KAŽDÉHO prihláseného —
