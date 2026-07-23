@@ -151,15 +151,17 @@ def live_server(tmp_path_factory):
     # field). Crafted so the NEWEST-first sort is observable: BETALOV holds the newest
     # order (1/M = 20260900) so its group sorts ABOVE ORBIS (newest 20260700); within
     # BETALOV 1/M (20260900) precedes 2/M (20260750).
+    # shopRemark column (#101): the shop's own internal order note, surfaced read-only
+    # on the row. Only the ORBIS order (20260700) carries one → its row shows .to-shopnote.
     (out / "orders_cache.csv").write_text(
-        "code;date;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20260900;2026-05-20 09:00:00;Vybavuje sa;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
-        "20260750;2026-05-02 11:30:00;Vybavuje sa;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
-        "20260700;2026-04-24 19:14:05;Vybavuje sa;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n"
+        "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20260900;2026-05-20 09:00:00;Vybavuje sa;;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
+        "20260750;2026-05-02 11:30:00;Vybavuje sa;;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
+        "20260700;2026-04-24 19:14:05;Vybavuje sa;chýba nám kus;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n"
         # 88/Z arrived WITHOUT a supplier (empty itemSupplier) → groups under '—' and
         # shows the inline supplier-assign field; OLDEST order (20260001) so '—' sorts
         # LAST and never disturbs the BETALOV-first / within-BETALOV ordering assertions.
-        "20260001;2026-01-05 10:00:00;Vybavuje sa;Bez Dodavatela Test;1;88/Z;Veľkosť: Z;\r\n",
+        "20260001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;88/Z;Veľkosť: Z;\r\n",
         encoding="cp1250")
     # GRUBE per-size code store: attaches a copyable itemId chip + .de link onto the
     # 1/M order row (its itemCode matches), exercising the Task-10 renderOrderRow path.

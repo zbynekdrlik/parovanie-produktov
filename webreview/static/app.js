@@ -9,6 +9,7 @@ let ORDERED = {};           // key -> true (ordered/objednané)
 let WAITING = {};           // key -> true (čaká sa — deferred active line)
 let INSTOCK = {};           // key -> true (skladom — máme/naskladnené)
 let UNAVAIL = {};           // key -> true (nedostupné — u dodávateľa)
+let ORDER_COMMENTS = {};    // orderCode -> comment (#101 per-order manager note)
 let NEDOSTUPNE = null;      // /api/nedostupne — flagged-unavailable products + customers (#100)
 let ND_PENDING = null;      // {code, type} — the send the preview modal is showing
 let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
@@ -713,7 +714,8 @@ async function loadOrders() {
     WAITING = (await (await fetch('/api/waiting')).json()).waiting || {};
     INSTOCK = (await (await fetch('/api/instock')).json()).instock || {};
     UNAVAIL = (await (await fetch('/api/unavailable')).json()).unavailable || {};
-  } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; }
+    ORDER_COMMENTS = (await (await fetch('/api/order-comment')).json()).comments || {};
+  } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; ORDER_COMMENTS = {}; }
 }
 
 async function saveOrdered(key, ordered) {
@@ -1004,6 +1006,40 @@ function supplierEditor(o, row, focus) {
   return wrap;
 }
 
+// #101 — per-ORDER comment (the manager's note about the whole order, mirroring the
+// Shoptet "Poznámka e-shopu"). Keyed by orderCode, so it applies to every line of that
+// order → after a save re-render the whole tab so all sibling lines reflect it (same
+// per-shared-property propagation as saveSupplier).
+async function saveOrderComment(o, comment, row) {
+  const r = await fetch('/api/order-comment', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ orderCode: o.orderCode, comment })
+  });
+  if (!r.ok) return;
+  if (comment) ORDER_COMMENTS[o.orderCode] = comment; else delete ORDER_COMMENTS[o.orderCode];
+  renderToOrder();
+}
+
+// comment editor (multi-line textarea + save) — opened from the 💬 button on a row.
+// Ctrl/⌘+Enter saves (plain Enter keeps the note multi-line, like the admin textarea).
+function commentEditor(o, row, focus) {
+  const wrap = el('div', 'to-comment-edit');
+  const inp = el('textarea', 'to-cominput');
+  inp.rows = 2;
+  inp.placeholder = 'komentár k objednávke…';
+  inp.value = ORDER_COMMENTS[o.orderCode] || '';
+  const save = el('button', 'to-comsave', '💾 Uložiť');
+  save.title = 'Uložiť komentár k objednávke (Ctrl+Enter)';
+  const doSave = () => saveOrderComment(o, inp.value.trim(), row);
+  save.onclick = doSave;
+  inp.onkeydown = (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSave(); }
+  };
+  wrap.appendChild(inp); wrap.appendChild(save);
+  if (focus) setTimeout(() => inp.focus(), 0);
+  return wrap;
+}
+
 function renderOrderRow(o) {
   const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : '') + (WAITING[o.key] ? ' waiting' : '')
     + (INSTOCK[o.key] ? ' instock' : '') + (UNAVAIL[o.key] ? ' unavail' : ''));
@@ -1076,6 +1112,31 @@ function renderOrderRow(o) {
     oa.textContent = '📋 obj. ' + o.orderCode;
     oa.title = 'Otvoriť objednávku ' + o.orderCode + ' v admine';
     row.appendChild(oa);
+  }
+  // #101 — existing Shoptet "Poznámka e-shopu" (read-only context; textContent → escaped)
+  if (o.shopRemark) {
+    const sr = el('span', 'to-shopnote');
+    const flat = o.shopRemark.replace(/\s+/g, ' ').trim();
+    sr.textContent = '🛈 ' + (flat.length > 40 ? flat.slice(0, 40) + '…' : flat);
+    sr.title = 'Poznámka e-shopu v Shoptete:\n' + o.shopRemark;
+    row.appendChild(sr);
+  }
+  // #101 — our per-ORDER comment: a chip (💬) when set (+ ✏️ edit), else an add button
+  const com = (o.orderCode && ORDER_COMMENTS[o.orderCode]) || '';
+  if (com) {
+    const tag = el('span', 'to-comment');
+    tag.textContent = '💬 ' + (com.length > 40 ? com.slice(0, 40) + '…' : com);
+    tag.title = com;
+    row.appendChild(tag);
+    const ce = el('button', 'to-comedit', '✏️');
+    ce.title = 'Upraviť komentár k objednávke';
+    ce.onclick = () => { tag.replaceWith(commentEditor(o, row, true)); ce.remove(); };
+    row.appendChild(ce);
+  } else {
+    const add = el('button', 'to-comadd', '💬 Komentár');
+    add.title = 'Pridať komentár k objednávke';
+    add.onclick = () => { add.replaceWith(commentEditor(o, row, true)); };
+    row.appendChild(add);
   }
   // 'čaká sa' — aktívna objednávka, ktorú zatiaľ neobjednávame/naskladňujeme
   const w = el('button', 'to-wait' + (WAITING[o.key] ? ' on' : ''));
