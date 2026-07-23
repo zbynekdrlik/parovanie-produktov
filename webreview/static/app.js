@@ -8,6 +8,8 @@ let ORDERED = {};           // key -> true (ordered/objednané)
 let WAITING = {};           // key -> true (čaká sa — deferred active line)
 let INSTOCK = {};           // key -> true (skladom — máme/naskladnené)
 let UNAVAIL = {};           // key -> true (nedostupné — u dodávateľa)
+let NEDOSTUPNE = null;      // /api/nedostupne — flagged-unavailable products + customers (#100)
+let ND_PENDING = null;      // {code, type} — the send the preview modal is showing
 let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
 let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
 let POSTA = null;           // /api/posta-uncollected — last run's display data
@@ -302,7 +304,8 @@ function renderFilters() {
 // Order = usage frequency (#117): 'Kontrola párovania' became the least-used
 // page once the review backlog stabilized, so it sits LAST inside the 'Eshop'
 // folder — before the 'Automatizácie' section, never first.
-const TABS = [['toorder', 'Na objednanie'], ['search', 'Hľadať / opraviť'],
+const TABS = [['toorder', 'Na objednanie'], ['nedostupne', 'Nedostupné tovary'],
+  ['search', 'Hľadať / opraviť'],
   ['notes', 'Poznámky'], ['review', 'Kontrola párovania']];
 
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
@@ -316,6 +319,7 @@ const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['orders_reminde
 const NAV_ICONS = {
   review: '<path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/>',
   toorder: '<path d="M9 5h6M9 9h6M9 13h4"/><rect x="4" y="3" width="16" height="18" rx="2"/>',
+  nedostupne: '<circle cx="12" cy="12" r="9"/><path d="M6 6l12 12"/>',
   search: '<circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/>',
   notes: '<path d="M4 4h16v12l-4 4H4z"/><path d="M16 20v-4h4"/>',
   users: '<circle cx="12" cy="8" r="4"/><path d="M4 21c1.5-4 5-6 8-6s6.5 2 8 6"/>',
@@ -344,6 +348,7 @@ function isAdmin() { return !!(ME && ME.is_admin); }
 function navCount(key) {
   if (key === 'review') return PRODUCTS.filter(p => !statusOf(p)).length;
   if (key === 'toorder') return ORDERS.length;
+  if (key === 'nedostupne') return NEDOSTUPNE ? NEDOSTUPNE.length : 0;
   if (key === 'notes') return NOTES.length;
   if (key === 'users') return USERS_LIST.length;
   if (key === 'posta') return POSTA ? (POSTA.uncollected || []).length : 0;
@@ -423,7 +428,7 @@ function renderTabs() {
 
 // Top-bar per-page title + a plain-language subtitle (with live counts).
 const PAGE_TITLES = {
-  review: 'Kontrola párovania', toorder: 'Na objednanie',
+  review: 'Kontrola párovania', toorder: 'Na objednanie', nedostupne: 'Nedostupné tovary',
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
   parovania_eshop: 'Párovania → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
@@ -440,6 +445,9 @@ function setPageHead() {
     s.textContent = `${PRODUCTS.length} produktov · ${un} čaká na kontrolu`;
   } else if (ACTIVE_TAB === 'toorder') {
     s.textContent = `${ORDERS.length} otvorených položiek u dodávateľov`;
+  } else if (ACTIVE_TAB === 'nedostupne') {
+    const n = NEDOSTUPNE ? NEDOSTUPNE.length : 0;
+    s.textContent = `${n} nedostupných tovarov · upozornenie zákazníkom s otvorenou objednávkou`;
   } else if (ACTIVE_TAB === 'search') {
     s.textContent = 'Prehľadá všetky polia všetkých produktov';
   } else if (ACTIVE_TAB === 'notes') {
@@ -522,6 +530,7 @@ function initFolders() {
 async function switchTab(tab) {
   ACTIVE_TAB = tab; localStorage.setItem('tab', tab); window.scrollTo(0, 0);
   if (tab === 'toorder' && !ORDERS.length) await loadOrders();
+  if (tab === 'nedostupne') await loadNedostupne();   // always fresh — orders/state change
   if (tab === 'notes' && !NOTES.length) await loadNotes();
   if (tab === 'users') await loadUsers();   // always fresh — small list
   if (tab === 'posta') await loadPosta();   // always fresh — status can change
@@ -553,6 +562,194 @@ async function saveOrdered(key, ordered) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key, ordered })
   });
+}
+
+// ── Nedostupné tovary (#100) ───────────────────────────────────────────────
+async function loadNedostupne() {
+  try {
+    NEDOSTUPNE = (await (await fetch('/api/nedostupne')).json()).products || [];
+  } catch (_) { NEDOSTUPNE = []; }
+}
+
+async function saveNdState(code, field, value) {
+  const p = (NEDOSTUPNE || []).find(x => x.code === code);
+  if (p) p[field === 'nedostupne' ? 'nedostupne' : 'alternativa'] = value;   // optimistic
+  render();
+  try {
+    await fetch('/api/nedostupne/state', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, field, value })
+    });
+  } catch (_) { /* store write best-effort; UI already reflects intent */ }
+}
+
+// Two customer-e-mail types; label + short human meaning for the tab UI.
+const ND_TYPES = {
+  nedostupne: { label: 'Nedostupné', desc: 'e-mail: objednaný produkt je nedostupný' },
+  alternativa: { label: 'Alternatíva', desc: 'e-mail: nedostupný + návrh alternatív' },
+};
+
+function renderNedostupne() {
+  const sec = document.getElementById('tab-nedostupne');
+  if (!sec) return;
+  sec.innerHTML = '';
+  const list = NEDOSTUPNE || [];
+  if (!list.length) {
+    sec.appendChild(el('div', 'nd-empty',
+      'Žiadne nedostupné tovary. Produkt označíš ako „nedostupné" na tabe '
+      + '<strong>Na objednanie</strong> — tu sa potom zozbierajú všetky na jednom mieste.'));
+    return;
+  }
+  for (const p of list) sec.appendChild(renderNdCard(p));
+}
+
+function renderNdCard(p) {
+  const card = el('div', 'nd-card');
+  card.dataset.code = p.code;
+  card.dataset.testid = 'nd-card-' + p.code;
+  const head = el('div', 'nd-head');
+  head.innerHTML = `<div class="nd-title">${escapeHtml(p.itemName || p.code)}</div>`
+    + `<div class="nd-code">kód ${escapeHtml(p.code)} · `
+    + `${p.order_count} ${p.order_count === 1 ? 'zákazník' : 'zákazníkov'} s otvorenou objednávkou</div>`;
+  card.appendChild(head);
+
+  // affected customers (open orders)
+  if (p.orders && p.orders.length) {
+    const ul = el('ul', 'nd-orders');
+    for (const o of p.orders) {
+      const badges = (o.unavailable_sent ? '<span class="nd-badge ok">✓ nedostupné</span>' : '')
+        + (o.alternative_sent ? '<span class="nd-badge ok">✓ alternatíva</span>' : '');
+      ul.appendChild(el('li', null,
+        `<span class="nd-oc">#${escapeHtml(o.orderCode)}</span> `
+        + `${escapeHtml(o.billFullName || '—')} · `
+        + `<span class="nd-em">${escapeHtml(o.email || 'bez e-mailu')}</span> ${badges}`));
+    }
+    card.appendChild(ul);
+  } else {
+    card.appendChild(el('div', 'nd-noorders', 'Žiadna otvorená objednávka na tento produkt.'));
+  }
+
+  // the two e-mail types, each = checkbox intent + Náhľad (preview → send)
+  const acts = el('div', 'nd-types');
+  acts.appendChild(renderNdType(p, 'nedostupne', p.nedostupne, p.unavailable_sent_count));
+  acts.appendChild(renderNdType(p, 'alternativa', p.alternativa, p.alternative_sent_count,
+    p.alternatives));
+  card.appendChild(acts);
+  return card;
+}
+
+function renderNdType(p, type, checked, sentCount, alternatives) {
+  const box = el('div', 'nd-type');
+  const t = ND_TYPES[type];
+  const cb = el('label', 'nd-check');
+  cb.innerHTML = `<input type="checkbox" data-testid="nd-cb-${type}-${p.code}" `
+    + `${checked ? 'checked' : ''}>`
+    + `<span><strong>${t.label}</strong><small>${t.desc}</small></span>`;
+  cb.querySelector('input').onchange = (e) => saveNdState(p.code, type, e.target.checked);
+  box.appendChild(cb);
+
+  if (type === 'alternativa' && alternatives && alternatives.length) {
+    const al = el('div', 'nd-alts', 'Alternatívy: ' + alternatives.map(a =>
+      a.url ? `<a href="${escapeHtml(a.url)}" target="_blank" rel="noopener">${escapeHtml(a.name)}</a>`
+        : escapeHtml(a.name)).join(', '));
+    box.appendChild(al);
+  }
+
+  const canSend = (p.order_count || 0) > 0;
+  const btn = el('button', 'btn sm nd-preview-btn',
+    `✉ Náhľad e-mailu${sentCount ? ` · odoslané ${sentCount}` : ''}`);
+  btn.disabled = !canSend;
+  btn.dataset.testid = `nd-preview-${type}-${p.code}`;
+  btn.onclick = () => openNdPreview(p.code, type);
+  box.appendChild(btn);
+  return box;
+}
+
+function _ndModalEls() {
+  return {
+    modal: document.getElementById('ndModal'),
+    head: document.getElementById('ndHead'),
+    hint: document.getElementById('ndHint'),
+    rec: document.getElementById('ndRecipients'),
+    frame: document.getElementById('ndPreview'),
+    msg: document.getElementById('ndMsg'),
+    send: document.getElementById('ndSend'),
+  };
+}
+
+function closeNdModal() {
+  const m = document.getElementById('ndModal');
+  if (m) m.hidden = true;
+  ND_PENDING = null;
+}
+
+async function openNdPreview(code, type) {
+  const E = _ndModalEls();
+  if (!E.modal) return;
+  ND_PENDING = { code, type };
+  E.head.textContent = 'Náhľad e-mailu — ' + ND_TYPES[type].label;
+  E.hint.textContent = 'Skontroluj komu a čo pôjde. E-mail sa odošle až po kliknutí „Odoslať".';
+  E.rec.innerHTML = 'Načítavam…';
+  E.frame.srcdoc = '';
+  E.msg.hidden = true;
+  E.send.disabled = true;
+  E.modal.hidden = false;
+  let j;
+  try {
+    j = await (await fetch('/api/nedostupne/preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code, type })
+    })).json();
+  } catch (_) { j = { ok: false }; }
+  if (!j || !j.ok) { E.rec.textContent = 'Náhľad sa nepodarilo načítať.'; return; }
+  const recips = j.recipients || [];
+  if (!recips.length) {
+    E.rec.innerHTML = '<em>Žiadni noví príjemcovia'
+      + (j.already_sent ? ` (${j.already_sent} už bolo informovaných)` : '') + '.</em>';
+    E.send.disabled = true;
+    E.send.textContent = '✉ Odoslať (0)';
+  } else {
+    E.rec.innerHTML = `<div class="nd-rec-head">Príjemcovia (${recips.length}):</div>`
+      + '<ul>' + recips.map(r =>
+        `<li>${escapeHtml(r.name || '—')} · <span class="nd-em">${escapeHtml(r.email)}</span> `
+        + `<span class="nd-oc">#${escapeHtml(r.orderCode)}</span></li>`).join('') + '</ul>';
+    E.send.disabled = false;
+    E.send.textContent = `✉ Odoslať (${recips.length})`;
+  }
+  E.frame.srcdoc = j.html || '';
+}
+
+async function ndSendNow() {
+  if (!ND_PENDING) return;
+  const E = _ndModalEls();
+  E.send.disabled = true;
+  E.msg.hidden = false;
+  E.msg.textContent = 'Odosielam…';
+  let j;
+  try {
+    j = await (await fetch('/api/nedostupne/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ND_PENDING)
+    })).json();
+  } catch (_) { j = { ok: false }; }
+  if (j && j.ok) {
+    E.msg.textContent = `✓ Odoslané: ${j.sent}` + (j.skipped ? ` · preskočené: ${j.skipped}` : '');
+    await loadNedostupne();
+    render();
+    setTimeout(closeNdModal, 1200);
+  } else {
+    E.msg.textContent = `Odoslanie zlyhalo${j && j.failed ? ` (${j.failed} chýb)` : ''}.`;
+    E.send.disabled = false;
+  }
+}
+
+function initNdModal() {
+  const bd = document.getElementById('ndBackdrop');
+  const cancel = document.getElementById('ndCancel');
+  const send = document.getElementById('ndSend');
+  if (bd) bd.onclick = closeNdModal;
+  if (cancel) cancel.onclick = closeNdModal;
+  if (send) send.onclick = ndSendNow;
 }
 
 async function saveWaiting(key, waiting) {
@@ -2310,6 +2507,7 @@ function render() {
   renderTabs();
   setPageHead();
   const toorder = ACTIVE_TAB === 'toorder';
+  const nedostupne = ACTIVE_TAB === 'nedostupne';
   const search = ACTIVE_TAB === 'search';
   const notes = ACTIVE_TAB === 'notes';
   const users = ACTIVE_TAB === 'users';
@@ -2323,11 +2521,12 @@ function render() {
   const imageHealth = ACTIVE_TAB === 'image_health';
   const dev = ACTIVE_TAB === 'dev';
   const auto = posta || shoptetSync || parovaniaEshop || dodavatelskySklad || rizikoVypadku || restockSkladom || ordersReminder || imageHealth;  // any automation tab
-  const plain = search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
+  const plain = nedostupne || search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
   const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || plain) ? 'none' : '';
   const filt = document.getElementById('filters'); if (filt) filt.style.display = plain ? 'none' : '';
+  const secNd = document.getElementById('tab-nedostupne'); if (secNd) secNd.hidden = !nedostupne;
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
   const secNotes = document.getElementById('tab-notes'); if (secNotes) secNotes.hidden = !notes;
   const secUsers = document.getElementById('tab-users'); if (secUsers) secUsers.hidden = !users;
@@ -2341,6 +2540,7 @@ function render() {
   const secImgHealth = document.getElementById('tab-image_health'); if (secImgHealth) secImgHealth.hidden = !imageHealth;
   const secDev = document.getElementById('tab-dev'); if (secDev) secDev.hidden = !dev;
   const mainEl = document.getElementById('list'); if (mainEl) mainEl.style.display = plain ? 'none' : '';
+  if (nedostupne) { document.getElementById('empty').hidden = true; renderNedostupne(); return; }
   if (dev) { document.getElementById('empty').hidden = true; renderDev(); return; }
   if (imageHealth) { document.getElementById('empty').hidden = true; renderImageHealth(); return; }
   if (ordersReminder) { document.getElementById('empty').hidden = true; renderOrdersReminder(); return; }
@@ -2390,6 +2590,7 @@ async function init() {
   initTheme();
   initFolders();
   initIdea();
+  initNdModal();
   // Who am I? (#91) — 401 → the fetch guard above already navigates to /login.
   try {
     const meR = await fetch('/api/me');

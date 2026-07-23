@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Kontrola párovania — Forestshop</title>
-  <link rel="stylesheet" href="/static/style.css?v=47">
+  <link rel="stylesheet" href="/static/style.css?v=48">
 </head>
 <body>
   <script>try{if(localStorage.getItem('theme')==='dark')document.body.setAttribute('data-theme','dark');}catch(e){}</script>
@@ -61,6 +61,7 @@
     </header>
     <main id="list"></main>
     <div id="empty" class="empty" hidden>Žiadne produkty v tomto filtri.</div>
+    <section id="tab-nedostupne" hidden></section>
     <section id="tab-search" hidden>
       <input id="searchBox" type="search" autocomplete="off"
              placeholder="Hľadať produkt podľa názvu, dodávateľa alebo kódu…">
@@ -103,6 +104,22 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js?v=53"></script>
+  <!-- Náhľad + odoslanie zákazníckeho e-mailu (#100): žiadny e-mail sa neposiela
+       automaticky — manažér najprv vidí komu + čo pôjde, potvrdí „Odoslať". -->
+  <div id="ndModal" class="nd-modal" hidden>
+    <div class="nd-backdrop" id="ndBackdrop"></div>
+    <div class="nd-dialog" role="dialog" aria-modal="true" aria-labelledby="ndHead">
+      <h2 id="ndHead">Náhľad e-mailu</h2>
+      <p class="nd-hint" id="ndHint"></p>
+      <div id="ndRecipients" class="nd-recipients"></div>
+      <iframe id="ndPreview" class="nd-preview" title="Náhľad e-mailu" sandbox=""></iframe>
+      <div id="ndMsg" class="nd-msg" hidden></div>
+      <div class="nd-acts">
+        <button id="ndCancel" class="btn ghost" type="button">Zrušiť</button>
+        <button id="ndSend" class="btn good" type="button">✉ Odoslať</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/app.js?v=54"></script>
 </body>
 </html>

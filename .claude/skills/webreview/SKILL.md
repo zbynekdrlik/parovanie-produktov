@@ -572,3 +572,38 @@ Starý audit (#12) navrhoval ĎALŠIE dva dedup kroky nad tie, čo sú už hotov
 - **`webreview/app.py::_load_catalog()` zámerne robí JEDEN cp1250 prechod** cez `data/products.csv`, čo postaví AJ `CODE2PAIR` AJ `CATALOG` (vyhľadávací index #115) z tých istých načítaných riadkov. Presmerovanie `CODE2PAIR` cez zdieľaný `csv_loader.load_code2pair` (ten ho stavia sám, bez `rows`) by vyžadovalo DRUHÝ celý prechod súborom — zdvojenie I/O pri každom štarte appky aj pri `/api/resync`, nie čistý dedup.
 
 Overuj PRED refaktorom, či „duplicitný" kód v skutočnosti nenesie skrytú závislosť (parsovaný výstup, jednoprechodový výkon) — CLAUDE.md's „NEkopíruj logiku" pravidlo pre `csv_loader`/`writer` sa vzťahuje na NOVÝ kód, nie na tieto dve už-zámerne-oddelené miesta.
+
+## Nedostupné tovary tab (#100, v0.71.0) — flagged-unavailable → preview-gated zákaznícky e-mail
+
+Samostatný WORK tab „Nedostupné tovary" (`#tab-nedostupne`, v TABS hneď za „Na objednanie") zbiera
+na jednom mieste každý produkt, ktorý manažér označil „nedostupné u dodávateľa" na tabe Na
+objednanie, napáruje ho na otvorené objednávky (zákazníkov) a nechá poslať zákazníkovi jeden z 2
+e-mailov — VŽDY za náhľadom, nikdy auto.
+
+- **Zdroj zoznamu = EXISTUJÚCI `unavailable_items.json`** (#84 per-line flag `<orderCode>|<itemCode>`).
+  `nedostupne.unavailable_item_codes` z neho vytiahne distinct itemCode-y → `affected_orders`
+  napáruje VŠETKY otvorené („Vybavuje sa") order-lines s tým EXAKTNÝM variant kódom (nie pairCode —
+  size L sa neupozorní keď je nedostupné len M). Pure logika v `src/parovanie/nedostupne.py`
+  (žiadna sieť/SMTP/súbor — testovateľné s fixture CSV + mock mailom).
+- **2 „štvorčeky" = nový store `data/out/nedostupne.json`** per itemCode: `{nedostupne, alternativa,
+  sent:{"<orderCode>|<type>":{at,email}}}`. Vzor per-flag store, ALE per-PRODUKT (itemCode), nie
+  per-line. Checkbox = len intent (`/api/nedostupne/state`), NEposiela.
+- **Bezpečné odoslanie (2 endpointy):** `/api/nedostupne/preview` (vráti príjemcov po dedupe +
+  vyrenderovaný e-mail, NEposiela — modal ho ukáže v `<iframe sandbox srcdoc>`) → `/api/nedostupne/send`
+  (pošle len tým, čo ešte nedostali; `plan_sends` dedupuje persistentne per order+type AJ per e-mail
+  v rámci dávky). SMTP je MIMO `_lock` + per-recipient re-check pod lockom (vzor `orders_reminder/override`),
+  immediate-persist po každom úspechu (crash mid-batch neposle duplikát). BCC owner automaticky
+  (`_send_mail_html`). E-mail HTML = ten istý štýl ako `orders_reminder.build_reminder_email`.
+- **Alternatívy = `relatedProduct*` z `data/products.csv`** (POZOR na názvy stĺpcov — viď skill
+  `shoptet`). `_ensure_nedostupne_catalog()` = LAZY {code|pairCode→name} + {code|pairCode→related
+  codes} sken exportu na PRVÉ otvorenie tabu (reset na resync spolu s `_CODE2URL`). URL alternatívy
+  z marketing XML `_CODE2URL`, fallback `forestshop /vyhladavanie/?string=<kód>` (vždy klikateľné).
+- **E2E fixture `nedostupne_server`** (funkčne-scoped): seedne `unavailable_items.json` +
+  fresh `orders_cache.csv` + `products.csv` s relatedProduct stĺpcami; **`MAIL_HOST=""`** poistka
+  (žiadny reálny send). Test klikne LEN náhľad (neklikaj Odoslať — 502 na nenakonfigurovanom SMTP).
+- **GOTCHA — `page.wait_for_selector("#el[hidden]")` NEČAKÁ na skrytie**: default state je „visible",
+  a `[hidden]` element nikdy nie je visible → timeout. Na čakanie na SKRYTIE modalu použi
+  `page.wait_for_selector("#el", state="hidden")`.
+- **GOTCHA — nový TAB v TABS rozbije `test_shell.py::test_nav_order_has_review_last`** (hard-koduje
+  celý zoznam label-ov `#tabs .tlabel`). Pridaj nový label na správnu pozíciu. Server-side pridaj
+  kľúč aj do `NAV_KEYS` (inak #173 premenovanie tabu → 400).
