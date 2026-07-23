@@ -145,6 +145,15 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
 3. Frontend: záložka do `AUTOMATION_TABS` (renderuje sa v sidebar sekcii `#autoTabs`
    „Automatizácie") + `#tab-<key>` sekcia + `render<Key>()` — vzor `renderPosta`
    (per-item tab) alebo `renderShoptetSync`/`renderParovaniaEshop` (status-only tab).
+   **Status-only tab s MALÝM výsledkom (len počty) čítaj z `a.last_result` PRIAMO**
+   (vzor `renderParovaniaEshop`/`renderGrubeExternalcode` #62) — NErob osobitný
+   `<key>.json` store + osobitný `<KEY>` global + `automations_server` fixture entry;
+   `automation_runner.status()` už `last_result` vracia. Osobitný store (vzor
+   `renderRestockSkladom` s globálom `RESTOCK`) treba LEN keď tab renderuje veľkú
+   tabuľku riadkov, nie zopár čísel. Frontend ešte: `#tab-<key>` sekcia v `index.html`
+   (pri ostatných), `render()` boolean + `auto` set + `hidden` toggle + dispatch riadok,
+   `PAGE_TITLES`, cache-bust `?v=` bump. Backend NAV_KEYS + `AUTOMATION_DESCRIPTIONS`
+   (drift-guard `test_nav_keys_match_appjs` + description test to vynúti).
    **Migrácia workflowu, ktorý VOLÁ EXISTUJÚCI endpoint appky** (napr. #109 nočný push
    párovaní/dodávateľov cez `/api/n8n/upload-pairings|upload-suppliers`) = **NEROB
    self-HTTP ani neduplikuj logiku**: vyextrahuj jadro endpointu do plain funkcie
@@ -156,7 +165,14 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
    na čítanie (čo pushnúť), nikdy ich nemení.
 4. **BEZPEČNOSŤ (dohodnuté #93): nová automatizácia štartuje `enabled=false`** — beží až po
    ▶ Štart; `enabled` prežíva reštart (`data/out/automations.json`); zmeškaný beh počas
-   výpadku sa preskočí dopredu. „⚡ Spustiť teraz" beží aj vypnutá (explicitná akcia) a
+   výpadku sa preskočí dopredu.
+   **GOTCHA (#62): nový ŽIVÝ zápis do eshopu NEZlievaj do UŽ ZAPNUTEJ automatizácie.**
+   `parovania_eshop` je na prode `enabled=true`, takže pridať doň nové write-pole (napr.
+   GRUBE `externalCode`, alebo split-linky #192) by ho na prode HNEĎ aktivovalo pri
+   najbližšom behu — poruší #93 (nový živý zápis musí štartovať DISABLED). Preto GRUBE
+   externalCode dostal VLASTNÚ default-disabled automatizáciu `grube_externalcode`
+   (denne 03:30), nie ďalší krok v `parovania_eshop`. Rovnaké platí pre každý budúci
+   nový write-feed — vlastná automatizácia = explicitný opt-in. „⚡ Spustiť teraz" beží aj vypnutá (explicitná akcia) a
    POSIELA REÁLNE e-maily zákazníkom pri KAŽDOM aktuálne nevyzdvihnutom balíku — pri overovaní
    na živom webe štandardne NEklikaj Spustiť teraz, toggle Štart→Stop stačí.
    **`parovania_eshop` (#109) PÍŠE do ŽIVÉHO eshopu** (nočný push párovaní/dodávateľov +
