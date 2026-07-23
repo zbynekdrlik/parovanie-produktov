@@ -817,6 +817,35 @@ def _save_unavailable(d: dict) -> None:
     os.replace(tmp, UNAVAIL)
 
 
+# Per-ORDER free-text comment for the Na-objednanie tab (key = '<orderCode>'). #101:
+# the manager's note about a WHOLE order — the same thing as the Shoptet admin's
+# "Poznámka e-shopu" (the order export's `shopRemark` column), which the shop already
+# fills for most orders. Keyed per ORDER (not per line) because the note is about the
+# order as a whole, exactly like shopRemark. This is OUR side (always built); writing
+# the note BACK into Shoptet's shopRemark is feasible (admin-form automation, verified
+# 2026-07-23) but deferred to a follow-up pending the boss's decision (overwrite vs
+# append, when to sync). Same safe atomic gitignored store, NEVER pruned → survives
+# deploy (an order code lives outside any review set, so a prune would wrongly drop it).
+ORDER_COMMENTS = os.path.join(OUT, "order_comments.json")
+ORDER_COMMENT_MAX = 2000   # generous cap — shopRemark in the admin holds multi-line notes
+
+
+def _load_order_comments() -> dict:
+    try:
+        with open(ORDER_COMMENTS, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _save_order_comments(d: dict) -> None:
+    tmp = ORDER_COMMENTS + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ORDER_COMMENTS)
+
+
 # „Nedostupné tovary" (#100): per-PRODUCT (itemCode) e-mail state — the two checkbox
 # intents (nedostupne/alternativa) + a `sent` dedup map keyed '<orderCode>|<type>' so the
 # same customer/order never gets a duplicate of the same e-mail. Gitignored, NEVER pruned
@@ -1068,6 +1097,10 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
             "supplier": (r.get("itemSupplier") or "").strip(),
             "name": (r.get("itemName") or "").strip(),
             "supplierUrl": code2url.get(code, ""),
+            # #101 — the shop's own internal note about this order ("Poznámka e-shopu"
+            # in the admin). Per-ORDER value (same on every line of the order); shown
+            # read-only on the row as context next to our editable comment.
+            "shopRemark": (r.get("shopRemark") or "").strip(),
         })
     return rows
 
@@ -2380,6 +2413,35 @@ def api_order_supplier():
     return jsonify({"ok": True})
 
 
+@app.route("/api/order-comment", methods=["GET", "POST"])
+def api_order_comment():
+    """#101 — per-ORDER free-text comment for the Na-objednanie tab (key='<orderCode>').
+    GET -> the {orderCode: comment} map. POST {orderCode, comment} sets/clears ONE
+    order's comment (empty comment clears it). Login-gated automatically (#91
+    before_request). Length-capped at ORDER_COMMENT_MAX. This is OUR side; the comment
+    is the manager's note about the whole order — the same thing as the Shoptet admin's
+    "Poznámka e-shopu" (shopRemark). Writing it BACK into Shoptet is a follow-up pending
+    the boss's decision (overwrite vs append the existing shopRemark, when to sync)."""
+    if request.method == "GET":
+        return jsonify({"comments": _load_order_comments()})
+    body = request.get_json(force=True)
+    order = str(body.get("orderCode") or "").strip()
+    comment = str(body.get("comment") or "").strip()
+    if not order:
+        return jsonify({"ok": False, "error": "missing orderCode"}), 400
+    if len(comment) > ORDER_COMMENT_MAX:
+        return jsonify({"ok": False, "error": "comment too long"}), 400
+    with _lock:
+        d = _load_order_comments()
+        if comment:
+            d[order] = comment
+        else:
+            d.pop(order, None)
+        _save_order_comments(d)
+    log.info("order-comment order=%s len=%d", order, len(comment))
+    return jsonify({"ok": True})
+
+
 @app.route("/api/orders")
 def api_orders():
     """To-order list: forestshop 'Vybavuje sa' items joined to supplier reorder
@@ -2397,9 +2459,11 @@ def api_orders():
     unavail = _load_unavailable()
     pairings = _load_order_pairings()
     assigns = _load_supplier_assign()
+    comments = _load_order_comments()                # #101 — per-order manager comment
     grube = _load_grube_codes()                      # loaded once per request
     for r in rows:
         r["ordered"] = bool(ordered.get(r["key"]))
+        r["comment"] = comments.get(r["orderCode"], "")   # per-ORDER note (our side)
         r["waiting"] = bool(waiting.get(r["key"]))   # 'čaká sa' — deferred active line
         r["instock"] = bool(instock.get(r["key"]))         # 'skladom' — máme/naskladnené
         r["unavailable"] = bool(unavail.get(r["key"]))     # 'nedostupné' — u dodávateľa

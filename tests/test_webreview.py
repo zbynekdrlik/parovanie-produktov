@@ -209,6 +209,80 @@ def test_order_pair_requires_code(monkeypatch, tmp_path):
     assert r.status_code == 400
 
 
+# --- #101: per-order comment (+ shopRemark surfaced) -------------------------- #
+def test_order_comment_endpoint_persists(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDER_COMMENTS", str(tmp_path / "oc.json"))
+    c = _client()
+    r = c.post("/api/order-comment",
+               json={"orderCode": "20261045", "comment": "zavolať zákazníkovi"})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert c.get("/api/order-comment").get_json()["comments"]["20261045"] == "zavolať zákazníkovi"
+    assert webapp._load_order_comments()["20261045"] == "zavolať zákazníkovi"
+    # empty comment clears the entry
+    c.post("/api/order-comment", json={"orderCode": "20261045", "comment": ""})
+    assert "20261045" not in c.get("/api/order-comment").get_json()["comments"]
+
+
+def test_order_comment_requires_ordercode(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDER_COMMENTS", str(tmp_path / "oc.json"))
+    r = _client().post("/api/order-comment", json={"comment": "x"})
+    assert r.status_code == 400
+    assert webapp._load_order_comments() == {}
+
+
+def test_order_comment_rejects_too_long(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDER_COMMENTS", str(tmp_path / "oc.json"))
+    big = "x" * (webapp.ORDER_COMMENT_MAX + 1)
+    r = _client().post("/api/order-comment", json={"orderCode": "20261045", "comment": big})
+    assert r.status_code == 400
+    assert webapp._load_order_comments() == {}
+    # exactly at the cap is accepted
+    ok = "y" * webapp.ORDER_COMMENT_MAX
+    assert _client().post("/api/order-comment",
+                          json={"orderCode": "20261045", "comment": ok}).status_code == 200
+
+
+def test_order_comment_tolerate_corrupt_store(monkeypatch, tmp_path):
+    f = tmp_path / "oc.json"
+    f.write_text("{ not json", encoding="utf-8")
+    monkeypatch.setattr(webapp, "ORDER_COMMENTS", str(f))
+    assert webapp._load_order_comments() == {}
+    f.write_text("[]", encoding="utf-8")   # wrong type
+    assert webapp._load_order_comments() == {}
+
+
+def test_build_to_order_rows_captures_shopremark():
+    orders = (
+        "code;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20261045;Vybavuje sa;chýba nám 1 kus;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+    rows = webapp.build_to_order_rows(orders, [], {}, {})
+    assert rows[0]["shopRemark"] == "chýba nám 1 kus"
+
+
+def test_orders_route_merges_comment_and_shopremark(monkeypatch, tmp_path):
+    orders = ("code;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261045;Vybavuje sa;interná poznámka;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS", [])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {})
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
+    monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "is.json"))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "un.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    monkeypatch.setattr(webapp, "ORDER_COMMENTS", str(tmp_path / "oc.json"))
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    j = _client().get("/api/orders").get_json()
+    row = j["orders"][0]
+    assert row["shopRemark"] == "interná poznámka"
+    assert row["comment"] == ""                       # none set yet
+    (tmp_path / "oc.json").write_text(
+        json.dumps({"20261045": "objednané u dodávateľa"}), encoding="utf-8")
+    row2 = _client().get("/api/orders").get_json()["orders"][0]
+    assert row2["comment"] == "objednané u dodávateľa"   # per-ORDER comment merged in
+
+
 # --- #174: split a product into per-size links -------------------------------- #
 def test_variant_link_endpoint_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "vl.json"))

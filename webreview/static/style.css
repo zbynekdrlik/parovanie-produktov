@@ -269,10 +269,27 @@ body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
 .toorder-row .to-order{color:#713AC7;text-decoration:none;font-weight:600;font-size:12px;flex:0 0 auto;
   background:#ede9fe;padding:3px 8px;border-radius:6px;white-space:nowrap}
 .toorder-row .to-order:hover{background:#ddd6fe;text-decoration:underline}
+/* #101 — order comment: read-only Shoptet note (🛈), our comment chip (💬) + editor */
+.toorder-row .to-shopnote{color:var(--soft);font-size:12px;flex:0 0 auto;max-width:220px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:help}
+.toorder-row .to-comment{background:#fef3c7;color:#7c4a03;font-size:12px;font-weight:600;
+  border-radius:6px;padding:3px 8px;flex:0 0 auto;max-width:240px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+body[data-theme=dark] .toorder-row .to-comment{background:#4a3a12;color:#fde68a}
+.toorder-row .to-comadd,.toorder-row .to-comedit{background:transparent;border:0;cursor:pointer;
+  font-size:12px;color:var(--soft);opacity:.75;flex:0 0 auto;padding:2px 4px}
+.toorder-row .to-comadd:hover,.toorder-row .to-comedit:hover{opacity:1}
+.toorder-row .to-comment-edit{display:flex;align-items:flex-start;gap:6px;flex:1 1 260px;min-width:200px}
+.toorder-row .to-cominput{flex:1 1 auto;min-width:120px;padding:6px 8px;border:1px solid var(--border);
+  border-radius:7px;font-size:13px;font-family:inherit;background:var(--panel);color:var(--text);resize:vertical}
+.toorder-row .to-comsave{flex:0 0 auto;background:#B45309;color:#fff;border:0;border-radius:7px;
+  padding:6px 11px;font-size:12px;font-weight:600;cursor:pointer}
+.toorder-row .to-comsave:hover{background:#92400e}
 @media(max-width:760px){
   .toorder-row{flex-wrap:wrap;gap:6px 10px}
   .toorder-row .to-name{flex-basis:100%;white-space:normal}
   .toorder-row .to-pair{flex-basis:100%}
+  .toorder-row .to-comment-edit{flex-basis:100%}
 }
 
 /* ---------------- HĽADAŤ / OPRAVIŤ ---------------- */
