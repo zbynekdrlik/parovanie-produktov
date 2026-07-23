@@ -87,6 +87,13 @@ Orders export NEMÁ interné admin `id` objednávky a prehľad objednávok
 s linkom na detail (`objednavky-detail/?id=<interné id>`). Používa ho tab
 „Nevyzdvihnuté zásielky"; použi ho pre KAŽDÝ budúci link do adminu podľa kódu objednávky.
 
+### Zápis poznámky K OBJEDNÁVKE (`shopRemark`) späť do Shoptetu (overené naživo 2026-07-23, #101)
+
+- **`shopRemark` (order export stĺpec 28) = admin textarea `name="shopRemark"`, label „Poznámka e-shopu"** na detaile objednávky — interná poznámka predajne (NIE `remark` = poznámka zákazníka, stĺpec 27). Väčšina objednávok ju má vyplnenú ručne.
+- **Order IMPORT (CSV/XML) v admine NEEXISTUJE** — overené: `import-objednavok/`/`import-objednavky/`/`objednavky-import/`/`import/` → **404**, funguje LEN `import-produktov/` (produkty). Takže „rozdelený CSV import ako pri produktoch" pre objednávky NEplatí — NEskúšaj to.
+- **Zapísateľné LEN cez admin-form automatizáciu** (Playwright, ako `scripts/shoptet_import.py`): detail objednávky je POST formulár `#document-update` (s CSRF), tlačidlo „Uložiť" (`type=submit`). Deep-link na objednávku podľa kódu = globálne vyhľadávanie vyššie → `objednavky-detail/?id=<internéID>` → fill `textarea[name=shopRemark]` → Uložiť → read-back over. Existujúce admin creds (`data/.shoptet_admin`) STAČIA — netreba API.
+- **Shoptet REST API** (`api.shoptet.com`) vie objednávky updatnúť (`PATCH`), ale vyžaduje API doplnok + OAuth token, ktorý **v `data/.shoptet_admin` NIE JE** → alternatíva len po pridaní API prístupu.
+
 ### Reálny Shoptet import formulár (overené naživo)
 
 - **URL:** `/admin/import-produktov/` (POZOR: NIE `produkty-import`). Login: placeholder `E-mail` / `Vaše heslo`, tlačidlo `Prihlásenie`.
