@@ -2008,6 +2008,11 @@ VY_STATUSES = {VY_NEW, VY_OTAZKA, VY_AKCIA, VY_POZIADANE, VY_HOTOVO}
 # send buttons / automations). These go into the mail, so they are formula-guarded.
 VY_EDIT_FIELDS = ("nazov", "datum", "miesto", "kontakt_osoba", "tel", "email",
                   "velkost_stanku", "kedy_riesit", "sposob")
+# …except tel + kontakt_osoba: a phone like „+421 905 …" legitimately leads with '+',
+# and neither reaches any CSV/formula sink (the mails interpolate only nazov/datum/
+# velkost_stanku), so guarding them just blocks valid data (the edit form posts every
+# field, so one '+' phone made the whole výstava unsavable). #198 FIX 2.
+VY_NO_FORMULA_GUARD = ("tel", "kontakt_osoba")
 VY_FIELD_MAX = 500                              # length cap per editable field
 VY_FEED_MAX = 100                               # feed entries kept per výstava
 
@@ -2110,7 +2115,7 @@ def _vy_clean_fields(raw: dict):
         val = str(raw.get(k) or "").strip()
         if len(val) > VY_FIELD_MAX:
             return None, f"pole '{k}' je príliš dlhé"
-        if val[:1] in _FORMULA_LEAD:
+        if k not in VY_NO_FORMULA_GUARD and val[:1] in _FORMULA_LEAD:
             return None, f"pole '{k}' nesmie začínať znakom = + - @"
         fields[k] = val
     return fields, None
@@ -2199,15 +2204,20 @@ def api_vystava():
 @app.route("/api/vystava/posli-otazku", methods=["POST"])
 def api_vystava_posli_otazku():
     """Manual send of the intro-question mail for ONE výstava (chain A, off-schedule).
-    The SMTP round-trip runs OUTSIDE the global _lock; on success status→Otázka poslaná,
-    the msgid is stored (for IMAP threading) and the feed records it. Mail failure → 502,
-    state unchanged (retryable)."""
+    Allowed ONLY from the Nová (empty) state — like /ideme guards VY_AKCIA — so re-sending
+    on an in-flight výstava can't reset it to Otázka poslaná and re-mail the organizer;
+    wrong state → 409. The SMTP round-trip runs OUTSIDE the global _lock; on success
+    status→Otázka poslaná, the msgid is stored (for IMAP threading) and the feed records
+    it. Mail failure → 502, state unchanged (retryable). #198 FIX 3."""
     body = request.get_json(silent=True) or {}
     vid = str(body.get("id") or "").strip()
     with _lock:
         v = _vy_find(_load_vystavy(), vid)
         if not v:
             return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
+        if v.get("status") != VY_NEW:
+            return jsonify({"ok": False,
+                            "error": "otázku možno poslať len z novej výstavy"}), 409
         snapshot = dict(v)
     email = (snapshot.get("email") or "").strip()
     if not email:
@@ -2221,6 +2231,8 @@ def api_vystava_posli_otazku():
         v = _vy_find(vystavy, vid)
         if not v:
             return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
+        if v.get("status") != VY_NEW:                       # changed meanwhile → don't double
+            return jsonify({"ok": False, "error": "stav sa medzičasom zmenil"}), 409
         v["status"] = VY_OTAZKA
         v["email_otazka_msgid"] = msgid
         v["email_datum"] = _now_iso()
@@ -4710,10 +4722,14 @@ def run_vystavy_otazka() -> dict:
     re-check (a manual edit meanwhile must not be clobbered)."""
     month = _sk_month_now()
     with _lock:
-        snapshots = [dict(v) for v in _load_vystavy()
+        all_vystavy = _load_vystavy()
+        snapshots = [dict(v) for v in all_vystavy
                      if v.get("status") == VY_NEW and v.get("sposob") == "email"
                      and (v.get("email") or "").strip()
                      and (v.get("kedy_riesit") or "").strip().casefold() == month]
+    # výstavy skipped this run (wrong month / not-new / pdf / no e-mail) — the spec
+    # summary shape is {poslane, preskocene} (design.md:145); the rest is a superset.
+    preskocene = len(all_vystavy) - len(snapshots)
     poslane = zlyhane = 0
     for snap in snapshots:
         subject, mbody = _vy_otazka_mail(snap)
@@ -4733,8 +4749,8 @@ def run_vystavy_otazka() -> dict:
                      f"Automaticky poslaná otázka organizátorovi ({snap['email'].strip()}).")
             _save_vystavy(vystavy)
             poslane += 1
-    result = {"poslane": poslane, "zlyhane": zlyhane, "mesiac": month,
-              "kandidati": len(snapshots)}
+    result = {"poslane": poslane, "preskocene": preskocene, "zlyhane": zlyhane,
+              "mesiac": month, "kandidati": len(snapshots)}
     log.info("vystavy_otazka: %s", result)
     return result
 
