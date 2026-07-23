@@ -640,6 +640,31 @@ function initTheme() {
   };
 }
 
+// Edit-mode toggle (#176): the per-tab ✏️ rename pencils are HIDDEN by default
+// (they used to show on every nav item at once, covering half the dashboard
+// names). An admin turns them on/off with the 'Upraviť názvy' button in the
+// sidebar footer; body.edit-labels is the CSS switch. State persists in
+// localStorage so the mode survives a reload, but the default is always OFF.
+function applyEditLabels(on) {
+  document.body.classList.toggle('edit-labels', on);
+  const b = document.getElementById('editLabelsBtn');
+  if (!b) return;
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  const lbl = b.querySelector('.editlbl');
+  if (lbl) lbl.textContent = on ? 'Hotovo — skryť ceruzky' : 'Upraviť názvy';
+}
+function initEditLabels() {
+  const b = document.getElementById('editLabelsBtn');
+  if (!b || !isAdmin()) return;   // admin-only; a non-admin never sees the toggle
+  b.hidden = false;
+  applyEditLabels(localStorage.getItem('editLabels') === 'on');
+  b.onclick = () => {
+    const on = !document.body.classList.contains('edit-labels');
+    localStorage.setItem('editLabels', on ? 'on' : 'off');
+    applyEditLabels(on);
+  };
+}
+
 // Sidebar folders (#118): collapsible nav groups, system-like tree. Each folder's
 // expanded/collapsed state persists per-key in localStorage (default = expanded).
 // Designed for extensibility — register more folders by calling initFolder().
@@ -2838,6 +2863,7 @@ async function init() {
     }
   }
   if (ACTIVE_TAB === 'users' && !(ME && ME.is_admin)) ACTIVE_TAB = 'toorder';
+  initEditLabels();   // #176 — admin edit-mode toggle (needs ME/isAdmin())
   loadVersion();
   const j = await (await fetch('/api/products')).json();
   PRODUCTS = j.products;
