@@ -446,8 +446,16 @@ Keď automatizácia beží len na pozadí a NEMÁ mať vlastnú záložku (jej e
 registruj ju do `AUTOMATIONS_REG` + **`AUTOMATION_DESCRIPTIONS`** (description-completeness test
 `test_ui_labels.py` iteruje VŠETKY `/api/automations` a vyžaduje neprázdny popis), ale **NEpridávaj**
 kľúč do `AUTOMATION_TABS` (app.js) ani do `NAV_KEYS` (app.py) — `test_nav_keys_match_appjs` odvodzuje
-`NAV_KEYS` z `TABS|AUTOMATION_TABS`, takže background kľúč v `NAV_KEYS` = drift fail. Dôsledok: taká
-automatizácia NEMÁ UI toggle (zapína sa len ručnou úpravou `automations.json`) — vedomý trade-off, nie bug.
+`NAV_KEYS` z `TABS|AUTOMATION_TABS`, takže background kľúč v `NAV_KEYS` = drift fail.
+
+**Ovládanie takej automatizácie patrí do HLAVIČKY jej WORK tabu (#198 FIX 1), NIE „len ručne v
+`automations.json`".** Vzor `vyAutoPanel()`/`vyAutoRow(key)` v renderVystavy: kompaktný panel so
+zoznamom kľúčov, každý riadok `autoByKey(key)` → názov+popis+stav+`next_run` + `toggleAutomation(key,
+!a.enabled)` (Štart/Stop) + `runAutomation(key, '<tab>')` (⚡ Spustiť teraz). DVA drôty nutné, inak sa
+panel po toggli neobnoví: (1) `load<Tab>()` musí volať `await loadAutomations()` (naplní `AUTOMATIONS`),
+(2) `_reloadAuto(tab)` potrebuje vetvu pre ten tab (`if (tab==='<tab>') { await load<Tab>(); return; }`)
+— `toggle/run` volajú `_reloadAuto(ACTIVE_TAB)`+`render()`, bez vetvy padnú do default `loadPosta`.
+Reusuje sa existujúca `.pill on/off` + `.btn sm good/warn/ghost`. E2E: toggle on→off (fixture zdieľaný).
 
 ## „Poľovnícke výstavy" (#111) — IMAP reply-detekcia + Message-ID threading
 
@@ -461,6 +469,19 @@ automatizácia NEMÁ UI toggle (zapína sa len ručnou úpravou `automations.jso
   reuse `MAIL_USER`/`MAIL_PASS`; self-signed → `ssl.CERT_NONE`. `fetch_inbox` degrade→`[]` (automat nespadne).
 - **Migračný store**: `scripts/migrate_vystavy.py` → gitignored `data/out/vystavy.json` (jednorazovo pri
   deployi, `--force` na re-migráciu; app toleruje chýbajúci súbor = 0 výstav). Pri deployi ho MUSÍŠ spustiť.
+- **Formula-guard LEN na polia, čo idú do CSV/formula sinku (#198 FIX 2)**: `_vy_clean_fields` strážila
+  formula-lead (`= + - @`) na VŠETKÝCH edit poliach — lenže `tel` (`+421 …` legitímne začína `+`) ani
+  `kontakt_osoba` nejdú do žiadneho CSV (maily interpolujú len `nazov/datum/velkost_stanku`), takže guard
+  blokoval platné dáta (edit form posiela VŠETKY polia → jeden `+` telefón znemožnil uložiť celú výstavu).
+  `VY_NO_FORMULA_GUARD=("tel","kontakt_osoba")` ich vyníma; ostatné polia ostávajú strážené. Pravidlo:
+  formula-guard patrí len na pole, čo naozaj tečie do CSV/formula sinku, nie na plain-text kontaktné pole.
+- **Send tlačidlá STRÁŽIA vstupný stav (#198 FIX 3)**: `posli-otazku` smie ísť LEN z `VY_NEW` (inak 409,
+  re-check aj po maili — ako `ideme` stráži `VY_AKCIA`), inak by priamy API na výstavu v „poziadane"/
+  „odpovedane" resetol stav→otazka a re-mailoval organizátora. Každé nové send tlačidlo pridaj s
+  rovnakým vstupno-stavovým guardom.
+- **Chain-A summary shape (#198 FIX 4)**: `run_vystavy_otazka` vracia `{poslane, preskocene, …}`
+  (`preskocene` = `len(all_vystavy)-len(candidates)`, výstavy preskočené kvôli mesiacu/stavu/pdf/mailu) —
+  spec `design.md:145` predpisuje `{poslane, preskocene}`, zvyšok je superset.
 
 ## Záložka „Vývoj" (#115, v0.59.0) — GitHub issues + žiarovka nápad→issue
 
