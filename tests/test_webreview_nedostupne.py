@@ -140,3 +140,28 @@ def test_send_reports_failure_when_smtp_down(iso, monkeypatch):
 def test_send_rejects_bad_type(iso):
     r = authed_client().post("/api/nedostupne/send", json={"code": "X", "type": "bogus"})
     assert r.status_code == 400
+
+
+def test_send_dedups_same_email_across_two_orders(iso, monkeypatch):
+    """Regression (#100 review Finding 1): one customer with the SAME unavailable
+    variant in TWO open orders must be e-mailed ONCE and never again. The dedup store
+    must record BOTH order keys — not just the winning one — or the second send
+    re-e-mails the sibling order (a real duplicate to a real customer)."""
+    csv2 = ("\r\n".join([
+        HEADER,
+        "5001;2026-07-10 10:00:00;Vybavuje sa;ada@example.com;Ada Nová;Nohavice FOREST;1;40237/3XL;3XL",
+        "5005;2026-07-13 12:00:00;Vybavuje sa;ada@example.com;Ada Nová;Nohavice FOREST;1;40237/3XL;3XL",
+    ]) + "\r\n").encode("cp1250")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: csv2)
+    c = authed_client()
+    r = c.post("/api/nedostupne/send", json={"code": "40237/3XL", "type": "nedostupne"}).get_json()
+    assert r["sent"] == 1                                   # ada e-mailed exactly ONCE
+    assert [m["to"] for m in iso["sent"]] == ["ada@example.com"]
+    # BOTH order keys recorded → the sibling order can never trigger a re-send
+    store = _nedostupne_store(iso)["40237/3XL"]["sent"]
+    assert set(store) == {"5001|nedostupne", "5005|nedostupne"}
+    # second send is a genuine no-op — NO duplicate e-mail to ada
+    iso["sent"].clear()
+    r2 = c.post("/api/nedostupne/send", json={"code": "40237/3XL", "type": "nedostupne"}).get_json()
+    assert r2["sent"] == 0
+    assert iso["sent"] == []
