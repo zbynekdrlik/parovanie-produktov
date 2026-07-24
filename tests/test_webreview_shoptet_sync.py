@@ -35,7 +35,7 @@ EXPORT_CSV = (
     "1/L;P1;Bunda Test;BETALOV;visible;Skladom;;59,90;69,90;2;https://x/a.jpg\r\n"
 ).encode("cp1250")
 
-# SYNTHETIC customer export (never real PII) — 32-col Shoptet schema, one fake row.
+# SYNTHETIC customer export (never real PII) — a few Shoptet customer columns, one fake row.
 CUSTOMERS_CSV = (
     "guid;registrationDate;billingFullName;email;phone;customerGroup\r\n"
     "g-test-1;2026-01-02;Test Zákazník;t@example.com;;Veľkoobchod\r\n"
@@ -235,34 +235,37 @@ def test_fetch_customers_csv_sanitizes_secret_url_on_network_failure(monkeypatch
     assert exc_info.value.__suppress_context__ is True
 
 
-# ── customers fetched LAST: a failure never rolls back the critical refresh ────
-def test_run_fails_on_customers_fetch_after_critical_already_refreshed(iso, monkeypatch):
-    # Customers is the LAST fetch — orders/catalog/review already landed before it.
-    # A customers failure raises (runner records error) but never rolls back the
-    # critical refresh, and never writes a partial customers cache.
+# ── customers fetched LAST + NON-FATAL: a failure never rolls back the critical
+#    refresh AND never turns the whole sync red (nothing consumes customers yet) ──
+def test_customers_fetch_failure_is_non_fatal_critical_refresh_survives(iso, monkeypatch):
     iso["customers_cache"].write_bytes(b"OLD CUSTOMERS DATA")
 
     def boom():
-        raise RuntimeError("SHOPTET_CUSTOMERS_URL chyba v data/.shoptet_admin")
+        raise RuntimeError("stiahnutie exportu zákazníkov zlyhalo: ConnectionError (URL skrytá)")
     monkeypatch.setattr(webapp, "_fetch_customers_csv", boom)
 
-    with pytest.raises(RuntimeError, match="SHOPTET_CUSTOMERS_URL"):
-        webapp.run_shoptet_sync()
+    result = webapp.run_shoptet_sync()          # does NOT raise (non-fatal)
 
     # the critical exports DID refresh (customers runs after them)
     assert iso["orders_cache"].read_bytes() == ORDERS_CSV
     assert iso["src"].read_bytes() == EXPORT_CSV
     assert webapp.PRODUCTS[0]["current"]["price"] == "59,90"
-    # customers cache untouched — the fetch raised before its write
+    # the customers problem is SURFACED in the result, not raised; cache untouched
+    assert "customers_error" in result
+    assert result["customers_bytes"] == 0
     assert iso["customers_cache"].read_bytes() == b"OLD CUSTOMERS DATA"
 
 
-def test_run_via_runner_after_customers_failure_records_error(iso, monkeypatch):
+def test_run_via_runner_customers_failure_stays_ok_with_error_surfaced(iso, monkeypatch):
+    # Non-fatal: runner records last_status="ok" (critical refresh succeeded) and
+    # surfaces the customers problem in last_result["customers_error"] — never a red
+    # sync status for an auxiliary export nothing consumes yet.
     def boom():
-        raise RuntimeError("SHOPTET_CUSTOMERS_URL chyba")
+        raise RuntimeError("stiahnutie exportu zákazníkov zlyhalo: ConnectionError (URL skrytá)")
     monkeypatch.setattr(webapp, "_fetch_customers_csv", boom)
 
-    assert webapp.RUNNER._execute("shoptet_sync") is True     # runner survives
+    assert webapp.RUNNER._execute("shoptet_sync") is True
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "shoptet_sync"]
-    assert st["last_status"] == "error"
-    assert "SHOPTET_CUSTOMERS_URL" in st["last_error"]
+    assert st["last_status"] == "ok"
+    assert "customers_error" in st["last_result"]
+    assert st["last_result"]["review_synced"] == 1     # critical refresh happened

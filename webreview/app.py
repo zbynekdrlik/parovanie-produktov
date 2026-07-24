@@ -3856,15 +3856,23 @@ def run_shoptet_sync() -> dict:
             json.dump(PRODUCTS, f, ensure_ascii=False)
         os.replace(tmp3, DATA)
 
-    # Customer export — fetched LAST so a customer-export hiccup never blocks the
-    # critical orders/catalog/review refresh that already landed above. Same
-    # fetch-then-swap + secret-safe pattern; raw cp1250 bytes cached for future
-    # customer automations (nothing parses it yet).
-    customers_bytes = _fetch_customers_csv()
-    tmp4 = CUSTOMERS_CACHE + ".tmp"
-    with open(tmp4, "wb") as f:
-        f.write(customers_bytes)
-    os.replace(tmp4, CUSTOMERS_CACHE)
+    # Customer export — fetched LAST and NON-FATAL: a customer-export hiccup must
+    # never turn the whole sync red, because orders/catalog/review already landed
+    # above and ARE the critical data (nothing consumes customers yet). On failure we
+    # log + surface customers_error in the result, but the run still reports OK for the
+    # critical refresh — the manager must not read a red status as "orders stale". Same
+    # fetch-then-swap + secret-safe pattern.
+    customers_bytes, customers_error = b"", None
+    try:
+        customers_bytes = _fetch_customers_csv()
+        tmp4 = CUSTOMERS_CACHE + ".tmp"
+        with open(tmp4, "wb") as f:
+            f.write(customers_bytes)
+        os.replace(tmp4, CUSTOMERS_CACHE)
+    except Exception as e:  # noqa: BLE001 — auxiliary source; never fail the whole sync
+        customers_error = str(e)   # already secret-sanitized by _fetch_customers_csv
+        log.warning("shoptet_sync: customer export refresh failed (non-fatal): %s",
+                    customers_error)
 
     result = {
         "orders_bytes": len(orders_bytes),
@@ -3874,6 +3882,8 @@ def run_shoptet_sync() -> dict:
         "review_stale": counts["stale"],
         "customers_bytes": len(customers_bytes),
     }
+    if customers_error:
+        result["customers_error"] = customers_error
     log.info("shoptet_sync: run OK %s", result)
     return result
 
