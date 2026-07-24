@@ -137,18 +137,28 @@ def test_orders_route_tolerates_corrupt_flag_store(monkeypatch, tmp_path):
     ordf.write_text("{ broken", encoding="utf-8")
     waitf = tmp_path / "w.json"
     waitf.write_text("[]", encoding="utf-8")  # wrong type
+    # decisions.json + supplier_assignments.json are the MOST exposed stores on this tab
+    # (decisions written on every review click; supplier_assign written by the app AND by
+    # n8n) — a corrupt/partial one must degrade to {} too, never 500 the whole /api/orders
+    # tab. This test drives the REAL corrupt-file path of _load_decisions +
+    # _load_supplier_assign (no monkeypatched loader) — RED before their guard, GREEN after.
+    decf = tmp_path / "decisions.json"
+    decf.write_text("{ broken", encoding="utf-8")
+    saf = tmp_path / "supplier_assignments.json"
+    saf.write_text("[]", encoding="utf-8")  # wrong type
     monkeypatch.setattr(webapp, "ORDERED", str(ordf))
     monkeypatch.setattr(webapp, "WAITING", str(waitf))
     monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "is.json"))
     monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "un.json"))
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
-    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
-    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    monkeypatch.setattr(webapp, "DECISIONS", str(decf))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(saf))
     r = _client().get("/api/orders")
     assert r.status_code == 200          # corrupt store degrades, tab still renders
     j = r.get_json()
     assert j["orders"][0]["ordered"] is False
     assert j["orders"][0]["waiting"] is False
+    assert j["orders"][0]["assignedSupplier"] == ""   # corrupt supplier_assign → {} → no assign
 
 
 def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):

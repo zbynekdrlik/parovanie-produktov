@@ -173,6 +173,52 @@ def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkey
     assert up == {"9/Z": "BETALOV"}
 
 
+# ── BUG 1 safety: FAIL-CLOSED when the export is missing/empty/unreadable. The
+#    exclusion guard (_codes_with_own_supplier) needs the catalog export to know which
+#    codes ALREADY carry their own eshop supplier. With NO export it cannot tell — it
+#    must NOT fall open and write, or a stale per-product assignment could clobber a
+#    real supplier in the live eshop (exactly the bug this PR fixes). The whole supplier
+#    upload is skipped: 0 written, everything blocked, the idempotency store untouched. ──
+def test_do_upload_suppliers_blocks_when_export_empty(iso, monkeypatch):
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "5/A": "ORBIS"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: "")  # export missing/unreadable
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+    assert status == 200
+    assert result["count"] == 0           # nothing written to the live eshop
+    assert result["blocked"] == 2         # both assignments held back
+    assert calls == []                    # the careful import never ran
+    # nothing recorded as uploaded → the idempotency store is never even written
+    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+
+
+# ── BUG 1 (case c): a code that IS in supplier_assignments but is NOT present in the
+#    current export has no "own supplier" there → it is NOT excluded, and the nightly
+#    write-back STILL emits it (unchanged pre-PR behaviour). A present-but-partial
+#    export must not silently drop a legitimate fill-in assignment — only a genuinely
+#    empty export blocks (test above), a non-empty one that merely lacks the code writes. ─
+def test_do_upload_suppliers_emits_code_absent_from_export(iso, monkeypatch):
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    # a NON-empty export listing OTHER products (5/A carries its own supplier) but NOT 9/Z
+    export = ("code;pairCode;supplier\r\n"
+              "5/A;555;REAL_SUPPLIER\r\n")
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: export)
+    # the exclusion helper does NOT flag 9/Z (it is absent from the export)
+    assert "9/Z" not in webapp._codes_with_own_supplier()
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+    assert status == 200
+    sup = next(c for c in calls if c["header"][2] == "supplier")
+    assert {r[0] for r in sup["rows"]} == {"9/Z"}      # still written (not excluded)
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {"9/Z": "BETALOV"}
+
+
 def test_run_is_idempotent_second_run_pushes_nothing(iso, monkeypatch):
     _seed_pairing()
     _seed_supplier()
