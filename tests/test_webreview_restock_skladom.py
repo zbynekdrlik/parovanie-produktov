@@ -19,6 +19,23 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+# Freshness fixtures are RELATIVE to real 'now' — the webreview restock automation
+# compares each supplier checkedAt against datetime.now() (a 48h window, MAX_PAIR_AGE_H).
+# A hardcoded date silently crosses the window as the clock advances (the 2026-07-24
+# time-bomb: a "2026-07-22" fresh ts was <48h on the 23rd, >48h on the 24th → 0 candidates).
+# now-1h is comfortably fresh; 3 weeks old is unambiguously stale, on any day.
+_TZ = timezone(timedelta(hours=2))
+
+
+def _fresh_ts():
+    return (datetime.now(_TZ) - timedelta(hours=1)).isoformat()
+
+
+def _stale_ts():
+    return (datetime.now(_TZ) - timedelta(days=21)).isoformat()
+
 from tests.conftest import authed_client  # noqa: E402
 
 # Two Vypredané+visible products (CEO-canonical: both availability fields Vypredané,
@@ -62,8 +79,8 @@ def iso(tmp_path, monkeypatch):
 def _seed_supplier_stock(p1_available=True, p2_fresh=True):
     """p/1 available+fresh (a restock candidate); p/2 available but STALE (>48h old,
     must NOT flip); p/3 available (control — but our product is already Skladom)."""
-    stale = "2026-07-01T05:00:00+02:00"          # weeks old -> not fresh
-    fresh = "2026-07-22T05:00:00+02:00"
+    stale = _stale_ts()          # weeks old -> not fresh
+    fresh = _fresh_ts()
     webapp._save_supplier_stock({
         "last_check": fresh,
         "rows": [
@@ -264,7 +281,7 @@ def _large_restock_fixture(n):
               "availabilityOutOfStock;price;stock;internalNote\r\n")
     lines = []
     stock_rows = []
-    fresh = "2026-07-22T05:00:00+02:00"
+    fresh = _fresh_ts()
     for i in range(n):
         code = f"{i}/M"
         link = f"https://supplier.test/p/{i}"

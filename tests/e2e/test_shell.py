@@ -229,3 +229,57 @@ def test_hidden_tab_sections_are_display_none_on_review(page, live_server):
         assert disp == "none", f"#{sec} visible on the review tab (display={disp})"
     assert not page.locator("#searchBox").is_visible()
     assert console == [], f"console not clean: {console}"
+
+
+def test_sidebar_resizer_drags_and_persists(page, live_server):
+    """The left sidebar carries a drag grip on its right edge: dragging widens/narrows
+    it, the chosen width persists across reloads (localStorage 'sideW'), and a
+    double-click resets to the default width (clears the stored value)."""
+    console = _console(page)
+    page.set_viewport_size({"width": 1400, "height": 900})
+    page.goto(live_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    grip = page.locator(".side-resizer")
+    assert grip.count() == 1, "sidebar resize grip missing"
+
+    def width():
+        return page.evaluate(
+            "() => parseInt(getComputedStyle(document.querySelector('.sidebar')).width, 10)")
+
+    start = width()
+    box = grip.bounding_box()
+    # drag the grip right → the sidebar gets wider
+    page.mouse.move(box["x"] + 4, box["y"] + 200)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 4 + 120, box["y"] + 200, steps=10)
+    page.mouse.up()
+    wider = width()
+    assert wider >= start + 80, f"drag did not widen the sidebar ({start} -> {wider})"
+    assert page.evaluate("() => localStorage.getItem('sideW')") is not None
+
+    # the width survives a reload
+    page.reload()
+    page.wait_for_selector('[data-testid="version"]')
+    assert abs(width() - wider) <= 3, "resized width did not persist across reload"
+
+    # #200 review (Important): releasing the button OUTSIDE the window must not leave the
+    # drag "stuck" (rubber-banding). A buttons===0 mousemove self-terminates the drag, so a
+    # later stray move no longer resizes. Fully synthetic → deterministic.
+    stuck = page.evaluate("""() => {
+      const g = document.querySelector('.side-resizer');
+      const w0 = document.querySelector('.sidebar').offsetWidth;
+      g.dispatchEvent(new MouseEvent('mousedown', {clientX: w0, buttons: 1, bubbles: true}));
+      document.dispatchEvent(new MouseEvent('mousemove', {clientX: w0 + 90, buttons: 0, bubbles: true}));
+      const released = document.querySelector('.sidebar').offsetWidth;
+      document.dispatchEvent(new MouseEvent('mousemove', {clientX: w0 + 260, buttons: 1, bubbles: true}));
+      const stray = document.querySelector('.sidebar').offsetWidth;
+      return stray !== released;   // true = still following cursor after release-outside (bug)
+    }""")
+    assert stuck is False, "drag stuck after mouse released outside the window (rubber-band)"
+
+    # double-click the grip resets to the default width (clears the stored width)
+    box2 = page.locator(".side-resizer").bounding_box()
+    page.mouse.dblclick(box2["x"] + 4, box2["y"] + 200)
+    assert page.evaluate("() => localStorage.getItem('sideW')") is None
+    assert console == [], f"console not clean: {console}"
