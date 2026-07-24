@@ -1,12 +1,13 @@
 """Hourly „Sync zo Shoptetu" automation (#119) — orders export + full catalog
-export refresh, in-memory CODE2PAIR/CATALOG rebuild, and review_data.json
-price/stock resync, wired through the generic automation runner (#93).
+export + customer export refresh, in-memory CODE2PAIR/CATALOG rebuild, and
+review_data.json price/stock resync, wired through the generic automation runner (#93).
 
-Hermetic: the two Shoptet fetch functions (_fetch_orders_csv / _fetch_export_csv)
-are monkeypatched with canned cp1250 CSV bytes / a raising stub — no network, no
-browser automation. Every store path (SRC/DATA/ORDERS_CACHE + the 5 manager
-decision stores) is redirected to tmp, mirroring test_webreview_automations.py's
-isolation pattern.
+Hermetic: the three Shoptet fetch functions (_fetch_orders_csv / _fetch_export_csv /
+_fetch_customers_csv) are monkeypatched with canned cp1250 CSV bytes / a raising stub
+— no network, no browser automation. Every store path (SRC/DATA/ORDERS_CACHE/
+CUSTOMERS_CACHE + the 5 manager decision stores) is redirected to tmp, mirroring
+test_webreview_automations.py's isolation pattern. The customer CSV fixture is
+SYNTHETIC — never real PII.
 """
 import json
 import os
@@ -34,6 +35,12 @@ EXPORT_CSV = (
     "1/L;P1;Bunda Test;BETALOV;visible;Skladom;;59,90;69,90;2;https://x/a.jpg\r\n"
 ).encode("cp1250")
 
+# SYNTHETIC customer export (never real PII) — 32-col Shoptet schema, one fake row.
+CUSTOMERS_CSV = (
+    "guid;registrationDate;billingFullName;email;phone;customerGroup\r\n"
+    "g-test-1;2026-01-02;Test Zákazník;t@example.com;;Veľkoobchod\r\n"
+).encode("cp1250")
+
 _MANAGER_STORES = (("DECISIONS", "decisions.json"), ("ORDERED", "ordered_items.json"),
                    ("WAITING", "waiting_items.json"),
                    ("ORDER_PAIRINGS", "order_pairings.json"),
@@ -54,16 +61,19 @@ def iso(tmp_path, monkeypatch):
     src = tmp_path / "products.csv"
     data = tmp_path / "review_data.json"
     orders_cache = tmp_path / "orders_cache.csv"
+    customers_cache = tmp_path / "customers_cache.csv"
     products = [_product()]
     data.write_text(json.dumps(products, ensure_ascii=False), encoding="utf-8")
     monkeypatch.setattr(webapp, "SRC", str(src))
     monkeypatch.setattr(webapp, "DATA", str(data))
     monkeypatch.setattr(webapp, "ORDERS_CACHE", str(orders_cache))
+    monkeypatch.setattr(webapp, "CUSTOMERS_CACHE", str(customers_cache))
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {})
     monkeypatch.setattr(webapp, "CATALOG", {})
     monkeypatch.setattr(webapp, "_fetch_orders_csv", lambda: ORDERS_CSV)
     monkeypatch.setattr(webapp, "_fetch_export_csv", lambda: EXPORT_CSV)
+    monkeypatch.setattr(webapp, "_fetch_customers_csv", lambda: CUSTOMERS_CSV)
     sentinel_paths = {}
     for name, fname in _MANAGER_STORES:
         p = tmp_path / fname
@@ -71,7 +81,7 @@ def iso(tmp_path, monkeypatch):
         monkeypatch.setattr(webapp, name, str(p))
         sentinel_paths[name] = p
     return {"tmp": tmp_path, "src": src, "data": data, "orders_cache": orders_cache,
-            "manager_stores": sentinel_paths}
+            "customers_cache": customers_cache, "manager_stores": sentinel_paths}
 
 
 # ── secret hygiene: a network failure must never leak the partner-hash URL ────
@@ -117,10 +127,12 @@ def test_run_now_success_refreshes_orders_catalog_and_review(iso):
     assert result["catalog_products"] == 1          # grouped under shared pairCode P1
     assert result["review_synced"] == 1
     assert result["review_stale"] == 0
+    assert result["customers_bytes"] == len(CUSTOMERS_CSV)
 
-    # fetch-then-swap: both files actually written to disk
+    # fetch-then-swap: all three exports actually written to disk
     assert iso["orders_cache"].read_bytes() == ORDERS_CSV
     assert iso["src"].read_bytes() == EXPORT_CSV
+    assert iso["customers_cache"].read_bytes() == CUSTOMERS_CSV
 
     # in-memory search index rebuilt (no restart needed)
     assert webapp.CODE2PAIR["1/M"] == "P1"
@@ -200,3 +212,57 @@ def test_run_never_touches_manager_decision_stores(iso):
     webapp.run_shoptet_sync()
     for _name, path in iso["manager_stores"].items():
         assert path.read_text(encoding="utf-8") == '{"sentinel": true}'
+
+
+# ── customer export: secret hygiene (same rule as the catalog export) ──────────
+def test_fetch_customers_csv_sanitizes_secret_url_on_network_failure(monkeypatch):
+    secret_url = "https://www.forestshop.sk/export/customers.csv?hash=TOTALLY-SECRET-HASH"
+    monkeypatch.setattr(webapp, "_cred",
+                        lambda key: secret_url if key == "SHOPTET_CUSTOMERS_URL" else None)
+
+    def boom(*a, **kw):
+        raise requests.ConnectionError(f"Failed to connect to {secret_url}")
+    monkeypatch.setattr(webapp.requests, "get", boom)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        webapp._fetch_customers_csv()
+
+    msg = str(exc_info.value)
+    assert "TOTALLY-SECRET-HASH" not in msg
+    assert "ConnectionError" in msg
+    # chain suppressed (`from None`) — hash never leaks via traceback/log.exception
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__suppress_context__ is True
+
+
+# ── customers fetched LAST: a failure never rolls back the critical refresh ────
+def test_run_fails_on_customers_fetch_after_critical_already_refreshed(iso, monkeypatch):
+    # Customers is the LAST fetch — orders/catalog/review already landed before it.
+    # A customers failure raises (runner records error) but never rolls back the
+    # critical refresh, and never writes a partial customers cache.
+    iso["customers_cache"].write_bytes(b"OLD CUSTOMERS DATA")
+
+    def boom():
+        raise RuntimeError("SHOPTET_CUSTOMERS_URL chyba v data/.shoptet_admin")
+    monkeypatch.setattr(webapp, "_fetch_customers_csv", boom)
+
+    with pytest.raises(RuntimeError, match="SHOPTET_CUSTOMERS_URL"):
+        webapp.run_shoptet_sync()
+
+    # the critical exports DID refresh (customers runs after them)
+    assert iso["orders_cache"].read_bytes() == ORDERS_CSV
+    assert iso["src"].read_bytes() == EXPORT_CSV
+    assert webapp.PRODUCTS[0]["current"]["price"] == "59,90"
+    # customers cache untouched — the fetch raised before its write
+    assert iso["customers_cache"].read_bytes() == b"OLD CUSTOMERS DATA"
+
+
+def test_run_via_runner_after_customers_failure_records_error(iso, monkeypatch):
+    def boom():
+        raise RuntimeError("SHOPTET_CUSTOMERS_URL chyba")
+    monkeypatch.setattr(webapp, "_fetch_customers_csv", boom)
+
+    assert webapp.RUNNER._execute("shoptet_sync") is True     # runner survives
+    (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "shoptet_sync"]
+    assert st["last_status"] == "error"
+    assert "SHOPTET_CUSTOMERS_URL" in st["last_error"]
