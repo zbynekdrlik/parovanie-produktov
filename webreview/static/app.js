@@ -149,6 +149,16 @@ function matchesFilter(p) {
 
 function el(tag, cls, html) { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; }
 function fmtDate(iso) { const p = (iso || '').split('-'); return p.length === 3 ? `${p[2]}.${p[1]}.${p[0]}` : (iso || ''); }  // 2026-04-24 → 24.04.2026
+// Celé dni od dátumu objednávky (YYYY-MM-DD) po dnes; prázdny/nevalidný → 0 (nikdy „staré").
+// `now` je injektovateľné pre deterministický test. Nezáporné (budúci dátum → 0).
+function orderAgeDays(orderDate, now) {
+  const p = (orderDate || '').split('-');
+  if (p.length !== 3) return 0;
+  const t = Date.parse(orderDate + 'T00:00:00');
+  if (isNaN(t)) return 0;
+  return Math.max(0, Math.floor(((now || Date.now()) - t) / 86400000));
+}
+const STALE_ORDER_DAYS = 14;   // nevybavená objednávka staršia než toľko dní → ⚠️ upozornenie
 function escapeHtml(s) { return (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function badge(s) {
   const t = { good: '✓ Dobré', manual: '✓ Vybraný link', split: '✂ Rozdelené na veľkosti',
@@ -762,6 +772,20 @@ async function saveOrdered(key, ordered) {
   });
 }
 
+// Označiť celú skupinu dodávateľa objednané naraz (manažér objedná od dodávateľa
+// všetko naraz). Pošle všetky per-riadkové kľúče cez bulk endpoint, updatne ORDERED
+// mapu a prekreslí. items = riadky skupiny (each carries o.key = orderCode|itemCode).
+async function markGroupOrdered(items, ordered) {
+  const keys = items.map(o => o.key);
+  const r = await fetch('/api/ordered/bulk', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ keys, ordered })
+  });
+  if (!r.ok) return;
+  for (const k of keys) { if (ordered) ORDERED[k] = true; else delete ORDERED[k]; }
+  renderToOrder();
+}
+
 // ── Nedostupné tovary (#100) ───────────────────────────────────────────────
 async function loadNedostupne() {
   try {
@@ -1142,6 +1166,16 @@ function renderOrderRow(o) {
     d.title = 'Dátum objednávky';
     row.appendChild(d);
   }
+  // ⚠️ stará NEVYBAVENÁ objednávka: keď nie je nijako poriešená a je staršia než
+  // STALE_ORDER_DAYS → nenápadný badge + trieda na riadok (aby nezapadla dole).
+  // Vybavená (ordered/waiting/instock/unavailable) alebo čerstvá → žiadny badge.
+  const ageDays = orderAgeDays(o.orderDate);
+  if (!isHandled(o) && ageDays > STALE_ORDER_DAYS) {
+    row.classList.add('stale');
+    const st = el('span', 'to-staleage', `⚠️ ${ageDays} dní`);
+    st.title = `Nevybavená objednávka stará ${ageDays} dní — pozri, nech nezapadne`;
+    row.appendChild(st);
+  }
   if (o.orderCode) {
     const oa = el('a', 'to-order');
     oa.href = 'https://www.forestshop.sk/admin/objednavky-detail/?code=' + encodeURIComponent(o.orderCode);
@@ -1279,9 +1313,20 @@ function renderToOrder() {
   const groups = {};
   for (const o of shown) { const s = effSup(o); (groups[s] = groups[s] || []).push(o); }
   for (const sup of Object.keys(groups).sort(byPriority)) {
-    groups[sup].sort((a, b) => oNum(b) - oNum(a));   // v rámci dodávateľa: najnovšia objednávka prvá
-    list.appendChild(el('div', 'toorder-supplier', `${escapeHtml(sup)} — ${groups[sup].length} položiek`));
-    for (const o of groups[sup]) list.appendChild(renderOrderRow(o));
+    const items = groups[sup];
+    items.sort((a, b) => oNum(b) - oNum(a));   // v rámci dodávateľa: najnovšia objednávka prvá
+    // header = escapovaná menovka (label FIRST → startsWith(sup) kontrakt) + hromadné
+    // tlačidlo „označiť skupinu objednané". Ak je UŽ všetko objednané, tlačidlo prepína späť.
+    const head = el('div', 'toorder-supplier');
+    head.appendChild(el('span', 'tosup-label', `${escapeHtml(sup)} — ${items.length} položiek`));
+    const allOrdered = items.every(o => ORDERED[o.key]);
+    const bulk = el('button', 'tosup-bulk', allOrdered ? '↺ Zrušiť objednané' : '✔ Označiť skupinu objednané');
+    bulk.title = allOrdered ? 'Odznačiť „objednané" pre celú skupinu'
+                            : 'Označiť VŠETKY položky tohto dodávateľa ako objednané';
+    bulk.onclick = () => markGroupOrdered(items, !allOrdered);
+    head.appendChild(bulk);
+    list.appendChild(head);
+    for (const o of items) list.appendChild(renderOrderRow(o));
   }
 }
 

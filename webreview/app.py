@@ -1810,6 +1810,33 @@ def api_ordered():
     return jsonify({"ok": True})
 
 
+@app.route("/api/ordered/bulk", methods=["POST"])
+def api_ordered_bulk():
+    """Mark a WHOLE supplier group ordered/un-ordered in one atomic write — the
+    manager orders everything from a supplier at once instead of clicking 15-20
+    rows. POST {keys:[...], ordered:bool}; each key is a per-line '<orderCode>|
+    <itemCode>' (same store as /api/ordered). Blank/non-string keys are dropped; a
+    missing/non-list `keys` → 400."""
+    body = request.get_json(force=True)
+    raw = body.get("keys")
+    if not isinstance(raw, list):
+        return jsonify({"ok": False, "error": "keys must be a list"}), 400
+    keys = [k for k in (str(x or "").strip() for x in raw) if k]
+    if not keys:
+        return jsonify({"ok": False, "error": "no valid keys"}), 400
+    ordered = bool(body.get("ordered"))
+    with _lock:
+        d = _load_ordered()
+        for key in keys:
+            if ordered:
+                d[key] = True
+            else:
+                d.pop(key, None)
+        _save_ordered(d)
+    log.info("ordered bulk n=%d ordered=%s", len(keys), ordered)
+    return jsonify({"ok": True, "count": len(keys)})
+
+
 @app.route("/api/waiting", methods=["GET", "POST"])
 def api_waiting():
     """Per-line 'čaká sa' flag (key='<orderCode>|<itemCode>'): active order line that

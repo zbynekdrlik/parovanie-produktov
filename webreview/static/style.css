@@ -232,8 +232,12 @@ body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f3
 .splitfoot{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 
 /* ---------------- NA OBJEDNANIE ---------------- */
-.toorder-supplier{font-weight:700;color:var(--text);margin:16px 0 8px;padding:4px 0;
-  border-bottom:2px solid var(--border);font-size:15px}
+.toorder-supplier{display:flex;align-items:center;gap:12px;color:var(--text);margin:16px 0 8px;
+  padding:4px 0;border-bottom:2px solid var(--border);font-size:15px}
+.toorder-supplier .tosup-label{font-weight:700}
+.toorder-supplier .tosup-bulk{margin-left:auto;flex:0 0 auto;background:var(--accent-hov);color:#fff;
+  border:0;border-radius:7px;padding:5px 11px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
+.toorder-supplier .tosup-bulk:hover{filter:brightness(1.08)}
 .toorder-row{display:flex;gap:12px;align-items:center;padding:10px 12px;background:var(--panel);
   border:1px solid var(--border);border-radius:10px;margin-bottom:8px;box-shadow:var(--shadow)}
 .toorder-row.done{opacity:.55;background:var(--row-done)}
@@ -277,6 +281,11 @@ body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
 .toorder-row .to-name{color:var(--muted);font-size:13px;flex:1;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .toorder-row .to-date{color:var(--soft);font-size:12px;flex:0 0 auto;white-space:nowrap}
+/* ⚠️ stará nevybavená objednávka — nenápadný badge, výrazný pri starých */
+.toorder-row.stale{box-shadow:inset 4px 0 0 #F59E0B}
+.toorder-row .to-staleage{background:#FEE2E2;color:#991B1B;font-size:12px;font-weight:700;
+  border-radius:6px;padding:3px 8px;flex:0 0 auto;white-space:nowrap}
+body[data-theme=dark] .toorder-row .to-staleage{background:#7F1D1D;color:#FECACA}
 .toorder-row .to-order{color:#713AC7;text-decoration:none;font-weight:600;font-size:12px;flex:0 0 auto;
   background:#ede9fe;padding:3px 8px;border-radius:6px;white-space:nowrap}
 .toorder-row .to-order:hover{background:#ddd6fe;text-decoration:underline}

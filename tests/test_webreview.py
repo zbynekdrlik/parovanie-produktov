@@ -79,6 +79,24 @@ def test_ordered_endpoint_persists(monkeypatch, tmp_path):
     assert "20261045|61247/L" not in c.get("/api/ordered").get_json()["ordered"]
 
 
+# --- VYLEPŠENIE 1: mark a whole supplier group ordered in one atomic write ------ #
+def test_ordered_bulk_endpoint_persists_and_validates(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    c = _client()
+    # set a whole group ordered; blank/whitespace keys are dropped
+    r = c.post("/api/ordered/bulk", json={"keys": ["A|1", "B|2", "", "  "], "ordered": True})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert r.get_json()["count"] == 2
+    assert c.get("/api/ordered").get_json()["ordered"] == {"A|1": True, "B|2": True}
+    # un-order the group
+    c.post("/api/ordered/bulk", json={"keys": ["A|1", "B|2"], "ordered": False})
+    assert c.get("/api/ordered").get_json()["ordered"] == {}
+    # missing / non-list keys → 400; all-blank keys → 400
+    assert c.post("/api/ordered/bulk", json={"ordered": True}).status_code == 400
+    assert c.post("/api/ordered/bulk", json={"keys": "nope", "ordered": True}).status_code == 400
+    assert c.post("/api/ordered/bulk", json={"keys": ["", "  "], "ordered": True}).status_code == 400
+
+
 # --- BUG 2: corrupt store must not 500 the tab; blank key must not write "None" --- #
 def test_ordered_waiting_reject_missing_key(monkeypatch, tmp_path):
     # a POST with no key must 400 — never write a "None"/"" key into the store
