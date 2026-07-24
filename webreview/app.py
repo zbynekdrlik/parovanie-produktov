@@ -1096,6 +1096,7 @@ def _supplier_meta(html: str):
 # Na objednanie: forestshop "Vybavuje sa" orders → supplier reorder links
 # --------------------------------------------------------------------------- #
 ORDERS_CACHE = os.path.join(OUT, "orders_cache.csv")
+CUSTOMERS_CACHE = os.path.join(OUT, "customers_cache.csv")  # hourly Shoptet customer export (cp1250)
 ORDERS_MAXAGE = 1800  # s — refresh the cached orders export at most every 30 min (Marek: raz za pol hodinu stačí)
 
 
@@ -1195,6 +1196,26 @@ def _fetch_export_csv() -> bytes:
                            "(URL skrytá — over SHOPTET_EXPORT_URL)") from None
     if not r.content:
         raise RuntimeError("stiahnutý export katalógu je prázdny")
+    return r.content
+
+
+def _fetch_customers_csv() -> bytes:
+    """Full Shoptet customer export (cp1250 bytes) — refreshed hourly alongside the
+    orders + catalog so customer-facing automations always read fresh data. Nothing
+    parses it yet; the raw bytes are cached exactly like the orders export. Secret-
+    safe: the partner-hash URL never enters an error message or a chained traceback
+    (same rule as _fetch_export_csv)."""
+    url = _cred("SHOPTET_CUSTOMERS_URL")
+    if not url:
+        raise RuntimeError(f"SHOPTET_CUSTOMERS_URL chýba v {CRED_PATH}")
+    try:
+        r = requests.get(url, headers={"User-Agent": UA}, timeout=120)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(f"stiahnutie exportu zákazníkov zlyhalo: {type(e).__name__} "
+                           "(URL skrytá — over SHOPTET_CUSTOMERS_URL)") from None
+    if not r.content:
+        raise RuntimeError("stiahnutý export zákazníkov je prázdny")
     return r.content
 
 
@@ -3786,7 +3807,8 @@ def run_shoptet_sync() -> dict:
     """Hourly refresh (#119): re-pulls the forestshop orders export (bypassing the
     30-min ORDERS_MAXAGE cache window — an hourly GUARANTEED pull, not just
     "whenever someone opens Na objednanie") AND the full Shoptet catalog export
-    (data/products.csv), then rebuilds the in-memory CODE2PAIR/CATALOG search
+    (data/products.csv) AND the customer export (data/out/customers_cache.csv),
+    then rebuilds the in-memory CODE2PAIR/CATALOG search
     index and resyncs each review card's price/stock snapshot
     (export_helpers.resync_current — the same logic scripts/resync_export.py
     runs manually). Passive READ-ONLY refresh: never touches the manager
@@ -3834,13 +3856,34 @@ def run_shoptet_sync() -> dict:
             json.dump(PRODUCTS, f, ensure_ascii=False)
         os.replace(tmp3, DATA)
 
+    # Customer export — fetched LAST and NON-FATAL: a customer-export hiccup must
+    # never turn the whole sync red, because orders/catalog/review already landed
+    # above and ARE the critical data (nothing consumes customers yet). On failure we
+    # log + surface customers_error in the result, but the run still reports OK for the
+    # critical refresh — the manager must not read a red status as "orders stale". Same
+    # fetch-then-swap + secret-safe pattern.
+    customers_bytes, customers_error = b"", None
+    try:
+        customers_bytes = _fetch_customers_csv()
+        tmp4 = CUSTOMERS_CACHE + ".tmp"
+        with open(tmp4, "wb") as f:
+            f.write(customers_bytes)
+        os.replace(tmp4, CUSTOMERS_CACHE)
+    except Exception as e:  # noqa: BLE001 — auxiliary source; never fail the whole sync
+        customers_error = str(e)   # already secret-sanitized by _fetch_customers_csv
+        log.warning("shoptet_sync: customer export refresh failed (non-fatal): %s",
+                    customers_error)
+
     result = {
         "orders_bytes": len(orders_bytes),
         "catalog_products": len(CATALOG),
         "catalog_codes": len(CODE2PAIR),
         "review_synced": counts["synced"],
         "review_stale": counts["stale"],
+        "customers_bytes": len(customers_bytes),
     }
+    if customers_error:
+        result["customers_error"] = customers_error
     log.info("shoptet_sync: run OK %s", result)
     return result
 
