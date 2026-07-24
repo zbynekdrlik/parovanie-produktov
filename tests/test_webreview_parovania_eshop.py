@@ -45,6 +45,12 @@ def iso(tmp_path, monkeypatch):
     products = [_product()]
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {"1/M": "P1", "9/Z": "777"})
+    # BUG 1 fail-closed: the supplier write-back refuses to run without a catalog export.
+    # Default to a minimal non-empty export so the normal push path proceeds (no code is
+    # excluded); tests that assert the exclusion / blocked-on-empty behaviour override
+    # _read_export_for_links themselves. Without this the CI box (no data/products.csv)
+    # reads an empty export and the supplier upload is blocked.
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: "code;pairCode;supplier\r\n")
     return {"tmp": tmp_path, "products": products}
 
 

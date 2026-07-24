@@ -1215,6 +1215,12 @@ def _arm_suppliers(monkeypatch, tmp_path, assigns, token="secret-tok"):
     monkeypatch.setattr(webapp, "SUPPLIERS_STATE", str(tmp_path / "uploaded_suppliers.json"))
     monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
     monkeypatch.setattr(webapp, "CODE2PAIR", {"88/Z": "777"})
+    # BUG 1 fail-closed: the write-back refuses to run without a catalog export. Provide a
+    # minimal non-empty export where 88/Z has NO own supplier (empty column) → not excluded
+    # → the assignment is written, exactly as in production. (Without this stub the CI box,
+    # which has no data/products.csv, would read an empty export and block the upload.)
+    monkeypatch.setattr(webapp, "_read_export_for_links",
+                        lambda: "code;pairCode;supplier\r\n88/Z;777;\r\n")
     webapp._save_supplier_assign(assigns)
     return token
 
