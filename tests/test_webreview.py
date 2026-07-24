@@ -79,6 +79,88 @@ def test_ordered_endpoint_persists(monkeypatch, tmp_path):
     assert "20261045|61247/L" not in c.get("/api/ordered").get_json()["ordered"]
 
 
+# --- VYLEPŠENIE 1: mark a whole supplier group ordered in one atomic write ------ #
+def test_ordered_bulk_endpoint_persists_and_validates(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    c = _client()
+    # set a whole group ordered; blank/whitespace keys are dropped
+    r = c.post("/api/ordered/bulk", json={"keys": ["A|1", "B|2", "", "  "], "ordered": True})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert r.get_json()["count"] == 2
+    assert c.get("/api/ordered").get_json()["ordered"] == {"A|1": True, "B|2": True}
+    # un-order the group
+    c.post("/api/ordered/bulk", json={"keys": ["A|1", "B|2"], "ordered": False})
+    assert c.get("/api/ordered").get_json()["ordered"] == {}
+    # missing / non-list keys → 400; all-blank keys → 400
+    assert c.post("/api/ordered/bulk", json={"ordered": True}).status_code == 400
+    assert c.post("/api/ordered/bulk", json={"keys": "nope", "ordered": True}).status_code == 400
+    assert c.post("/api/ordered/bulk", json={"keys": ["", "  "], "ordered": True}).status_code == 400
+
+
+# --- BUG 2: corrupt store must not 500 the tab; blank key must not write "None" --- #
+def test_ordered_waiting_reject_missing_key(monkeypatch, tmp_path):
+    # a POST with no key must 400 — never write a "None"/"" key into the store
+    # (mirrors instock/unavailable). Guards the /api/ordered + /api/waiting sinks.
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
+    c = _client()
+    assert c.post("/api/ordered", json={"ordered": True}).status_code == 400
+    assert c.post("/api/waiting", json={"waiting": True}).status_code == 400
+    assert c.post("/api/ordered", json={"key": "  ", "ordered": True}).status_code == 400
+    assert c.get("/api/ordered").get_json()["ordered"] == {}
+    assert c.get("/api/waiting").get_json()["waiting"] == {}
+
+
+def test_toorder_loaders_tolerate_corrupt_store(monkeypatch, tmp_path):
+    # a hand-corrupted / wrong-type flag store must degrade to {} (like _load_instock),
+    # never raise — one bad file must not 500 the whole /api/orders tab.
+    for name, loader in (("ORDERED", "_load_ordered"), ("WAITING", "_load_waiting"),
+                         ("ORDER_PAIRINGS", "_load_order_pairings"),
+                         ("VARIANT_LINKS", "_load_variant_links")):
+        bad = tmp_path / (name + ".json")
+        bad.write_text("{ this is not json", encoding="utf-8")
+        monkeypatch.setattr(webapp, name, str(bad))
+        assert getattr(webapp, loader)() == {}, name
+        bad.write_text("[]", encoding="utf-8")   # wrong top-level type
+        assert getattr(webapp, loader)() == {}, name
+
+
+def test_orders_route_tolerates_corrupt_flag_store(monkeypatch, tmp_path):
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS",
+        [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
+          "variant_codes": ["61247/L"], "pairCode": "231"}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
+    ordf = tmp_path / "o.json"
+    ordf.write_text("{ broken", encoding="utf-8")
+    waitf = tmp_path / "w.json"
+    waitf.write_text("[]", encoding="utf-8")  # wrong type
+    # decisions.json + supplier_assignments.json are the MOST exposed stores on this tab
+    # (decisions written on every review click; supplier_assign written by the app AND by
+    # n8n) — a corrupt/partial one must degrade to {} too, never 500 the whole /api/orders
+    # tab. This test drives the REAL corrupt-file path of _load_decisions +
+    # _load_supplier_assign (no monkeypatched loader) — RED before their guard, GREEN after.
+    decf = tmp_path / "decisions.json"
+    decf.write_text("{ broken", encoding="utf-8")
+    saf = tmp_path / "supplier_assignments.json"
+    saf.write_text("[]", encoding="utf-8")  # wrong type
+    monkeypatch.setattr(webapp, "ORDERED", str(ordf))
+    monkeypatch.setattr(webapp, "WAITING", str(waitf))
+    monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "is.json"))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "un.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "DECISIONS", str(decf))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(saf))
+    r = _client().get("/api/orders")
+    assert r.status_code == 200          # corrupt store degrades, tab still renders
+    j = r.get_json()
+    assert j["orders"][0]["ordered"] is False
+    assert j["orders"][0]["waiting"] is False
+    assert j["orders"][0]["assignedSupplier"] == ""   # corrupt supplier_assign → {} → no assign
+
+
 def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
               "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
@@ -1133,6 +1215,12 @@ def _arm_suppliers(monkeypatch, tmp_path, assigns, token="secret-tok"):
     monkeypatch.setattr(webapp, "SUPPLIERS_STATE", str(tmp_path / "uploaded_suppliers.json"))
     monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
     monkeypatch.setattr(webapp, "CODE2PAIR", {"88/Z": "777"})
+    # BUG 1 fail-closed: the write-back refuses to run without a catalog export. Provide a
+    # minimal non-empty export where 88/Z has NO own supplier (empty column) → not excluded
+    # → the assignment is written, exactly as in production. (Without this stub the CI box,
+    # which has no data/products.csv, would read an empty export and block the upload.)
+    monkeypatch.setattr(webapp, "_read_export_for_links",
+                        lambda: "code;pairCode;supplier\r\n88/Z;777;\r\n")
     webapp._save_supplier_assign(assigns)
     return token
 

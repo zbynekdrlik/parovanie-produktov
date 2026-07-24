@@ -45,6 +45,12 @@ def iso(tmp_path, monkeypatch):
     products = [_product()]
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {"1/M": "P1", "9/Z": "777"})
+    # BUG 1 fail-closed: the supplier write-back refuses to run without a catalog export.
+    # Default to a minimal non-empty export so the normal push path proceeds (no code is
+    # excluded); tests that assert the exclusion / blocked-on-empty behaviour override
+    # _read_export_for_links themselves. Without this the CI box (no data/products.csv)
+    # reads an empty export and the supplier upload is blocked.
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: "code;pairCode;supplier\r\n")
     return {"tmp": tmp_path, "products": products}
 
 
@@ -143,6 +149,80 @@ def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-import")))
     result2 = webapp.run_parovania_eshop()
     assert result2["pairings"]["count"] == 0 and result2["pairings"]["order_count"] == 0
+
+
+# ── BUG 1: the nightly supplier write-back must NOT overwrite a REAL eshop
+#    supplier with a (possibly stale) manual assignment. A per-product assignment
+#    is meant to FILL IN a supplier for an order line that arrived WITHOUT one —
+#    a code whose product ALREADY carries its own `supplier` in the current export
+#    is excluded, so the automation never clobbers live catalog data. ──────────────
+def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkeypatch):
+    # two assignments: 9/Z (no own supplier in the export → should be written) and
+    # 5/A (product ALREADY has its own supplier in the export → must be excluded).
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "5/A": "STALE_ASSIGN"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
+    export = ("code;pairCode;supplier\r\n"
+              "9/Z;777;\r\n"
+              "5/A;555;REAL_SUPPLIER\r\n")
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: export)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+    assert status == 200
+    sup = next(c for c in calls if c["header"][2] == "supplier")
+    written = {r[0] for r in sup["rows"]}
+    assert written == {"9/Z"}          # 5/A excluded (own supplier already in export)
+    assert "5/A" not in written
+    # only the code we actually wrote is recorded as uploaded
+    up = json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text())
+    assert up == {"9/Z": "BETALOV"}
+
+
+# ── BUG 1 safety: FAIL-CLOSED when the export is missing/empty/unreadable. The
+#    exclusion guard (_codes_with_own_supplier) needs the catalog export to know which
+#    codes ALREADY carry their own eshop supplier. With NO export it cannot tell — it
+#    must NOT fall open and write, or a stale per-product assignment could clobber a
+#    real supplier in the live eshop (exactly the bug this PR fixes). The whole supplier
+#    upload is skipped: 0 written, everything blocked, the idempotency store untouched. ──
+def test_do_upload_suppliers_blocks_when_export_empty(iso, monkeypatch):
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "5/A": "ORBIS"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: "")  # export missing/unreadable
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+    assert status == 200
+    assert result["count"] == 0           # nothing written to the live eshop
+    assert result["blocked"] == 2         # both assignments held back
+    assert calls == []                    # the careful import never ran
+    # nothing recorded as uploaded → the idempotency store is never even written
+    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+
+
+# ── BUG 1 (case c): a code that IS in supplier_assignments but is NOT present in the
+#    current export has no "own supplier" there → it is NOT excluded, and the nightly
+#    write-back STILL emits it (unchanged pre-PR behaviour). A present-but-partial
+#    export must not silently drop a legitimate fill-in assignment — only a genuinely
+#    empty export blocks (test above), a non-empty one that merely lacks the code writes. ─
+def test_do_upload_suppliers_emits_code_absent_from_export(iso, monkeypatch):
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    # a NON-empty export listing OTHER products (5/A carries its own supplier) but NOT 9/Z
+    export = ("code;pairCode;supplier\r\n"
+              "5/A;555;REAL_SUPPLIER\r\n")
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: export)
+    # the exclusion helper does NOT flag 9/Z (it is absent from the export)
+    assert "9/Z" not in webapp._codes_with_own_supplier()
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+    assert status == 200
+    sup = next(c for c in calls if c["header"][2] == "supplier")
+    assert {r[0] for r in sup["rows"]} == {"9/Z"}      # still written (not excluded)
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {"9/Z": "BETALOV"}
 
 
 def test_run_is_idempotent_second_run_pushes_nothing(iso, monkeypatch):
