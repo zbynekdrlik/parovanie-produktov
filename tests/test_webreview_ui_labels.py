@@ -187,7 +187,8 @@ def test_nav_keys_match_appjs():
         assert m, f"{var} not found in app.js"
         return set(re.findall(r"\[\s*'([a-z_]+)'\s*,", m.group(1)))
 
-    appjs_keys = _keys("const TABS") | _keys("const AUTOMATION_TABS") | {"users", "dev"}
+    appjs_keys = (_keys("const TABS") | _keys("const AUTOMATION_TABS")
+                  | _keys("const SYSTEM_TABS") | {"users", "dev"})
     assert appjs_keys == webapp.NAV_KEYS, (
         f"app.js nav keys vs server NAV_KEYS drift — only in app.js: "
         f"{appjs_keys - webapp.NAV_KEYS}; only in server: {webapp.NAV_KEYS - appjs_keys}")

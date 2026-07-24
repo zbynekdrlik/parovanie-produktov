@@ -17,6 +17,18 @@
       <span class="brandtxt">Forestshop<small>Firemný systém</small></span>
     </div>
     <nav class="side-nav">
+      <!-- 'System' — foundational automations (Sync zo Shoptetu). First: nothing
+           works without a fresh orders+catalog sync. Collapsible like the others. -->
+      <div class="nav-folder" id="folder-system">
+        <button class="folder-head" id="folderSystemHead" type="button" aria-expanded="true" aria-controls="folder-system-body">
+          <svg class="folder-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 100-7 3.5 3.5 0 000 7z"/><path d="M12 2v2m0 16v2m10-10h-2M4 12H2m15.07-7.07l-1.42 1.42M6.34 17.66l-1.41 1.41m12.14 0l-1.41-1.41M6.34 6.34L4.93 4.93"/></svg>
+          <span class="ftitle">System</span>
+          <svg class="folder-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="folder-body" id="folder-system-body">
+          <div class="tabs" id="systemTabs"></div>
+        </div>
+      </div>
       <div class="nav-folder" id="folder-eshop">
         <button class="folder-head" id="folderEshopHead" type="button" aria-expanded="true" aria-controls="folder-eshop-body">
           <svg class="folder-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z"/></svg>
@@ -25,7 +37,17 @@
         </button>
         <div class="folder-body" id="folder-eshop-body">
           <div class="tabs" id="tabs"></div>
-          <div class="nav-sec">Automatizácie</div>
+        </div>
+      </div>
+      <!-- 'Automatizácie' — now its OWN collapsible folder (was a flat label inside
+           Eshop), so it can be minimized. -->
+      <div class="nav-folder" id="folder-automations">
+        <button class="folder-head" id="folderAutomationsHead" type="button" aria-expanded="true" aria-controls="folder-automations-body">
+          <svg class="folder-ico" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L3 14h9l-1 8 10-12h-9z"/></svg>
+          <span class="ftitle">Automatizácie</span>
+          <svg class="folder-chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+        <div class="folder-body" id="folder-automations-body">
           <div class="tabs" id="autoTabs"></div>
         </div>
       </div>
@@ -134,6 +156,6 @@
       </div>
     </div>
   </div>
-  <script src="/static/app.js?v=66"></script>
+  <script src="/static/app.js?v=67"></script>
 </body>
 </html>

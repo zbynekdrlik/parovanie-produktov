@@ -448,10 +448,14 @@ const TABS = [['toorder', 'Na objednanie'], ['nedostupne', 'Nedostupné tovary']
   ['search', 'Hľadať / opraviť'],
   ['notes', 'Poznámky'], ['review', 'Kontrola párovania']];
 
+// 'System' — foundational automations in their own top nav folder (#systemTabs).
+// 'Sync zo Shoptetu' lives here: it fetches the fresh orders + catalog that
+// everything else reads, so it is the base of the system, not an eshop feature.
+const SYSTEM_TABS = [['shoptet_sync', 'Sync zo Shoptetu']];
+
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
-// sidebar section (#autoTabs) + its own tab section. New automations: add here.
+// sidebar folder (#autoTabs) + its own tab section. New automations: add here.
 const AUTOMATION_TABS = [['posta', 'Nevyzdvihnuté zásielky'], ['orders_reminder', 'Pripomienky objednávok'],
-  ['shoptet_sync', 'Sync zo Shoptetu'],
   ['parovania_eshop', 'Párovania → eshop'], ['grube_externalcode', 'GRUBE kódy → eshop'],
   ['split_links', 'Veľkostné linky → eshop'],
   ['dodavatelsky_sklad', 'Dodávateľský sklad'],
@@ -555,6 +559,11 @@ function renderTabs() {
   const t = document.getElementById('tabs'); if (!t) return;
   t.innerHTML = '';
   for (const [key, lbl] of TABS) t.appendChild(_navButton(key, lbl));
+  const st = document.getElementById('systemTabs');
+  if (st) {
+    st.innerHTML = '';
+    for (const [key, lbl] of SYSTEM_TABS) st.appendChild(_navButton(key, lbl));
+  }
   const at = document.getElementById('autoTabs');
   if (at) {
     at.innerHTML = '';
@@ -708,7 +717,9 @@ function initFolder(id, key) {
   };
 }
 function initFolders() {
+  initFolder('folder-system', 'folder:system');
   initFolder('folder-eshop', 'folder:eshop');
+  initFolder('folder-automations', 'folder:automations');
 }
 
 async function switchTab(tab) {

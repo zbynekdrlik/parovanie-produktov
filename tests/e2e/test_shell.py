@@ -283,3 +283,49 @@ def test_sidebar_resizer_drags_and_persists(page, live_server):
     page.mouse.dblclick(box2["x"] + 4, box2["y"] + 200)
     assert page.evaluate("() => localStorage.getItem('sideW')") is None
     assert console == [], f"console not clean: {console}"
+
+
+def test_system_folder_holds_shoptet_sync(page, live_server):
+    """'Sync zo Shoptetu' now lives in its OWN top 'System' folder (the foundational
+    sync everything reads), not under Eshop or Automatizácie."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector(".sidebar #tabs button")
+
+    # 'System' folder header exists.
+    assert page.locator(".folder-head", has_text="System").count() == 1
+    # 'Sync zo Shoptetu' is inside the System folder body …
+    assert page.locator("#folder-system-body #systemTabs button").filter(
+        has_text="Sync zo Shoptetu").count() == 1
+    # … and NOT under Eshop (#tabs) nor Automatizácie (#autoTabs).
+    assert page.locator("#folder-eshop-body button").filter(
+        has_text="Sync zo Shoptetu").count() == 0
+    assert page.locator("#autoTabs button").filter(has_text="Sync zo Shoptetu").count() == 0
+    # System sits ABOVE Eshop in the sidebar.
+    order_ok = page.evaluate(
+        "() => { const p = el => [...document.querySelectorAll('.nav-folder')].indexOf(el);"
+        " return p(document.getElementById('folder-system'))"
+        " < p(document.getElementById('folder-eshop')); }")
+    assert order_ok, "System folder must be above Eshop"
+    assert console == [], f"console not clean: {console}"
+
+
+def test_automations_folder_collapses(page, live_server):
+    """'Automatizácie' is its OWN collapsible folder now (was a flat label inside
+    Eshop): clicking its header hides the automation nav + persists the state."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector("#autoTabs button")
+
+    head = page.locator(".folder-head", has_text="Automatizácie")
+    assert head.count() == 1
+    assert page.locator("#autoTabs button").first.is_visible()   # default expanded
+
+    head.click()                                                  # collapse
+    page.wait_for_selector("#autoTabs button", state="attached")
+    assert not page.locator("#autoTabs button").first.is_visible()
+    assert page.evaluate("() => localStorage.getItem('folder:automations')") == "collapsed"
+
+    page.locator(".folder-head", has_text="Automatizácie").click()  # expand again
+    assert page.evaluate("() => localStorage.getItem('folder:automations')") == "open"
+    assert console == [], f"console not clean: {console}"
