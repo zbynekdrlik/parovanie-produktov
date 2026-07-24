@@ -130,10 +130,16 @@ log.info("catalog: %d products indexed (%d codes, %d variant labels) from %s",
 
 
 def _load_decisions() -> dict:
-    if os.path.exists(DECISIONS):
+    # Corrupt/wrong-type store degrades to {} (like _load_instock/_load_ordered) — a
+    # hand-corrupted or partially-written decisions.json (written on EVERY review click)
+    # must never raise: it feeds /api/orders + /api/products, so one bad file would 500
+    # the whole tab. Always a dict (a stray non-dict would break every .get() caller).
+    try:
         with open(DECISIONS, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_decisions(d: dict) -> None:
@@ -985,10 +991,16 @@ SUPPLIER_ASSIGN = os.path.join(OUT, "supplier_assignments.json")
 
 
 def _load_supplier_assign() -> dict:
-    if os.path.exists(SUPPLIER_ASSIGN):
+    # Corrupt/wrong-type store degrades to {} (like _load_instock/_load_ordered) — this
+    # store is written by the app AND by n8n, so it is the most exposed to a partial
+    # write. It feeds /api/orders + the nightly write-back; a JSONDecodeError here would
+    # 500 the whole to-order tab. Always a dict (a stray non-dict breaks .get() callers).
+    try:
         with open(SUPPLIER_ASSIGN, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_supplier_assign(d: dict) -> None:
@@ -3352,16 +3364,19 @@ def _supplier_summary(uploaded, assigns):
             "remaining": max(0, total - up), "review_url": PUBLIC_URL}
 
 
-def _codes_with_own_supplier() -> set:
+def _codes_with_own_supplier(text: str | None = None) -> set:
     """Forestshop variant codes whose product ALREADY carries its own `supplier`
     in the current catalog export (data/products.csv). A per-product manual
     assignment is meant to FILL IN a supplier for an order line that arrived
     WITHOUT one — it must NEVER overwrite a real eshop supplier. So the nightly
     write-back excludes any code the export already shows a supplier for. Read from
-    the same on-disk cp1250 export as CODE2PAIR (_read_export_for_links); a missing/
-    unreadable export → empty set (fail-open — the idempotency store still guards
-    re-uploads)."""
-    text = _read_export_for_links()
+    the same on-disk cp1250 export as CODE2PAIR (_read_export_for_links; pass `text`
+    to reuse an already-read export). An empty set means "no code is protected",
+    which is only safe when the export is KNOWN to be present — so any WRITE caller
+    must fail CLOSED on an empty export BEFORE relying on this (see
+    _do_upload_suppliers); here a missing export still yields an empty set."""
+    if text is None:
+        text = _read_export_for_links()
     if not text:
         return set()
     csv.field_size_limit(10**9)
@@ -3392,9 +3407,25 @@ def _do_upload_suppliers(dry):
         return {"ok": True, "count": 0, "products": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
+    # BUG 1 safety — FAIL CLOSED on a missing/empty export. The exclusion guard below
+    # needs the catalog export to know which codes already carry their own eshop
+    # supplier. With NO export it cannot tell, so it would fall open (exclude nothing)
+    # and a stale assignment could clobber a real supplier in the LIVE eshop. Refuse to
+    # write anything: hold all new assignments (blocked), touch nothing. A present-but-
+    # partial export that merely lacks a given code is fine — that code is simply not
+    # excluded and gets written (unchanged behaviour); only a genuinely empty export blocks.
+    export_text = _read_export_for_links()
+    if not export_text.strip():
+        log.warning("n8n suppliers: export missing/empty — supplier upload BLOCKED "
+                    "(%d new assignments held, no eshop write)", len(new_codes))
+        return {"ok": True, "count": 0, "products": products,
+                "message": "export unavailable — upload blocked (fail-closed)",
+                "blocked": len(new_codes),
+                **_supplier_summary(uploaded, assigns)}, 200
+
     # BUG 1: never overwrite a supplier the eshop already has — exclude codes whose
     # product carries its own supplier in the current export.
-    own_supplier = _codes_with_own_supplier()
+    own_supplier = _codes_with_own_supplier(export_text)
     rows = import_builder.supplier_rows(
         {c: assigns[c] for c in new_codes}, CODE2PAIR, exclude_codes=own_supplier)
     if not rows:
