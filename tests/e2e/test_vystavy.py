@@ -136,6 +136,6 @@ def test_loads_on_remembered_tab(page, vystavy_server):
     # the seeded 'akcia bude' card renders without any nav click
     page.wait_for_selector('[data-testid="vy-card-vy-akcia"]', timeout=8000)
     assert page.locator('[data-testid="vy-card-vy-akcia"]').is_visible()
-    # cleanup so the remembered tab does not leak into other tests (shared context)
+    # reset the remembered tab (defensive tidy — the browser context is fresh per test)
     page.evaluate("() => localStorage.removeItem('tab')")
     assert console == [], f"console not clean: {console}"

@@ -263,6 +263,21 @@ def test_sidebar_resizer_drags_and_persists(page, live_server):
     page.wait_for_selector('[data-testid="version"]')
     assert abs(width() - wider) <= 3, "resized width did not persist across reload"
 
+    # #200 review (Important): releasing the button OUTSIDE the window must not leave the
+    # drag "stuck" (rubber-banding). A buttons===0 mousemove self-terminates the drag, so a
+    # later stray move no longer resizes. Fully synthetic → deterministic.
+    stuck = page.evaluate("""() => {
+      const g = document.querySelector('.side-resizer');
+      const w0 = document.querySelector('.sidebar').offsetWidth;
+      g.dispatchEvent(new MouseEvent('mousedown', {clientX: w0, buttons: 1, bubbles: true}));
+      document.dispatchEvent(new MouseEvent('mousemove', {clientX: w0 + 90, buttons: 0, bubbles: true}));
+      const released = document.querySelector('.sidebar').offsetWidth;
+      document.dispatchEvent(new MouseEvent('mousemove', {clientX: w0 + 260, buttons: 1, bubbles: true}));
+      const stray = document.querySelector('.sidebar').offsetWidth;
+      return stray !== released;   // true = still following cursor after release-outside (bug)
+    }""")
+    assert stuck is False, "drag stuck after mouse released outside the window (rubber-band)"
+
     # double-click the grip resets to the default width (clears the stored width)
     box2 = page.locator(".side-resizer").bounding_box()
     page.mouse.dblclick(box2["x"] + 4, box2["y"] + 200)

@@ -3455,6 +3455,7 @@ init();
   let startX = 0, startW = 0, dragging = false;
   const onMove = (e) => {
     if (!dragging) return;
+    if (e.buttons === 0) { onUp(); return; }   // released outside the window → stop (no rubber-band)
     const w = Math.max(MIN, Math.min(MAX, startW + (e.clientX - startX)));
     document.documentElement.style.setProperty('--side-w', w + 'px');
   };
