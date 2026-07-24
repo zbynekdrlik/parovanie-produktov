@@ -3429,6 +3429,7 @@ async function init() {
   if (ACTIVE_TAB === 'users') await loadUsers();
   if (ACTIVE_TAB === 'posta') await loadPosta();
   if (ACTIVE_TAB === 'dev') await loadDevIssues();
+  if (ACTIVE_TAB === 'vystavy') await loadVystavy();   // #199: deep-link / remembered tab must load data
   initSearch();
   render();
   const y = parseInt(localStorage.getItem('scrollY') || '0', 10);
