@@ -741,10 +741,14 @@ ORDERED = os.path.join(OUT, "ordered_items.json")
 
 
 def _load_ordered() -> dict:
-    if os.path.exists(ORDERED):
+    # Corrupt/wrong-type store degrades to {} (like _load_instock) — one bad file
+    # must never 500 the whole /api/orders tab.
+    try:
         with open(ORDERED, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_ordered(d: dict) -> None:
@@ -763,10 +767,12 @@ ORDER_PAIRINGS = os.path.join(OUT, "order_pairings.json")
 
 
 def _load_order_pairings() -> dict:
-    if os.path.exists(ORDER_PAIRINGS):
+    try:
         with open(ORDER_PAIRINGS, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_order_pairings(d: dict) -> None:
@@ -786,10 +792,12 @@ VARIANT_LINKS = os.path.join(OUT, "variant_links.json")
 
 
 def _load_variant_links() -> dict:
-    if os.path.exists(VARIANT_LINKS):
+    try:
         with open(VARIANT_LINKS, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_variant_links(d: dict) -> None:
@@ -807,10 +815,12 @@ WAITING = os.path.join(OUT, "waiting_items.json")
 
 
 def _load_waiting() -> dict:
-    if os.path.exists(WAITING):
+    try:
         with open(WAITING, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def _save_waiting(d: dict) -> None:
@@ -1785,7 +1795,9 @@ def api_ordered():
     if request.method == "GET":
         return jsonify({"ordered": _load_ordered()})
     body = request.get_json(force=True)
-    key = str(body.get("key"))
+    key = str(body.get("key") or "").strip()   # blank key must never write a "None" entry
+    if not key:
+        return jsonify({"ok": False, "error": "key required"}), 400
     ordered = bool(body.get("ordered"))
     with _lock:
         d = _load_ordered()
@@ -1806,7 +1818,9 @@ def api_waiting():
     if request.method == "GET":
         return jsonify({"waiting": _load_waiting()})
     body = request.get_json(force=True)
-    key = str(body.get("key"))
+    key = str(body.get("key") or "").strip()   # blank key must never write a "None" entry
+    if not key:
+        return jsonify({"ok": False, "error": "key required"}), 400
     waiting = bool(body.get("waiting"))
     with _lock:
         d = _load_waiting()
@@ -3311,6 +3325,27 @@ def _supplier_summary(uploaded, assigns):
             "remaining": max(0, total - up), "review_url": PUBLIC_URL}
 
 
+def _codes_with_own_supplier() -> set:
+    """Forestshop variant codes whose product ALREADY carries its own `supplier`
+    in the current catalog export (data/products.csv). A per-product manual
+    assignment is meant to FILL IN a supplier for an order line that arrived
+    WITHOUT one — it must NEVER overwrite a real eshop supplier. So the nightly
+    write-back excludes any code the export already shows a supplier for. Read from
+    the same on-disk cp1250 export as CODE2PAIR (_read_export_for_links); a missing/
+    unreadable export → empty set (fail-open — the idempotency store still guards
+    re-uploads)."""
+    text = _read_export_for_links()
+    if not text:
+        return set()
+    csv.field_size_limit(10**9)
+    codes = set()
+    for r in csv.DictReader(io.StringIO(text), delimiter=";"):
+        code = (r.get("code") or "").strip()
+        if code and (r.get("supplier") or "").strip():
+            codes.add(code)
+    return codes
+
+
 def _do_upload_suppliers(dry):
     """Core of the nightly supplier write-back — the SINGLE place the logic lives
     (NEkopíruj logiku). Reads the supplier assignments, builds code;pairCode;supplier
@@ -3318,7 +3353,9 @@ def _do_upload_suppliers(dry):
     import, records what went up, and returns (result, status). Shared by the n8n
     HTTP endpoint (below) and the in-app „Párovania → eshop" automation (#109) — no
     auth / Flask request access here. Touches ONLY the `supplier` column —
-    links/state/prices are left untouched."""
+    links/state/prices are left untouched. Codes whose product ALREADY has its own
+    supplier in the current export are excluded, so a stale assignment never clobbers
+    a real eshop supplier (BUG 1)."""
     assigns = _load_supplier_assign()
     uploaded = _load_uploaded_suppliers()
     new_codes = import_builder.new_supplier_keys(assigns, uploaded)
@@ -3328,15 +3365,21 @@ def _do_upload_suppliers(dry):
         return {"ok": True, "count": 0, "products": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
-    rows = import_builder.supplier_rows({c: assigns[c] for c in new_codes}, CODE2PAIR)
+    # BUG 1: never overwrite a supplier the eshop already has — exclude codes whose
+    # product carries its own supplier in the current export.
+    own_supplier = _codes_with_own_supplier()
+    rows = import_builder.supplier_rows(
+        {c: assigns[c] for c in new_codes}, CODE2PAIR, exclude_codes=own_supplier)
     if not rows:
-        log.warning("n8n suppliers: %d new codes but 0 import rows", len(new_codes))
+        log.warning("n8n suppliers: %d new codes but 0 import rows "
+                    "(%d already have their own eshop supplier)",
+                    len(new_codes), len(own_supplier & set(new_codes)))
         return {"ok": True, "count": 0, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
                 **_supplier_summary(uploaded, assigns)}, 200
 
-    # supplier_rows is 1:1 with codes (no product→variant indirection), so every new
-    # code has exactly one row — written_codes == set(new_codes).
+    # supplier_rows is 1:1 with codes (no product→variant indirection), but codes with
+    # their own eshop supplier are excluded — so written_codes ⊆ new_codes.
     written_codes = {r[0] for r in rows}
 
     if not _import_lock.acquire(blocking=False):

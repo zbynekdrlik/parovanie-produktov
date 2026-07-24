@@ -1005,9 +1005,10 @@ function pairEditor(o, row, focus) {
   return pair;
 }
 
-// effective supplier for grouping: a manually-assigned supplier wins over the
-// order-given one (empty for lines that arrived without a supplier → '—')
-const effSup = (o) => (o.assignedSupplier || o.supplier || '—');
+// effective supplier for grouping: the order's OWN supplier (from Shoptet) wins;
+// a manual assignment only fills in a line that arrived WITHOUT a supplier (BUG 1 —
+// a stale assignment must never prebiehať the real supplier / clobber the eshop).
+const effSup = (o) => (o.supplier || o.assignedSupplier || '—');
 
 // Inline supplier assign: fill in the supplier for an order line that arrived WITHOUT
 // one. Persists per forestshop code; the row then regroups under that supplier and the

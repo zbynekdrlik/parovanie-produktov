@@ -115,8 +115,10 @@ def test_orders_route_tolerates_corrupt_flag_store(monkeypatch, tmp_path):
         [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
           "variant_codes": ["61247/L"], "pairCode": "231"}])
     monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
-    ordf = tmp_path / "o.json"; ordf.write_text("{ broken", encoding="utf-8")
-    waitf = tmp_path / "w.json"; waitf.write_text("[]", encoding="utf-8")  # wrong type
+    ordf = tmp_path / "o.json"
+    ordf.write_text("{ broken", encoding="utf-8")
+    waitf = tmp_path / "w.json"
+    waitf.write_text("[]", encoding="utf-8")  # wrong type
     monkeypatch.setattr(webapp, "ORDERED", str(ordf))
     monkeypatch.setattr(webapp, "WAITING", str(waitf))
     monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "is.json"))
