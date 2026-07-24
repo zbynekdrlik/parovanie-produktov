@@ -34,15 +34,24 @@ body{margin:0;display:flex;min-height:100vh;background:var(--bg);color:var(--tex
 a{color:inherit}
 
 /* ---------------- SIDEBAR ---------------- */
-.sidebar{width:242px;flex:0 0 242px;background:var(--side);border-right:1px solid var(--border);
+.sidebar{width:var(--side-w,242px);flex:0 0 var(--side-w,242px);background:var(--side);border-right:1px solid var(--border);
   display:flex;flex-direction:column;position:sticky;top:0;height:100vh}
+/* Draggable width grip on the sidebar's right edge (persists in localStorage). */
+.side-resizer{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;z-index:30;
+  background:transparent;transition:background .12s}
+.side-resizer:hover,.side-resizer.dragging{background:var(--accent-hov)}
+body.resizing-side{cursor:col-resize;user-select:none}
 .brand{display:flex;align-items:center;gap:10px;padding:16px 18px 14px;font-weight:800;
   font-size:17px;letter-spacing:-.01em}
 .brand .logo{width:30px;height:30px;flex:0 0 30px;border-radius:9px;background:var(--accent-hov);
   display:flex;align-items:center;justify-content:center}
 .brand .logo svg{width:18px;height:18px;stroke:#fff;fill:none;stroke-width:1.7}
 .brand .brandtxt small{display:block;font-weight:500;font-size:11px;color:var(--muted);margin-top:1px}
-.side-nav{padding:6px 10px;overflow-y:auto;flex:1}
+.side-nav{padding:6px 10px;overflow-y:auto;flex:1;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.side-nav::-webkit-scrollbar{width:7px}
+.side-nav::-webkit-scrollbar-track{background:transparent}
+.side-nav::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.side-nav::-webkit-scrollbar-thumb:hover{background:var(--soft)}
 .nav-sec{font-size:10.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;
   color:var(--soft);padding:16px 10px 6px}
 .tabs{display:flex;flex-direction:column;gap:2px}

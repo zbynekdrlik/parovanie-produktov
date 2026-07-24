@@ -3435,3 +3435,49 @@ async function init() {
   if (y) window.scrollTo(0, y);
 }
 init();
+
+// Resizable sidebar — drag the right-edge grip to widen/narrow; width persists in
+// localStorage('sideW'). Double-click the grip resets to the default. The width is
+// applied via the CSS var --side-w (see .sidebar in style.css).
+(function initSidebarResize() {
+  const side = document.querySelector('.sidebar');
+  if (!side) return;
+  const MIN = 170, MAX = 560, KEY = 'sideW';
+  const saved = parseInt(localStorage.getItem(KEY) || '', 10);
+  if (saved >= MIN && saved <= MAX) {
+    document.documentElement.style.setProperty('--side-w', saved + 'px');
+  }
+  const grip = document.createElement('div');
+  grip.className = 'side-resizer';
+  grip.title = 'Ťahaj pre zmenu šírky (dvojklik = pôvodná)';
+  side.appendChild(grip);
+  let startX = 0, startW = 0, dragging = false;
+  const onMove = (e) => {
+    if (!dragging) return;
+    const w = Math.max(MIN, Math.min(MAX, startW + (e.clientX - startX)));
+    document.documentElement.style.setProperty('--side-w', w + 'px');
+  };
+  const onUp = () => {
+    if (!dragging) return;
+    dragging = false;
+    grip.classList.remove('dragging');
+    document.body.classList.remove('resizing-side');
+    localStorage.setItem(KEY, parseInt(getComputedStyle(side).width, 10));
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+  };
+  grip.addEventListener('mousedown', (e) => {
+    dragging = true;
+    startX = e.clientX;
+    startW = parseInt(getComputedStyle(side).width, 10);
+    grip.classList.add('dragging');
+    document.body.classList.add('resizing-side');
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    e.preventDefault();
+  });
+  grip.addEventListener('dblclick', () => {
+    document.documentElement.style.removeProperty('--side-w');
+    localStorage.removeItem(KEY);
+  });
+})();
