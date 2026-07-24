@@ -121,3 +121,21 @@ def test_add_edit_delete_roundtrip(page, vystavy_server):
     assert page.locator(".vy-card").filter(has_text="E2E Test Výstava").count() == 0
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_loads_on_remembered_tab(page, vystavy_server):
+    """#199 — when 'vystavy' is the remembered active tab, init() must load the data
+    so a reload (or deep-link) renders the cards WITHOUT a manual nav click. Before the
+    fix the tab painted empty ('0 výstav') until the user clicked away and back."""
+    console = _console(page)
+    page.goto(vystavy_server)
+    page.wait_for_selector('[data-testid="version"]')
+    # make 'vystavy' the remembered tab, then reload — cards must appear on their own
+    page.evaluate("() => localStorage.setItem('tab', 'vystavy')")
+    page.reload()
+    # the seeded 'akcia bude' card renders without any nav click
+    page.wait_for_selector('[data-testid="vy-card-vy-akcia"]', timeout=8000)
+    assert page.locator('[data-testid="vy-card-vy-akcia"]').is_visible()
+    # cleanup so the remembered tab does not leak into other tests (shared context)
+    page.evaluate("() => localStorage.removeItem('tab')")
+    assert console == [], f"console not clean: {console}"
