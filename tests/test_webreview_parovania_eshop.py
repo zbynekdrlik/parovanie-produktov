@@ -145,6 +145,34 @@ def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
     assert result2["pairings"]["count"] == 0 and result2["pairings"]["order_count"] == 0
 
 
+# ── BUG 1: the nightly supplier write-back must NOT overwrite a REAL eshop
+#    supplier with a (possibly stale) manual assignment. A per-product assignment
+#    is meant to FILL IN a supplier for an order line that arrived WITHOUT one —
+#    a code whose product ALREADY carries its own `supplier` in the current export
+#    is excluded, so the automation never clobbers live catalog data. ──────────────
+def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkeypatch):
+    # two assignments: 9/Z (no own supplier in the export → should be written) and
+    # 5/A (product ALREADY has its own supplier in the export → must be excluded).
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "5/A": "STALE_ASSIGN"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
+    export = ("code;pairCode;supplier\r\n"
+              "9/Z;777;\r\n"
+              "5/A;555;REAL_SUPPLIER\r\n")
+    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: export)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+    assert status == 200
+    sup = next(c for c in calls if c["header"][2] == "supplier")
+    written = {r[0] for r in sup["rows"]}
+    assert written == {"9/Z"}          # 5/A excluded (own supplier already in export)
+    assert "5/A" not in written
+    # only the code we actually wrote is recorded as uploaded
+    up = json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text())
+    assert up == {"9/Z": "BETALOV"}
+
+
 def test_run_is_idempotent_second_run_pushes_nothing(iso, monkeypatch):
     _seed_pairing()
     _seed_supplier()

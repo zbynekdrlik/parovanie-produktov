@@ -79,6 +79,58 @@ def test_ordered_endpoint_persists(monkeypatch, tmp_path):
     assert "20261045|61247/L" not in c.get("/api/ordered").get_json()["ordered"]
 
 
+# --- BUG 2: corrupt store must not 500 the tab; blank key must not write "None" --- #
+def test_ordered_waiting_reject_missing_key(monkeypatch, tmp_path):
+    # a POST with no key must 400 — never write a "None"/"" key into the store
+    # (mirrors instock/unavailable). Guards the /api/ordered + /api/waiting sinks.
+    monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
+    monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
+    c = _client()
+    assert c.post("/api/ordered", json={"ordered": True}).status_code == 400
+    assert c.post("/api/waiting", json={"waiting": True}).status_code == 400
+    assert c.post("/api/ordered", json={"key": "  ", "ordered": True}).status_code == 400
+    assert c.get("/api/ordered").get_json()["ordered"] == {}
+    assert c.get("/api/waiting").get_json()["waiting"] == {}
+
+
+def test_toorder_loaders_tolerate_corrupt_store(monkeypatch, tmp_path):
+    # a hand-corrupted / wrong-type flag store must degrade to {} (like _load_instock),
+    # never raise — one bad file must not 500 the whole /api/orders tab.
+    for name, loader in (("ORDERED", "_load_ordered"), ("WAITING", "_load_waiting"),
+                         ("ORDER_PAIRINGS", "_load_order_pairings"),
+                         ("VARIANT_LINKS", "_load_variant_links")):
+        bad = tmp_path / (name + ".json")
+        bad.write_text("{ this is not json", encoding="utf-8")
+        monkeypatch.setattr(webapp, name, str(bad))
+        assert getattr(webapp, loader)() == {}, name
+        bad.write_text("[]", encoding="utf-8")   # wrong top-level type
+        assert getattr(webapp, loader)() == {}, name
+
+
+def test_orders_route_tolerates_corrupt_flag_store(monkeypatch, tmp_path):
+    orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+              "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
+    monkeypatch.setattr(webapp, "PRODUCTS",
+        [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
+          "variant_codes": ["61247/L"], "pairCode": "231"}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
+    ordf = tmp_path / "o.json"; ordf.write_text("{ broken", encoding="utf-8")
+    waitf = tmp_path / "w.json"; waitf.write_text("[]", encoding="utf-8")  # wrong type
+    monkeypatch.setattr(webapp, "ORDERED", str(ordf))
+    monkeypatch.setattr(webapp, "WAITING", str(waitf))
+    monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "is.json"))
+    monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "un.json"))
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    monkeypatch.setattr(webapp, "_load_decisions", lambda: {})
+    r = _client().get("/api/orders")
+    assert r.status_code == 200          # corrupt store degrades, tab still renders
+    j = r.get_json()
+    assert j["orders"][0]["ordered"] is False
+    assert j["orders"][0]["waiting"] is False
+
+
 def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
               "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
