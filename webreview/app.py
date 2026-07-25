@@ -5429,6 +5429,8 @@ def api_orders_reminder_override():
         if row is None:
             return jsonify({"ok": False, "error": "objednávka sa v aktuálnom zozname nenašla"}), 404
         prev_entry = (st.get("orders") or {}).get(code)
+        if not isinstance(prev_entry, dict):
+            prev_entry = None       # garbage from a partial write — treat as 'not resolved'
         prev_status = (prev_entry or {}).get("status")
         sending_now = _reminder_claim_active(prev_entry)
         if action == "contact" and (_reminder_is_terminal(prev_entry) or sending_now):
@@ -5456,7 +5458,8 @@ def api_orders_reminder_override():
         """Undo OUR claim (only ours — never a concurrent winner's terminal record)."""
         with _lock:
             st2 = _load_orders_reminder()
-            cur = (st2.get("orders") or {}).get(code) or {}
+            cur = (st2.get("orders") or {}).get(code)
+            cur = cur if isinstance(cur, dict) else {}
             if cur.get("claim") != claim_token:
                 return
             if prev_entry is None:
@@ -5499,7 +5502,8 @@ def api_orders_reminder_override():
         with _lock:
             st = _load_orders_reminder()
             done = st.setdefault("orders", {})
-            if done.get(code, {}).get("status") == "emailed":
+            if _reminder_is_terminal(done.get(code)) and \
+                    done[code].get("status") == "emailed":
                 # a concurrent request already recorded this send while we were talking to SMTP —
                 # the e-mail landed (this one too, unlikely double-click race), state is correct either way.
                 return jsonify({"ok": True, "status": "emailed"})

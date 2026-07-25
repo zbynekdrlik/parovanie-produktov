@@ -630,3 +630,33 @@ def test_override_send_reports_honestly_when_the_mail_left_but_the_write_failed(
     assert len([m for m in iso["sent"] if m["to"] == "a@x.sk"]) == 1     # sent exactly once
     assert any("20261000" in rec.getMessage() for rec in caplog.records
                if rec.levelname == "ERROR")
+
+
+def test_override_survives_a_corrupt_order_record(iso):
+    """A partial write can leave a non-dict under a code. The override endpoint must still
+    answer (the store guard pattern), not 500 — a 500 here tells the manager nothing and the
+    order stays unresolvable."""
+    c = _seed(iso)
+    st = _store(iso)
+    st.setdefault("orders", {})["20261000"] = "kaboom"      # garbage from a partial write
+    webapp._save_orders_reminder(st)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200 and r.get_json()["status"] == "emailed"
+    assert [m["to"] for m in iso["sent"] if m["to"] == "a@x.sk"] == ["a@x.sk"]
+
+    st2 = _store(iso)
+    st2["orders"]["20261002"] = ["also", "wrong"]
+    webapp._save_orders_reminder(st2)
+    r2 = c.post("/api/orders-reminder/override", json={"code": "20261002", "action": "contact"})
+    assert r2.status_code == 200 and r2.get_json()["status"] == "skipped_contacted"
+
+
+def test_run_survives_a_corrupt_order_record(iso):
+    webapp.run_orders_reminder()
+    st = _store(iso)
+    st["orders"]["20261001"] = "kaboom"
+    webapp._save_orders_reminder(st)
+    iso["sent"].clear()
+    stats = webapp.run_orders_reminder()                    # must not raise
+    assert stats["emailed_now"] == 1                        # re-processed, record repaired
+    assert _store(iso)["orders"]["20261001"]["status"] == "emailed"
