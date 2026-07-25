@@ -1275,7 +1275,7 @@ def _strip_date_params(url: str) -> str:
     if not sep:
         return url
     kept = [p for p in query.split("&")
-            if p and p.split("=", 1)[0] not in ("dateFrom", "dateUntil")]
+            if p and p.split("=", 1)[0].lower() not in ("datefrom", "dateuntil")]
     return head + ("?" + "&".join(kept) if kept else "")
 
 
@@ -1283,7 +1283,14 @@ def _fetch_orders_csv() -> bytes:
     base = _cred("SHOPTET_ORDERS_URL")
     if not base:
         raise RuntimeError(f"SHOPTET_ORDERS_URL chýba v {CRED_PATH}")
-    base = _strip_date_params(base)
+    configured, base = base, _strip_date_params(base)
+    if base != configured:
+        # Never silent: this is the one function whose window underwrites the dedup prune's
+        # „a droppable record cannot belong to a live order" argument, so an operator who
+        # hand-widened it in the creds file must see that it was narrowed back.
+        log.warning("orders export: SHOPTET_ORDERS_URL niesla vlastné dateFrom/dateUntil — "
+                    "ignorované, platí okno %d dní (väzba na dedup retention)",
+                    ORDERS_EXPORT_WINDOW_DAYS)
     today = time.strftime("%Y-%m-%d")
     frm = time.strftime("%Y-%m-%d",
                         time.localtime(time.time() - ORDERS_EXPORT_WINDOW_DAYS * 86400))

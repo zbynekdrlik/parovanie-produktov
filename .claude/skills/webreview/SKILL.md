@@ -424,7 +424,8 @@ nevmestí. Čerstvý read vyššie len rozhoduje, či sa objednávkou vôbec opl
   každý riadok nesie pole `pending` = dôvod, ktorý appka vypíše. Týka sa: stratený claim race,
   nezapísaný claim, `_release` po zlyhanej klasifikácii/sende, chýbajúce `MAIL_BCC`, chýbajúci
   `OPENAI_API_KEY`. **`pending` MUSÍŠ zmazať vo VŠETKÝCH TROCH cestách, ktorými sa objednávka
-  vyrieši** — `_relocate` (kopíruje cez `{**r}`), inkrementálna rýchla cesta (`dict(prev_row)`)
+  vyrieši** — `_relocate` (kopíruje riadok, dnes už filtrovanou comprehension),
+  inkrementálna rýchla cesta (`dict(prev_row)` + `row.pop("pending", None)`)
   **A ručný override endpoint** (`api_orders_reminder_override` mal `append({**row, …})` na OBOCH
   miestach — `skipped` pri `contact` aj `orange` pri `send`; teraz `row_done`). Inak varovanie
   „automat to nestihol" visí na vybavenom riadku a nafukuje počítadlo nedokončených až do
@@ -560,8 +561,10 @@ Vzor `orders_reminder.prune_done` + terminálna cache v `run_posta_uncollected`:
   (180 d) je **dvojnásobok okna orders exportu** — `ORDERS_EXPORT_WINDOW_DAYS = 90`
   (`_fetch_orders_csv`): záznam dosť starý na zmazanie nemôže patriť objednávke, ktorá je ešte
   v exporte — ani v skrátenom. Strop ostáva len pre záznamy BEZ použiteľného dátumu (tie nikdy
-  nevypršia sami). **Tá väzba je PINNUTÁ testom** (`test_retention_stays_at_least_twice_the_
-  orders_export_window`) — okno bolo holá `90` bez čohokoľvek, čo ju spája s retentiou, takže
+  nevypršia sami). **Tá väzba je PINNUTÁ testom**
+  `test_retention_stays_at_least_twice_the_orders_export_window` (identifikátor drž na JEDNOM
+  riadku — zalomený v backtickoch sa nedá vygrepovať) — okno bolo holá `90` bez čohokoľvek, čo
+  ju spája s retentiou (import konštanty do `orders_reminder.py` by bol cyklický, preto test), takže
   rozšírenie exportu nad 180 d by ticho začalo mazať záznamy živých objednávok. Keď meníš okno,
   meň konštantu (nie literál) a rešpektuj `>= 2×`. **Ako testovať anti-strop správne:** test
   s `max_undated=3` chytí len strop, ktorý recykluje `max_undated` — proti stropu s vlastným
@@ -585,9 +588,16 @@ Vzor `orders_reminder.prune_done` + terminálna cache v `run_posta_uncollected`:
   zápisu, budúci dátum po skoku hodín), robilo záznam **navždy čerstvým** — zásielka sa
   preskakovala celé 30-dňové okno a 7-dňová sebauzdravovacia poistka bola ticho vypnutá
   (nález revízie PR #224). Správne: `recheck_before <= str(cached.get("at") or "") <= today_iso`.
-  Platí pre KAŽDÝ „čerstvosť z uloženého ISO dátumu" test v tejto appke: horná hranica
-  (`<= dnes`) je to, čo drží pravidlo „poškodené/nejednoznačné → over to", inak sa smetie
-  tvári ako najčerstvejší možný záznam.
+  Platí pre KAŽDÝ „čerstvosť z uloženého času" test v tejto appke: horná hranica je to, čo drží
+  pravidlo „poškodené/nejednoznačné → over to", inak sa smetie tvári ako najčerstvejší možný
+  záznam. **Druhý taký test je `_reminder_claim_active`** — mal iba `< SENDING_CLAIM_TTL_S`,
+  takže `claimed_at` v BUDÚCNOSTI sa tváril ako živý nárok, kým ho reálny čas nedobehol:
+  manažérovi „▶ Poslať pripomienku" vracalo 409 a beh objednávku preskakoval ako pending →
+  zákazník pripomienku NIKDY nedostal a TTL (ktorý existuje presne preto, aby nárok objednávku
+  nezamkol navždy) bol vyradený. Správne `0 <= (now - claimed).total_seconds() < TTL`. Túto
+  dieru našla až revízia PR #224 — pri prvom fixe som ohraničil len `at` a v playbooku vyhlásil
+  pravidlo za univerzálne; keď takéto pravidlo píšeš, VYGREPUJ všetky ostatné výskyty vzoru
+  (`>= cutoff`, `< TTL`, `total_seconds()`) a oprav ich v tom istom PR.
 - **Do `TERMINAL_STATE_CODES` daj LEN live overené kódy.** Live probe api.posta.sk
   (2026-07-25) vrátil presne štyri: `received`, `transit`, `notified`, `delivered` — a
   ukázal, že `delivered` pokrýva OBA konce eskalácie: „Doručená" (OK) aj **„Prevzatá na pošte"

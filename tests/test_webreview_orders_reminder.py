@@ -1184,9 +1184,10 @@ def _captured_orders_url(monkeypatch, base):
 
 def test_the_orders_export_window_is_the_named_constant(monkeypatch):
     """…and the constant is not decoration: it is what actually reaches Shoptet."""
-    url = _captured_orders_url(monkeypatch, "https://shop.test/export/orders.csv?patternId=-9")
+    # `want` FIRST: computing it after the call would flake if midnight ticked in between.
     want = time.strftime("%Y-%m-%d", time.localtime(
         time.time() - webapp.ORDERS_EXPORT_WINDOW_DAYS * 86400))
+    url = _captured_orders_url(monkeypatch, "https://shop.test/export/orders.csv?patternId=-9")
     assert f"dateFrom={want}" in url
     assert "patternId=-9" in url                       # the configured parameters survive
 
@@ -1203,6 +1204,17 @@ def test_a_date_window_configured_in_the_url_does_not_survive(monkeypatch):
     assert url.count("dateFrom=") == 1 and "dateFrom=2020-01-01" not in url
     assert url.count("dateUntil=") == 1 and "dateUntil=2020-02-01" not in url
     assert "hash=aB+cD%2F1" in url                     # byte-identical, never re-encoded
+
+
+def test_the_date_window_strip_matches_the_KEY_not_a_substring():
+    """Two ways the strip could misfire, both checked directly on the helper: it must not eat a
+    parameter that merely CONTAINS the word, and it must catch a differently-cased one (the
+    docstring promises our window is the only one that can apply)."""
+    kept = webapp._strip_date_params("https://s.test/e.csv?myDateFrom=1&x=2")
+    assert kept == "https://s.test/e.csv?myDateFrom=1&x=2"
+    assert webapp._strip_date_params("https://s.test/e.csv?a=1&DATEFROM=x&datefrom=y") == \
+        "https://s.test/e.csv?a=1"
+    assert webapp._strip_date_params("https://s.test/e.csv") == "https://s.test/e.csv"
 
 
 # ═════════════════════════════════════════════════════════════════════════════════

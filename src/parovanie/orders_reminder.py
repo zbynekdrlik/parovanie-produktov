@@ -203,15 +203,19 @@ def all_order_codes(orders_csv) -> set[str]:
 
 
 # How long a dedup record survives after its order left the export (#220). This is the PRIMARY
-# bound and it is deliberately twice the 90-day orders-export window (_fetch_orders_csv), so a
-# record for an order that is still in the export is ALWAYS inside retention — even if the
-# export we happened to read was truncated. That margin is what makes age-based pruning safe.
+# bound and it is deliberately twice the orders-export window (webreview/app.py
+# ORDERS_EXPORT_WINDOW_DAYS, used by _fetch_orders_csv), so a record for an order that is still
+# in the export is ALWAYS inside retention — even if the export we happened to read was
+# truncated. That margin is what makes age-based pruning safe. Importing the constant here would
+# be circular (app.py imports this module), so the coupling is held by
+# test_retention_stays_at_least_twice_the_orders_export_window instead — change one, and it tells
+# you about the other.
 DEDUP_RETENTION_DAYS = 180
 # A backstop for records we cannot date at all (a partial write with no usable timestamp): those
 # can never age out, so they are capped. It is deliberately NOT applied to dated records — a
 # count-based cap would drop a record that is still protecting a live order, which costs a
-# duplicate customer mail. Retention bounds the dated ones, and the 90-day export window bounds
-# how many orders can even be resolved in that period.
+# duplicate customer mail. Retention bounds the dated ones, and the export window bounds how
+# many orders can even be resolved in that period.
 DEDUP_MAX_UNDATED_RECORDS = 500
 
 
@@ -244,7 +248,7 @@ def prune_done(done: dict, window_codes, now: datetime | None = None,
        so nothing is pruned at all (fail closed, the same reflex as the supplier upload: no
        source of truth, no destructive action).
     3. Everything else is kept while it is younger than ``retention_days``. Age is the ONLY
-       criterion here, and it is safe because retention is twice the 90-day export window: a
+       criterion here, and it is safe because retention is twice the orders-export window: a
        record old enough to be dropped belongs to an order that cannot be in the export at all,
        not even a truncated one. A COUNT-based cap is deliberately NOT applied to dated records
        — it would drop a record that is still protecting a live order the moment a short export
