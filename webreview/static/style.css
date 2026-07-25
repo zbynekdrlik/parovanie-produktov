@@ -148,6 +148,12 @@ body.toorder-wide .filters button.active{background:#DDA43C;border-color:#DDA43C
 .to-toolbar{grid-column:1 / -1;display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:6px}
 .to-toolbar .to-sum{font-size:13px;font-weight:600;color:var(--muted)}
 .to-toolbar .to-sum.alldone{color:#6CAB68}
+.to-toolbar .to-hidehandled{margin-left:auto;background:var(--panel);color:var(--muted);
+  border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:12.5px;
+  font-weight:600;cursor:pointer;white-space:nowrap}
+.to-toolbar .to-hidehandled:hover{border-color:var(--soft)}
+.to-toolbar .to-hidehandled.on{background:var(--accent-soft);color:var(--accent);
+  border-color:var(--accent)}
 .downloads{display:flex;gap:8px}
 .downloads a{background:var(--accent-hov);color:#fff;text-decoration:none;font-size:13.5px;
   font-weight:600;padding:9px 15px;border-radius:9px}

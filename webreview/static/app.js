@@ -1617,6 +1617,19 @@ function renderOrderToolbar() {
   const sum = el('span', 'to-sum' + (s.total > 0 && s.remaining === 0 ? ' alldone' : ''));
   sum.textContent = toOrderSummaryText(s);
   bar.appendChild(sum);
+  // #205 — hide the lines already dealt with. A VIEW filter only: nothing is written,
+  // the chips keep counting every line, and the choice survives a reload.
+  const hide = el('button', 'to-hidehandled' + (HIDE_HANDLED ? ' on' : ''),
+                  HIDE_HANDLED ? '🙈 Poriešené skryté' : '👁 Skryť poriešené');
+  hide.title = HIDE_HANDLED
+    ? 'Zobraziť aj riadky, ktoré si už vybavil'
+    : 'Skryť riadky, ktoré si už vybavil (objednané / čaká sa / skladom / nedostupné)';
+  hide.onclick = () => {
+    HIDE_HANDLED = !HIDE_HANDLED;
+    localStorage.setItem('hideHandled', HIDE_HANDLED ? '1' : '0');
+    renderToOrder();     // the ONE repaint path — carries open editors across (#233)
+  };
+  bar.appendChild(hide);
 }
 
 // Build the supplier filter chips for the Na-objednanie tab, coloured by resolved state:
@@ -1723,6 +1736,32 @@ function captureOpenEditors() {
   return out;
 }
 
+// Does this snapshot hold work the manager would LOSE if its editor disappeared? The
+// same test — in the same load-bearing order — that decides whether an editor is put back
+// after a repaint, so „stays open" (restoreOpenEditors) and „stays visible" (the #205
+// hide filter) can never disagree about the same box.
+function editorSnapHasWork(s, o) {
+  const spec = _EDITORS[s.kind];
+  if (!spec || !o) return false;
+  // only UNSAVED TYPING counts. An EMPTY box holds none — and pair/supplier
+  // editors are rendered empty BY DEFAULT on every unpaired/unassigned row, so treating
+  // one as unsaved work would pin an empty input onto a sibling line that a
+  // just-propagated per-product value (#204) has since paired. A value that now equals
+  // what is stored was likewise just saved, and re-opening its editor would undo the
+  // „it landed" feedback (the row would show an input instead of the new link / tag).
+  // an EMPTY box normally holds no unsaved work — but one the manager OPENED with ✏️/💬
+  // is his, whether he has typed into it yet or has deliberately cleared it. That
+  // exception has to be weighed BEFORE „same as stored": on a row with nothing stored
+  // the box and the stored value are BOTH '', so `same` fired first and closed the box
+  // under a manager who was about to type into it. A NON-empty value equal to what is
+  // stored is the just-saved case and still closes — re-opening it would replace the
+  // freshly rendered link / tag with an input again.
+  const emptyOpened = s.opened && !s.value.trim();
+  if (!emptyOpened && spec.same(s.value, spec.stored(o))) return false;
+  if (!s.value.trim() && !s.opened) return false;
+  return true;
+}
+
 function restoreOpenEditors(snaps) {
   if (!snaps.length) return;
   const rows = [...document.querySelectorAll('#list .toorder-row')];
@@ -1731,6 +1770,7 @@ function restoreOpenEditors(snaps) {
     const row = rows.find(r => r.dataset.key === s.key);   // filtered out / gone → drop it
     const o = row && ORDERS.find(x => x.key === s.key);
     if (!spec || !o) continue;
+    if (!editorSnapHasWork(s, o)) continue;
     // only UNSAVED TYPING is carried over. An EMPTY box holds none — and pair/supplier
     // editors are rendered empty BY DEFAULT on every unpaired/unassigned row, so treating
     // one as unsaved work would pin an empty input onto a sibling line that a
@@ -1744,9 +1784,6 @@ function restoreOpenEditors(snaps) {
     // under a manager who was about to type into it. A NON-empty value equal to what is
     // stored is the just-saved case and still closes — re-opening it would replace the
     // freshly rendered link / tag with an input again.
-    const emptyOpened = s.opened && !s.value.trim();
-    if (!emptyOpened && spec.same(s.value, spec.stored(o))) continue;
-    if (!s.value.trim() && !s.opened) continue;
     let inp = row.querySelector(spec.input);
     let ed = null;
     if (!inp) { ed = spec.open(o, row); inp = ed && ed.querySelector(spec.input); }
@@ -1801,7 +1838,19 @@ function renderToOrder() {
   }
   renderOrderFilters({ canon, known });   // live-coloured chips (recomputed from the flag maps)
   const list = document.getElementById('list'); list.innerHTML = '';
-  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || supFilterKey(o) === ORDER_SUPPLIER);
+  // #205 — „skryť poriešené" hides handled lines, with ONE exemption: a row holding
+  // unsaved editor work stays visible. Hiding it would strand the half-typed pair URL /
+  // supplier / comment (restoreOpenEditors drops a snapshot whose row is gone), and the
+  // manager would get no message about it — exactly the silent loss #214/#233 removed
+  // from the flag writes. The exemption uses the SAME predicate restoreOpenEditors uses,
+  // so „visible" and „restored" can never disagree.
+  const busy = new Set(
+    HIDE_HANDLED
+      ? editors.filter(s => editorSnapHasWork(s, ORDERS.find(x => x.key === s.key)))
+               .map(s => s.key)
+      : []);
+  const shown = ORDERS.filter(o => (ORDER_SUPPLIER === 'all' || supFilterKey(o) === ORDER_SUPPLIER)
+    && !(HIDE_HANDLED && isHandled(o) && !busy.has(o.key)));
   document.getElementById('empty').hidden = shown.length > 0;
   const groups = Object.create(null);
   for (const o of shown) { const s = supFilterKey(o); (groups[s] = groups[s] || []).push(o); }
@@ -4149,6 +4198,10 @@ async function init() {
     ? savedSup : 's:' + supKey(savedSup);
   // persist the migrated form, so the old value is converted once and not on every load
   if (ORDER_SUPPLIER !== savedSup) localStorage.setItem('orderSupplier', ORDER_SUPPLIER);
+  // #205 — working a long supplier list down spans several visits, so the „skryť
+  // poriešené" choice is remembered. Default OFF: the tab must never hide rows the
+  // manager did not ask it to hide.
+  HIDE_HANDLED = localStorage.getItem('hideHandled') === '1';
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
   if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes'
