@@ -2339,6 +2339,93 @@ function bccMissingWarning() {
     + 'žiadne e-maily zákazníkom, kým sa nedoplní konfigurácia.');
 }
 
+// #225 — the evidence of who was already mailed is unreadable, so the automation refuses to send
+// anything. Without this banner the tab would render as a clean, empty day: the manager would see
+// „0 objednávok" and never learn the automation had stopped (same class of silent death the
+// bcc_missing warning exists for). NEVER tell them to delete the file — an empty store means
+// every customer gets mailed again.
+function storeCorruptWarning(file) {
+  return el('div', 'autoerr', '⛔ Poškodená evidencia odoslaných e-mailov (data/out/'
+    + escapeHtml(file) + ') — automatizácia NEPOSIELA nič, aby zákazníci nedostali maily '
+    + 'druhýkrát. Zoznam nižšie je preto prázdny. Súbor treba opraviť podľa zálohy '
+    + '<code>.corrupt-*</code> v tom istom priečinku (NEMAZAŤ ho).');
+}
+
+// ── #217 — read-only e-mail preview shared by both customer-mail automations ────────────
+// The manager could not see what a customer gets until the automation had already sent it.
+// This dialog is inert BY CONSTRUCTION: the endpoints behind it write nothing (no claim, no
+// state, no SMTP) and the dialog has no „Odoslať" button at all, so looking can never turn
+// into sending by accident. Sending stays on its own confirmed path (the row's ▶ button).
+function _emModalEls() {
+  return {
+    modal: document.getElementById('emModal'),
+    head: document.getElementById('emHead'),
+    hint: document.getElementById('emHint'),
+    rec: document.getElementById('emRecipient'),
+    frame: document.getElementById('emPreview'),
+  };
+}
+
+function closeEmModal() {
+  const m = document.getElementById('emModal');
+  if (m) m.hidden = true;
+}
+
+// Two quick clicks used to be able to show customer A's e-mail under order B's heading: the
+// heading is set synchronously per click, the body by whichever fetch resolves last. On a screen
+// whose whole point is „see exactly what THIS customer gets", a mis-paired header/body is the one
+// failure worth guarding — so a superseded response is dropped.
+let _emSeq = 0;
+
+async function openEmailPreview(url, payload, head) {
+  const E = _emModalEls();
+  if (!E.modal) return;
+  const my = ++_emSeq;
+  E.head.textContent = head;
+  E.hint.textContent = 'Presne toto dostane zákazník. Nič sa teraz neodosiela.';
+  E.rec.innerHTML = 'Načítavam…';
+  E.frame.srcdoc = '';
+  E.modal.hidden = false;
+  let j;
+  try {
+    j = await (await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })).json();
+  } catch (_) { j = null; }
+  if (my !== _emSeq) return;              // a later click already owns the dialog
+  if (!j || !j.ok) {
+    E.rec.textContent = 'Náhľad sa nepodarilo načítať'
+      + (j && j.error ? ': ' + j.error : '.');
+    return;
+  }
+  E.rec.innerHTML = '<div class="nd-rec-head">Príjemca:</div><ul><li>'
+    + `${escapeHtml(j.name || '—')} · `
+    + `<span class="nd-em">${escapeHtml(j.recipient || 'bez e-mailu')}</span></li></ul>`
+    + `<div class="nd-subj">Predmet: <strong>${escapeHtml(j.subject || '')}</strong></div>`
+    + (j.max_reached
+      ? '<div class="nd-subj">⚠️ Zákazník už dostal maximálny počet upozornení — automat '
+        + 'ďalšie neposiela. Toto je posledné, ktoré odišlo.</div>'
+      : '');
+  E.frame.srcdoc = j.html || '';
+}
+
+function initEmModal() {
+  const bd = document.getElementById('emBackdrop');
+  const close = document.getElementById('emClose');
+  if (bd) bd.onclick = closeEmModal;
+  if (close) close.onclick = closeEmModal;
+}
+
+// One „👁 Náhľad" button, wired to the read-only preview endpoint. Never disabled by a send —
+// it is safe to click at any time, on any row.
+function _previewBtn(testid, url, payload, head) {
+  const b = el('button', 'btn sm ghost act-preview', '👁 Náhľad');
+  b.dataset.testid = testid;
+  b.onclick = () => openEmailPreview(url, payload, head);
+  return b;
+}
+
 function renderPosta() {
   const wrap = document.getElementById('tab-posta');
   if (!wrap) return;
@@ -2393,6 +2480,7 @@ function renderPosta() {
   wrap.appendChild(st);
 
   const p = POSTA || {};
+  if (p.store_corrupt) wrap.appendChild(storeCorruptWarning('posta_uncollected.json'));
   // uncollected shipments table
   const unc = p.uncollected || [];
   if (!unc.length) {
@@ -2403,10 +2491,11 @@ function renderPosta() {
     const tbl = el('table', 'posta-table');
     tbl.dataset.testid = 'posta-table';
     tbl.innerHTML = '<thead><tr><th>Zásielka</th><th>Objednávka</th><th>Zákazník</th>'
-      + '<th>Na pošte</th><th>Vyzdvihnúť do</th><th>E-maily</th></tr></thead>';
+      + '<th>Na pošte</th><th>Vyzdvihnúť do</th><th>E-maily</th><th>Náhľad</th></tr></thead>';
     const tb = el('tbody');
     for (const u of unc) {
       const tr = el('tr', u.call_needed ? 'callneeded' : '');
+      tr.dataset.pkg = u.packageNumber || '';
       tr.innerHTML =
         `<td><a href="${escapeHtml(u.tracking_link)}" target="_blank" rel="noopener">${escapeHtml(u.packageNumber)}</a>`
         + `<div class="sub2">${escapeHtml(u.office_name || '')}</div></td>`
@@ -2418,6 +2507,12 @@ function renderPosta() {
         + `<td>${u.count || 0}/4`
         + (u.last_sent ? `<div class="sub2">naposledy ${escapeHtml(u.last_sent)}</div>` : '')
         + (u.call_needed ? '<div class="callbadge">⚠️ TREBA ZAVOLAŤ</div>' : '') + '</td>';
+      // #217 — see the escalation mail BEFORE the automation sends it (read-only, no SMTP)
+      const actTd = el('td', 'ordrem-actions');
+      actTd.appendChild(_previewBtn(
+        `posta-preview-${u.packageNumber}`, '/api/posta-uncollected/preview',
+        { package: u.packageNumber }, `Náhľad e-mailu — zásielka ${u.packageNumber}`));
+      tr.appendChild(actTd);
       tb.appendChild(tr);
     }
     tbl.appendChild(tb);
@@ -3241,6 +3336,7 @@ function renderOrdersReminder() {
   wrap.appendChild(st);
 
   const d = ORDERS_REMINDER || {};
+  if (d.store_corrupt) wrap.appendChild(storeCorruptWarning('orders_reminder.json'));
   const red = d.red || [];
   const orange = d.orange || [];
   const skipped = d.skipped || [];
@@ -3285,6 +3381,7 @@ function renderOrdersReminder() {
         + `<td>${escapeHtml(o.itemName || '')}</td>`
         + `<td>${o.days || 0} ${dniLabel(o.days || 0)}</td>`;
       const actTd = el('td', 'ordrem-actions');
+      actTd.appendChild(_ordremPreviewBtn(o.code));
       const sendBtn = el('button', 'btn sm ghost ordrem-act-send', '▶ Poslať pripomienku');
       _ordremAction(sendBtn, o.code, 'send');
       const contactBtn = el('button', 'btn sm ghost ordrem-act-contact', '✓ Kontaktované');
@@ -3345,19 +3442,33 @@ function renderOrdersReminder() {
     wrap.appendChild(tbl);
   }
 
-  // The backend keeps both kinds of row in one `skipped` list (so the override endpoint finds
-  // them the same way), but they mean very different things to the manager, so they render as
-  // TWO sections: the AI's „already contacted" verdicts, and the orders the run STARTED but
-  // could not finish (`pending` — failed send, failed classification, unwritable claim, missing
-  // config). Putting the latter under the „AI usúdilo…" heading would state something that
-  // never happened — with no MAIL_BCC the AI does not run at all.
-  _ordremSkippedTable(wrap, skipped.filter(o => !o.pending), _ordremAction,
+  // The backend keeps all three kinds of row in one `skipped` list (so the override endpoint
+  // finds them the same way), but they mean very different things to the manager, so they render
+  // as THREE sections — and every row lands in exactly one of them:
+  //   • `pending`  — the run STARTED the order but could not finish it (failed send, failed
+  //     classification, unwritable claim, missing config);
+  //   • `manual`   — the MANAGER resolved it by hand (#227);
+  //   • the rest   — the AI's own „already contacted" verdicts.
+  // Only the last group may carry the „AI usúdilo…" heading: for the other two the classifier
+  // frequently never ran at all (a red row has no note; with no MAIL_BCC or no OPENAI_API_KEY
+  // the AI is deliberately not called), so that heading would state something that never
+  // happened and hide the fact that a HUMAN decided.
+  _ordremSkippedTable(wrap, skipped.filter(o => !o.pending && !o.manual), _ordremAction,
     `⚪ %n — AI usúdilo, že zákazník je už kontaktovaný`, 'ordrem-skipped');
+  _ordremSkippedTable(wrap, skipped.filter(o => !o.pending && o.manual), _ordremAction,
+    `✋ %n — vybavené ručne manažérom`, 'ordrem-manual');
   _ordremSkippedTable(wrap, skipped.filter(o => o.pending), _ordremAction,
     `⚠️ %n — automat ich nestihol vybaviť (pošli ručne)`, 'ordrem-pending');
 }
 
-// One „skipped-shaped" table (note + „▶ Poslať pripomienku"), rendered for both sections above.
+// #217 — „👁 Náhľad" for one order's reminder e-mail (read-only; the send is the ▶ button).
+function _ordremPreviewBtn(code) {
+  return _previewBtn(`ordrem-preview-${code}`, '/api/orders-reminder/preview',
+    { code }, `Náhľad pripomienky — objednávka ${code}`);
+}
+
+// One „skipped-shaped" table (note + „▶ Poslať pripomienku"), rendered for all three sections
+// above.
 function _ordremSkippedTable(wrap, rows, actionWire, headTpl, testid) {
   if (rows.length) {
     wrap.appendChild(el('div', 'warnhead', headTpl.replace('%n', String(rows.length))));
@@ -3376,6 +3487,7 @@ function _ordremSkippedTable(wrap, rows, actionWire, headTpl, testid) {
         + (o.pending ? `<div class="sub2">⚠️ ${escapeHtml(o.pending)}</div>` : '')
         + `</td>`;
       const actTd = el('td', 'ordrem-actions');
+      actTd.appendChild(_ordremPreviewBtn(o.code));
       const sendBtn = el('button', 'btn sm ghost ordrem-act-send', '▶ Poslať pripomienku');
       actionWire(sendBtn, o.code, 'send');
       actTd.appendChild(sendBtn);
@@ -3502,6 +3614,7 @@ async function init() {
   initFolders();
   initIdea();
   initNdModal();
+  initEmModal();
   // Who am I? (#91) — 401 → the fetch guard above already navigates to /login.
   try {
     const meR = await fetch('/api/me');

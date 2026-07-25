@@ -112,6 +112,8 @@ Manažér si priamo na webe značí stav. Tieto súbory držia jeho ŽIVÚ prác
 
 **GOTCHA — dodávateľ objednávky (`o.supplier`) VYHRÁVA nad ručným priradením (`o.assignedSupplier`); priradenie je len FILL-IN pre riadok BEZ vlastného dodávateľa (BUG 1).** Priradenie je per-PRODUKT, ale realita objednávky je per-RIADOK — ten istý kód môže mať jednu objednávku bez dodávateľa (dostane priradenie) a inú už s vlastným zo Shoptetu. Preto `effSup = o.supplier || o.assignedSupplier || '—'` (NIE naopak — obrátené poradie prebíjalo reálneho dodávateľa v zoskupení). A nočná `_do_upload_suppliers` (na prode ENABLED, píše `supplier` NAŽIVO) MUSÍ vylúčiť kódy, ktorých produkt UŽ má vlastného `supplier` v aktuálnom exporte — `_codes_with_own_supplier(text=None)` (číta `supplier` stĺpec z `_read_export_for_links()`) → `supplier_rows(..., exclude_codes=...)`. Bez toho stará priradenie natrvalo prepíše reálneho dodávateľa v eshope. `uploaded_suppliers.json` idempotencia sama nestačí (priradenie sa nemení → stále „nové"). Riadok BEZ `o.supplier` naďalej zobrazuje inline supplier-assign pole (`if (!o.supplier)`) — nič sa tu nemení. **FAIL-CLOSED na chýbajúci export (PR #213 review):** samotný `_codes_with_own_supplier` stále vracia prázdnu množinu pri prázdnom exporte, ALE zápisový volajúci NESMIE fail-openovať — `_do_upload_suppliers` na PRÁZDNY/nečitateľný `_read_export_for_links()` (`if not export_text.strip()`) preskočí CELÝ supplier upload (`count=0`, `blocked=len(new_codes)`, `uploaded_suppliers.json` netknuté, log.warning), lebo bez exportu nevie ktoré kódy sú chránené → prázdna množina by povolila prepis reálneho dodávateľa. Prítomný-ale-partial export (nemá daný kód) blokádu NEspustí — kód sa len nevyloči a zapíše sa (pred-PR správanie). **TEST-PASCA:** každý test, čo vezme `_do_upload_suppliers`/`run_parovania_eshop`/`/api/n8n/upload-suppliers` cez reálny zápis, MUSÍ `monkeypatch _read_export_for_links` na NEPRÁZDNY export (kódy s prázdnym `supplier`) — inak prejde na dev boxe (reálny `data/products.csv` existuje) a padne na CI (žiadny `data/` → prázdny export → blocked). Zdieľané fixtúry `_arm_suppliers` (test_webreview) + `iso` (test_webreview_parovania_eshop) to stubujú; over cez `WEBREVIEW_PRODUCTS=/nonexistent`.
 
+**GOTCHA — SAFE loader platí pre DISPLAY/flag stores, NIE pre DEDUP stores (#225).** Než pridáš `try/except → {}` na nový loader, rozhodni, čo strata dát znamená: display flag = kozmetika (degraduj), evidencia „komu sme už poslali mail" = **duplicitný mail zákazníkovi** (nikdy nedegraduj). Detail nižšie v „Fail-closed dedup stores".
+
 **GOTCHA — VŠETKY loadery čo kŕmia `/api/orders` používaj SAFE vzor `_load_instock` (try/except `(FileNotFoundError, json.JSONDecodeError)` → `{}` + `isinstance dict` guard), NIE `os.path.exists`+holé `json.load()`.** Ten starý vzor zhodil CELÝ `/api/orders` (500) pri jednom poškodenom súbore. Guardnuté: `_load_ordered`/`_load_waiting`/`_load_order_pairings`/`_load_variant_links` a (PR #213 review) aj `_load_decisions` + `_load_supplier_assign` — tie DVE sú NAJexponovanejšie (`decisions.json` sa píše pri KAŽDOM review kliku, `supplier_assignments.json` píše app AJ n8n), takže najviac náchylné na partial write; corrupt-store test ich MUSÍ prehnať reálnou corrupt-file cestou (monkeypatch `DECISIONS`/`SUPPLIER_ASSIGN` na poškodený súbor, NIE `_load_*` na lambdu). Endpointy `/api/ordered`+`/api/waiting` (ako instock/unavailable) validujú `key = str(body.get('key') or '').strip(); if not key: 400` — inak `str(None)='None'` zapíše trvalý smetný kľúč. Hromadné „označiť skupinu objednané" = `POST /api/ordered/bulk {keys,ordered}` (atomicky pod `_lock`, non-list keys → 400) + `markGroupOrdered(items, ordered)` v hlavičke skupiny. Stará nevybavená objednávka: `orderAgeDays(orderDate, now)` (pure, `now` injektovateľné pre test) + `!isHandled(o) && age>STALE_ORDER_DAYS(14)` → badge `.to-staleage`.
 
 **Hlavička skupiny `.toorder-supplier` je teraz FLEX kontajner: `.tosup-label` (menovka PRVÁ — E2E `startswith(sup)` kontrakt) + `.tosup-bulk` tlačidlo.** Pri zmene hlavičky drž menovku PRVÚ a escapuj ju (`escapeHtml` — XSS test `.toorder-supplier i` count==0).
@@ -436,6 +438,38 @@ nevmestí. Čerstvý read vyššie len rozhoduje, či sa objednávkou vôbec opl
   už kontaktovaný" — pri chýbajúcom `MAIL_BCC` AI vôbec nebežala, takže by hlavička tvrdila
   niečo, čo sa nestalo.
 
+**`manual` je PRESNÝ OPAK `pending` — vlastnosť ZÁZNAMU, ktorú re-derivuješ, nie per-beh
+poznámka, ktorú strippuješ (#227).** Override zapisoval `manual: True` do záznamu, ale nie do
+DISPLAY riadku, takže tab tvrdil „⚪ AI usúdilo…" aj o riadkoch, kde klasifikátor NIKDY nebežal
+(bez poznámky / bez `OPENAI_API_KEY` / bez `MAIL_BCC`). Fix je jeden zdieľaný `_mark_manual(row,
+entry)` volaný vo VŠETKÝCH ŠTYROCH cestách, čo riadok vyrábajú: override endpoint, terminálna
+vetva behu, inkrementálna rýchla cesta, `_relocate`. **Re-derivuj z aktuálneho záznamu, nekopíruj
+z predošlého riadku** — tým je výsledok správny bez ohľadu na cestu a sám sa opraví aj na riadku
+prenesenom z čias, keď pole ešte neexistovalo. Tab potom delí `skipped` na TRI sekcie (AI /
+`✋ ručne` / `⚠️ nedokončené`); filtre musia byť disjunktné (`!pending && !manual`, `!pending &&
+manual`, `pending`), inak riadok zmizne alebo sa zdvojí. Pri PRIDANÍ ďalšieho takého príznaku sa
+najprv rozhodni, či je per-BEH (strippuj) alebo vlastnosť ZÁZNAMU (re-derivuj).
+
+### Náhľad zákazníckeho e-mailu — VLASTNÝ read-only endpoint + VLASTNÝ modal bez „Odoslať" (#217)
+
+Manažér musí vidieť, čo zákazník dostane, PRED odoslaním. Vzor pre každú mailovú automatizáciu:
+
+- `GET|POST /api/<key>/preview` — vráti `{subject, html, recipient}` z **TÝCH ISTÝCH builderov**,
+  ktoré použije beh aj ručné odoslanie (`posta_uncollected.build_email` /
+  `orders_reminder.build_reminder_email`), kŕmených reálnymi hodnotami z aktuálneho display
+  riadku. NIKDY nekopíruj šablónu do endpointu — dvojička sa rozíde s tým, čo sa naozaj posiela.
+- **Inertný BY CONSTRUCTION**: žiadny claim, žiadny zápis, žiadne SMTP, žiadne volanie Pošta API.
+  Test to LOCKNE porovnaním BAJTOV store súboru pred/po + `_send_mail_html` nevolané.
+- Eskalačný náhľad ukazuje NASLEDUJÚCI mail (`už_odoslané + 1`); po vyčerpaní kadencie
+  (`>= MAX_EMAILS`) vráť posledný odoslaný + `max_reached: True` — vymyslený „5. mail", ktorý
+  automat nikdy nepošle, je klamstvo.
+- Frontend: `openEmailPreview(url, payload, head)` + **SAMOSTATNÝ `#emModal`**, ktorý zámerne
+  NEMÁ tlačidlo Odoslať (recykluje `.nd-*` CSS). `#ndModal` (#100) ostáva preview+send; miešať
+  ich by znamenalo, že pozeranie sa dá odklikať na odoslanie. E2E smie modal otvárať bezpečne.
+- E2E gotcha: `automations_server` je **function-scoped** (fresh store pre KAŽDÝ test) — testy
+  nemusia po sebe upratovať ani závisieť od poradia. A `page.locator(".warnhead", has_text="ručne")`
+  padne na strict-mode, keď dve hlavičky zdieľajú slovo — cieľ celou frázou.
+
 **GOTCHA — tranzitný claim NIE JE mitigácia zlyhaného post-send zápisu (PR #223 review).**
 Nechať claim po zlyhaní zápisu (aby manažér neklikol znova) kupuje len `SENDING_CLAIM_TTL_S`;
 potom `sending` nie je ani aktívny ani terminálny → nočný beh objednávku považuje za
@@ -540,6 +574,55 @@ objednávku preskočil ako „práve sa posiela" — nie preto, že by bola vyba
 správanie NASLEDUJÚCEHO behu, preto MUSÍ claim nechať vypršať:
 `monkeypatch.setattr(webapp, "SENDING_CLAIM_TTL_S", 0)` pred druhým behom. Overenie, či test
 naozaj testuje: dočasne odstráň fix a pozri, či PADNE (bez TTL patchu prejde = vata).
+
+### Fail-closed DEDUP stores — poškodený súbor NESMIE degradovať na `{}` (#225)
+
+`orders_reminder.json` (komu už pripomienka odišla) a `posta_uncollected.json` (`escalation`
+= koľký mail zásielka dostala) NIE SÚ display stores. Keby `_load_*` pri `JSONDecodeError`
+vrátil `{}` (bežný SAFE vzor), prvý ďalší `_claim`/`_persist_done`/escalation bump zapíše
+**nový JEDNOpoložkový súbor** — celá evidencia je preč a KAŽDÁ otvorená objednávka dostane
+DRUHÝ mail. Vzor, ktorý drž pri každom novom dedup store:
+
+- `_load_dedup_store(path, label, dedup_keys)`: chýbajúci súbor → `{}` (**legitímny prvý beh**
+  — nikdy neblokuj, inak sa nerozbehne čerstvý deploy); nečitateľný ALEBO ne-dict → zálohuj +
+  `raise DedupStoreCorrupt`. Ne-dict je druhá tichá wipe cesta (`else {}`), nie kuriozita.
+- **Strážiť VONKAJŠÍ dict NESTAČÍ — validuj aj samotnú dedup MAPU** (`dedup_keys`: `orders` /
+  `escalation`). `{"orders": null}` sa naparsuje A JE dict, takže vonkajší guard ho pustí, beh
+  prečíta „nikomu sme ešte neposlali" a zapíše to ako fakt → ďalší beh mailuje všetkých znova
+  (revízia PR #228, reprodukované). Kľúč, ktorý CHÝBA, je naďalej v poriadku (prvý beh).
+- **Fail-closed daj LEN na to, čo drží „čo už odišlo".** `posta_uncollected.json`'s `terminal`
+  je VÝKONNOSTNÁ cache — jej strata stojí API volanie, nikdy nie duplicitný mail, kým padnutie
+  behu na nej by UMLČALO reálne upozornenie zákazníkovi. Preto `terminal` NIE je v `dedup_keys`
+  a jeho ne-dict hodnotu len skoercuj na `{}` (`dict("kaboom")` inak zhodí celý beh).
+- **Chytaj `ValueError`, nie `json.JSONDecodeError`.** Stores sa píšu `ensure_ascii=False` a sú
+  plné slovenčiny → zápis prerezaný uprostred viacbajtového znaku hodí `UnicodeDecodeError`
+  (najpravdepodobnejšia reálna korupcia). Ten guardu unikal: žiadna záloha, 500 na tabe, raw
+  traceback v `last_error`. Oba sú podtriedy `ValueError`.
+- **Po zavedení guardu VYHĎ všetky zvyšné fail-openy na tej ceste**, inak liečiš jednu úroveň a
+  druhá ostane: `if not isinstance(orders_map, dict): orders_map = dict(done)` vo finálnom save
+  bola posledná wipe cesta (zapísala prázdne `done` ako celú evidenciu).
+- **Hláška NESMIE radiť „zmaž súbor"** — prázdny/chýbajúci súbor je „prvý beh", teda presne ten
+  wipe. Píš „oprav podľa zálohy, NEMAŽ ho".
+- **Záloha je KÓPIA, nie presun.** Presunutý originál = ďalší load vidí „súbor neexistuje" =
+  prvý beh = presne ten wipe. Originál necháš na mieste, nech padá nahlas, kým to človek
+  neopraví. Kópie dedupuj podľa OBSAHU (`<path>.corrupt-<ts>`), inak denná automatizácia
+  nechá jednu zálohu za každý beh.
+- **Fail-closed je DEFAULT loader**, tolerantná je explicitná `_load_*_display()` varianta
+  (len read-only taby). Nový call site tak zdedí bezpečné správanie, nie nebezpečné. Display
+  varianta vracia **`(state, corrupt)`** a endpoint pošle `store_corrupt` → tab vykreslí
+  `storeCorruptWarning()`. Bez toho poškodený store vyzerá ako pokojný deň (prázdne zoznamy) a
+  korupcia, čo vznikne MEDZI behmi, je neviditeľná — tá istá „ticho mŕtva automatizácia", proti
+  ktorej existuje `bcc_missing`.
+- Zálohu rob **idempotentne per (path, obsah)**: `hashlib.sha256` memo + VLASTNÝ malý zámok
+  (`_quarantine_lock`, NIE globálny `_lock` — nie je reentrantný a volajúci ho často už drží).
+  Poškodený store sa číta aj pri KAŽDOM display requeste (tab poll-uje počas behu), takže bez
+  memo by každý request skenoval priečinok a čítal všetky doterajšie zálohy.
+- Beh `raise`-ne → `automation_runner._execute` zapíše `last_status='error'` + hlášku do
+  `last_error`, tab ju vykreslí ako `.autoerr`. **Endpointy rieši jeden `@app.errorhandler(
+  DedupStoreCorrupt)` → 503** (nie 500 — manažér má vidieť, čo opraviť, nie klikať dokola).
+- Store čítaj **PRED** exportom/sieťou (lacný lokálny diskvalifikátor pred drahou prácou).
+- Ne-dict hodnota POD jedným kódom ostáva tolerovaná (stojí max. jednu klasifikáciu navyše) —
+  fail-closed je o CELOM súbore. Nemýliť si tie dve veci (`test_run_survives_a_corrupt_order_record`).
 
 ### Rastúci stav automatizácie — prunuj proti SOURCE OKNU, nikdy len podľa veku (#220, #222)
 

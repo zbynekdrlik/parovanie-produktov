@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
+from parovanie import orders_reminder  # noqa: E402
 from tests.conftest import authed_client  # noqa: E402
 
 # the UNPATCHED helper — the „BCC vždy" wiring tests need the real SMTP path (behind a fake
@@ -549,6 +550,39 @@ def test_a_dropped_immediate_write_does_not_remail_on_the_next_run(iso, monkeypa
     stats2 = webapp.run_orders_reminder()
     assert stats2["emailed_now"] == 0
     assert all(m["to"] != "b@x.sk" for m in iso["sent"])
+
+
+def test_a_store_that_vanishes_mid_run_keeps_the_dedup_history(iso, monkeypatch):
+    """PR #228 review (F3): the final save re-reads `orders` from DISK, so when the store file
+    disappears while the run is in flight — deleted by hand (the corrupt-store message used to
+    tell the manager to do exactly that), a cleanup job, a botched restore — an `or {}` fallback
+    writes an EMPTY dedup map back. Every previously mailed order loses its record and the next
+    run mails those customers a SECOND time. The run's own `done` (start-of-run snapshot PLUS
+    the records this run persisted) is never less complete than a missing map, so it is the only
+    safe fallback here. The loader's dedup_keys guard already raises on a non-dict map, so this
+    fallback is purely protective — it can only fire when the map is absent."""
+    webapp.run_orders_reminder()                      # run 1: mails go out and are recorded
+    recorded = set(_store(iso).get("orders", {}))
+    assert recorded, "precondition: run 1 must leave dedup records behind"
+
+    real_load = webapp._load_orders_reminder
+    path = iso["tmp"] / "orders_reminder.json"
+
+    def vanishing_load():
+        data = real_load()
+        path.unlink(missing_ok=True)                  # the file is gone right after the read
+        return data
+
+    monkeypatch.setattr(webapp, "_load_orders_reminder", vanishing_load)
+    webapp.run_orders_reminder()                      # run 2: nothing new, but it saves display
+    monkeypatch.setattr(webapp, "_load_orders_reminder", real_load)
+
+    assert set(_store(iso).get("orders", {})) >= recorded, "run 2 wiped the dedup history"
+
+    iso["sent"].clear()
+    stats3 = webapp.run_orders_reminder()             # run 3 must not re-mail anybody
+    assert stats3["emailed_now"] == 0
+    assert iso["sent"] == []
 
 
 # ── VYLEPŠENIE 4 — „BCC vždy": no MAIL_BCC → the customer mail does not go out ─────
@@ -1244,3 +1278,300 @@ def test_a_future_claim_does_not_block_a_manual_send(iso):
     assert r.status_code == 200
     assert [m["to"] for m in iso["sent"]] == ["a@x.sk"]
     assert _store(iso)["orders"]["20261000"]["status"] == "emailed"
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #225 — a CORRUPT dedup store must never be degraded to {}.
+# Every other store in this app uses the „SAFE loader" pattern (unparseable → {}) because
+# losing a display flag is cosmetic. This file is different: it IS the record of which
+# customers were already mailed. Swallow a partial write here and the very next `_claim` /
+# `_persist_done` persists a brand-new ONE-entry map — the whole dedup history is gone and
+# every open order gets a SECOND reminder. So it fails CLOSED: copy the corrupt bytes aside,
+# abort the run, mail nobody, and let a human repair the file. A MISSING file stays a
+# legitimate first run and must not be blocked.
+# ═════════════════════════════════════════════════════════════════════════════════
+_TRUNCATED = '{"orders": {"20261001": {"status": "emai'      # partial write / full disk
+
+
+def test_corrupt_dedup_store_aborts_the_run_and_mails_nobody(iso):
+    webapp.run_orders_reminder()                       # run 1: 20261001 gets its reminder
+    assert len(iso["sent"]) == 1
+    p = iso["tmp"] / "orders_reminder.json"
+    p.write_text(_TRUNCATED, encoding="utf-8")
+    iso["sent"].clear()
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+
+    assert iso["sent"] == []                           # NOTHING was mailed
+    # the corrupt bytes are still there (never silently replaced by a fresh empty store)…
+    assert p.read_text(encoding="utf-8") == _TRUNCATED
+    # …and a copy is preserved for repair
+    backups = list(iso["tmp"].glob("orders_reminder.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == _TRUNCATED
+
+
+def test_a_json_list_in_the_store_is_corruption_too(iso):
+    """`isinstance(d, dict) else {}` was the second silent-wipe path: a store that parses but
+    is not a dict used to become {} exactly like an unreadable one."""
+    (iso["tmp"] / "orders_reminder.json").write_text('["not", "a", "store"]', encoding="utf-8")
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+
+
+def test_a_missing_store_is_a_normal_first_run(iso):
+    """The guard must distinguish „no file yet" (nothing was ever sent — nothing to lose) from
+    „unreadable file". Blocking the first run would break every fresh deploy."""
+    assert not (iso["tmp"] / "orders_reminder.json").exists()
+    stats = webapp.run_orders_reminder()               # must NOT raise
+    assert stats["emailed_now"] == 1
+
+
+def test_repeated_runs_do_not_pile_up_identical_corrupt_copies(iso):
+    """A daily automation would otherwise leave one backup per run until someone notices."""
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    for _ in range(3):
+        with pytest.raises(webapp.DedupStoreCorrupt):
+            webapp.run_orders_reminder()
+    assert len(list(iso["tmp"].glob("orders_reminder.json.corrupt-*"))) == 1
+
+
+def test_corrupt_store_surfaces_as_an_automation_error(iso):
+    """The manager must SEE why nothing was sent — a dead automation that looks like a quiet
+    day is the exact failure `bcc_missing` / `· chyby: N` exist to prevent."""
+    c = authed_client()
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    assert c.post("/api/automations/orders_reminder/run").get_json()["started"] is True
+    webapp.RUNNER._threads["orders_reminder"].join(timeout=15)
+    (a,) = [x for x in c.get("/api/automations").get_json()["automations"]
+            if x["key"] == "orders_reminder"]
+    assert a["last_status"] == "error"
+    assert "poškoden" in a["last_error"].lower()
+    assert iso["sent"] == []
+
+
+def test_manual_override_refuses_to_send_from_a_corrupt_store(iso):
+    """The endpoint writes into the SAME dedup map, so it must fail closed too — otherwise the
+    manual send is recorded into a fresh empty store and the wipe happens anyway."""
+    c = _seed(iso)
+    iso["sent"].clear()
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 503
+    assert "poškoden" in r.get_json()["error"].lower()
+    assert iso["sent"] == []
+
+
+def test_the_tab_still_renders_with_a_corrupt_store(iso):
+    """Read-only DISPLAY must keep degrading gracefully (never a 500) — the fail-closed rule is
+    about SENDING, not about rendering."""
+    c = _seed(iso)
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    r = c.get("/api/orders-reminder")
+    assert r.status_code == 200
+    assert r.get_json()["red"] == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #227 — a row the MANAGER resolved by hand must not be presented as an AI verdict.
+# The backend already writes `manual: True` onto the RECORD, but never onto the DISPLAY
+# row, so the tab renders every skipped row under „⚪ AI usúdilo, že zákazník je už
+# kontaktovaný" — including rows where the classifier provably never ran (no note at all,
+# no OPENAI_API_KEY, no MAIL_BCC). Unlike `pending` (a per-RUN note, stripped everywhere),
+# `manual` is a property of the RECORD and has to survive every later rebuild.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_manual_contact_marks_the_display_row_manual(iso):
+    c = _seed(iso)
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "contact"}).status_code == 200
+    st = _store(iso)
+    (row,) = [r for r in st["skipped"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
+    # …and the AI's OWN verdict must stay unmarked, or the split would be meaningless
+    (ai_row,) = [r for r in st["skipped"] if r["code"] == "20261002"]
+    assert "manual" not in ai_row
+
+
+def test_manual_send_marks_the_display_row_manual(iso):
+    c = _seed(iso)
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "send"}).status_code == 200
+    (row,) = [r for r in _store(iso)["orange"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
+
+
+def test_the_manual_flag_survives_a_rebuild_by_the_next_run(iso, monkeypatch):
+    """The run rebuilds the display lists from scratch. A manually-handled order that gets
+    re-processed (its fingerprint changed) must come back marked — otherwise the tab silently
+    re-attributes the manager's decision to the AI on the very next run."""
+    c = _seed(iso)
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "contact"}).status_code == 200
+    # the note appears → the order's fingerprint changes → it is fully re-processed, not carried
+    # forward by the incremental fast path
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    webapp.run_orders_reminder()
+    (row,) = [r for r in _store(iso)["skipped"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
+
+
+def _csv_with_one_more_note_order():
+    """A fresh >4d order WITH a note, so the next run really goes through OpenAI/SMTP for it —
+    while 20261000 stays note-free (RED) and remains clickable by the manager."""
+    return (ORDERS_CSV.decode("cp1250").rstrip("\r\n") + "\r\n"
+            + f"20261005;{OLD} 07:00:00;Vybavuje sa;volať zákazníka;e@x.sk;;Nový Zákazník;"
+              "Batoh;1;70,00\r\n").encode("cp1250")
+
+
+def test_a_row_resolved_by_hand_during_the_run_is_marked_manual(iso, monkeypatch):
+    """The third row-producing path (`_relocate`): the manager resolves the RED order WHILE the
+    run is busy classifying/mailing ANOTHER one, so the run moves its freshly-built red row into
+    `skipped` at the final save. That row must carry the manager's mark too."""
+    _seed(iso)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_one_more_note_order)
+    clicked = {}
+
+    def classify_and_click(note):
+        if "r" not in clicked:      # the manager handles the RED order mid-run
+            clicked["r"] = authed_client().post(
+                "/api/orders-reminder/override", json={"code": "20261000", "action": "contact"})
+        return _CLASSIFY[note]
+
+    monkeypatch.setattr(webapp, "_classify_contacted", classify_and_click)
+    webapp.run_orders_reminder()
+    assert clicked["r"].status_code == 200
+    st = _store(iso)
+    assert not [r for r in st["red"] if r["code"] == "20261000"]     # relocated out of red
+    (row,) = [r for r in st["skipped"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #217 — e-mail preview before sending. The manager could not see what the customer
+# gets until the automation had already sent it (blind send). The preview endpoint is
+# deliberately SEPARATE from the override 'send' action and must be provably inert:
+# no SMTP call, and not one byte written to the dedup store.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_reminder_preview_requires_login(iso):
+    anon = webapp.app.test_client()
+    assert anon.post("/api/orders-reminder/preview",
+                     json={"code": "20261000"}).status_code == 401
+
+
+def test_reminder_preview_returns_the_real_email_and_sends_nothing(iso):
+    c = _seed(iso)
+    iso["sent"].clear()
+    before = (iso["tmp"] / "orders_reminder.json").read_bytes()
+
+    r = c.post("/api/orders-reminder/preview", json={"code": "20261000"})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["ok"] is True
+    assert j["recipient"] == "a@x.sk"
+    # the SAME builder the automation and the manual send use — not a lookalike template
+    subject, html = orders_reminder.build_reminder_email("Ján Bez", "20261000")
+    assert (j["subject"], j["html"]) == (subject, html)
+    assert "Ján Bez" in j["html"] and "20261000" in j["html"]
+
+    assert iso["sent"] == []                                            # nothing was e-mailed
+    assert (iso["tmp"] / "orders_reminder.json").read_bytes() == before  # nothing was written
+    assert "20261000" not in (_store(iso).get("orders") or {})          # no claim, no record
+
+
+def test_reminder_preview_works_over_get_too(iso):
+    c = _seed(iso)
+    iso["sent"].clear()
+    r = c.get("/api/orders-reminder/preview?code=20261002")
+    assert r.status_code == 200 and r.get_json()["recipient"] == "c@x.sk"
+    assert iso["sent"] == []
+
+
+def test_reminder_preview_rejects_a_missing_or_unknown_code(iso):
+    c = _seed(iso)
+    iso["sent"].clear()
+    assert c.post("/api/orders-reminder/preview", json={}).status_code == 400
+    r = c.post("/api/orders-reminder/preview", json={"code": "99999999"})
+    assert r.status_code == 404
+    assert iso["sent"] == []
+
+
+def test_reminder_preview_fails_closed_on_a_corrupt_store(iso):
+    """It reads the same dedup store, so it inherits the #225 answer: a plain „not found" would
+    be misleading — the row may well exist, we just cannot read the file."""
+    c = _seed(iso)
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    r = c.post("/api/orders-reminder/preview", json={"code": "20261000"})
+    assert r.status_code == 503
+    assert "poškoden" in r.get_json()["error"].lower()
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #228 adversarial review — the #225 guard only validated the OUTER dict, so the
+# wipe it was written to stop was still reachable one level down. Plus two smaller
+# holes in the same guard: the most likely real truncation is not a JSONDecodeError,
+# and a corrupt store looked like a quiet day on the tab.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_a_non_dict_orders_map_is_corruption_not_an_empty_store(iso):
+    """`{"orders": null}` parses, and the file IS a dict — so the outer guard passed it, the run
+    read „nobody was ever mailed", and the final save persisted that as fact. Reproduced: the
+    run after that mailed the same customer a second time."""
+    webapp.run_orders_reminder()                       # run 1: 20261001 gets its reminder
+    assert len(iso["sent"]) == 1
+    p = iso["tmp"] / "orders_reminder.json"
+    st = json.loads(p.read_text())
+    st["orders"] = None                                # the dedup MAP itself is gone
+    p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    iso["sent"].clear()
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+    # …and the store was NOT rewritten with an empty map, so a later run cannot re-mail either
+    assert json.loads(p.read_text())["orders"] is None
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+
+
+def test_a_truncated_multibyte_write_is_corruption_too(iso):
+    """These stores are written with ensure_ascii=False and are full of Slovak text, so a write
+    cut mid-character raises UnicodeDecodeError — NOT JSONDecodeError. It used to escape the
+    loader entirely: no quarantine copy, a raw traceback in last_error, and a 500 on the tab."""
+    p = iso["tmp"] / "orders_reminder.json"
+    p.write_bytes(b'{"orders": {"20261001": {"status": "emailed", "name": "Ja\xc3')
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+    assert len(list(iso["tmp"].glob("orders_reminder.json.corrupt-*"))) == 1   # preserved
+    # the read-only tab still degrades gracefully instead of 500ing
+    assert authed_client().get("/api/orders-reminder").status_code == 200
+
+
+def test_the_tab_says_the_store_is_corrupt_instead_of_looking_empty(iso):
+    """An empty red/orange/skipped payload is indistinguishable from a quiet day. A corruption
+    appearing BETWEEN runs would otherwise be invisible until the next run failed — the same
+    „ticho mŕtva automatizácia" that bcc_missing exists to prevent."""
+    c = _seed(iso)
+    assert c.get("/api/orders-reminder").get_json().get("store_corrupt") in (False, None)
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    j = c.get("/api/orders-reminder").get_json()
+    assert j["store_corrupt"] is True and j["red"] == []
+
+
+def test_the_fast_path_re_derives_manual_from_the_record(iso):
+    """#227 self-heal: a display row carried over from before the flag existed (or one whose
+    record was corrected) must be re-marked from the RECORD, not trusted as rendered."""
+    webapp.run_orders_reminder()
+    p = iso["tmp"] / "orders_reminder.json"
+    st = json.loads(p.read_text())
+    st["orders"]["20261002"]["manual"] = True           # the record says: a human decided
+    for r in st["skipped"]:                             # …but the rendered row does not
+        r.pop("manual", None)
+    p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+
+    webapp.run_orders_reminder()                        # unchanged fingerprint → fast path
+    (row,) = [r for r in json.loads(p.read_text())["skipped"] if r["code"] == "20261002"]
+    assert row.get("manual") is True

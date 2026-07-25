@@ -106,9 +106,35 @@ def test_mark_red_order_as_contacted_moves_it_to_skipped(page, automations_serve
         "() => document.querySelectorAll('[data-testid=ordrem-red]"
         " tr[data-code=\"20261000\"]').length === 0")
     assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 0
-    skipped = page.locator('[data-testid="ordrem-skipped"]')
-    assert skipped.is_visible()
-    assert "20261000" in skipped.inner_text()
+    # …into the MANUAL section (#227), never under the „AI usúdilo…" heading: this order had no
+    # internal note at all, so the classifier never ran — the manager decided.
+    manual = page.locator('[data-testid="ordrem-manual"]')
+    assert manual.is_visible()
+    assert "20261000" in manual.inner_text()
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261000"]').count() == 0
+
+    assert console == [], f"console not clean: {console}"
+
+
+# ── #227 — a hand-resolved row must not be presented as an AI verdict ──────────────
+def test_manually_handled_row_renders_in_its_own_section(page, automations_server):
+    """Both kinds of row live in the backend's one `skipped` list (so the override endpoint finds
+    them the same way), but they mean opposite things: „⚪ AI usúdilo, že zákazník je už
+    kontaktovaný" is a claim about a classification that, for a manually-handled row, never
+    happened (no note, or no OPENAI_API_KEY / MAIL_BCC — the AI is deliberately not called)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    manual = page.locator('[data-testid="ordrem-manual"]')
+    assert manual.is_visible()
+    row = manual.locator('tr[data-code="20261007"]')
+    assert row.count() == 1
+    assert "Termoska Test Manual" in row.inner_text()
+    assert page.locator(".warnhead", has_text="vybavené ručne manažérom").count() == 1
+
+    # …and it is NOT in the AI-verdict table, while the AI's own row still is
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261007"]').count() == 0
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261002"]').count() == 1
 
     assert console == [], f"console not clean: {console}"
 
@@ -183,4 +209,33 @@ def test_an_unfinished_order_shows_its_reason_and_stays_actionable(page, automat
     assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261006"]').count() == 0
     assert "nestihol vybaviť" in page.locator(".warnhead", has_text="automat").inner_text()
 
+    assert console == [], f"console not clean: {console}"
+
+
+# ── #217 — náhľad e-mailu PRED odoslaním ──────────────────────────────────────────
+def test_preview_button_shows_the_email_without_sending(page, automations_server):
+    """The manager could not see what a customer gets until the automation had already sent it.
+    The preview dialog is inert BY CONSTRUCTION — it has no „Odoslať" button at all — so this
+    test can safely open it (it never clicks a send)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    row = page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]')
+    with page.expect_response("**/api/orders-reminder/preview") as resp:
+        row.locator('[data-testid="ordrem-preview-20261000"]').click()
+    assert resp.value.status == 200
+
+    modal = page.locator("#emModal")
+    modal.wait_for(state="visible")
+    assert "Ján Bez" in page.locator("#emRecipient").inner_text()
+    assert "jan@example.com" in page.locator("#emRecipient").inner_text()
+    assert "20261000" in page.locator("#emHead").inner_text()
+    # the rendered mail really is in the sandboxed iframe
+    assert "Ján Bez" in page.frame_locator("#emPreview").locator("body").inner_text()
+    # …and this dialog can never send: there is no send control in it
+    assert modal.locator("button").count() == 1
+    assert modal.locator("button").inner_text().strip() == "Zavrieť"
+
+    modal.locator("#emClose").click()
+    page.wait_for_selector("#emModal", state="hidden")
     assert console == [], f"console not clean: {console}"

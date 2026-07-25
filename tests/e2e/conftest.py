@@ -475,7 +475,12 @@ def automations_server(tmp_path_factory):
                                 "itemName": "Nohavice", "note": "volať zákazníka"},
                    "20261002": {"status": "skipped_contacted", "date": "2026-07-22T08:00:04+02:00",
                                 "name": "Iva Stará", "email": "iva@example.com",
-                                "itemName": "Čiapka", "note": "volané so zákazníkom"}},
+                                "itemName": "Čiapka", "note": "volané so zákazníkom"},
+                   # #227 — resolved BY THE MANAGER (`manual`), not by the classifier
+                   "20261007": {"status": "skipped_contacted", "manual": True,
+                                "date": "2026-07-22T08:10:00+02:00",
+                                "name": "Ručne Vybavený", "email": "rucne@example.com",
+                                "itemName": "Termoska", "note": ""}},
         "red": [{"code": "20261000", "billFullName": "Ján Bez", "phone": "+421900111222",
                  "email": "jan@example.com", "itemName": "Bunda Test Red", "days": 9,
                  "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261000&src=orders"}],
@@ -494,7 +499,16 @@ def automations_server(tmp_path_factory):
                      "email": "pending@example.com", "itemName": "Čelovka Test Pending",
                      "shopRemark": "volať zákazníka", "days": 5,
                      "pending": "odoslanie e-mailu zlyhalo — skúsim v ďalšom behu",
-                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261006&src=orders"}],
+                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261006&src=orders"},
+                    # #227 — an order the MANAGER resolved by hand. It shares the `skipped`
+                    # list with the AI's verdicts (so the override endpoint finds them the same
+                    # way) but means something completely different: here the classifier never
+                    # ran at all (no note), so rendering it under „AI usúdilo…" would be a lie.
+                    {"code": "20261007", "billFullName": "Ručne Vybavený",
+                     "email": "rucne@example.com", "itemName": "Termoska Test Manual",
+                     "shopRemark": "", "days": 4, "manual": True,
+                     "sent_date": "2026-07-22T08:10:00+02:00",
+                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261007&src=orders"}],
         # BUG 4 — an order whose customer has no e-mail on file: it can never be reminded, so
         # the run surfaces it here INSTEAD of paying for an AI classification on every run.
         "no_email": [{"code": "20261004", "billFullName": "Bez Mailu", "phone": "+421900999888",
