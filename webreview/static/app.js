@@ -753,37 +753,242 @@ async function switchTab(tab) {
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
 
+// The flag maps are replaced by the server's own state, so every in-flight write's
+// bookkeeping becomes void — dropping it stops a late failure from rolling FRESH data
+// back to a baseline that predates the reload (the `live` check in saveOrderFlag).
+// Fetch first, then drop the bookkeeping and install the new maps in ONE synchronous
+// block: clearing `_flagWrites` five awaits BEFORE the maps were swapped left a window in
+// which a click seeded its baseline from a still-optimistic value AND bound its write to
+// a map object about to be thrown away — a rollback into thin air.
 async function loadOrders() {
+  const _wipe = () => { for (const k of Object.keys(_flagWrites)) delete _flagWrites[k]; };
   try {
-    ORDERS = (await (await fetch('/api/orders')).json()).orders || [];
-    ORDERED = (await (await fetch('/api/ordered')).json()).ordered || {};
-    WAITING = (await (await fetch('/api/waiting')).json()).waiting || {};
-    INSTOCK = (await (await fetch('/api/instock')).json()).instock || {};
-    UNAVAIL = (await (await fetch('/api/unavailable')).json()).unavailable || {};
-    ORDER_COMMENTS = (await (await fetch('/api/order-comment')).json()).comments || {};
-  } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; ORDER_COMMENTS = {}; }
+    const [orders, ordered, waiting, instock, unavail, comments] = await Promise.all(
+      ['/api/orders', '/api/ordered', '/api/waiting', '/api/instock', '/api/unavailable',
+       '/api/order-comment'].map(u => fetch(u).then(r => r.json())));
+    _wipe();
+    ORDERS = orders.orders || [];
+    ORDERED = ordered.ordered || {};
+    WAITING = waiting.waiting || {};
+    INSTOCK = instock.instock || {};
+    UNAVAIL = unavail.unavailable || {};
+    ORDER_COMMENTS = comments.comments || {};
+  } catch (_) {
+    _wipe();
+    ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; ORDER_COMMENTS = {};
+  }
 }
 
-async function saveOrdered(key, ordered) {
-  if (ordered) ORDERED[key] = true; else delete ORDERED[key];
-  await fetch('/api/ordered', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, ordered })
-  });
+// #214 — every write on the „Na objednanie" tab reports its own failure. A silent
+// `if (!r.ok) return;` left the manager guessing whether his click landed (and, for the
+// optimistic flag toggles, showing a flag the server never stored). One message shape
+// for all of them, in the manager's language.
+const TO_ERR_DEDUP_MS = 5000;
+// Object.create(null): `where` carries the manager's free text (a supplier name), and a
+// group named '__proto__' must not swallow the entry.
+const _toOrderErrSeen = Object.create(null);
+// `where` = which row/order/product the write belonged to. It is part of the message AND
+// of the dedup key on purpose: working DOWN a supplier group is what this tab is for, so
+// 3-5 rows failing within a couple of seconds is the normal shape of a partial outage,
+// not a repeat of one event. Keying the dedup on the prose alone (which carries no row
+// identity) told the manager once and let the other flags quietly flip back, leaving him
+// unable to tell which of his writes landed — the silent failure #214 exists to remove.
+// `value` never reaches the manager — it is dedup-only. Without it a CORRECTION is
+// swallowed: he fixes a rejected pair URL and re-saves within the window (same what /
+// where / 'chyba 500') and gets no feedback at all, which is the silence being fixed.
+function toOrderSaveFailed(what, detail, where, value) {
+  const msg = '⚠️ ' + what + ' sa nepodarilo uložiť' + (where ? ' — ' + where : '')
+    + (detail ? ' (' + detail + ')' : '') + '. Skús to prosím znova.';
+  // alert() blocks the thread, so re-clicking the SAME refused write during one outage
+  // must still yield one modal — dedup per WRITE, within a few seconds.
+  const now = Date.now();
+  for (const k of Object.keys(_toOrderErrSeen)) {
+    if (now - _toOrderErrSeen[k] >= TO_ERR_DEDUP_MS) delete _toOrderErrSeen[k];
+  }
+  // NUL-joined, written as a source ESCAPE (a raw NUL byte in the file would have git
+  // and half the editors treat app.js as binary): the parts are free-form human text,
+  // so a printable separator could let two writes collide and swallow a message
+  const dedupKey = [what, where || '', detail || '', String(value == null ? '' : value)]
+    .join('\u0000');
+  if (_toOrderErrSeen[dedupKey] !== undefined) return;
+  _toOrderErrSeen[dedupKey] = now;
+  alert(msg);
 }
+
+// „obj. 20260910, kód C1" — the per-line key (orderCode|itemCode) in the manager's terms.
+// Empty parts are dropped, so a row missing one never reads as a dangling „kód .".
+const toOrderPartLabel = (kind, v) => (v ? kind + ' ' + v : '');
+function toOrderRowLabel(key) {
+  const [order, code] = String(key || '').split('|');
+  return [toOrderPartLabel('obj.', order), toOrderPartLabel('kód', code)]
+    .filter(Boolean).join(', ');
+}
+
+// Run one to-order write. Returns '' on success, else a short human reason. Reporting is
+// left to the caller ON PURPOSE: a caller that changed the UI optimistically must roll
+// back FIRST, so the tab is already telling the truth when the message pops up.
+async function postToOrder(path, payload) {
+  try {
+    const r = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (r.ok) return '';
+    // surface the endpoint's own reason — 'comment too long' / 'invalid supplier' /
+    // 'unauthorized' are all deterministic, so a bare status code would have the manager
+    // retrying a write that can never succeed
+    const j = await r.json().catch(() => null);
+    return 'chyba ' + r.status + (j && j.error ? ': ' + j.error : '');
+  } catch (_) {
+    return 'server neodpovedal';
+  }
+}
+
+// The four per-line flags (objednané / čaká sa / skladom / nedostupné) share one writer:
+// the flag map is set optimistically (the row + the supplier chips repaint synchronously
+// in the click handler), and on ANY failure it is rolled back and the tab re-rendered, so
+// what the manager sees is never a flag the server refused (#214).
+// One entry per (flag, row) that has a write in flight: { seq, confirmed }. `confirmed`
+// is the value the SERVER is known to hold — NOT a per-call snapshot of the map. A plain
+// double-click fires two writes for one row, and the second one's snapshot would be the
+// OPTIMISTIC value the first had just written; rolling back to that restores a flag the
+// server explicitly refused (the manager is told the save failed and then looks at a row
+// claiming it succeeded). Keyed per FLAG too — 'čaká sa' and 'skladom' are independent
+// writes on the same row and must not supersede each other.
+// (Responses arriving out of REQUEST order stay inherently unresolvable client-side;
+// this fixes the client's own bookkeeping, which is what invented the phantom flag.)
+const _flagWrites = Object.create(null);
+
+// The entry is NEVER deleted (bounded by rows x 4 flags): `confirmed` is this row+flag's
+// last known SERVER value and is the baseline for every future write. Deleting it on
+// settle opened a generation hole — a straggler from an older burst would land on the
+// entry a LATER click had freshly created and poison its baseline, putting the phantom
+// flag right back. `confirmedSeq` is what closes it: a write's acceptance only counts if
+// no LATER-issued write has already been accepted.
+function _flagEntry(field, key, map) {
+  const wk = field + '\u0000' + key;
+  return _flagWrites[wk]
+    || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedSeq: 0, inflight: 0 });
+}
+
+// When the LAST response outstanding for a (flag, row) has settled, the map must agree
+// with what the server confirmed. A superseded write that returned BLIND lost an ACCEPTED
+// write whose success landed after a newer one had already rolled back — and refused-fast
+// + accepted-slow is exactly what a partial outage produces (a 500/401 answers instantly
+// while a real write queues behind the app's `with _lock:` + atomic replace). The manager
+// was told „nepodarilo sa uložiť", the row showed the flag OFF, and the server held it ON.
+// `confirmed` is maintained by the highest-seq SUCCESSFUL write and still carries the
+// original baseline when every write failed, so reconciling to it is right in both
+// directions. Only the settling of the last in-flight write may do it: reconciling while
+// another write is still out would fight that write's own optimistic value.
+function _reconcileFlag(st, map, key) {
+  if (!!map[key] === st.confirmed) return;
+  if (st.confirmed) map[key] = true; else delete map[key];
+  renderToOrder();
+}
+
+async function saveOrderFlag(path, field, map, key, on, what) {
+  const st = _flagEntry(field, key, map);
+  const seq = ++st.seq;
+  st.inflight += 1;
+  let err;
+  // the decrement must be unskippable: postToOrder swallows every throw today, but a
+  // leaked counter would permanently disable reconciliation for this (flag, row) —
+  // the entry is never deleted, so it would never reach 0 again for the page's lifetime
+  try {
+    if (on) map[key] = true; else delete map[key];
+    err = await postToOrder(path, { key, [field]: on });
+  } finally { st.inflight -= 1; }
+  // `loadOrders()` drops the whole map when it re-reads the server, so an entry that is
+  // no longer the live one for its key must not roll anything back over fresh data
+  const live = _flagWrites[st.wk] === st;
+  if (!err && live && seq >= st.confirmedSeq) { st.confirmed = on; st.confirmedSeq = seq; }
+  if (!live || seq !== st.seq) {              // superseded: the newest write owns the row
+    if (live && st.inflight === 0) _reconcileFlag(st, map, key);
+    // A write the reload DISOWNED has no map left to roll back — but it still failed, and
+    // returning `false` in silence is the very silent-lost-write #214 exists to kill. A
+    // write superseded by a NEWER one on the same row stays quiet on purpose: that newer
+    // write owns the row and does the reporting.
+    if (!live && err) toOrderSaveFailed(what, err, toOrderRowLabel(key), on);
+    return !err;
+  }
+  if (!err) return true;
+  if (st.confirmed) map[key] = true; else delete map[key];
+  renderToOrder();              // roll the tab back BEFORE the message, never after
+  toOrderSaveFailed(what, err, toOrderRowLabel(key), on);
+  return false;
+}
+
+const saveOrdered = (key, on) =>
+  saveOrderFlag('/api/ordered', 'ordered', ORDERED, key, on, 'Označenie „objednané“');
+const saveWaiting = (key, on) =>
+  saveOrderFlag('/api/waiting', 'waiting', WAITING, key, on, 'Označenie „čaká sa“');
+const saveInstock = (key, on) =>
+  saveOrderFlag('/api/instock', 'instock', INSTOCK, key, on, 'Označenie „skladom“');
+const saveUnavailable = (key, on) =>
+  saveOrderFlag('/api/unavailable', 'unavailable', UNAVAIL, key, on, 'Označenie „nedostupné“');
 
 // Označiť celú skupinu dodávateľa objednané naraz (manažér objedná od dodávateľa
 // všetko naraz). Pošle všetky per-riadkové kľúče cez bulk endpoint, updatne ORDERED
 // mapu a prekreslí. items = riadky skupiny (each carries o.key = orderCode|itemCode).
+// ORDERED sa mení až PO úspechu, takže pri zlyhaní netreba nič vracať — len to povedať.
+//
+// A write that does not go through saveOrderFlag still changes the same rows, so it joins
+// the same `_flagWrites` bookkeeping — and it takes its sequence numbers when it is
+// ISSUED, exactly like a per-row write. Claiming them at RESPONSE time was the bug: the
+// bulk then outranked per-row writes the manager issued AFTER clicking it (newer intent,
+// and committed LATER on the server behind the bulk's own `with _lock:`), so his last
+// click was silently inverted — the tab painted the row the bulk's way, `_reconcileFlag`
+// forced the map to match on settle, and nothing was reported. Issue-time sequencing puts
+// the bulk where it belongs in the order and keeps the mirror case right too: a bulk that
+// was ACCEPTED is the newest server truth for its rows, so a later refused write rolls
+// back onto it, not onto the pre-bulk baseline.
 async function markGroupOrdered(items, ordered) {
   const keys = items.map(o => o.key);
-  const r = await fetch('/api/ordered/bulk', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ keys, ordered })
+  const sts = keys.map(k => _flagEntry('ordered', k, ORDERED));
+  const seqs = sts.map(st => ++st.seq);
+  sts.forEach(st => { st.inflight += 1; });
+  let err;
+  // unskippable, for the same reason as in saveOrderFlag: a leaked counter would disable
+  // reconciliation for those rows for the lifetime of the page
+  try {
+    err = await postToOrder('/api/ordered/bulk', { keys, ordered });
+  } finally { sts.forEach(st => { st.inflight -= 1; }); }
+  let repaint = false;
+  keys.forEach((key, i) => {
+    const st = sts[i], seq = seqs[i];
+    if (_flagWrites[st.wk] !== st) return;      // loadOrders() disowned this write
+    if (!err && seq >= st.confirmedSeq) { st.confirmed = ordered; st.confirmedSeq = seq; }
+    if (seq !== st.seq) {                       // a later write owns this row now
+      // …and once nothing else is out for it, the map owes the server's own last word
+      if (st.inflight === 0 && !!ORDERED[key] !== st.confirmed) {
+        if (st.confirmed) ORDERED[key] = true; else delete ORDERED[key];
+        repaint = true;
+      }
+      return;
+    }
+    if (err) {
+      // The bulk writes the map only on SUCCESS, so a refused owner is the ONE writer that
+      // neither wrote its value nor has one to roll back — and a predecessor it superseded
+      // skipped its own reconcile (still `inflight` then). Settling owes the server's last
+      // word here too, or that predecessor's refused optimistic value stays for good.
+      if (st.inflight === 0 && !!ORDERED[key] !== st.confirmed) {
+        if (st.confirmed) ORDERED[key] = true; else delete ORDERED[key];
+        repaint = true;
+      }
+      return;
+    }
+    if (ordered) ORDERED[key] = true; else delete ORDERED[key];
+    repaint = true;
   });
-  if (!r.ok) return;
-  for (const k of keys) { if (ordered) ORDERED[k] = true; else delete ORDERED[k]; }
+  if (err) {
+    if (repaint) renderToOrder();        // roll the tab back BEFORE the message, never after
+    toOrderSaveFailed('Hromadné označenie skupiny', err,
+                      items.length ? 'skupina ' + effSup(items[0]) : '', ordered);
+    return false;
+  }
   renderToOrder();
+  return true;
 }
 
 // ── Nedostupné tovary (#100) ───────────────────────────────────────────────
@@ -974,54 +1179,36 @@ function initNdModal() {
   if (send) send.onclick = ndSendNow;
 }
 
-async function saveWaiting(key, waiting) {
-  if (waiting) WAITING[key] = true; else delete WAITING[key];
-  await fetch('/api/waiting', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, waiting })
-  });
-}
-
-async function saveInstock(key, instock) {
-  if (instock) INSTOCK[key] = true; else delete INSTOCK[key];
-  await fetch('/api/instock', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, instock })
-  });
-}
-
-async function saveUnavailable(key, unavailable) {
-  if (unavailable) UNAVAIL[key] = true; else delete UNAVAIL[key];
-  await fetch('/api/unavailable', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, unavailable })
-  });
-}
-
 // Inline pairing: paste the supplier reorder URL straight onto an order line.
 // Persists per forestshop code (covers items outside the review dataset too).
-async function savePairUrl(o, url, row) {
-  if (url && !/^https?:\/\//.test(url)) return;   // ignore non-URL input
-  const r = await fetch('/api/order-pair', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code: o.itemCode, url })
-  });
-  if (!r.ok) return;
-  o.pairUrl = url;                       // re-render so the new link shows immediately
-  row.replaceWith(renderOrderRow(o));
+async function savePairUrl(o, url) {
+  if (url && !/^https?:\/\//.test(url)) {
+    // #214 — the guard used to drop a typo'd URL on the floor with no explanation
+    alert('⚠️ Zadaj platnú adresu začínajúcu http:// alebo https:// — takto sa uložiť nedá.');
+    return false;
+  }
+  const err = await postToOrder('/api/order-pair', { code: o.itemCode, url });
+  if (err) { toOrderSaveFailed('Párovacia URL', err, toOrderPartLabel('kód', o.itemCode), url); return false; }
+  // the pairing is keyed by itemCode (a PRODUCT property) → /api/orders already serves
+  // it on EVERY order line of that code, so mirror that client-side: without it the
+  // sibling lines keep showing an empty paste box for a product that IS paired (#204).
+  for (const x of ORDERS) if (x.itemCode === o.itemCode) x.pairUrl = url;
+  renderToOrder();                       // re-render so the new link shows immediately
+  return true;
 }
 
 // inline-pairing editor (code + URL input + save) — used for an unpaired row and
 // when ✏️-editing an already-paired one
-function pairEditor(o, row, focus) {
+function pairEditor(o, focus) {
   const pair = el('div', 'to-pair');
+  pair.dataset.editor = 'pair';        // so a repaint can carry unsaved typing over
   pair.appendChild(el('span', 'to-pcode', escapeHtml(o.itemCode || '')));
   const inp = el('input', 'to-pairurl'); inp.type = 'url';
   inp.placeholder = o.pairUrl ? 'upraviť párovaciu URL…' : 'vlož párovaciu URL dodávateľa…';
   inp.value = o.pairUrl || '';
   const save = el('button', 'to-pairsave', '💾 Spárovať');
   save.title = 'Uložiť párovaciu URL — objaví sa ako odkaz a pôjde do importu';
-  const doSave = () => savePairUrl(o, inp.value.trim(), row);
+  const doSave = () => commitEditor(pair, () => savePairUrl(o, inp.value.trim()));
   save.onclick = doSave;
   inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
   pair.appendChild(inp); pair.appendChild(save);
@@ -1029,37 +1216,155 @@ function pairEditor(o, row, focus) {
   return pair;
 }
 
+// Does this order line carry its OWN supplier from Shoptet? A supplier of only spaces is
+// truthy but is not a supplier. Single source of truth for BOTH the grouping (effSup) and
+// the row-level gate that shows the inline assign editor — when only effSup trimmed, such
+// a row grouped under '—' yet showed no editor, i.e. the one place it could be fixed.
+const hasOwnSupplier = (o) => !!(o.supplier || '').trim();
+
+// Every href built from a STORE value goes through this: the write endpoints validate
+// the scheme, but a `javascript:` left in a store by any other path would otherwise
+// render as a clickable link. Same guard the GRUBE .de link already carries.
+const safeHttpUrl = (u) => (/^https?:\/\//.test(u || '') ? u : '');
+
+// Swap a read-only chip/link for its editor. The marker says the manager OPENED this
+// one himself, so a repaint keeps it open even if he has emptied it (unlike the
+// editors a row renders by default when nothing is paired/assigned yet).
+function openRowEditor(node, editor, alsoRemove) {
+  editor.dataset.editorOpened = '1';
+  node.replaceWith(editor);
+  if (alsoRemove) alsoRemove.remove();
+}
+
+// Saving CONSUMES the „he opened it himself" claim: once the manager has committed the
+// value, the repaint that follows must be free to collapse the editor back to the link /
+// tag / add-button — including when he deliberately saved it EMPTY to delete the note
+// (value and stored are then both '', so only this marker tells the two apart from the
+// „opened, nothing typed yet" box that MUST survive). A save that FAILED gives the claim
+// straight back: that box still holds his unsaved work.
+async function commitEditor(wrap, save) {
+  wrap.dataset.editorSaving = '1';
+  if (await save()) return;
+  delete wrap.dataset.editorSaving;
+  // …but a repaint during the flight (a failed flag write, a sibling's successful save)
+  // has already dropped this node, and an EMPTY commit leaves captureOpenEditors nothing
+  // to carry over (value '' with the „he opened it himself" claim consumed) — so the box
+  // simply vanished, and the claim just went back to a DETACHED node. He is being told
+  // his save failed while the editor holding that work is gone: give it back.
+  if (!wrap.isConnected) reopenDetachedEditor(wrap);
+}
+
+// Re-open the editor `wrap` used to be, on the freshly rendered row, with the text it
+// held. The old subtree is detached but intact, so it still carries both the row key and
+// the value. Deliberately mirrors restoreOpenEditors' mechanics (same `_EDITORS` spec) —
+// this is the same job, just one repaint too late to be caught by the snapshot.
+function reopenDetachedEditor(wrap) {
+  const spec = _EDITORS[wrap.dataset.editor];
+  const oldRow = wrap.closest('.toorder-row');
+  const key = oldRow && oldRow.dataset.key;
+  const opened = wrap.dataset.editorOpened === '1';
+  const inpOld = spec && wrap.querySelector(spec.input);
+  if (!spec || !key || !inpOld) return;
+  const value = inpOld.value;
+  if (!value.trim() && !opened) return;      // nothing of his to give back
+  const row = [...document.querySelectorAll('#list .toorder-row')]
+    .find(r => r.dataset.key === key);
+  const o = row && ORDERS.find(x => x.key === key);
+  if (!o) return;                            // row filtered out / gone — nowhere to put it
+  let inp = row.querySelector(spec.input), ed = null;
+  if (!inp) { ed = spec.open(o, row); inp = ed && ed.querySelector(spec.input); }
+  if (!inp) return;
+  if (opened && ed) ed.dataset.editorOpened = '1';   // the claim comes back with the box
+  inp.value = value;
+  inp.focus();
+}
+
 // effective supplier for grouping: the order's OWN supplier (from Shoptet) wins;
 // a manual assignment only fills in a line that arrived WITHOUT a supplier (BUG 1 —
 // a stale assignment must never prebiehať the real supplier / clobber the eshop).
-const effSup = (o) => (o.supplier || o.assignedSupplier || '—');
+const effSup = (o) => (hasOwnSupplier(o) ? o.supplier : (o.assignedSupplier || '')).trim() || '—';
+
+// #203 — the supplier name is free text the manager types by hand, so the SAME supplier
+// keeps arriving spelled differently ('CITRADE' / 'Citrade' / 'Citrade  s.r.o.'). Group,
+// colour and filter by a case+whitespace-insensitive key so one supplier is ONE chip and
+// ONE group; the CASE of the stored value is never touched (it goes verbatim into the
+// eshop `supplier` column). normSupplierName mirrors the server's `" ".join(s.split())`
+// exactly, so the name the client shows is the name the server stored.
+const normSupplierName = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+const supKey = (s) => normSupplierName(s).toLocaleLowerCase('sk');
+// Chip/filter keys are namespaced so a supplier literally named "All" can never collide
+// with the 'all' (Všetci) sentinel — with case-folding that collision got likelier.
+const supFilterKey = (o) => 's:' + supKey(effSup(o));
+// The spelling to SHOW for a normalised key: the one used most often (ties → alphabetical,
+// so the label never flickers between renders).
+const supCanonPick = (counts) => Object.keys(counts).sort(
+  (a, b) => (counts[b] - counts[a]) || (a < b ? -1 : a > b ? 1 : 0))[0];
+
+// One pass over ORDERS → { canon, known }:
+//   canon: chip/group key ('s:'+normalised) → the spelling to display
+//   known: every distinct supplier seen in EITHER column, deduped case-insensitively,
+//          canonical spelling, alphabetical — the `known-suppliers` autocomplete list
+//          (which exists precisely to stop typo/case fragmentation at the source).
+// Object.create(null) everywhere the KEY comes from the manager's free text: a supplier
+// named '__proto__' silently swallows writes on a normal object literal (the chip would
+// render as its raw key and vanish from the datalist) and one named 'constructor' would
+// write the counter onto the global Object.
+function supplierSpellingIndex(orders) {
+  const bump = (m, k, raw) => {
+    const b = (m[k] = m[k] || Object.create(null));
+    b[raw] = (b[raw] || 0) + 1;
+  };
+  const grp = Object.create(null), all = Object.create(null);
+  for (const o of orders || []) {
+    // the DISPLAYED spelling is whitespace-normalised (mirrors what the server stored),
+    // only the capitalisation the manager chose is preserved
+    bump(grp, supFilterKey(o), normSupplierName(effSup(o)));
+    for (const raw of [o.supplier, o.assignedSupplier]) {
+      const name = normSupplierName(raw);
+      if (name) bump(all, supKey(name), name);
+    }
+  }
+  const canon = Object.create(null);
+  for (const k of Object.keys(grp)) canon[k] = supCanonPick(grp[k]);
+  // The datalist must offer the SAME spelling the chip shows. `grp` counts one vote per
+  // ROW (effSup — the order's own supplier wins), `all` one vote per COLUMN, so a stale
+  // assignment could outvote the chip: the tab said 'CITRADE (4)' while the autocomplete
+  // offered 'Citrade', and the manager typed the one the datalist gave him. `all` still
+  // decides WHICH suppliers are offered (a shadowed assignment is a real name he used) —
+  // only the spelling of a name that has a chip is taken from `canon`.
+  const known = Object.keys(all).sort().map(k => canon['s:' + k] || supCanonPick(all[k]));
+  return { canon, known };
+}
 
 // Inline supplier assign: fill in the supplier for an order line that arrived WITHOUT
 // one. Persists per forestshop code; the row then regroups under that supplier and the
 // name is written back to the eshop `supplier` field by the nightly upload.
-async function saveSupplier(o, supplier, row) {
-  const r = await fetch('/api/order-supplier', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code: o.itemCode, supplier })
-  });
-  if (!r.ok) return;
+async function saveSupplier(o, raw) {
+  // normalise BEFORE sending, with the same rule the endpoint applies — otherwise the row
+  // (and the ✏️ editor reopened on it) would keep showing 'Citrade   s.r.o.' while the
+  // store, and the eshop `supplier` column it feeds, hold 'Citrade s.r.o.'
+  const supplier = normSupplierName(raw);
+  const err = await postToOrder('/api/order-supplier', { code: o.itemCode, supplier });
+  if (err) { toOrderSaveFailed('Priradenie dodávateľa', err, toOrderPartLabel('kód', o.itemCode), supplier); return false; }
   // assignment is keyed by itemCode (a product property) → apply to EVERY order line
   // of that code, so all sibling lines regroup together (not just the clicked one)
   for (const x of ORDERS) if (x.itemCode === o.itemCode) x.assignedSupplier = supplier;
   renderToOrder();                 // re-render: the row(s) move into the supplier group
+  return true;
 }
 
 // supplier editor (text input with known-supplier autocomplete + save) — used for an
 // unassigned no-supplier row and when ✏️-editing an already-assigned one
-function supplierEditor(o, row, focus) {
+function supplierEditor(o, focus) {
   const wrap = el('div', 'to-supplier');
+  wrap.dataset.editor = 'supplier';    // so a repaint can carry unsaved typing over
   const inp = el('input', 'to-supinput'); inp.type = 'text';
   inp.placeholder = o.assignedSupplier ? 'upraviť dodávateľa…' : 'doplniť dodávateľa…';
   inp.value = o.assignedSupplier || '';
   inp.setAttribute('list', 'known-suppliers');   // autocomplete from existing suppliers
   const save = el('button', 'to-supsave', '💾 Uložiť');
   save.title = 'Priradiť dodávateľa — položka sa zaradí pod neho a zapíše sa do eshopu';
-  const doSave = () => saveSupplier(o, inp.value.trim(), row);
+  const doSave = () => commitEditor(wrap, () => saveSupplier(o, inp.value.trim()));
   save.onclick = doSave;
   inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
   wrap.appendChild(inp); wrap.appendChild(save);
@@ -1071,27 +1376,26 @@ function supplierEditor(o, row, focus) {
 // Shoptet "Poznámka e-shopu"). Keyed by orderCode, so it applies to every line of that
 // order → after a save re-render the whole tab so all sibling lines reflect it (same
 // per-shared-property propagation as saveSupplier).
-async function saveOrderComment(o, comment, row) {
-  const r = await fetch('/api/order-comment', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ orderCode: o.orderCode, comment })
-  });
-  if (!r.ok) return;
+async function saveOrderComment(o, comment) {
+  const err = await postToOrder('/api/order-comment', { orderCode: o.orderCode, comment });
+  if (err) { toOrderSaveFailed('Komentár k objednávke', err, toOrderPartLabel('obj.', o.orderCode), comment); return false; }
   if (comment) ORDER_COMMENTS[o.orderCode] = comment; else delete ORDER_COMMENTS[o.orderCode];
   renderToOrder();
+  return true;
 }
 
 // comment editor (multi-line textarea + save) — opened from the 💬 button on a row.
 // Ctrl/⌘+Enter saves (plain Enter keeps the note multi-line, like the admin textarea).
-function commentEditor(o, row, focus) {
+function commentEditor(o, focus) {
   const wrap = el('div', 'to-comment-edit');
+  wrap.dataset.editor = 'comment';     // so a repaint can carry unsaved typing over
   const inp = el('textarea', 'to-cominput');
   inp.rows = 2;
   inp.placeholder = 'komentár k objednávke…';
   inp.value = ORDER_COMMENTS[o.orderCode] || '';
   const save = el('button', 'to-comsave', '💾 Uložiť');
   save.title = 'Uložiť komentár k objednávke (Ctrl+Enter)';
-  const doSave = () => saveOrderComment(o, inp.value.trim(), row);
+  const doSave = () => commitEditor(wrap, () => saveOrderComment(o, inp.value.trim()));
   save.onclick = doSave;
   inp.onkeydown = (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSave(); }
@@ -1109,24 +1413,36 @@ function renderOrderRow(o) {
   cb.title = 'Označiť ako objednané';
   cb.onchange = () => { saveOrdered(o.key, cb.checked); row.classList.toggle('done', cb.checked); renderOrderFilters(); };
   row.appendChild(cb);
-  if (o.supplierUrl) {
+  // A stored value `safeHttpUrl` refuses must NOT become an <a> at all: `href=""`
+  // resolves to the PAGE ITSELF, so one click reloads the tab and takes every open
+  // editor — and the half-typed work in it — with it. The value is never echoed back
+  // into a tooltip either.
+  const supHref = safeHttpUrl(o.supplierUrl), pairHref = safeHttpUrl(o.pairUrl);
+  if (supHref) {
     // reviewed decision link — authoritative, read-only (mení sa v párovacom tabe)
-    const a = el('a', 'to-link'); a.href = o.supplierUrl; a.target = '_blank'; a.rel = 'noopener';
+    const a = el('a', 'to-link'); a.href = supHref; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
-  } else if (o.pairUrl) {
+  } else if (o.supplierUrl) {
+    // read-only slot with an unusable value — say so instead of faking a link
+    const bad = el('span', 'to-badlink', '🔗 ' + escapeHtml(o.itemCode || 'link'));
+    bad.title = 'Uložená adresa nie je platný http(s) odkaz — oprav ju v párovacom tabe';
+    row.appendChild(bad);
+  } else if (pairHref) {
     // inline-napárované → svieti rovnako ako ostatné napárované (🔗 odkaz) +
     // malá ✏️ na opravu, ak dal zlú URL
-    const a = el('a', 'to-link'); a.href = o.pairUrl; a.target = '_blank'; a.rel = 'noopener';
-    a.textContent = '🔗 ' + (o.itemCode || 'link'); a.title = o.pairUrl;
+    const a = el('a', 'to-link'); a.href = pairHref; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
     const edit = el('button', 'to-pairedit', '✏️');
     edit.title = 'Zmeniť / opraviť párovaciu URL';
-    edit.onclick = () => { a.replaceWith(pairEditor(o, row, true)); edit.remove(); };
+    edit.onclick = () => openRowEditor(a, pairEditor(o, true), edit);
     row.appendChild(edit);
   } else {
+    // an unusable inline pairing falls through to the paste box (its value pre-filled,
+    // inert in an input) so the manager can repair it right where he sees it
     // nenapárované → políčko na vloženie URL (otvára produkt pri objednávaní)
-    row.appendChild(pairEditor(o, row, false));
+    row.appendChild(pairEditor(o, false));
   }
   // GRUBE per-veľkosť kód: kopírovateľný čip + .de objednávacia linka. GRUBE nemá B2B
   // auto-objednávanie, takže manažér skopíruje presný veľkostný kód do e-mailu.
@@ -1148,17 +1464,17 @@ function renderOrderRow(o) {
   row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));
   // supplier assign — ONLY for order lines that arrived WITHOUT a supplier. Same shape
   // as the URL pairing: doplniť → svieti názov + malá ✏️ na opravu.
-  if (!o.supplier) {
+  if (!hasOwnSupplier(o)) {
     if (o.assignedSupplier) {
       const tag = el('span', 'to-suptag', '🏷️ ' + escapeHtml(o.assignedSupplier));
       tag.title = 'Doplnený dodávateľ (zapíše sa do eshopu)';
       row.appendChild(tag);
       const sed = el('button', 'to-supedit', '✏️');
       sed.title = 'Zmeniť / opraviť dodávateľa';
-      sed.onclick = () => { tag.replaceWith(supplierEditor(o, row, true)); sed.remove(); };
+      sed.onclick = () => openRowEditor(tag, supplierEditor(o, true), sed);
       row.appendChild(sed);
     } else {
-      row.appendChild(supplierEditor(o, row, false));
+      row.appendChild(supplierEditor(o, false));
     }
   }
   if (o.orderDate) {
@@ -1201,12 +1517,12 @@ function renderOrderRow(o) {
     row.appendChild(tag);
     const ce = el('button', 'to-comedit', '✏️');
     ce.title = 'Upraviť komentár k objednávke';
-    ce.onclick = () => { tag.replaceWith(commentEditor(o, row, true)); ce.remove(); };
+    ce.onclick = () => openRowEditor(tag, commentEditor(o, true), ce);
     row.appendChild(ce);
   } else {
     const add = el('button', 'to-comadd', '💬 Komentár');
     add.title = 'Pridať komentár k objednávke';
-    add.onclick = () => { add.replaceWith(commentEditor(o, row, true)); };
+    add.onclick = () => openRowEditor(add, commentEditor(o, true));
     row.appendChild(add);
   }
   // 'čaká sa' — aktívna objednávka, ktorú zatiaľ neobjednávame/naskladňujeme
@@ -1261,64 +1577,193 @@ function isHandled(o) {
 // GREEN (todo) = at least one line still un-flagged, ORANGE (active) = the selected chip.
 // Called by renderToOrder AND by every per-line flag toggle so the chips recolour LIVE as
 // the manager works the list (each toggle updates a flag map, then re-renders this bar).
-function renderOrderFilters() {
+function renderOrderFilters(idx) {
   const fbar = document.getElementById('filters');
   if (!fbar || ACTIVE_TAB !== 'toorder') return;
   const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
+  // keyed by the NORMALISED supplier (#203) so case variants share one chip/count/colour.
+  // renderToOrder passes its own index in (one pass per paint instead of two); a bare
+  // toggle-triggered call builds it itself.
+  const { canon } = idx || supplierSpellingIndex(ORDERS);
   const cnt = {}, newest = {}, unhandled = {};
   for (const o of ORDERS) {
-    const s = effSup(o);
+    const s = supFilterKey(o);
     cnt[s] = (cnt[s] || 0) + 1;
     if (!isHandled(o)) unhandled[s] = (unhandled[s] || 0) + 1;
     newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
   }
   const allHandledGlobal = ORDERS.length > 0 && ORDERS.every(isHandled);
-  const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
+  const lbl = (k) => canon[k] || k;   // sort/compare on the DISPLAYED spelling
+  const byPriority = (a, b) => (newest[b] - newest[a])
+    || (lbl(a) < lbl(b) ? -1 : lbl(a) > lbl(b) ? 1 : 0);
   fbar.innerHTML = '';
-  const mk = (key, lbl, done) => {
+  const mk = (key, text, done) => {         // `text`, not `lbl` — would shadow lbl() above
     const cls = (ORDER_SUPPLIER === key ? 'active ' : '') + (done ? 'done' : 'todo');
-    const b = el('button', cls, lbl);
+    const b = el('button', cls, text);
     b.onclick = () => { ORDER_SUPPLIER = key; localStorage.setItem('orderSupplier', key); window.scrollTo(0, 0); render(); };
     return b;
   };
   fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`, allHandledGlobal));
   // escapeHtml: a supplier name is manually assignable (free text) → never trust it in
   // the innerHTML-based el() helper. done (RED) = no un-flagged line left; todo (GREEN) = some.
-  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${escapeHtml(s)} (${cnt[s]})`, !unhandled[s]));
+  for (const s of Object.keys(cnt).sort(byPriority)) {
+    fbar.appendChild(mk(s, `${escapeHtml(lbl(s))} (${cnt[s]})`, !unhandled[s]));
+  }
+}
+
+// A whole-tab repaint (a failed flag's rollback, a saved pair URL / supplier / comment)
+// used to silently destroy whatever the manager had half-typed into ANY open inline
+// editor on ANY row — and the message he got talked only about the flag, so the lost note
+// was invisible. Since #204 even a SUCCESSFUL pair save repaints the whole tab, so this
+// hits the happy path too. The three editors tag their wrapper with `data-editor`, which
+// lets one generic pass carry the unsaved text across the repaint.
+// null-prototype: the lookup key is a `data-editor` attribute read off the DOM, and no
+// DOM-keyed map in this file may inherit `constructor` / `toString`
+const _EDITORS = Object.assign(Object.create(null), {
+  pair: {
+    input: '.to-pairurl',
+    stored: (o) => o.pairUrl || '',
+    same: (a, b) => a.trim() === b.trim(),
+    open: (o, row) => {
+      const a = row.querySelector('a.to-link'), edit = row.querySelector('.to-pairedit');
+      if (!a || !edit) return null;
+      const ed = pairEditor(o, false); a.replaceWith(ed); edit.remove(); return ed;
+    },
+  },
+  supplier: {
+    input: '.to-supinput',
+    stored: (o) => o.assignedSupplier || '',
+    // the endpoint whitespace-normalises what it stores, so '  X   Y ' IS the saved value
+    same: (a, b) => normSupplierName(a) === normSupplierName(b),
+    open: (o, row) => {
+      const tag = row.querySelector('.to-suptag'), edit = row.querySelector('.to-supedit');
+      if (!tag || !edit) return null;
+      const ed = supplierEditor(o, false); tag.replaceWith(ed); edit.remove(); return ed;
+    },
+  },
+  comment: {
+    input: '.to-cominput',
+    stored: (o) => (o.orderCode && ORDER_COMMENTS[o.orderCode]) || '',
+    same: (a, b) => a.trim() === b.trim(),
+    open: (o, row) => {
+      const add = row.querySelector('.to-comadd');
+      if (add) { const ed = commentEditor(o, false); add.replaceWith(ed); return ed; }
+      const tag = row.querySelector('.to-comment'), edit = row.querySelector('.to-comedit');
+      if (!tag || !edit) return null;
+      const ed = commentEditor(o, false); tag.replaceWith(ed); edit.remove(); return ed;
+    },
+  },
+});
+
+function captureOpenEditors() {
+  const out = [];
+  for (const w of document.querySelectorAll('#list [data-editor]')) {
+    const spec = _EDITORS[w.dataset.editor];
+    const row = w.closest('.toorder-row');
+    const inp = spec && w.querySelector(spec.input);
+    if (!row || !inp) continue;
+    // the selection API throws on some input types; this runs BEFORE list.innerHTML='',
+    // so an unguarded throw here would abort the repaint and skip the rollback with it
+    let sel = [null, null];
+    try { sel = [inp.selectionStart, inp.selectionEnd]; } catch (_) { /* no selection API */ }
+    out.push({
+      kind: w.dataset.editor, key: row.dataset.key, value: inp.value,
+      opened: w.dataset.editorOpened === '1' && w.dataset.editorSaving !== '1',
+      focused: document.activeElement === inp, sel,
+    });
+  }
+  return out;
+}
+
+function restoreOpenEditors(snaps) {
+  if (!snaps.length) return;
+  const rows = [...document.querySelectorAll('#list .toorder-row')];
+  for (const s of snaps) {
+    const spec = _EDITORS[s.kind];
+    const row = rows.find(r => r.dataset.key === s.key);   // filtered out / gone → drop it
+    const o = row && ORDERS.find(x => x.key === s.key);
+    if (!spec || !o) continue;
+    // only UNSAVED TYPING is carried over. An EMPTY box holds none — and pair/supplier
+    // editors are rendered empty BY DEFAULT on every unpaired/unassigned row, so treating
+    // one as unsaved work would pin an empty input onto a sibling line that a
+    // just-propagated per-product value (#204) has since paired. A value that now equals
+    // what is stored was likewise just saved, and re-opening its editor would undo the
+    // „it landed" feedback (the row would show an input instead of the new link / tag).
+    // an EMPTY box normally holds no unsaved work — but one the manager OPENED with ✏️/💬
+    // is his, whether he has typed into it yet or has deliberately cleared it. That
+    // exception has to be weighed BEFORE „same as stored": on a row with nothing stored
+    // the box and the stored value are BOTH '', so `same` fired first and closed the box
+    // under a manager who was about to type into it. A NON-empty value equal to what is
+    // stored is the just-saved case and still closes — re-opening it would replace the
+    // freshly rendered link / tag with an input again.
+    const emptyOpened = s.opened && !s.value.trim();
+    if (!emptyOpened && spec.same(s.value, spec.stored(o))) continue;
+    if (!s.value.trim() && !s.opened) continue;
+    let inp = row.querySelector(spec.input);
+    let ed = null;
+    if (!inp) { ed = spec.open(o, row); inp = ed && ed.querySelector(spec.input); }
+    if (!inp) continue;
+    if (s.opened && ed) ed.dataset.editorOpened = '1';   // stays „opened" across repaints
+    inp.value = s.value;
+    if (s.focused) {
+      inp.focus();
+      try { inp.setSelectionRange(s.sel[0], s.sel[1]); } catch (_) { /* no selection API */ }
+    }
+  }
 }
 
 function renderToOrder() {
+  // `#list`/`#empty` are SHARED with the review tab, and this now runs from async
+  // continuations (a failed save's rollback, a saved pair URL / supplier / comment) —
+  // without this guard a late re-render would wipe the review cards, and any open
+  // resolution panel with them, after the manager switched tabs. Same guard as
+  // renderOrderFilters; switchTab → render() repaints the tab on return anyway.
+  if (ACTIVE_TAB !== 'toorder') return;
   // Najnovšie objednávky hore — Marek je tak naučený zo Shoptetu. Čísla objednávok sú
   // chronologické (vyššie = novšie); dodávateľ s NAJNOVŠOU objednávkou hore, v rámci
   // dodávateľa od najnovšej. Ne-číselné orderCode = -Infinity (nikdy nedominuje vrch).
+  const keepY = window.scrollY;    // list.innerHTML='' collapses the page → the browser
+                                   // would clamp the scroll to 0 on every save/rollback
+  const editors = captureOpenEditors();   // …and would eat any half-typed editor with it
   const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
-  // datalist of known supplier names (avoid typo-fragmented groups) — distinct real
-  // suppliers seen across orders, both order-given and manually assigned
-  const known = [...new Set(ORDERS.flatMap(o => [o.supplier, o.assignedSupplier]).filter(Boolean))].sort();
+  // #203 — one entry per REAL supplier: grouping keys and the datalist of known supplier
+  // names (which exists to avoid typo/case-fragmented groups) both come from the
+  // case+whitespace-insensitive index, labelled with the manager's most-used spelling.
+  const { canon, known } = supplierSpellingIndex(ORDERS);
   let dl = document.getElementById('known-suppliers');
   if (!dl) { dl = el('datalist'); dl.id = 'known-suppliers'; document.body.appendChild(dl); }
   dl.innerHTML = '';
   for (const s of known) { const opt = document.createElement('option'); opt.value = s; dl.appendChild(opt); }
   const newest = {};
   for (const o of ORDERS) {
-    const s = effSup(o);
+    const s = supFilterKey(o);
     newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
   }
-  // dodávateľ s NAJNOVŠOU objednávkou hore; zhoda → abecedne
-  const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
-  renderOrderFilters();   // live-coloured supplier chips (recomputed from the flag maps)
+  // dodávateľ s NAJNOVŠOU objednávkou hore; zhoda → abecedne (podľa zobrazenej menovky)
+  const lbl = (k) => canon[k] || k;
+  const byPriority = (a, b) => (newest[b] - newest[a])
+    || (lbl(a) < lbl(b) ? -1 : lbl(a) > lbl(b) ? 1 : 0);
+  // a selection carried over from another day (or migrated from the old raw-name scheme)
+  // may match no supplier in today's orders → the manager would face an empty list with no
+  // active chip. Fall back to „Všetci"; never on an empty ORDERS (a transient /api/orders
+  // failure must not throw his filter away).
+  if (ORDERS.length > 0 && ORDER_SUPPLIER !== 'all' && !canon[ORDER_SUPPLIER]) {
+    ORDER_SUPPLIER = 'all';
+    localStorage.setItem('orderSupplier', 'all');
+  }
+  renderOrderFilters({ canon, known });   // live-coloured chips (recomputed from the flag maps)
   const list = document.getElementById('list'); list.innerHTML = '';
-  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || effSup(o) === ORDER_SUPPLIER);
+  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || supFilterKey(o) === ORDER_SUPPLIER);
   document.getElementById('empty').hidden = shown.length > 0;
-  const groups = {};
-  for (const o of shown) { const s = effSup(o); (groups[s] = groups[s] || []).push(o); }
+  const groups = Object.create(null);
+  for (const o of shown) { const s = supFilterKey(o); (groups[s] = groups[s] || []).push(o); }
   for (const sup of Object.keys(groups).sort(byPriority)) {
     const items = groups[sup];
     items.sort((a, b) => oNum(b) - oNum(a));   // v rámci dodávateľa: najnovšia objednávka prvá
     // header = escapovaná menovka (label FIRST → startsWith(sup) kontrakt) + hromadné
     // tlačidlo „označiť skupinu objednané". Ak je UŽ všetko objednané, tlačidlo prepína späť.
     const head = el('div', 'toorder-supplier');
-    head.appendChild(el('span', 'tosup-label', `${escapeHtml(sup)} — ${items.length} položiek`));
+    head.appendChild(el('span', 'tosup-label', `${escapeHtml(lbl(sup))} — ${items.length} položiek`));
     const allOrdered = items.every(o => ORDERED[o.key]);
     const bulk = el('button', 'tosup-bulk', allOrdered ? '↺ Zrušiť objednané' : '✔ Označiť skupinu objednané');
     bulk.title = allOrdered ? 'Odznačiť „objednané" pre celú skupinu'
@@ -1328,6 +1773,8 @@ function renderToOrder() {
     list.appendChild(head);
     for (const o of items) list.appendChild(renderOrderRow(o));
   }
+  restoreOpenEditors(editors);   // put the manager's unsaved typing back where it was
+  window.scrollTo(0, keepY);   // stay where the manager was working (same as renderCards)
 }
 
 // ---- Hľadať / opraviť (catalog search + re-pair) tab --------------------- //
@@ -3646,7 +4093,13 @@ async function init() {
   PRODUCTS.sort((a, b) =>
     ((a.ai_status === 'unmatched') ? 1 : 0) - ((b.ai_status === 'unmatched') ? 1 : 0) || a.idx - b.idx);
   FILTER = localStorage.getItem('filter') || 'unreviewed';
-  ORDER_SUPPLIER = localStorage.getItem('orderSupplier') || 'all';
+  // #203 — chip keys are now 's:'+normalised supplier. Migrate a value stored by an
+  // older build (the raw supplier name) so the manager keeps his selected supplier.
+  const savedSup = localStorage.getItem('orderSupplier') || 'all';
+  ORDER_SUPPLIER = (savedSup === 'all' || savedSup.startsWith('s:'))
+    ? savedSup : 's:' + supKey(savedSup);
+  // persist the migrated form, so the old value is converted once and not on every load
+  if (ORDER_SUPPLIER !== savedSup) localStorage.setItem('orderSupplier', ORDER_SUPPLIER);
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
   if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes'

@@ -579,6 +579,28 @@ def test_order_supplier_rejects_formula_code_and_supplier(monkeypatch, tmp_path)
                   json={"code": "88/Z", "supplier": "JŠ SERVIS"}).status_code == 200
 
 
+def test_order_supplier_collapses_inner_whitespace(monkeypatch, tmp_path):
+    """#203 — 'Citrade  s.r.o.' and 'Citrade s.r.o.' are the same supplier; a stray
+    double space would fragment the grouping AND write two spellings into the eshop
+    `supplier` column. Whitespace is normalised on write.
+
+    Case is deliberately NOT folded here: this value goes VERBATIM into
+    import_suppliers.csv → the Shoptet `supplier` field, so lower-casing it would
+    rewrite the supplier's real name in the eshop. Case-insensitivity is a DISPLAY
+    concern and lives in the tab's grouping (supKey in app.js)."""
+    monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    c = _client()
+    assert c.post("/api/order-supplier",
+                  json={"code": "88/Z", "supplier": " Citrade   s.r.o. "}).status_code == 200
+    assert webapp._load_supplier_assign()["88/Z"] == "Citrade s.r.o."
+    # a tab/newline inside the name collapses too (it would break the CSV cell)
+    c.post("/api/order-supplier", json={"code": "77/X", "supplier": "JŠ\tSERVIS"})
+    assert webapp._load_supplier_assign()["77/X"] == "JŠ SERVIS"
+    # capitalisation is preserved exactly as the manager typed it
+    c.post("/api/order-supplier", json={"code": "66/L", "supplier": "CITRADE"})
+    assert webapp._load_supplier_assign()["66/L"] == "CITRADE"
+
+
 def test_orders_exposes_assigned_supplier(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
               "20261060;Vybavuje sa;Bez dod;1;88/Z;Veľkosť: Z;\r\n")   # NO itemSupplier

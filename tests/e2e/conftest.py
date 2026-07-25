@@ -60,7 +60,7 @@ def _admin_session_cookie(base: str) -> str:
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
                     "automations_server", "imgfail_server", "imgflood_server", "dev_server",
-                    "nedostupne_server", "vystavy_server")
+                    "nedostupne_server", "vystavy_server", "toorder_server")
 
 
 @pytest.fixture(autouse=True)
@@ -603,6 +603,59 @@ def nedostupne_server(tmp_path_factory):
         "PYTHONPATH": os.path.join(ROOT, "src"),
         "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
         "MAIL_HOST": "",                              # never a real send from the fixture
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def toorder_server(tmp_path_factory):
+    """Isolated webreview instance for the „Na objednanie" grouping/feedback E2E
+    (#203 supplier case-fragmentation, #204 sibling pair propagation, #214 failed-save
+    feedback). Function-scoped + own out-dir so the pairings/flags these tests write can
+    never leak into — nor be perturbed by — the shared session `live_server`.
+
+    The orders CSV is crafted so that:
+      * CITRADE (2 lines) / Citrade / citrade are the SAME supplier → exactly ONE chip
+        counting 4 lines, labelled with the most-used spelling (CITRADE, 2× vs 1× each);
+      * ORBIS has TWO lines carrying the SAME itemCode S1 (different orders) → siblings
+        for the pair-URL propagation test;
+      * N1 arrived WITHOUT a supplier → groups under '—' and shows the inline
+        supplier-assign editor (the failed-save feedback test needs it);
+      * every line is unpaired (no review data) so the inline pair editor is present.
+    WEBREVIEW_PRODUCTS points at a nonexistent file so a dev box's real data/products.csv
+    can never influence the run (CI has none)."""
+    out = tmp_path_factory.mktemp("wr_toorder_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "review_data.json").write_text("[]", encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20260910;2026-05-20 09:00:00;Vybavuje sa;;Bunda Cit Test;1;C1;Veľkosť: M;CITRADE\r\n"
+        "20260905;2026-05-19 09:00:00;Vybavuje sa;;Ciapka Cit Test;1;C2;Veľkosť: M;Citrade\r\n"
+        "20260904;2026-05-18 09:00:00;Vybavuje sa;;Rukavice Cit Test;1;C3;Veľkosť: M;CITRADE\r\n"
+        "20260903;2026-05-17 09:00:00;Vybavuje sa;;Nozik Cit Test;1;C4;Veľkosť: M;citrade\r\n"
+        "20260900;2026-05-16 09:00:00;Vybavuje sa;;Nohavice Orb Test;1;S1;Veľkosť: M;ORBIS\r\n"
+        "20260890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
+        "20260001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(out / "no_products_here.csv"),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)

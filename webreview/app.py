@@ -2920,7 +2920,13 @@ def api_order_supplier():
     leading formula char is rejected here AND escaped at the CSV sink (_csv_safe)."""
     body = request.get_json(force=True)
     code = str(body.get("code") or "").strip()
-    supplier = str(body.get("supplier") or "").strip()
+    # #203 — normalise whitespace on write: a stray double space / tab makes 'Citrade
+    # s.r.o.' and 'Citrade  s.r.o.' two different suppliers in the store AND writes two
+    # spellings into the eshop `supplier` column. Case is deliberately NOT folded — the
+    # value goes VERBATIM into import_suppliers.csv → Shoptet, so lower-casing it would
+    # rewrite the supplier's real name in the eshop. Case-insensitive GROUPING is a
+    # display concern and lives in the tab (supKey in app.js).
+    supplier = " ".join(str(body.get("supplier") or "").split())
     if not code:
         return jsonify({"ok": False, "error": "missing code"}), 400
     # forestshop codes always start alphanumeric — a leading formula char (=,+,-,@,…)
