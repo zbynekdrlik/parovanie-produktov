@@ -1433,39 +1433,37 @@ function groupQtyTotals(items) {
   return t;
 }
 
-// #207 — GRUBE (and most of the others) has no B2B auto-ordering: the manager writes the
-// order by hand, so he needs the whole supplier list as plain text in one click.
-//
-// The text AGGREGATES by product+size, summing the pieces (the same arithmetic #206 put
-// on screen): an order to a supplier asks for „3 ks of S1", never for the three separate
-// customer lines that produced it. Order of first appearance is kept, so the pasted list
-// reads in the same order as the tab.
-//
-// A GRUBE line carries its per-size itemId — the code GRUBE actually wants — so it is
-// included when present. Only http(s) links are pasted (`safeHttpUrl`), never a stored
-// value the row itself refuses to render as a link.
 const TO_COPY_LABEL = '📋 Kopírovať objednávku';
 
+// The link to paste for a line, in the same precedence the ROW itself renders: the
+// reviewed decision link, then the inline pairing, then the grube .de order page. Only
+// http(s) survives (`safeHttpUrl`) — a stored value the row refuses to turn into a link
+// must never reach the supplier's inbox either.
+const _copyUrl = (o) => safeHttpUrl(o.supplierUrl) || safeHttpUrl(o.pairUrl)
+                        || safeHttpUrl(o.grubeDeUrl) || '';
+// GRUBE's per-size itemId — the code GRUBE actually wants in the e-mail; '' elsewhere.
+const _copyGrube = (o) => String((o && o.grubeItemId) || '').trim();
+
+// #207 — GRUBE (and most of the others) has no B2B auto-ordering: the manager writes the
+// order by hand, so he needs the whole supplier list as plain text in one click.
+// The text AGGREGATES by product+SIZE, summing the pieces (the same arithmetic #206 put
+// on screen): an order to a supplier asks for 3 ks of S1, never for the three separate
+// customer lines that produced it. Order of first appearance is kept, so the pasted list
+// reads in the same order as the tab.
 function orderCopyLines(items) {
-  const seen = Object.create(null), out = [];
+  const seen = Object.create(null), out = [];   // keys are export free text -> null proto
   for (const o of items || []) {
     const code = o.itemCode || '';
     const size = (o.size || '').trim();
-    const k = code + ' ' + size;
+    const k = code + ' ' + size;
     let e = seen[k];
     if (!e) {
-      e = seen[k] = {
-        code, size, qty: 0,
-        grube: (o.grubeItemId || '').trim(),
-        url: safeHttpUrl(o.supplierUrl) || safeHttpUrl(o.pairUrl)
-             || safeHttpUrl(o.grubeDeUrl) || '',
-      };
+      e = seen[k] = { code, size, qty: 0, grube: '', url: '' };
       out.push(e);
     }
     e.qty += orderQty(o);
-    if (!e.grube && o.grubeItemId) e.grube = String(o.grubeItemId).trim();
-    if (!e.url) e.url = safeHttpUrl(o.supplierUrl) || safeHttpUrl(o.pairUrl)
-                        || safeHttpUrl(o.grubeDeUrl) || '';
+    if (!e.grube) e.grube = _copyGrube(o);
+    if (!e.url) e.url = _copyUrl(o);
   }
   // empty parts are DROPPED, never padded with a placeholder — a '—' column in a pasted
   // e-mail reads like an instruction to the supplier
@@ -1872,20 +1870,9 @@ function restoreOpenEditors(snaps) {
     const row = rows.find(r => r.dataset.key === s.key);   // filtered out / gone → drop it
     const o = row && ORDERS.find(x => x.key === s.key);
     if (!spec || !o) continue;
+    // only UNSAVED TYPING is carried over — the whole rule (and why the two conditions
+    // are in that order) lives in editorSnapHasWork above
     if (!editorSnapHasWork(s, o)) continue;
-    // only UNSAVED TYPING is carried over. An EMPTY box holds none — and pair/supplier
-    // editors are rendered empty BY DEFAULT on every unpaired/unassigned row, so treating
-    // one as unsaved work would pin an empty input onto a sibling line that a
-    // just-propagated per-product value (#204) has since paired. A value that now equals
-    // what is stored was likewise just saved, and re-opening its editor would undo the
-    // „it landed" feedback (the row would show an input instead of the new link / tag).
-    // an EMPTY box normally holds no unsaved work — but one the manager OPENED with ✏️/💬
-    // is his, whether he has typed into it yet or has deliberately cleared it. That
-    // exception has to be weighed BEFORE „same as stored": on a row with nothing stored
-    // the box and the stored value are BOTH '', so `same` fired first and closed the box
-    // under a manager who was about to type into it. A NON-empty value equal to what is
-    // stored is the just-saved case and still closes — re-opening it would replace the
-    // freshly rendered link / tag with an input again.
     let inp = row.querySelector(spec.input);
     let ed = null;
     if (!inp) { ed = spec.open(o, row); inp = ed && ed.querySelector(spec.input); }
