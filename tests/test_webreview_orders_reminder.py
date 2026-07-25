@@ -7,6 +7,7 @@ path is redirected to tmp. Mirrors test_webreview_automations.py.
 import json
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -1147,3 +1148,58 @@ def test_a_manual_send_override_does_not_carry_a_stale_pending_note(iso, monkeyp
     st = _store(iso)
     assert st["orders"]["20261001"]["status"] == "emailed"
     assert _pending_row(iso, "orange", "20261001") == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #224 review — the dedup prune (#220) drops old records on AGE ALONE, and the only
+# thing that makes that safe is „retention (180 d) is twice the orders export window
+# (90 d)": a record old enough to go cannot belong to an order the export still carries.
+# The 90 lived as a bare literal inside _fetch_orders_csv with nothing tying it to the
+# retention constant, so widening the export past 180 d would silently start dropping
+# records for live orders — one duplicate customer mail each.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_retention_stays_at_least_twice_the_orders_export_window():
+    assert (webapp.orders_reminder.DEDUP_RETENTION_DAYS
+            >= 2 * webapp.ORDERS_EXPORT_WINDOW_DAYS)
+
+
+def _captured_orders_url(monkeypatch, base):
+    seen = {}
+
+    class _Resp:
+        content = b""
+
+        def raise_for_status(self):
+            pass
+
+    def _get(url, **kw):
+        seen["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(webapp, "_cred", lambda key: base)
+    monkeypatch.setattr(webapp.requests, "get", _get)
+    webapp._fetch_orders_csv()
+    return seen["url"]
+
+
+def test_the_orders_export_window_is_the_named_constant(monkeypatch):
+    """…and the constant is not decoration: it is what actually reaches Shoptet."""
+    url = _captured_orders_url(monkeypatch, "https://shop.test/export/orders.csv?patternId=-9")
+    want = time.strftime("%Y-%m-%d", time.localtime(
+        time.time() - webapp.ORDERS_EXPORT_WINDOW_DAYS * 86400))
+    assert f"dateFrom={want}" in url
+    assert "patternId=-9" in url                       # the configured parameters survive
+
+
+def test_a_date_window_configured_in_the_url_does_not_survive(monkeypatch):
+    """SHOPTET_ORDERS_URL is hand-edited config; if someone pastes a URL that already carries
+    dateFrom, appending ours would send the parameter twice and leave the effective window to
+    the server — with the retention coupling above silently invalidated. Ours must be the only
+    one, and every other parameter (the `hash` token!) must come through untouched."""
+    url = _captured_orders_url(
+        monkeypatch,
+        "https://shop.test/export/orders.csv?patternId=-9&dateFrom=2020-01-01"
+        "&hash=aB+cD%2F1&dateUntil=2020-02-01")
+    assert url.count("dateFrom=") == 1 and "dateFrom=2020-01-01" not in url
+    assert url.count("dateUntil=") == 1 and "dateUntil=2020-02-01" not in url
+    assert "hash=aB+cD%2F1" in url                     # byte-identical, never re-encoded
