@@ -74,3 +74,30 @@ def test_clearing_the_pair_url_clears_every_sibling_line(page, toorder_server):
         "() => document.querySelectorAll(\"[data-code='S1'] .to-link\").length === 0",
         timeout=3000)
     assert _rows(page, "S1").locator(".to-pairurl").count() == 2
+
+
+def test_a_non_http_stored_pair_url_never_renders_as_a_clickable_link(page, toorder_server):
+    """PR #233 review — `/api/order-pair` validates the scheme on WRITE, but the row
+    rendered `a.href = o.pairUrl` (and `o.supplierUrl`) straight from the store, so a
+    `javascript:` value left there by any other path would render as a clickable link.
+    The GRUBE .de link on the same row already carried this guard; now all three do."""
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    r = page.evaluate("""() => {
+      const mk = (o) => renderOrderRow(Object.assign(
+        {key: 'X|W1', itemCode: 'W1', orderCode: 'X', name: 'T', supplier: 'S',
+         qty: '1', size: '', orderDate: '2026-05-20 09:00:00'}, o));
+      const href = (o) => {
+        const a = mk(o).querySelector('.to-link');
+        return a ? a.getAttribute('href') : null;
+      };
+      return {
+        evil_pair: href({pairUrl: 'javascript:alert(1)'}),
+        evil_decision: href({supplierUrl: 'javascript:alert(1)'}),
+        good_pair: href({pairUrl: 'https://dodavatel.test/x'}),
+        good_decision: href({supplierUrl: 'https://dodavatel.test/y'}),
+      };
+    }""")
+    assert r == {"evil_pair": "", "evil_decision": "",
+                 "good_pair": "https://dodavatel.test/x",
+                 "good_decision": "https://dodavatel.test/y"}, r

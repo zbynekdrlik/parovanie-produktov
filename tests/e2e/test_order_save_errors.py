@@ -56,19 +56,28 @@ def _chip(alert, label):
     return next(c for c in alert["chips"] if c.startswith(label))
 
 
-# Holds every /api/instock POST open until the test releases it — with the status IT
-# picks — so two writes for the SAME row are genuinely in flight at once (a stubbed route
-# answers far too fast to race). A held write is released with `window.__held[i](status)`;
-# a 200 is passed straight through to the real server so its state really does change.
-# `__realFetch` stays available so the test can read that state back afterwards.
-_HOLD_INSTOCK = """
+# Holds every POST to `path` open until the test releases it — with the status IT picks —
+# so two writes for the SAME row are genuinely in flight at once (a stubbed route answers
+# far too fast to race). Release with `window.__held[i](status, passthrough)`:
+# `(200, true)` replays the request against the real server so its state really changes,
+# `(200)` fakes the success without touching it (client bookkeeping in isolation), any
+# other status fakes that failure. `__realFetch` stays available to read the state back.
+_HOLD_TEMPLATE = """
 window.__held = [];
+window.__settled = [];
 window.__realFetch = window.fetch.bind(window);
 window.fetch = (url, opts) => {
-  if (String(url).indexOf('/api/instock') !== -1 && opts && opts.method === 'POST') {
-    return new Promise((resolve, reject) => window.__held.push((status) => {
-      if (status === 200) { window.__realFetch(url, opts).then(resolve, reject); return; }
-      resolve(new Response('{"ok": false}',
+  const p = new URL(String(url), location.href).pathname;
+  if (p === '__PATH__' && opts && opts.method === 'POST') {
+    return new Promise((resolve, reject) => window.__held.push((status, passthrough) => {
+      if (status === 200 && passthrough) {
+        window.__realFetch(url, opts).then(
+          (r) => { window.__settled.push(r.status); resolve(r); },
+          (e) => { window.__settled.push('err'); reject(e); });
+        return;
+      }
+      window.__settled.push(status || 500);
+      resolve(new Response(status === 200 ? '{"ok": true}' : '{"ok": false}',
                            {status: status || 500,
                             headers: {'Content-Type': 'application/json'}}));
     }));
@@ -76,6 +85,13 @@ window.fetch = (url, opts) => {
   return window.__realFetch(url, opts);
 };
 """
+
+
+def _hold(path):
+    return _HOLD_TEMPLATE.replace("__PATH__", path)
+
+
+_HOLD_INSTOCK = _hold("/api/instock")
 
 
 def test_failed_bulk_mark_tells_the_manager_and_marks_nothing(page, toorder_server):
@@ -269,7 +285,11 @@ def test_a_refused_second_write_rolls_back_to_what_the_server_ACCEPTED(page, too
     target is the state captured before the FIRST in-flight write, then a first write the
     server ACCEPTED is thrown off the tab when a second one is refused. The manager's
     successful click would silently disappear until the next reload — the same class of
-    loss, mirrored. The rollback target is therefore the last value the server took."""
+    loss, mirrored. The rollback target is therefore the last value the server took.
+
+    This half was never demonstrated red on the pre-fix code (its per-call snapshot
+    happened to give the right answer for THIS ordering) — it is a mutation guard, and it
+    does kill the mutant that drops saveOrderFlag's `confirmed` update."""
     _open(page, toorder_server)
     page.evaluate(_HOLD_INSTOCK)
 
@@ -278,8 +298,10 @@ def test_a_refused_second_write_rolls_back_to_what_the_server_ACCEPTED(page, too
     btn.click()                      # write #2: off — will be refused
     page.wait_for_function("() => window.__held.length === 2", timeout=3000)
 
-    page.evaluate("() => window.__held[0](200)")   # #1 really lands on the server
-    page.wait_for_timeout(200)
+    page.evaluate("() => window.__held[0](200, true)")   # #1 really lands on the server
+    # gate on the round-trip ACTUALLY finishing: a fixed sleep would flip the release
+    # order on a loaded runner and fail this test against correct code
+    page.wait_for_function("() => window.__settled.length === 1", timeout=5000)
     page.evaluate("() => window.__held[1](500)")
     _wait_alert(page)
     page.wait_for_timeout(300)
@@ -291,6 +313,76 @@ def test_a_refused_second_write_rolls_back_to_what_the_server_ACCEPTED(page, too
     row = page.locator(".toorder-row[data-code='N1']")
     assert "instock" in (row.get_attribute("class") or "").split()
     assert "on" in (row.locator(".to-instock").get_attribute("class") or "").split()
+
+
+def test_a_straggler_from_an_older_burst_cannot_poison_a_later_click(page, toorder_server):
+    """Sequencing that DELETES its bookkeeping when a burst settles leaves a generation
+    hole. Click on / click off (both in flight) → the OFF write is accepted and the entry
+    is dropped → the manager clicks on again → the first burst's ACCEPTED reply finally
+    lands and writes its value onto the FRESH entry → the third write is refused and rolls
+    back to that stale value. The phantom flag is right back, with a „save failed" over it.
+
+    Every response here is faked (the server is never touched), because that is the point:
+    what is under test is the CLIENT's own bookkeeping, not the inherently unresolvable
+    question of which POST reached the server last."""
+    _open(page, toorder_server)
+    page.evaluate(_HOLD_INSTOCK)
+
+    btn = page.locator(".toorder-row[data-code='N1'] .to-instock")
+    btn.click()                      # burst 1, write #1: on
+    btn.click()                      # burst 1, write #2: off
+    page.wait_for_function("() => window.__held.length === 2", timeout=3000)
+    page.evaluate("() => window.__held[1](200)")          # #2 accepted → burst 1 settles
+    page.wait_for_function("() => window.__settled.length === 1", timeout=3000)
+
+    page.locator(".toorder-row[data-code='N1'] .to-instock").click()   # burst 2, write #3
+    page.wait_for_function("() => window.__held.length === 3", timeout=3000)
+    page.evaluate("() => window.__held[0](200)")          # #1's late reply, ACCEPTED
+    page.wait_for_function("() => window.__settled.length === 2", timeout=3000)
+    page.evaluate("() => window.__held[2](500)")          # #3 refused
+    _wait_alert(page)
+
+    # #2 (off) is the newest write the client ever saw accepted — that is the baseline
+    assert page.evaluate("() => Object.keys(INSTOCK)") == [], "a stale burst set the baseline"
+    row = page.locator(".toorder-row[data-code='N1']")
+    assert "instock" not in (row.get_attribute("class") or "").split()
+
+
+def test_a_bulk_write_supersedes_an_in_flight_per_row_write(page, toorder_server):
+    """The bulk „označiť skupinu objednané" writes the SAME rows as the per-row checkbox,
+    so it has to join the same bookkeeping. Otherwise: the manager ticks a row (POST slow),
+    then marks the whole group — the group write lands — and the row's own write then
+    fails and rolls the row back to un-ordered, with an alert, while the server holds it
+    as ordered. N1 is alone in its '—' group, so the bulk write covers exactly that row."""
+    _open(page, toorder_server)
+    page.evaluate(_hold("/api/ordered"))      # only the PER-ROW endpoint is held
+
+    page.locator(".toorder-row[data-code='N1'] input[type=checkbox]").click()
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+
+    page.evaluate("""() => {
+      const h = [...document.querySelectorAll('.toorder-supplier')]
+        .find(x => x.querySelector('.tosup-label').textContent.trim().startsWith('—'));
+      h.querySelector('.tosup-bulk').click();
+    }""")
+    page.wait_for_function("""() => {
+      const h = [...document.querySelectorAll('.toorder-supplier')]
+        .find(x => x.querySelector('.tosup-label').textContent.trim().startsWith('—'));
+      return h && h.querySelector('.tosup-bulk').textContent.includes('Zrušiť');
+    }""", timeout=3000)     # the group write landed and the tab repainted
+
+    page.evaluate("() => window.__held[0](500)")          # the per-row write is refused
+    page.wait_for_function("() => window.__settled.length === 1", timeout=3000)
+    page.wait_for_timeout(400)     # give the (wrong) rollback every chance to happen
+
+    assert page.evaluate("() => Object.keys(ORDERED)") == ["20260001|N1"]
+    server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
+    assert list(server["ordered"]) == ["20260001|N1"], server
+    assert "done" in (page.locator(".toorder-row[data-code='N1']")
+                      .get_attribute("class") or "").split()
+    # nothing failed from the manager's point of view: the group write carried the row
+    assert page.evaluate("() => window.__alerts.length") == 0, \
+        page.evaluate("() => window.__alerts.map(a => a.msg)")
 
 
 # ── PR #233 review: a repaint must not eat unsaved typing ────────────────────
@@ -354,14 +446,25 @@ def test_an_unsaved_supplier_and_pair_edit_survive_a_repaint_too(page, toorder_s
 
 def test_the_same_failing_write_is_reported_only_once(page, toorder_server):
     """alert() blocks the thread, so re-clicking the same refused toggle during one
-    outage must not queue a second modal."""
+    outage must not queue a second modal. The POST counter is what makes the assertion
+    able to fail at all: without it „no second alert yet" and „the second write has not
+    finished yet" look identical."""
     _open(page, toorder_server)
-    _fail(page, "/api/instock")
+    posts = []
+
+    def refuse(route):
+        posts.append(1)
+        route.fulfill(status=500, content_type="application/json", body='{"ok": false}')
+
+    page.route("**/api/instock", refuse)
 
     page.locator(".toorder-row[data-code='C1'] .to-instock").click()
     _wait_alert(page)
     page.locator(".toorder-row[data-code='C1'] .to-instock").click()   # same write again
-    page.wait_for_timeout(400)
-
+    # the second write really happened AND really rolled back — only the MESSAGE was
+    # suppressed (an un-flagged row after two refused clicks is the observable proof)
+    page.wait_for_function(
+        "() => document.querySelectorAll('.toorder-row.instock').length === 0",
+        timeout=3000)
+    assert len(posts) == 2, posts
     assert page.evaluate("() => window.__alerts.length") == 1
-    assert page.locator(".toorder-row.instock").count() == 0
