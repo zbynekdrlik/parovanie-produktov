@@ -202,11 +202,17 @@ def all_order_codes(orders_csv) -> set[str]:
             if (c := (r.get("code") or "").strip())}
 
 
-# How long a dedup record survives after its order left the export, and the hard cap on how
-# many such records are kept at all (#220). Generous on purpose: the ONLY cost of keeping a
-# record is a few hundred bytes, while dropping one too early costs a duplicate customer mail.
+# How long a dedup record survives after its order left the export (#220). This is the PRIMARY
+# bound and it is deliberately twice the 90-day orders-export window (_fetch_orders_csv), so a
+# record for an order that is still in the export is ALWAYS inside retention — even if the
+# export we happened to read was truncated. That margin is what makes age-based pruning safe.
 DEDUP_RETENTION_DAYS = 180
-DEDUP_MAX_RECORDS = 500
+# A backstop for records we cannot date at all (a partial write with no usable timestamp): those
+# can never age out, so they are capped. It is deliberately NOT applied to dated records — a
+# count-based cap would drop a record that is still protecting a live order, which costs a
+# duplicate customer mail. Retention bounds the dated ones, and the 90-day export window bounds
+# how many orders can even be resolved in that period.
+DEDUP_MAX_UNDATED_RECORDS = 500
 
 
 def _record_date(entry) -> datetime | None:
@@ -223,8 +229,10 @@ def _record_date(entry) -> datetime | None:
 
 def prune_done(done: dict, window_codes, now: datetime | None = None,
                retention_days: int = DEDUP_RETENTION_DAYS,
-               max_records: int = DEDUP_MAX_RECORDS) -> dict:
+               max_undated: int = DEDUP_MAX_UNDATED_RECORDS) -> tuple[dict, list[str]]:
     """Bound the per-order dedup map (#220) without ever losing a record that still matters.
+    Returns ``(kept_map, dropped_codes)`` — the caller logs what went, because a duplicate-mail
+    incident caused by a silent drop would be undebuggable.
 
     A record is the ONLY thing that stops a customer being reminded a second time, so the rules
     are asymmetric — cheap to keep, expensive to drop:
@@ -235,9 +243,14 @@ def prune_done(done: dict, window_codes, now: datetime | None = None,
     2. ``window_codes`` EMPTY means the export was empty or unreadable — the window is unknown,
        so nothing is pruned at all (fail closed, the same reflex as the supplier upload: no
        source of truth, no destructive action).
-    3. Everything else is kept while it is younger than ``retention_days``, newest first, up to
-       ``max_records``. A record with no usable timestamp sorts oldest (dropped first) but is
-       never dropped by age alone.
+    3. Everything else is kept while it is younger than ``retention_days``. Age is the ONLY
+       criterion here, and it is safe because retention is twice the 90-day export window: a
+       record old enough to be dropped belongs to an order that cannot be in the export at all,
+       not even a truncated one. A COUNT-based cap is deliberately NOT applied to dated records
+       — it would drop a record that is still protecting a live order the moment a short export
+       made the window look small (found in the PR #224 adversarial review).
+    4. Records with no usable timestamp cannot age out, so they alone are capped at
+       ``max_undated`` — the only unbounded-growth path left.
 
     REOPEN — the deliberate decision this bounding does NOT change: an order that becomes
     „Vybavuje sa" again keeps its terminal record and therefore never receives a second
@@ -248,24 +261,28 @@ def prune_done(done: dict, window_codes, now: datetime | None = None,
     left the export AND the retention window does the record go, so a genuinely new order cycle
     months later starts clean."""
     if not isinstance(done, dict):
-        return {}
+        return {}, []
     window = set(window_codes or ())
     if not window:
-        return dict(done)                       # window unknown → prune nothing (rule 2)
+        return dict(done), []                   # window unknown → prune nothing (rule 2)
     now = now or datetime.now()
     cutoff = now - timedelta(days=retention_days)
-    kept = {c: v for c, v in done.items() if c in window}
-    rest = []
+    kept, undated, dropped = {}, [], []
     for c, v in done.items():
-        if c in window:
+        if c in window:                         # rule 1 — live order, never dropped
+            kept[c] = v
             continue
         ts = _record_date(v)
-        if ts is None or ts >= cutoff:
-            rest.append((ts or datetime.min, c, v))
-    rest.sort(key=lambda t: t[0], reverse=True)
-    for _, c, v in rest[:max_records]:
+        if ts is None:
+            undated.append((c, v))              # rule 4 — capped below
+        elif ts >= cutoff:
+            kept[c] = v                         # rule 3 — inside retention, kept on age alone
+        else:
+            dropped.append(c)
+    for c, v in undated[:max_undated]:
         kept[c] = v
-    return kept
+    dropped.extend(c for c, _ in undated[max_undated:])
+    return kept, dropped
 
 
 def order_fingerprint(o: dict) -> str:

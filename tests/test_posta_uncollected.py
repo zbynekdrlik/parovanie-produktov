@@ -279,11 +279,26 @@ def test_invalid_format_is_not_terminal():
     assert pu.terminal_state(_fix("tracking_invalid_format.json")) == ""
 
 
-def test_returned_shipment_is_terminal():
+def test_collected_at_the_post_office_is_terminal():
+    """The case that matters most for the escalation: a parcel that WAS „notified" (ZNP1AN) and
+    the customer finally collected it at the office. A live probe of api.posta.sk (2026-07-25)
+    showed Pošta SK reports that as stateCode 'delivered' / detailCode 'OKP', not a separate
+    code — this fixture is that real (anonymized) response."""
+    fx = _fix("tracking_collected_at_office.json")
+    states = [e["stateCode"] for e in fx["results"][0]["events"]]
+    assert "notified" in states                      # it really was an uncollected parcel…
+    assert pu.terminal_state(fx) == "delivered"      # …and collecting it ends the chase
+
+
+def test_an_unverified_return_state_is_not_trusted():
+    """'returned' was never observed in the live probe, so it is NOT in TERMINAL_STATE_CODES
+    (#226). If Pošta SK used it for „vrátená na dodaciu poštu" — back at the office and still
+    collectible — trusting it would silently freeze a genuinely uncollected parcel out of the
+    escalation. An unverified code must cost an API call, never a missed customer notice."""
     api = {"status": "ok", "results": [{"number": "EF1SK", "status": "ok", "events": [
         {"stateCode": "received", "detailCode": "PODOD", "localDate": "2026-07-01T08:00:00"},
         {"stateCode": "returned", "detailCode": "VRAT", "localDate": "2026-07-20T08:00:00"}]}]}
-    assert pu.terminal_state(api) == "returned"
+    assert pu.terminal_state(api) == ""
 
 
 def test_unknown_state_is_never_treated_as_terminal():

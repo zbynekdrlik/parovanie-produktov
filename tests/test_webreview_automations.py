@@ -384,3 +384,49 @@ def test_a_corrupt_terminal_cache_does_not_skip_the_shipment(iso, monkeypatch):
                         lambda pkg: asked.append(pkg) or TRACKING[pkg])
     webapp.run_posta_uncollected()
     assert "EF000000001SK" in asked
+
+
+def test_a_terminal_cache_entry_for_a_different_order_does_not_skip_the_shipment(iso, monkeypatch):
+    """Tracking numbers are typed into Shoptet by hand, so the same one can end up on a second
+    order. The cached verdict must prove it belongs to THIS order — otherwise a stale
+    „delivered" would silence a genuinely uncollected parcel and the customer would never be
+    told. The cache is an optimisation; when it cannot prove itself it must defer to the API."""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000002SK": {"state": "delivered", "at": "2026-07-01",
+                                       "code": "SOMEONE-ELSE"}}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000002SK" in asked                   # checked, not silently skipped
+    assert stats["emails_sent"] == 1                  # …and the customer IS told
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["terminal"]["EF000000001SK"]["code"] == "2026105"   # entries carry their order
+
+
+def test_a_stale_terminal_cache_entry_is_re_verified(iso, monkeypatch):
+    """A cached verdict is trusted for POSTA_TERMINAL_RECHECK_DAYS, then checked once more. It
+    may only ever save an API call — never silence a customer notice — so a single wrong or
+    freak reading has to self-heal within a week instead of sticking for the whole 30-day
+    source window (the `at` field was write-only before this)."""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000002SK": {"state": "delivered", "at": "2020-01-01",
+                                       "code": "2026100"}}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000002SK" in asked                   # stale verdict → re-verified
+    assert stats["emails_sent"] == 1                  # …and it was wrong: the customer IS told
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF000000002SK" not in st["terminal"]      # the wrong entry is gone, not refreshed
+
+
+def test_a_fresh_terminal_cache_entry_is_still_trusted(iso, monkeypatch):
+    """…and the re-check window must not defeat the optimisation itself."""
+    webapp.run_posta_uncollected()
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    webapp.run_posta_uncollected()
+    assert "EF000000001SK" not in asked

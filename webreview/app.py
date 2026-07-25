@@ -3874,6 +3874,8 @@ def n8n_upload_variant_links():
 # --------------------------------------------------------------------------- #
 AUTOMATIONS_STATE = os.path.join(OUT, "automations.json")
 POSTA_STATE = os.path.join(OUT, "posta_uncollected.json")
+# How long a cached TERMINAL tracking verdict is trusted before one re-verification (#222).
+POSTA_TERMINAL_RECHECK_DAYS = 7
 ORDERS_REMINDER_STATE = os.path.join(OUT, "orders_reminder.json")   # #105 dedup + display
 
 
@@ -3928,13 +3930,27 @@ def run_posta_uncollected() -> dict:
         term_cache = dict(st0.get("terminal") or {})
     uncollected, invalid, errors = [], [], []
     sent = failed = api_skipped = 0
-    today_iso = datetime.now().date().isoformat()
+    today = datetime.now().date()
+    today_iso = today.isoformat()
+    # A cached terminal verdict is trusted for this long, then re-verified once. Cheap insurance:
+    # it still removes ~6 of every 7 calls for a delivered parcel, while bounding ANY wrong or
+    # freak reading to a week instead of the full 30-day source window.
+    recheck_before = (today - timedelta(days=POSTA_TERMINAL_RECHECK_DAYS)).isoformat()
     for s in shipments:
         cached = term_cache.get(s["packageNumber"])
-        if isinstance(cached, dict) and cached.get("state"):
-            # delivered / returned — final, so there is nothing left to check or e-mail. A
-            # garbage cache entry (not a dict, no state) deliberately falls through to a real
-            # check: corruption must degrade to „check it", never to „ignore it forever".
+        if (isinstance(cached, dict) and cached.get("state")
+                and cached.get("code") == s["code"]
+                and cached.get("at", "") >= recheck_before):
+            # Delivered (at home or collected at the post office) — final, so there is nothing
+            # left to check or e-mail. Three ways this deliberately falls through to a REAL
+            # check instead: a garbage entry (not a dict, no state); a package number that now
+            # belongs to a DIFFERENT order — tracking numbers are typed into Shoptet by hand, so
+            # a reused/mistyped one must not let a stale „delivered" silence a genuinely
+            # uncollected parcel; and an entry older than POSTA_TERMINAL_RECHECK_DAYS, so one
+            # wrong or freak reading self-heals within a week instead of sticking for the whole
+            # 30-day window. Corruption, ambiguity and age all degrade to „check it", never to
+            # „ignore it forever" — a cached verdict may only ever save an API call, never
+            # silence a customer notification.
             api_skipped += 1
             continue
         try:
@@ -3947,7 +3963,14 @@ def run_posta_uncollected() -> dict:
             continue
         final = posta_uncollected.terminal_state(tj)
         if final:
-            term_cache[s["packageNumber"]] = {"state": final, "at": today_iso}
+            # `code` is part of the entry so the skip above can prove the cached verdict really
+            # belongs to THIS order, not to an earlier one that used the same tracking number.
+            term_cache[s["packageNumber"]] = {"state": final, "at": today_iso, "code": s["code"]}
+        else:
+            # We just looked, and it is NOT final — so any cached verdict for this parcel has
+            # been DISPROVED (a stale entry we re-checked, or one left by a mistyped number).
+            # Drop it rather than leave a wrong „delivered" sitting in the store.
+            term_cache.pop(s["packageNumber"], None)
         r = posta_uncollected.evaluate_shipment(s, tj, esc.get(s["code"], ""))
         if r["invalid"]:
             # The exact class of package numbers that silently broke the n8n
@@ -4959,6 +4982,10 @@ def run_orders_reminder() -> dict:
                                                ("code", "billFullName", "email", "itemName",
                                                 "shopRemark", "days", "admin_link")}
         row["days"] = o["days"]
+        # An order only reaches the fast path once it is TERMINAL, so a „run could not finish
+        # it" note from an earlier run is stale by definition — carried forward it would warn
+        # about a resolved order forever (found in the PR #224 adversarial review).
+        row.pop("pending", None)
         (orange if status == "emailed" else skipped).append(row)
 
     for o in to_process:
@@ -4998,6 +5025,17 @@ def run_orders_reminder() -> dict:
             no_email.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
                                                "itemName", "shopRemark", "days", "admin_link")})
             continue
+        # Both remaining gates are CONFIG gaps and both are free to check, so they come before
+        # the claim and the paid OpenAI call. The key is checked first purely so `ai_unavailable`
+        # stays truthful: ordering it after the BCC gate would report 0 „AI nedostupné" whenever
+        # BCC also happened to be missing, hiding a second config gap behind the first.
+        if not have_key:
+            ai_unavailable += 1
+            log.warning("orders_reminder: obj. %s má poznámku, ale OPENAI_API_KEY nie je "
+                        "nastavený — AI nedostupné, pripomienku neposielam (skúsim ďalší beh)", code)
+            pending.append(_pending_row(
+                o, "AI klasifikácia nedostupná — chýba OPENAI_API_KEY"))
+            continue                                # do NOT record → retried when key is present
         if bcc_missing:
             # „BCC vždy" is BINDING for this customer mail (require_bcc below), so the send WILL
             # be refused — and the order never becomes terminal, so it would be claimed and
@@ -5010,13 +5048,6 @@ def run_orders_reminder() -> dict:
             pending.append(_pending_row(
                 o, "chýba MAIL_BCC v data/.mail_env — pripomienka sa neodošle"))
             continue                                # no claim, no OpenAI call, nothing recorded
-        if not have_key:
-            ai_unavailable += 1
-            log.warning("orders_reminder: obj. %s má poznámku, ale OPENAI_API_KEY nie je "
-                        "nastavený — AI nedostupné, pripomienku neposielam (skúsim ďalší beh)", code)
-            pending.append(_pending_row(
-                o, "AI klasifikácia nedostupná — chýba OPENAI_API_KEY"))
-            continue                                # do NOT record → retried when key is present
         # From here the run talks to OpenAI + SMTP for this order — claim it first so a manual
         # send clicked in that window is rejected (409) instead of mailing the customer twice.
         claimed = _claim(code, o["email"])
@@ -5062,7 +5093,12 @@ def run_orders_reminder() -> dict:
         else:
             errors += 1                             # SMTP failed → not recorded → retried next run
             _release(code, prev)                    # claim must not outlive the attempt
-            pending.append(_pending_row(o, "odoslanie e-mailu zlyhalo — skúsim v ďalšom behu"))
+            # „mail neodišiel" is a guarantee, not a hedge: _smtp_deliver reports success once
+            # sendmail() returns (a failing quit() after delivery is NOT a failure) and treats a
+            # rejected CUSTOMER address as the only send failure — so False here means the
+            # customer really did not get it, and clicking „▶ Poslať pripomienku" is safe.
+            pending.append(_pending_row(
+                o, "odoslanie e-mailu zlyhalo (mail neodišiel) — skúsim v ďalšom behu"))
 
     with _lock:
         # `done` is a snapshot taken at the START of the run and this run spends minutes in
@@ -5090,7 +5126,13 @@ def run_orders_reminder() -> dict:
         # dropping one of those is what would re-mail a customer. See orders_reminder.prune_done
         # for the full rule set, including the deliberate REOPEN decision (a reopened order
         # keeps its record and is not reminded twice; a manual send from the tab still works).
-        orders_map = orders_reminder.prune_done(orders_map, window_codes)
+        orders_map, pruned_codes = orders_reminder.prune_done(orders_map, window_codes)
+        if pruned_codes:
+            # Never drop a dedup record silently: if a customer ever gets a second reminder,
+            # this line is the only place that can show whether pruning was the cause.
+            log.info("orders_reminder: z dedup evidencie vypadlo %d starých objednávok "
+                     "(mimo exportu a staršie než %d dní): %s", len(pruned_codes),
+                     orders_reminder.DEDUP_RETENTION_DAYS, ", ".join(sorted(pruned_codes)[:20]))
 
         # Display lists are computed from the start-of-run snapshot and written wholesale, so an
         # order the manager resolved WHILE the run was working would come back onto the tab as
@@ -5108,7 +5150,11 @@ def run_orders_reminder() -> dict:
                     continue
                 dest = orange if ent.get("status") == "emailed" else skipped
                 if r.get("code") not in {x.get("code") for x in dest}:
-                    dest.append({**r, "sent_date": ent.get("date", "")})
+                    # drop `pending`: the order IS resolved now, so carrying the „run could not
+                    # finish it" note across would leave a permanent warning on a finished row
+                    # (and keep inflating the „z toho N nedokončených" heading every run).
+                    dest.append({k: v for k, v in r.items() if k != "pending"}
+                                | {"sent_date": ent.get("date", "")})
             return keep
 
         red = _relocate(red)

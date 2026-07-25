@@ -1048,3 +1048,59 @@ def test_prune_is_skipped_when_the_export_is_unreadable(iso, monkeypatch):
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: b"")
     webapp.run_orders_reminder()
     assert "19990000" in _store(iso)["orders"]
+
+
+def test_pending_rows_do_not_pile_up_across_runs(iso, monkeypatch):
+    """The rescued rows must be TRANSIENT — the display lists are rebuilt every run, so a run
+    that keeps failing must re-list each order once, never accumulate duplicates the manager
+    then sees twice on the tab."""
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    for _ in range(3):
+        webapp.run_orders_reminder()
+    codes = [r["code"] for r in _store(iso)["skipped"]]
+    assert len(codes) == len(set(codes))
+
+
+def test_a_rescued_row_disappears_once_the_next_run_succeeds(iso, monkeypatch):
+    """…and the rescue must not become sticky: as soon as the send works, the order belongs in
+    orange with no „nedokončené" note left behind."""
+    calls = {"n": 0}
+    real_send = webapp._send_mail_html
+
+    def flaky_send(to, subject, body, bcc=None, **kw):
+        calls["n"] += 1
+        return False if calls["n"] == 1 else real_send(to, subject, body, bcc=bcc, **kw)
+
+    monkeypatch.setattr(webapp, "_send_mail_html", flaky_send)
+    webapp.run_orders_reminder()
+    assert any(r.get("pending") for r in _store(iso)["skipped"])
+    webapp.run_orders_reminder()
+    st = _store(iso)
+    assert not any(r.get("pending") for r in st["skipped"])
+    assert "20261001" in {r["code"] for r in st["orange"]}
+
+
+def test_a_stale_pending_note_is_not_carried_forward_forever(iso, monkeypatch):
+    """`pending` must not stick to a row once the order IS resolved: _relocate copies rows with
+    `{**r}` and the incremental fast path copies them with dict(prev_row), so an order whose
+    classification failed once would keep warning „AI klasifikácia zlyhala" — and keep inflating
+    the „z toho N nedokončených" heading — on every run from then on. Found in the PR #224
+    adversarial review."""
+    boom = {"n": 0}
+    real_classify = webapp._classify_contacted
+
+    def classify_once_failing(note):
+        boom["n"] += 1
+        if boom["n"] == 1:
+            raise RuntimeError("OpenAI 500")
+        return real_classify(note)
+
+    monkeypatch.setattr(webapp, "_classify_contacted", classify_once_failing)
+    webapp.run_orders_reminder()                     # run 1: one order ends up pending
+    assert any(r.get("pending") for r in _store(iso)["skipped"])
+    webapp.run_orders_reminder()                     # run 2: it is resolved…
+    webapp.run_orders_reminder()                     # run 3: …and takes the incremental path
+    st = _store(iso)
+    stale = [r for r in st["skipped"] + st["orange"] if r.get("pending")]
+    assert stale == []

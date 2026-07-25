@@ -176,21 +176,31 @@ def classify_tracking(api_json, today: date | None = None) -> dict:
 # A shipment in one of these states can never change again, so its tracking never
 # has to be fetched a second time (#222 — the daily run re-queried every parcel in
 # the 30-day window, including long-delivered ones, sequentially at up to 180 s each:
-# 60 s timeout × 3 tries). 'delivered' is live-verified — it is the stateCode of the
-# last event on a delivered parcel (tests/fixtures/posta/tracking_delivered.json is a
-# real anonymized api.posta.sk response, detailCode 'OK' / „Doručená"). 'returned' is
-# its mirror image for a parcel sent back to us. 'notified' is deliberately ABSENT:
-# that is the state this automation exists to chase, and it still changes. Anything
-# unrecognised is NOT terminal (fail-safe — keep checking rather than freeze a
-# shipment out of the automation forever on a guess about the API's vocabulary).
-TERMINAL_STATE_CODES = frozenset({"delivered", "returned"})
+# 60 s timeout × 3 tries).
+#
+# ONLY live-verified state codes belong here. A live probe of api.posta.sk over the
+# real shipment set (2026-07-25) returned exactly four codes — received, transit,
+# notified, delivered — and showed that 'delivered' covers BOTH outcomes that end an
+# escalation: „Doručená" (detailCode OK, home delivery) AND „Prevzatá na pošte"
+# (detailCode OKP — the customer finally collected it, i.e. the natural end of the
+# uncollected-parcel chase; see tests/fixtures/posta/tracking_collected_at_office.json,
+# a real anonymized response whose events go notified/ZNP1AN → delivered/OKP).
+#
+# 'notified' is deliberately ABSENT: that is the state this automation exists to
+# chase, and it still changes. A 'returned' code was NOT observed and is therefore
+# NOT trusted (#226): if Pošta SK were to use it for „vrátená na dodaciu poštu" — a
+# parcel that is back at the office and still collectible — caching it as final would
+# silently freeze a genuinely uncollected shipment out of the escalation and the
+# customer would never be told. Anything unrecognised is NOT terminal (fail-safe:
+# keep checking rather than act on a guess about the API's vocabulary).
+TERMINAL_STATE_CODES = frozenset({"delivered"})
 
 
 def terminal_state(api_json) -> str:
-    """The FINAL tracking state of a shipment ('delivered' / 'returned'), or '' when the
-    shipment can still change and must be re-checked. Never raises: any unexpected shape
-    (no results, a per-result status other than 'ok' such as invalid_format, no events, an
-    unknown stateCode) reads as 'not final'."""
+    """The FINAL tracking state of a shipment ('delivered' — delivered at home OR collected at
+    the post office), or '' when the shipment can still change and must be re-checked. Never
+    raises: any unexpected shape (no results, a per-result status other than 'ok' such as
+    invalid_format, no events, an unknown stateCode) reads as 'not final'."""
     if not isinstance(api_json, dict):
         return ""
     results = api_json.get("results") or []

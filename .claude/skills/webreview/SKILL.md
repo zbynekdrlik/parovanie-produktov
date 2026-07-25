@@ -423,7 +423,12 @@ nevmestí. Čerstvý read vyššie len rozhoduje, či sa objednávkou vôbec opl
   ich cez `_relocate` prilej do `skipped` (ten riadok nesie poznámku AJ „▶ Poslať pripomienku");
   každý riadok nesie pole `pending` = dôvod, ktorý appka vypíše. Týka sa: stratený claim race,
   nezapísaný claim, `_release` po zlyhanej klasifikácii/sende, chýbajúce `MAIL_BCC`, chýbajúci
-  `OPENAI_API_KEY`.
+  `OPENAI_API_KEY`. **`pending` MUSÍŠ pri vyriešení zmazať** (`_relocate` kopíruje riadok cez
+  `{**r}` a inkrementálna rýchla cesta cez `dict(prev_row)`) — inak varovanie visí na vybavenom
+  riadku navždy a nafukuje počítadlo nedokončených každý beh (nález revízie PR #224). A tieto
+  `pending` riadky renderuj vo VLASTNEJ sekcii, nie pod hlavičkou „AI usúdilo, že zákazník je
+  už kontaktovaný" — pri chýbajúcom `MAIL_BCC` AI vôbec nebežala, takže by hlavička tvrdila
+  niečo, čo sa nestalo.
 
 **GOTCHA — tranzitný claim NIE JE mitigácia zlyhaného post-send zápisu (PR #223 review).**
 Nechať claim po zlyhaní zápisu (aby manažér neklikol znova) kupuje len `SENDING_CLAIM_TTL_S`;
@@ -543,15 +548,31 @@ Vzor `orders_reminder.prune_done` + terminálna cache v `run_posta_uncollected`:
   4-dňový prah o pár dní).
 - **Prázdne okno = neprunuj vôbec** (fail-closed — rovnaký reflex ako fail-closed supplier
   upload): prázdny/nečitateľný export nie je „nič nie je živé", je to „neviem".
-- Mimo okna: retention (180 d) + tvrdý strop N najnovších (500). Držať záznam stojí bajty,
-  zmazať ho priskoro stojí duplicitný mail — pravidlá sú preto zámerne asymetrické.
+- **POČETNÝ strop NIKDY neaplikuj na datované záznamy — len na nedatovateľné** (nález
+  adversariálnej revízie PR #224, reprodukovaný). Skrátený/čiastočný export spraví okno malé,
+  takže záznamy ŽIVÝCH objednávok vypadnú „mimo okna" — a strop ich potom zahodí len preto, že
+  ich je veľa → duplicitný mail. Bezpečné je iba VEKOVÉ kritérium, a to preto, že retention
+  (180 d) je **dvojnásobok 90-dňového okna orders exportu** (`_fetch_orders_csv`): záznam dosť
+  starý na zmazanie nemôže patriť objednávke, ktorá je ešte v exporte — ani v skrátenom. Strop
+  ostáva len pre záznamy BEZ použiteľného dátumu (tie nikdy nevypršia sami).
+- **Zmazanie dedup záznamu LOGUJ** (kódy + dôvod). Keď zákazník dostane druhý mail, je to
+  jediné miesto, kde sa dá zistiť, či za to mohol prune.
 - **Cache terminálneho stavu (#222)** je prunovaná tým istým oknom, takže rásť ani nemôže:
-  `terminal: {packageNumber: {state, at}}` v `posta_uncollected.json`. Terminálne =
-  `stateCode` posledného eventu v `TERMINAL_STATE_CODES` (`delivered` — live overené vo
-  fixtúre, `returned`); **`notified` tam NIE JE** (to je stav, ktorý automatizácia naháňa),
-  a neznámy kód / `invalid_format` / bez eventov je NEterminálny (fail-safe: radšej kontrolovať
-  ďalej než zmraziť zásielku mimo automatizácie). Poškodený záznam cache prepadne na reálnu
-  kontrolu — korupcia degraduje na „skontroluj", nikdy na „ignoruj navždy".
+  `terminal: {packageNumber: {state, at, code}}` v `posta_uncollected.json`. **Cache smie
+  ušetriť API volanie, NIKDY nesmie umlčať zákaznícke upozornenie** — preto prepadne na reálnu
+  kontrolu v ŠTYROCH prípadoch: poškodený záznam, iný `code` (trackovacie čísla sa do Shoptetu
+  píšu ručne — preklep/recyklované číslo nesmie stiahnuť cudzí verdikt), `at` staršie než
+  `POSTA_TERMINAL_RECHECK_DAYS` (7 — jedno chybné čítanie sa zahojí do týždňa, nie až po 30
+  dňoch), a vyvrátený verdikt sa z cache **maže** (nie iba ignoruje).
+- **Do `TERMINAL_STATE_CODES` daj LEN live overené kódy.** Live probe api.posta.sk
+  (2026-07-25) vrátil presne štyri: `received`, `transit`, `notified`, `delivered` — a
+  ukázal, že `delivered` pokrýva OBA konce eskalácie: „Doručená" (OK) aj **„Prevzatá na pošte"
+  (OKP)**, teda aj vyzdvihnutie po ZNP oznámení (fixtúra `tracking_collected_at_office.json`).
+  `notified` tam NIE JE (to je stav, ktorý automatizácia naháňa). `returned` sa NEpozorovalo →
+  **NEdôveruje sa mu** (#226): keby to znamenalo „vrátená na dodaciu poštu" (späť na pošte,
+  stále vyzdvihnuteľná), cache by ticho zmrazila reálne nevyzdvihnutú zásielku. Neznámy kód /
+  `invalid_format` / bez eventov = NEterminálne. Overiť sa dá zadarmo: `TRACKING_API` je
+  verejné GET API, stačí prebehnúť reálne čísla z `orders_cache.csv` a vypísať `stateCode`-y.
 - **Reopen (vedomé rozhodnutie #220):** reopenutá objednávka si ponechá terminálny záznam a
   druhú AUTOMATICKÚ pripomienku nedostane, kým je v exporte (duplicitný mail zákazník vidí,
   chýbajúci nie); manažér vie poslať ručne z tabu. Nový cyklus o mesiace neskôr už začne čistý.
