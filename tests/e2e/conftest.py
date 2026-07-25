@@ -629,6 +629,8 @@ def toorder_server(tmp_path_factory):
         counting 4 lines, labelled with the most-used spelling (CITRADE, 2× vs 1× each);
       * ORBIS has TWO lines carrying the SAME itemCode S1 (different orders) → siblings
         for the pair-URL propagation test;
+      * N1 arrived WITHOUT a supplier → groups under '—' and shows the inline
+        supplier-assign editor (the failed-save feedback test needs it);
       * every line is unpaired (no review data) so the inline pair editor is present.
     WEBREVIEW_PRODUCTS points at a nonexistent file so a dev box's real data/products.csv
     can never influence the run (CI has none)."""
@@ -643,7 +645,8 @@ def toorder_server(tmp_path_factory):
         "20260904;2026-05-18 09:00:00;Vybavuje sa;;Rukavice Cit Test;1;C3;Veľkosť: M;CITRADE\r\n"
         "20260903;2026-05-17 09:00:00;Vybavuje sa;;Nozik Cit Test;1;C4;Veľkosť: M;citrade\r\n"
         "20260900;2026-05-16 09:00:00;Vybavuje sa;;Nohavice Orb Test;1;S1;Veľkosť: M;ORBIS\r\n"
-        "20260890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n",
+        "20260890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
+        "20260001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
         encoding="cp1250")
     env = {
         **os.environ,

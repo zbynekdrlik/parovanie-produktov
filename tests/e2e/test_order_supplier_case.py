@@ -51,8 +51,8 @@ def test_case_variants_are_one_chip_labelled_with_the_most_used_spelling(page, t
     # label = the spelling the manager used most often (CITRADE 2× vs Citrade/citrade 1×),
     # count = ALL lines of that supplier (4), not the 2 of the winning spelling
     assert citrade[0].startswith("CITRADE (4)"), citrade[0]
-    # 'Všetci' + CITRADE + ORBIS — nothing else
-    assert len(texts) == 3, texts
+    # 'Všetci' + CITRADE + ORBIS + '—' (the supplier-less line) — nothing else
+    assert len(texts) == 4, texts
 
     assert console == [], f"console not clean: {console}"
 
