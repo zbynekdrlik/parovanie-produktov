@@ -2330,6 +2330,15 @@ function fmtDt(iso) {
 
 function dniLabel(n) { return n === 1 ? 'deň' : (n >= 2 && n <= 4 ? 'dni' : 'dní'); }
 
+// „BCC vždy" is BINDING for the two CUSTOMER automations (Pošta escalation + order reminders):
+// with no MAIL_BCC configured they refuse to send anything at all. That used to be an ERROR line
+// in the log only, so the tab showed a healthy run that had quietly mailed nobody — a silently
+// dead automation. The run now reports `bcc_missing` and both tabs surface it.
+function bccMissingWarning() {
+  return el('div', 'autoerr', '⚠️ Chýba MAIL_BCC v data/.mail_env — automatizácia NEPOSIELA '
+    + 'žiadne e-maily zákazníkom, kým sa nedoplní konfigurácia.');
+}
+
 function renderPosta() {
   const wrap = document.getElementById('tab-posta');
   if (!wrap) return;
@@ -2378,6 +2387,7 @@ function renderPosta() {
         + (lr.invalid ? ` · nesledovateľné: ${lr.invalid}` : '')
         + (lr.errors ? ` · chyby pri kontrole: ${lr.errors}` : '')));
     }
+    if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
   }
   wrap.appendChild(st);
 
@@ -3220,15 +3230,18 @@ function renderOrdersReminder() {
       + ` · odoslané pripomienky teraz: ${lr.emailed_now ?? 0}`
       + (lr.emailed_total ? ` · spolu pripomenutých: ${lr.emailed_total}` : '')
       + (lr.ai_unavailable ? ` · AI nedostupné: ${lr.ai_unavailable}` : '')
+      + (lr.no_email ? ` · chýba e-mail: ${lr.no_email}` : '')
       + (lr.errors ? ` · chyby: ${lr.errors}` : '')));
   }
+  if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
   wrap.appendChild(st);
 
   const d = ORDERS_REMINDER || {};
   const red = d.red || [];
   const orange = d.orange || [];
   const skipped = d.skipped || [];
-  if (!red.length && !orange.length && !skipped.length) {
+  const noEmail = d.no_email || [];
+  if (!red.length && !orange.length && !skipped.length && !noEmail.length) {
     wrap.appendChild(el('div', 'empty2',
       d.last_check ? `Žiadne objednávky na pripomenutie (kontrola ${fmtDt(d.last_check)}).`
                    : 'Zatiaľ neprebehla žiadna kontrola — spusti automatizáciu (▶ Štart) alebo klikni ⚡ Spustiť teraz.'));
@@ -3238,8 +3251,17 @@ function renderOrdersReminder() {
   // manual per-row override (#153) — "send" (▶ pripomienka teraz) works on red AND skipped rows
   // (overriding a wrong AI 'už kontaktovaný' verdict); "contact" (✓ kontaktované) only on red
   // rows (no note ever ran through the AI, so it can't already be resolved).
+  // The button is disabled for the whole round-trip: the send takes ~20s (SMTP), and a second
+  // click during it used to reach the server as a second 'send' request. The backend now
+  // rejects that with 409, but a disabled button is what keeps the manager from triggering it
+  // (and from staring at an unresponsive row) in the first place.
   function _ordremAction(btn, code, action) {
-    btn.onclick = () => overrideOrdersReminder(code, action);
+    btn.onclick = async () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      try { await overrideOrdersReminder(code, action); }
+      finally { btn.disabled = false; }   // no-op when the re-render already replaced the row
+    };
   }
 
   // RED — >4d orders with NO internal note (nobody has touched them yet)
@@ -3265,6 +3287,32 @@ function renderOrdersReminder() {
       _ordremAction(contactBtn, o.code, 'contact');
       actTd.appendChild(sendBtn); actTd.appendChild(contactBtn);
       tr.appendChild(actTd);
+      tb.appendChild(tr);
+    }
+    tbl.appendChild(tb);
+    wrap.appendChild(tbl);
+  }
+
+  // NO E-MAIL — the customer has no address on file, so the reminder can never be sent and the
+  // order is never classified (an AI call every run would be paid for nothing). Shown so the
+  // manager can add the address in Shoptet — the next run then handles the order normally.
+  if (noEmail.length) {
+    wrap.appendChild(el('div', 'warnhead',
+      `✉️ ${noEmail.length} — chýba e-mail zákazníka (doplň ho v Shoptete)`));
+    const tbl = el('table', 'posta-table');
+    tbl.dataset.testid = 'ordrem-noemail';
+    tbl.innerHTML = '<thead><tr><th>Objednávka</th><th>Zákazník</th><th>Položka</th>'
+      + '<th>Interná poznámka</th><th>Bez pohybu</th></tr></thead>';
+    const tb = el('tbody');
+    for (const o of noEmail) {
+      const tr = el('tr', 'callneeded'); tr.dataset.code = o.code;
+      tr.innerHTML =
+        `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
+        + `<td>${escapeHtml(o.billFullName || '')}`
+        + `<div class="sub2">${escapeHtml(o.phone || '') || 'bez telefónu'} · chýba e-mail</div></td>`
+        + `<td>${escapeHtml(o.itemName || '')}</td>`
+        + `<td class="sub2">${escapeHtml(o.shopRemark || '—')}</td>`
+        + `<td>${o.days || 0} ${dniLabel(o.days || 0)}</td>`;
       tb.appendChild(tr);
     }
     tbl.appendChild(tb);

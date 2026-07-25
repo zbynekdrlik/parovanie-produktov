@@ -376,10 +376,125 @@ zdieľaný zámok pre VŠETKY stores v appke — držať ho cez `_send_mail_html
 SMTP timeout) by zmrazilo KAŽDÚ inú admin akciu na webe na tú dobu. `run_orders_reminder()` už
 sieťové volania robí MIMO zámku (len zápis súboru je locknutý) — nový endpoint, čo volá von
 (mail/AI), musí ROBIŤ TO ISTÉ: (1) krátky `with _lock:` na kontrolu stavu, (2) sieťové volanie
-BEZ zámku, (3) krátky `with _lock:` na finálny zápis + **re-check stavu** (concurrentný
-double-click medzitým mohol už zapísať terminálny status — re-check zabráni duplicitnému zápisu/
-mailu). Nájdené vlastnou review-passou v #153 (žiaden subagent-dispatch tool v tomto prostredí —
-review robil worker sám priamo nad diffom).
+BEZ zámku, (3) krátky `with _lock:` na finálny zápis + **re-check stavu**. Nájdené vlastnou
+review-passou v #153.
+
+**Re-check pri zápise ale NESTAČÍ — akcia, čo POSIELA MAIL, si musí odoslanie NÁROKOVAŤ PRED
+SMTP (DÁVKA A, PR #223).** Re-check dedupne len ZÁPIS; dva súbežné klik-y oba prejdú
+pre-checkom a OBA POŠLÚ mail (zákazník dostane dva). Vzor claim (`api_orders_reminder_override`):
+pod prvým `_lock` zapíš tranzitný stav `{status:'sending', claimed_at, claim:<token>}` +
+persistuj → druhý request vidí živý claim → **409**; po úspechu prepíš terminálnym stavom; na
+KAŽDEJ zlyhanej ceste claim **uvoľni** (obnov pôvodný záznam) nech je retry možný. Claim MUSÍ
+mať TTL (`SENDING_CLAIM_TTL_S`, 10 min) — bez neho pád/restart medzi claim-om a sendom objednávku
+**natrvalo zamkne**. Helpery `_reminder_is_terminal` / `_reminder_claim_active` sú tolerantné k
+smetiu (non-dict, naive/neparsovateľný `claimed_at`) a **fail-open** = re-claimovateľné, nikdy
+mŕtvy zámok. Kto testuje claim, musí testovať AJ: expirovaný claim neblokuje ani `contact`
+akciu, a zlyhaný send claim uvoľní.
+
+**Claim MUSÍ byť SYMETRICKÝ — nárokuje si ho AJ dlhý BEH, nielen endpoint (PR #223 review).**
+Jednostranný claim (len endpoint) nechráni pred ničím: `run_orders_reminder` spraví čerstvý
+per-order read, **pustí `_lock`** a strávi ~20 s v OpenAI+SMTP **bez akéhokoľvek in-flight
+markera na disku** → manuálny klik v tom okne prejde 409 bránou, claimne a pošle — a beh pošle
+tiež (zákazník dostane dva maily). Beh preto nárokuje v TOM ISTOM `with _lock:` bloku ako
+čerstvý read, hneď PO claim/terminal checkoch a AŽ za lacnými diskvalifikátormi (no-note /
+no-email / no-key — tie žiadny claim nepotrebujú). Štyri veci, na ktorých to inak padne:
+- **`claimed_at` ber ČERSTVO pri každom claime**, nie `now_iso` zo začiatku behu — dlhý beh by
+  rozdával claimy, čo už vyzerajú expirované.
+- **`claim` token je per-BEH** (`secrets.token_hex`) a release obnoví `prev` **len keď sa token
+  na disku stále zhoduje** — inak by beh prepísal terminálny záznam súbežného override-u.
+- **Uvoľni na KAŽDEJ ceste bez výsledku** (zlyhaná klasifikácia AJ zlyhaný send), inak je
+  objednávka zamknutá do vypršania TTL.
+- **Claim, ktorý sa NEPODARILO zapísať, nechráni nič** → objednávku PRESKOČ (retry ďalší beh),
+  neposielaj ju „nenárokovanú"; a zápis claimu obaľ `try/except`, inak plný disk zhodí celý beh.
+
+**GOTCHA — tranzitný claim NIE JE mitigácia zlyhaného post-send zápisu (PR #223 review).**
+Nechať claim po zlyhaní zápisu (aby manažér neklikol znova) kupuje len `SENDING_CLAIM_TTL_S`;
+potom `sending` nie je ani aktívny ani terminálny → nočný beh objednávku považuje za
+nespracovanú a pošle DRUHÝ mail. Zapíš **NEEXPIRUJÚCI terminálny marker** (`{status:'emailed',
+persist_failed:True}`) vlastnou minimálnou transakciou (bez display-list práce — tá zlyhala
+pravdepodobne ako prvá), vo vlastnom `try/except`. Ak zlyhá aj ten, nič nie je horšie.
+
+**GOTCHA — dlhý beh, čo si na ZAČIATKU spraví snapshot stavu, ho NESMIE na konci zapísať
+wholesale — a NESMIE z neho ani ČÍTAŤ rozhodnutia (lost update, OBE strany).** `run_orders_reminder`
+strávi minúty v OpenAI+SMTP; manažér medzitým cez tab zapíše override. **Zápis:** finálny
+`_save_*` musí znovu načítať `orders` z disku (priebežné `_persist_done` tam už zapísalo) a
+prepísať LEN display polia. **Čítanie (na toto sa zabudlo pri prvom fixe — našla adversariálna
+review):** per-objednávkové rozhodnutie „už je vybavená / práve sa posiela" sa musí čítať
+`_load_*()` **čerstvo pod `_lock` tesne pred rozhodnutím**, nie zo štartového snapshotu — inak
+beh pošle mail zákazníkovi, ktorého manažér pred 2 minútami vybavil. Platí pre KAŽDÝ dlhý beh
+so súbežne editovateľným storom.
+
+**A ten „čítaj z disku" fix si vypýta ĎALŠIE DVE veci (PR #223 review) — bez nich lieči jeden bug
+a otvorí druhý:**
+- **Zlyhaný priebežný zápis sa finálnym save-om ZARUČENE ZAHODÍ.** Keď `orders` berieš z čerstvého
+  disk readu, in-memory záznam z `_persist_done`, ktorého zápis padol, tam nikdy nebude → mail
+  odišiel, stav sa stratil, ďalší beh pošle znova (`emailed_now: 1`, ale store ten kód
+  neobsahuje). Zbieraj kódy zlyhaných zápisov (`failed_writes`) a vo finálnom save ich **re-apply
+  NA VRCH** disk mapy — ale LEN keď záznam na disku nie je terminálny (súbežný override, čo
+  medzitým dospel k verdiktu, musí vyhrať; tým ostáva lost-update fix zachovaný).
+- **DISPLAY listy počítané zo štartového snapshotu a zapísané wholesale vracajú vyriešený riadok
+  na tab.** Objednávka vybavená cez override počas behu sa vráti do `red`/`no_email` a manažérov
+  ďalší klik dostane nevysvetliteľné 409. Fix má DVE polovice: (1) čerstvý per-order read patrí
+  **NAD** vetvu `if not o["has_note"]` (nad KAŽDÚ display vetvu), (2) tesne pred finálnym save-om
+  prefiltruj `red`/`no_email` proti čerstvej `orders` mape a terminálne riadky **presuň** do
+  `orange`/`skipped` (nielen zahoď — inak riadok z tabu úplne zmizne).
+
+**GOTCHA — `smtplib` má DVE pasce, kvôli ktorým helper hlási zlý výsledok; obe rieši zdieľaný
+`_smtp_deliver()` (nová mailová cesta MUSÍ ísť cezeň, nekopíruj connect/send/quit).**
+(1) Mail je **DORUČENÝ v momente, keď `sendmail()` vráti** — `quit()`, čo potom vyhodí výnimku
+(server zhodí spojenie po DATA), sa NESMIE hlásiť ako zlyhanie: volajúci by nezapísal dedup stav
+a ďalší beh pošle ten istý mail znova. (2) `sendmail()` vyhodí výnimku LEN keď sú odmietnutí
+**VŠETCI** príjemcovia; pri čiastočnom odmietnutí vráti **dict** odmietnutých — odmietnutý
+ZÁKAZNÍK musí byť zlyhanie (stav sa nebumpne → retry), odmietnuté len-BCC nesmie zahodiť fakt,
+že zákazníkovi mail odišiel. Porovnanie adries case-insensitive + strip.
+(3) `quit()` sa dosiahne LEN na úspešnej ceste — výnimka zo `starttls()`/`login()`/`sendmail()`
+(alebo zo samotného `quit()`) nechala socket GC-čku; `_smtp_deliver` preto zatvára v `try/finally`
+best-effort `close()`, keď sa `quit()` nedosiahol. Teardown NESMIE prebiť pôvodný výsledok
+(doručený mail ostáva úspech).
+
+**Automatizačný ZÁKAZNÍCKY mail posielaj `require_bcc=True`** (`_send_mail_html`): bez `MAIL_BCC`
+sa NEodošle vôbec (retry) namiesto tichého odoslania bez kópie pre majiteľa. Reset hesla /
+nedostupné / výstavy ostávajú best-effort (jednorazový warning). **Zápis stavu PO úspešnom
+maili obaľ `try/except`** — a keď zlyhá, NEhlás manažérovi obyčajnú chybu (klikol by znova =
+druhý mail): povedz explicitne „mail ODIŠIEL, neklikaj znova" + zaloguj kód objednávky. V behu
+(nie endpointe) po zlyhanom zápise **nerob `continue`**, ktorý by riadok vyhodil z tabu — je to
+presne ten riadok, čo má manažér skontrolovať.
+
+**„Konfigurácia chýba" hlás ako KONFIGURÁCIU, nie ako zlyhané odoslanie, a UKÁŽ to v UI
+(PR #223 review).** Generické 502 „odoslanie zlyhalo" manažér nerozozná od prechodného výpadku →
+kliká donekonečna. Endpoint, čo posiela `require_bcc=True` mail, si chýbajúce `MAIL_BCC`
+**pre-flightne PRED claimom** (`_mail_bcc() is None` → **503** + hláška „Chýba MAIL_BCC v
+data/.mail_env — mail sa neodošle, doplň konfiguráciu"; žiadny premárnený claim). A obe
+zákaznícke automatizácie vracajú v stats `bcc_missing`, z ktorého taby renderujú `.autoerr`
+riadok (`bccMissingWarning()` v app.js) — bez toho je mŕtva automatizácia vidno LEN v logu
+(`emails_sent: 0` vyzerá ako pokojný beh). **`_mail_bcc()` je JEDINÁ definícia „BCC je
+nastavené"** — používajú ju všetky tri sendery, pre-flight aj `bcc_missing`; nová cesta MUSÍ ísť
+cezeň (holý `os.environ.get("MAIL_BCC")` bez `.strip()` berie prázdny `MAIL_BCC=` riadok ako
+nastavený → tab a sender by si protirečili).
+
+**GOTCHA — DRAHÉ (platené) volanie až PO lacných diskvalifikátoroch.** `_classify_contacted`
+(OpenAI) bežalo pred kontrolou `if not o['email']` — taká objednávka sa nikdy nestane terminálnou,
+takže sa klasifikovala **každý beh donekonečna**. Pri každom novom AI/scrape kroku over poradie:
+najprv všetko, čo vie položku vylúčiť zadarmo, až potom platené volanie.
+
+**Test-pasca — monkeypatch stub `_send_mail_html` MUSÍ mať `**kw`.** Stuby po celom test-suite
+sú `lambda to, subject, body, bcc=None, **kw:` — bez `**kw` každé budúce rozšírenie signatúry
+(`require_bcc`) zhodí cudzie testy `TypeError`-om. Kto chce testovať REÁLNU SMTP cestu spod
+stubovaného `iso` fixture, uloží si `_REAL_SEND_MAIL_HTML = webapp._send_mail_html` na úrovni
+MODULU (pred akýmkoľvek patchom) a monkeypatchne ho späť + `smtplib.SMTP`/`SMTP_SSL` na fake
+(+ `MAIL_PORT=587`, inak reálny `.mail_env` s portom 465 obíde `SMTP` fake cez `SMTP_SSL`).
+
+**Test-pasca — `MAIL_BCC` PRIPNI vo fixture, presne ako `MAIL_HOST` (PR #223 review).** Odkedy
+beh vracia `bcc_missing` a endpoint pre-flightuje `MAIL_BCC`, rozhoduje o VETVE — a `app.py`
+načíta repo `data/.mail_env` do `os.environ` (`setdefault`), takže dev box (súbor má) a CI (nemá)
+by šli inou vetvou: zelené tu, červené tam. Oba automation `iso` fixtures aj e2e `automations_server`
+majú `MAIL_BCC` pripnuté; test, čo chce missing-BCC vetvu, si ho `delenv`-ne sám.
+
+**Test-pasca — flaky `_save_*` cieli podľa OBSAHU, nie podľa poradia volania.** Odkedy beh
+zapisuje aj claimy, `if n["calls"] == 1` netrafí priebežný `_persist_done`, ale claim (test
+potom testuje niečo úplne iné a stále „prejde"). Podmieňuj zlyhanie tým, čo sa zapisuje
+(`data["orders"]["<kód>"]["status"] == "emailed"`). A `monkeypatch.undo()` v teste zhodí AJ celú
+`iso` izoláciu — na dočasné vrátenie jedného patchu si ulož originál a `setattr`-ni ho späť.
 
 **GOTCHA — e2e fixtúra, čo klikne skutočnú `_send_mail_html`/`_send_mail` cestu, MUSÍ pripnúť
 `MAIL_HOST=""` do `env`.** `_load_env_file()` číta `data/.mail_env` podľa ABSOLÚTNEJ repo cesty

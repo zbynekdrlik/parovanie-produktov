@@ -134,3 +134,26 @@ def test_send_now_button_posts_and_surfaces_smtp_failure(page, automations_serve
     assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 1
 
     assert _unexpected(console) == [], f"console not clean: {console}"
+
+
+# ── BUG 4 — orders whose customer has no e-mail get their own section ──────────────
+def test_no_email_section_renders_and_offers_no_send_button(page, automations_server):
+    """An order with no customer address can never be reminded, so the run surfaces it here
+    (instead of paying for an AI classification every run). It must be visible to the manager
+    — and must NOT offer a 'send' button that could only ever fail."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    tbl = page.locator('[data-testid="ordrem-noemail"]')
+    assert tbl.is_visible()
+    body = tbl.inner_text()
+    assert "20261004" in body and "Bez Mailu" in body and "Rukavice Test NoMail" in body
+    assert "treba doriešiť" in body                 # the note the AI never had to read
+    assert "chýba e-mail" in body
+    row = tbl.locator('tr[data-code="20261004"]')
+    assert row.locator(".ordrem-act-send").count() == 0
+    assert row.locator(".ordrem-act-contact").count() == 0
+    # and it is NOT mixed into the „bez internej poznámky" (red) list — it HAS a note
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261004"]').count() == 0
+
+    assert console == [], f"console not clean: {console}"
