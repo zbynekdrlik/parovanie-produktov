@@ -967,7 +967,17 @@ async function markGroupOrdered(items, ordered) {
       }
       return;
     }
-    if (err) return;
+    if (err) {
+      // The bulk writes the map only on SUCCESS, so a refused owner is the ONE writer that
+      // neither wrote its value nor has one to roll back — and a predecessor it superseded
+      // skipped its own reconcile (still `inflight` then). Settling owes the server's last
+      // word here too, or that predecessor's refused optimistic value stays for good.
+      if (st.inflight === 0 && !!ORDERED[key] !== st.confirmed) {
+        if (st.confirmed) ORDERED[key] = true; else delete ORDERED[key];
+        repaint = true;
+      }
+      return;
+    }
     if (ordered) ORDERED[key] = true; else delete ORDERED[key];
     repaint = true;
   });
