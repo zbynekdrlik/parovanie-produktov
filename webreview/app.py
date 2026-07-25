@@ -4836,7 +4836,12 @@ def _reminder_is_terminal(entry) -> bool:
 
 def _reminder_claim_active(entry, now=None) -> bool:
     """True while a manual send for this order is genuinely IN FLIGHT (fresh 'sending' claim).
-    An unparseable or expired claim returns False — abandoned claims must be re-claimable."""
+    An unparseable, expired or future-dated claim returns False — abandoned claims must be
+    re-claimable. The age is bounded from BOTH sides for the same reason the terminal tracking
+    cache bounds its `at`: a timestamp AHEAD of now (a clock/TZ step backwards, a partial write)
+    would otherwise read as a live claim until real time catches up, and then the manager's
+    „▶ Poslať pripomienku" 409s while the run skips the order — the reminder is silently never
+    sent, and the TTL that exists so a claim can never lock an order forever is defeated."""
     if not isinstance(entry, dict) or entry.get("status") != "sending":
         return False
     now = now or datetime.now(timezone.utc).astimezone()
@@ -4846,7 +4851,7 @@ def _reminder_claim_active(entry, now=None) -> bool:
         return False
     if claimed.tzinfo is None:
         claimed = claimed.replace(tzinfo=now.tzinfo)
-    return (now - claimed).total_seconds() < SENDING_CLAIM_TTL_S
+    return 0 <= (now - claimed).total_seconds() < SENDING_CLAIM_TTL_S
 
 
 def run_orders_reminder() -> dict:
