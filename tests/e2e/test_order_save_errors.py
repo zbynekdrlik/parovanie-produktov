@@ -370,6 +370,15 @@ def test_a_straggler_from_an_older_burst_cannot_poison_a_later_click(page, toord
     page.wait_for_function("() => window.__held.length === 2", timeout=3000)
     page.evaluate("() => window.__held[1](200)")          # #2 accepted → burst 1 settles
     page.wait_for_function("() => window.__settled.length === 1", timeout=3000)
+    page.wait_for_timeout(200)                            # let the continuation run
+
+    # The never-delete rule, asserted DIRECTLY: everything below still passes with
+    # delete-on-settle put back (the `live` identity check neutralises the straggler on
+    # its own), so without this the rule the code and the playbook both call load-bearing
+    # would be unpinned prose. One row, one flag → exactly one entry, and it SURVIVES the
+    # burst settling; only `loadOrders()` may ever clear the bookkeeping.
+    assert page.evaluate("() => Object.keys(_flagWrites).length") == 1, \
+        "the (flag, row) entry was dropped when its burst settled"
 
     page.locator(".toorder-row[data-code='N1'] .to-instock").click()   # burst 2, write #3
     page.wait_for_function("() => window.__held.length === 3", timeout=3000)
