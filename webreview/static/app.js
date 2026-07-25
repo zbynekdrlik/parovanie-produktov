@@ -2339,6 +2339,18 @@ function bccMissingWarning() {
     + 'žiadne e-maily zákazníkom, kým sa nedoplní konfigurácia.');
 }
 
+// #225 — the evidence of who was already mailed is unreadable, so the automation refuses to send
+// anything. Without this banner the tab would render as a clean, empty day: the manager would see
+// „0 objednávok" and never learn the automation had stopped (same class of silent death the
+// bcc_missing warning exists for). NEVER tell them to delete the file — an empty store means
+// every customer gets mailed again.
+function storeCorruptWarning(file) {
+  return el('div', 'autoerr', '⛔ Poškodená evidencia odoslaných e-mailov (data/out/'
+    + escapeHtml(file) + ') — automatizácia NEPOSIELA nič, aby zákazníci nedostali maily '
+    + 'druhýkrát. Zoznam nižšie je preto prázdny. Súbor treba opraviť podľa zálohy '
+    + '<code>.corrupt-*</code> v tom istom priečinku (NEMAZAŤ ho).');
+}
+
 // ── #217 — read-only e-mail preview shared by both customer-mail automations ────────────
 // The manager could not see what a customer gets until the automation had already sent it.
 // This dialog is inert BY CONSTRUCTION: the endpoints behind it write nothing (no claim, no
@@ -2359,9 +2371,16 @@ function closeEmModal() {
   if (m) m.hidden = true;
 }
 
+// Two quick clicks used to be able to show customer A's e-mail under order B's heading: the
+// heading is set synchronously per click, the body by whichever fetch resolves last. On a screen
+// whose whole point is „see exactly what THIS customer gets", a mis-paired header/body is the one
+// failure worth guarding — so a superseded response is dropped.
+let _emSeq = 0;
+
 async function openEmailPreview(url, payload, head) {
   const E = _emModalEls();
   if (!E.modal) return;
+  const my = ++_emSeq;
   E.head.textContent = head;
   E.hint.textContent = 'Presne toto dostane zákazník. Nič sa teraz neodosiela.';
   E.rec.innerHTML = 'Načítavam…';
@@ -2374,6 +2393,7 @@ async function openEmailPreview(url, payload, head) {
       body: JSON.stringify(payload)
     })).json();
   } catch (_) { j = null; }
+  if (my !== _emSeq) return;              // a later click already owns the dialog
   if (!j || !j.ok) {
     E.rec.textContent = 'Náhľad sa nepodarilo načítať'
       + (j && j.error ? ': ' + j.error : '.');
@@ -2460,6 +2480,7 @@ function renderPosta() {
   wrap.appendChild(st);
 
   const p = POSTA || {};
+  if (p.store_corrupt) wrap.appendChild(storeCorruptWarning('posta_uncollected.json'));
   // uncollected shipments table
   const unc = p.uncollected || [];
   if (!unc.length) {
@@ -3315,6 +3336,7 @@ function renderOrdersReminder() {
   wrap.appendChild(st);
 
   const d = ORDERS_REMINDER || {};
+  if (d.store_corrupt) wrap.appendChild(storeCorruptWarning('orders_reminder.json'));
   const red = d.red || [];
   const orange = d.orange || [];
   const skipped = d.skipped || [];

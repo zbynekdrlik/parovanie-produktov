@@ -583,15 +583,40 @@ vrátil `{}` (bežný SAFE vzor), prvý ďalší `_claim`/`_persist_done`/escala
 **nový JEDNOpoložkový súbor** — celá evidencia je preč a KAŽDÁ otvorená objednávka dostane
 DRUHÝ mail. Vzor, ktorý drž pri každom novom dedup store:
 
-- `_load_dedup_store(path, label)`: chýbajúci súbor → `{}` (**legitímny prvý beh** — nikdy
-  neblokuj, inak sa nerozbehne čerstvý deploy); nečitateľný ALEBO ne-dict → zálohuj + `raise
-  DedupStoreCorrupt`. Ne-dict je druhá tichá wipe cesta (`else {}`), nie kuriozita.
+- `_load_dedup_store(path, label, dedup_keys)`: chýbajúci súbor → `{}` (**legitímny prvý beh**
+  — nikdy neblokuj, inak sa nerozbehne čerstvý deploy); nečitateľný ALEBO ne-dict → zálohuj +
+  `raise DedupStoreCorrupt`. Ne-dict je druhá tichá wipe cesta (`else {}`), nie kuriozita.
+- **Strážiť VONKAJŠÍ dict NESTAČÍ — validuj aj samotnú dedup MAPU** (`dedup_keys`: `orders` /
+  `escalation`). `{"orders": null}` sa naparsuje A JE dict, takže vonkajší guard ho pustí, beh
+  prečíta „nikomu sme ešte neposlali" a zapíše to ako fakt → ďalší beh mailuje všetkých znova
+  (revízia PR #228, reprodukované). Kľúč, ktorý CHÝBA, je naďalej v poriadku (prvý beh).
+- **Fail-closed daj LEN na to, čo drží „čo už odišlo".** `posta_uncollected.json`'s `terminal`
+  je VÝKONNOSTNÁ cache — jej strata stojí API volanie, nikdy nie duplicitný mail, kým padnutie
+  behu na nej by UMLČALO reálne upozornenie zákazníkovi. Preto `terminal` NIE je v `dedup_keys`
+  a jeho ne-dict hodnotu len skoercuj na `{}` (`dict("kaboom")` inak zhodí celý beh).
+- **Chytaj `ValueError`, nie `json.JSONDecodeError`.** Stores sa píšu `ensure_ascii=False` a sú
+  plné slovenčiny → zápis prerezaný uprostred viacbajtového znaku hodí `UnicodeDecodeError`
+  (najpravdepodobnejšia reálna korupcia). Ten guardu unikal: žiadna záloha, 500 na tabe, raw
+  traceback v `last_error`. Oba sú podtriedy `ValueError`.
+- **Po zavedení guardu VYHĎ všetky zvyšné fail-openy na tej ceste**, inak liečiš jednu úroveň a
+  druhá ostane: `if not isinstance(orders_map, dict): orders_map = dict(done)` vo finálnom save
+  bola posledná wipe cesta (zapísala prázdne `done` ako celú evidenciu).
+- **Hláška NESMIE radiť „zmaž súbor"** — prázdny/chýbajúci súbor je „prvý beh", teda presne ten
+  wipe. Píš „oprav podľa zálohy, NEMAŽ ho".
 - **Záloha je KÓPIA, nie presun.** Presunutý originál = ďalší load vidí „súbor neexistuje" =
   prvý beh = presne ten wipe. Originál necháš na mieste, nech padá nahlas, kým to človek
   neopraví. Kópie dedupuj podľa OBSAHU (`<path>.corrupt-<ts>`), inak denná automatizácia
   nechá jednu zálohu za každý beh.
 - **Fail-closed je DEFAULT loader**, tolerantná je explicitná `_load_*_display()` varianta
-  (len read-only taby). Nový call site tak zdedí bezpečné správanie, nie nebezpečné.
+  (len read-only taby). Nový call site tak zdedí bezpečné správanie, nie nebezpečné. Display
+  varianta vracia **`(state, corrupt)`** a endpoint pošle `store_corrupt` → tab vykreslí
+  `storeCorruptWarning()`. Bez toho poškodený store vyzerá ako pokojný deň (prázdne zoznamy) a
+  korupcia, čo vznikne MEDZI behmi, je neviditeľná — tá istá „ticho mŕtva automatizácia", proti
+  ktorej existuje `bcc_missing`.
+- Zálohu rob **idempotentne per (path, obsah)**: `hashlib.sha256` memo + VLASTNÝ malý zámok
+  (`_quarantine_lock`, NIE globálny `_lock` — nie je reentrantný a volajúci ho často už drží).
+  Poškodený store sa číta aj pri KAŽDOM display requeste (tab poll-uje počas behu), takže bez
+  memo by každý request skenoval priečinok a čítal všetky doterajšie zálohy.
 - Beh `raise`-ne → `automation_runner._execute` zapíše `last_status='error'` + hlášku do
   `last_error`, tab ju vykreslí ako `.autoerr`. **Endpointy rieši jeden `@app.errorhandler(
   DedupStoreCorrupt)` → 503** (nie 500 — manažér má vidieť, čo opraviť, nie klikať dokola).
