@@ -857,19 +857,40 @@ const _flagWrites = Object.create(null);
 function _flagEntry(field, key, map) {
   const wk = field + '\u0000' + key;
   return _flagWrites[wk]
-    || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedSeq: 0 });
+    || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedSeq: 0, inflight: 0 });
+}
+
+// When the LAST response outstanding for a (flag, row) has settled, the map must agree
+// with what the server confirmed. A superseded write that returned BLIND lost an ACCEPTED
+// write whose success landed after a newer one had already rolled back — and refused-fast
+// + accepted-slow is exactly what a partial outage produces (a 500/401 answers instantly
+// while a real write queues behind the app's `with _lock:` + atomic replace). The manager
+// was told „nepodarilo sa uložiť", the row showed the flag OFF, and the server held it ON.
+// `confirmed` is maintained by the highest-seq SUCCESSFUL write and still carries the
+// original baseline when every write failed, so reconciling to it is right in both
+// directions. Only the settling of the last in-flight write may do it: reconciling while
+// another write is still out would fight that write's own optimistic value.
+function _reconcileFlag(st, map, key) {
+  if (!!map[key] === st.confirmed) return;
+  if (st.confirmed) map[key] = true; else delete map[key];
+  renderToOrder();
 }
 
 async function saveOrderFlag(path, field, map, key, on, what) {
   const st = _flagEntry(field, key, map);
   const seq = ++st.seq;
+  st.inflight += 1;
   if (on) map[key] = true; else delete map[key];
   const err = await postToOrder(path, { key, [field]: on });
+  st.inflight -= 1;
   // `loadOrders()` drops the whole map when it re-reads the server, so an entry that is
   // no longer the live one for its key must not roll anything back over fresh data
   const live = _flagWrites[st.wk] === st;
   if (!err && live && seq >= st.confirmedSeq) { st.confirmed = on; st.confirmedSeq = seq; }
-  if (!live || seq !== st.seq) return !err;   // superseded: the newest write owns the row
+  if (!live || seq !== st.seq) {              // superseded: the newest write owns the row
+    if (live && st.inflight === 0) _reconcileFlag(st, map, key);
+    return !err;
+  }
   if (!err) return true;
   if (st.confirmed) map[key] = true; else delete map[key];
   renderToOrder();              // roll the tab back BEFORE the message, never after
@@ -1295,22 +1316,34 @@ function renderOrderRow(o) {
   cb.title = 'Označiť ako objednané';
   cb.onchange = () => { saveOrdered(o.key, cb.checked); row.classList.toggle('done', cb.checked); renderOrderFilters(); };
   row.appendChild(cb);
-  if (o.supplierUrl) {
+  // A stored value `safeHttpUrl` refuses must NOT become an <a> at all: `href=""`
+  // resolves to the PAGE ITSELF, so one click reloads the tab and takes every open
+  // editor — and the half-typed work in it — with it. The value is never echoed back
+  // into a tooltip either.
+  const supHref = safeHttpUrl(o.supplierUrl), pairHref = safeHttpUrl(o.pairUrl);
+  if (supHref) {
     // reviewed decision link — authoritative, read-only (mení sa v párovacom tabe)
-    const a = el('a', 'to-link'); a.href = safeHttpUrl(o.supplierUrl); a.target = '_blank'; a.rel = 'noopener';
+    const a = el('a', 'to-link'); a.href = supHref; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
-  } else if (o.pairUrl) {
+  } else if (o.supplierUrl) {
+    // read-only slot with an unusable value — say so instead of faking a link
+    const bad = el('span', 'to-link to-badlink', '🔗 ' + escapeHtml(o.itemCode || 'link'));
+    bad.title = 'Uložená adresa nie je platný http(s) odkaz — oprav ju v párovacom tabe';
+    row.appendChild(bad);
+  } else if (pairHref) {
     // inline-napárované → svieti rovnako ako ostatné napárované (🔗 odkaz) +
     // malá ✏️ na opravu, ak dal zlú URL
-    const a = el('a', 'to-link'); a.href = safeHttpUrl(o.pairUrl); a.target = '_blank'; a.rel = 'noopener';
-    a.textContent = '🔗 ' + (o.itemCode || 'link'); a.title = o.pairUrl;
+    const a = el('a', 'to-link'); a.href = pairHref; a.target = '_blank'; a.rel = 'noopener';
+    a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
     const edit = el('button', 'to-pairedit', '✏️');
     edit.title = 'Zmeniť / opraviť párovaciu URL';
     edit.onclick = () => openRowEditor(a, pairEditor(o, true), edit);
     row.appendChild(edit);
   } else {
+    // an unusable inline pairing falls through to the paste box (its value pre-filled,
+    // inert in an input) so the manager can repair it right where he sees it
     // nenapárované → políčko na vloženie URL (otvára produkt pri objednávaní)
     row.appendChild(pairEditor(o, false));
   }
@@ -1559,9 +1592,15 @@ function restoreOpenEditors(snaps) {
     // just-propagated per-product value (#204) has since paired. A value that now equals
     // what is stored was likewise just saved, and re-opening its editor would undo the
     // „it landed" feedback (the row would show an input instead of the new link / tag).
-    if (spec.same(s.value, spec.stored(o))) continue;
-    // an EMPTY box normally holds no unsaved work — but one the manager OPENED with ✏️
-    // and then cleared is a deliberate „delete this note", which is work all the same
+    // an EMPTY box normally holds no unsaved work — but one the manager OPENED with ✏️/💬
+    // is his, whether he has typed into it yet or has deliberately cleared it. That
+    // exception has to be weighed BEFORE „same as stored": on a row with nothing stored
+    // the box and the stored value are BOTH '', so `same` fired first and closed the box
+    // under a manager who was about to type into it. A NON-empty value equal to what is
+    // stored is the just-saved case and still closes — re-opening it would replace the
+    // freshly rendered link / tag with an input again.
+    const emptyOpened = s.opened && !s.value.trim();
+    if (!emptyOpened && spec.same(s.value, spec.stored(o))) continue;
     if (!s.value.trim() && !s.opened) continue;
     let inp = row.querySelector(spec.input);
     let ed = null;

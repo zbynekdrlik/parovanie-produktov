@@ -253,6 +253,8 @@ body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f3
 .toorder-row .to-unavail.on{background:#D14D3B;color:#fff}
 .toorder-row .to-link{color:#2563eb;text-decoration:none;font-weight:600;font-size:13px;flex:0 0 auto;min-width:110px}
 .toorder-row .to-link:hover{text-decoration:underline}
+.toorder-row .to-badlink{color:#9ca3af;font-weight:600;cursor:not-allowed;text-decoration:line-through}
+.toorder-row .to-badlink:hover{text-decoration:line-through}
 body[data-theme=dark] .toorder-row .to-link{color:#60a5fa}
 .toorder-row .to-pair{display:flex;align-items:center;gap:6px;flex:1 1 320px;min-width:230px}
 .toorder-row .to-pcode{color:var(--soft);font-size:12px;flex:0 0 auto}
