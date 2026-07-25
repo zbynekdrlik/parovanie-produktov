@@ -80,7 +80,15 @@ def test_a_non_http_stored_pair_url_never_renders_as_a_clickable_link(page, toor
     """PR #233 review — `/api/order-pair` validates the scheme on WRITE, but the row
     rendered `a.href = o.pairUrl` (and `o.supplierUrl`) straight from the store, so a
     `javascript:` value left there by any other path would render as a clickable link.
-    The GRUBE .de link on the same row already carried this guard; now all three do."""
+    The GRUBE .de link on the same row already carried this guard; now all three do.
+
+    SECOND review pass: sanitising the href to '' was not enough, and this test used to
+    pin that half-fix (`evil_pair: ""`). `href=""` resolves to the PAGE ITSELF, so the
+    „harmless" dead link reloads the tab on one click and discards every open editor —
+    exactly the unsaved work the rest of this PR was written to protect. A refused value
+    must therefore produce NO anchor at all: the inline pairing falls back to its paste
+    box (where the manager can repair it), the read-only decision slot to an inert span.
+    The value is not echoed back into a tooltip either."""
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
     r = page.evaluate("""() => {
@@ -88,16 +96,34 @@ def test_a_non_http_stored_pair_url_never_renders_as_a_clickable_link(page, toor
         {key: 'X|W1', itemCode: 'W1', orderCode: 'X', name: 'T', supplier: 'S',
          qty: '1', size: '', orderDate: '2026-05-20 09:00:00'}, o));
       const href = (o) => {
-        const a = mk(o).querySelector('.to-link');
+        const a = mk(o).querySelector('a.to-link');
         return a ? a.getAttribute('href') : null;
       };
+      const evilPair = mk({pairUrl: 'javascript:alert(1)'});
+      const evilDec = mk({supplierUrl: 'javascript:alert(1)'});
+      const badHrefs = (n) => [...n.querySelectorAll('a')]
+        .filter(a => !/^https?:\/\//.test(a.getAttribute('href') || '')).length;
+      const poisoned = (n) => [...n.querySelectorAll('*')]
+        .some(e => String(e.title || '').includes('javascript:'));
       return {
         evil_pair: href({pairUrl: 'javascript:alert(1)'}),
         evil_decision: href({supplierUrl: 'javascript:alert(1)'}),
+        // no anchor on the row carries a non-http(s) href — `href=""` (the old
+        // sanitised-but-still-clickable form) navigates the tab to ITSELF
+        evil_pair_anchors: badHrefs(evilPair),
+        evil_decision_anchors: badHrefs(evilDec),
+        // …and the manager still gets a way to fix / see it
+        evil_pair_has_box: !!evilPair.querySelector('.to-pairurl'),
+        evil_decision_has_span: !!evilDec.querySelector('span.to-badlink'),
+        evil_pair_title_leak: poisoned(evilPair),
+        evil_decision_title_leak: poisoned(evilDec),
         good_pair: href({pairUrl: 'https://dodavatel.test/x'}),
         good_decision: href({supplierUrl: 'https://dodavatel.test/y'}),
       };
     }""")
-    assert r == {"evil_pair": "", "evil_decision": "",
+    assert r == {"evil_pair": None, "evil_decision": None,
+                 "evil_pair_anchors": 0, "evil_decision_anchors": 0,
+                 "evil_pair_has_box": True, "evil_decision_has_span": True,
+                 "evil_pair_title_leak": False, "evil_decision_title_leak": False,
                  "good_pair": "https://dodavatel.test/x",
                  "good_decision": "https://dodavatel.test/y"}, r
