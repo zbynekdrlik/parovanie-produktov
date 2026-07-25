@@ -8,7 +8,14 @@ its per-line flags are untouched.
 SCOPE (review of the #205-#208 batch): the chip counts the supplier's OUTSTANDING lines
 — the same set „📋 Kopírovať objednávku" (#207) pastes — so the number on screen always
 equals the number in the e-mail, whatever the „skryť poriešené" (#205) toggle says. The
-FULL demand (handled lines included) stays readable in the chip's tooltip.
+FULL demand (settled lines included) stays readable in the chip's tooltip.
+
+SCOPE (review pass 2): that equality has to hold WITHOUT a reload too. A per-row flag
+toggle deliberately does not repaint `#list`, so the chips are rewritten in place on every
+toggle — otherwise the screen keeps the number from the last full paint while the copy
+button (narrowed at click time) already pastes the smaller one. And the chip belongs to a
+product that spans SEVERAL order lines, so it survives a sibling being flagged: it then
+shows what is left, with the whole demand in the tooltip.
 
 `toorder_server` has exactly this shape: ORBIS's two lines share itemCode S1 with
 quantities 1 and 2 (→ spolu 3 ks), while CITRADE's four lines are four distinct codes.
@@ -51,11 +58,13 @@ def test_repeated_product_shows_the_summed_quantity(page, toorder_server):
     assert console == [], f"console not clean: {console}"
 
 
-def test_total_drops_a_handled_line_and_keeps_it_in_the_tooltip(page, toorder_server):
+def test_a_handled_line_leaves_the_chip_showing_what_is_left(page, toorder_server):
     """The chip is the number the manager types into the supplier e-mail, so it counts the
     OUTSTANDING lines only: the moment he flags one of the two S1 lines „skladom", the
-    supplier is owed the rest — not the original 3 ks. Independent of the #205 toggle: the
-    same number with it on and off, and the full demand one hover away."""
+    supplier is owed the rest — not the original 3 ks. It must NOT disappear at that point:
+    the product genuinely spans two orders, and „the full demand is one hover away" is only
+    true while the chip carrying that tooltip is on screen. Independent of the #205 toggle:
+    the same number with it on and off."""
     console = _console_watch(page)
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
@@ -69,14 +78,51 @@ def test_total_drops_a_handled_line_and_keeps_it_in_the_tooltip(page, toorder_se
 
     assert page.locator(".toorder-row[data-code='S1']").count() == 2, \
         "with the filter off both lines stay on screen"
-    # one outstanding line left → the chip would only repeat its own „2 ks" → no chip
-    assert page.locator(".to-total").count() == 0
+    # the product still spans two orders → both rows keep the chip, now stating the work
+    # LEFT, and the whole demand stays readable in the tooltip
+    assert page.locator(".to-total").all_inner_texts() == ["Σ spolu 2 ks"] * 2
+    assert page.locator(".to-total").first.get_attribute("title") == \
+        "Spolu vo všetkých objednávkach: 3 ks · nevybavené: 2 ks"
 
-    # …and with „skryť poriešené" on, the surviving row still shows no second number
+    # …and with „skryť poriešené" on, the surviving row says exactly the same thing
     page.locator("#toToolbar .to-hidehandled").click()
     page.wait_for_function(
         "() => document.querySelectorAll(\".toorder-row[data-code='S1']\").length === 1")
-    assert page.locator(".to-total").count() == 0
+    assert page.locator(".to-total").all_inner_texts() == ["Σ spolu 2 ks"]
+    assert page.locator(".to-total").first.get_attribute("title") == \
+        "Spolu vo všetkých objednávkach: 3 ks · nevybavené: 2 ks"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_the_chip_follows_a_flag_toggle_without_a_repaint(page, toorder_server):
+    """NO `reload()` between the flag click and the copy click — that window IS the bug.
+    A per-row toggle deliberately does not repaint `#list` (#205/#233: a row the manager is
+    typing in must never vanish under him), so the chip has to be rewritten IN PLACE. Left
+    stale it kept the number from the last full paint — „Σ spolu 3 ks" on screen, tooltip
+    positively claiming „nevybavené: 3 ks" — while „Kopírovať objednávku", narrowed at
+    click time, already pasted 2 ks. Two numbers for one supplier order, again."""
+    console = _console_watch(page)
+    page.add_init_script(_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    assert page.locator(".to-total").all_inner_texts() == ["Σ spolu 3 ks"] * 2
+
+    page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
+    page.wait_for_function(
+        "() => /6 položiek z 7/.test(document.getElementById('toToolbar').textContent)")
+
+    # the list was NOT repainted — both rows are still there, and both chips now say 2 ks
+    assert page.locator(".toorder-row[data-code='S1']").count() == 2
+    assert page.locator(".to-total").all_inner_texts() == ["Σ spolu 2 ks"] * 2
+    assert page.locator(".to-total").first.get_attribute("title") == \
+        "Spolu vo všetkých objednávkach: 3 ks · nevybavené: 2 ks"
+
+    # …and the clipboard agrees with what the screen says, in the SAME session
+    page.locator(".toorder-supplier").filter(has_text="ORBIS").locator(".tosup-copy").click()
+    page.wait_for_function("() => window.__copied.length === 1")
+    assert page.evaluate("() => window.__copied[0]") == \
+        "Objednávka — ORBIS (1 položka)\nS1 | Veľkosť: M | 2 ks"
 
     assert console == [], f"console not clean: {console}"
 
@@ -152,22 +198,30 @@ def test_quantity_parsing_matches_what_the_row_displays(page, toorder_server):
 
 def test_outstanding_scope_reads_the_live_flag_maps(page, toorder_server):
     """`outstandingOf` is the ONE scope both the chip and the copy use, and it reads the
-    LIVE flag maps (like isHandled) — never the o.* snapshot, never the rendered set."""
+    LIVE flag maps (like isHandled) — never the o.* snapshot, never the rendered set.
+
+    It holds back only the three SETTLED flags. „čaká sa" is a SCHEDULING flag (the line is
+    still to be ordered — see test_a_waiting_line_still_goes_into_the_order), so it stays in
+    the scope even though `isHandled` — which drives the #205 hide filter and the chip
+    colours — counts it as dealt with."""
     console = _console_watch(page)
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
 
     out = page.evaluate("""() => {
       const items = [{key: 'a', itemCode: 'A', qty: '1'}, {key: 'b', itemCode: 'A', qty: '2'},
-                     {key: 'c', itemCode: 'A', qty: '4'}];
-      ORDERED = {a: true}; WAITING = {}; INSTOCK = {}; UNAVAIL = {c: true};
+                     {key: 'c', itemCode: 'A', qty: '4'}, {key: 'd', itemCode: 'A', qty: '8'}];
+      ORDERED = {a: true}; WAITING = {d: true}; INSTOCK = {}; UNAVAIL = {c: true};
       return { keys: outstandingOf(items).map(o => o.key),
                totals: groupQtyTotals(outstandingOf(items)),
+               handled: items.map(o => isHandled(o)),
                empty: outstandingOf([]).length, nullish: outstandingOf(null).length };
     }""")
 
-    assert out["keys"] == ["b"]
-    assert out["totals"] == {"A": {"qty": 2, "lines": 1}}
+    assert out["keys"] == ["b", "d"], 'a parked („čaká sa") line is still work to order'
+    assert out["totals"] == {"A": {"qty": 10, "lines": 2}}
+    # …while the wider `isHandled` predicate keeps treating it as dealt with
+    assert out["handled"] == [True, False, True, True]
     assert out["empty"] == 0 and out["nullish"] == 0
 
     assert console == [], f"console not clean: {console}"

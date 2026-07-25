@@ -5,11 +5,15 @@ order by hand, and until now there was no way to get the whole supplier list out
 tab. The button puts it into the clipboard as plain text (kód | veľkosť | ks | odkaz).
 
 SCOPE (review of the #205-#208 batch): the copied text is the supplier's OUTSTANDING
-lines — the ones with no flag on them yet — and that set does NOT depend on the „skryť
-poriešené" (#205) toggle. The old rule was WYSIWYG („copy what the group shows"), which
-with the toggle OFF (the default) pasted lines the manager had already ticked
-„objednané" straight into a supplier e-mail, and made the on-screen „Σ spolu" chip
-contradict the copied quantities.
+lines, and that set does NOT depend on the „skryť poriešené" (#205) toggle. The old rule
+was WYSIWYG („copy what the group shows"), which with the toggle OFF (the default) pasted
+lines the manager had already ticked „objednané" straight into a supplier e-mail, and made
+the on-screen „Σ spolu" chip contradict the copied quantities.
+
+SCOPE (review pass 2): „outstanding" means NOT SETTLED — objednané / skladom / nedostupné.
+„čaká sa" is a scheduling flag on a line that still has to be ordered, so it stays IN the
+copy. And a group whose every line is settled copies NOTHING: an „Objednávka (0 položiek)"
+in a supplier's inbox is an order for nothing.
 
 The clipboard itself is asserted through a SPY installed before the page loads
 (`navigator.clipboard.writeText`): it pins the exact text the code hands over — which is
@@ -136,6 +140,76 @@ def test_copy_is_the_outstanding_work_in_both_toggle_states(page, toorder_server
     _group(page, "CITRADE").locator(".tosup-copy").click()
     page.wait_for_function("() => window.__copied.length === 2")
     assert page.evaluate("() => window.__copied[1]") == shown_text
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_waiting_line_still_goes_into_the_order(page, toorder_server):
+    """„čaká sa" is a SCHEDULING flag, not a done flag: `/api/orders` defines it as an
+    ACTIVE line that cannot be stocked yet — waiting on the supplier, BATCHING MORE ITEMS,
+    or deferred by agreement with the customer — and the row button's own tooltip repeats
+    „zbierame viac položiek". A line the manager parks until the order is worth placing is
+    therefore still work to order: dropping it from the pasted e-mail orders less than the
+    shop needs, while the row sits visibly on screen implying it went out. Only the three
+    SETTLED flags (objednané / skladom / nedostupné) are held back."""
+    console = _console_watch(page)
+    page.add_init_script(_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    page.locator(".toorder-row[data-code='C2'] .to-wait").click()      # parked, not done
+    page.locator(".toorder-row[data-code='C3'] .to-instock").click()   # genuinely settled
+    page.wait_for_function(
+        "() => /čaká sa 1/.test(document.getElementById('toToolbar').textContent)"
+        " && /skladom 1/.test(document.getElementById('toToolbar').textContent)")
+
+    _group(page, "CITRADE").locator(".tosup-copy").click()
+    page.wait_for_function("() => window.__copied.length === 1")
+    text = page.evaluate("() => window.__copied[0]")
+
+    assert "C2 | Veľkosť: M | 1 ks" in text, "a parked line is still to be ordered"
+    assert "C3 |" not in text, "a stocked line must not be re-ordered"
+    assert text.startswith("Objednávka — CITRADE (3 položky)"), text
+
+    # the button says which lines it takes, so the scope is not folklore
+    title = _group(page, "CITRADE").locator(".tosup-copy").get_attribute("title")
+    assert "objednan" in title and "skladov" in title and "nedostupn" in title, title
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_copying_a_fully_handled_group_pastes_nothing_and_says_so(page, toorder_server):
+    """With the hide filter OFF (the default) a supplier group whose every line is settled
+    stays on screen, copy button and all. Handing „Objednávka — ORBIS (0 položiek)" to the
+    clipboard and reporting „✓ Skopírované" produces an e-mail that orders nothing — the
+    button must refuse and say so instead."""
+    console = _console_watch(page)
+    page.add_init_script(_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    for i in range(2):
+        page.locator(".toorder-row[data-code='S1']").nth(i).locator(".to-instock").click()
+    page.wait_for_function(
+        "() => /5 položiek z 7/.test(document.getElementById('toToolbar').textContent)")
+    assert page.locator(".toorder-row[data-code='S1']").count() == 2, \
+        "the filter is off — the settled rows (and their copy button) stay on screen"
+
+    copy = _group(page, "ORBIS").locator(".tosup-copy")
+    copy.click()
+    page.wait_for_function(
+        "() => /Nič na objednanie/.test("
+        "[...document.querySelectorAll('.toorder-supplier')]"
+        ".find(h => /ORBIS/.test(h.textContent)).querySelector('.tosup-copy').textContent)")
+    assert page.evaluate("() => window.__copied.length") == 0, \
+        "an empty order must never reach the clipboard"
+    assert "ok" not in (copy.get_attribute("class") or "")
+
+    # …and the label goes back on the same timer as every other outcome
+    page.wait_for_function(
+        "(lbl) => [...document.querySelectorAll('.toorder-supplier')]"
+        ".find(h => /ORBIS/.test(h.textContent)).querySelector('.tosup-copy')"
+        ".textContent === lbl", arg=COPY_LABEL, timeout=6000)
 
     assert console == [], f"console not clean: {console}"
 

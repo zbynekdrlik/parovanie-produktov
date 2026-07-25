@@ -136,9 +136,40 @@ def test_everything_handled_reads_as_success_not_as_missing_data(page, toorder_s
     assert console == [], f"console not clean: {console}"
 
 
+def test_a_finished_supplier_does_not_claim_the_whole_day_is_done(page, toorder_server):
+    """„Všetko vybavené" is a claim about the WHOLE day, so it may only be printed while the
+    manager is looking at the whole day. With a supplier chip selected, the other suppliers'
+    lines are out of VIEW, not done — announcing the day finished over 5 still-outstanding
+    lines is the same lie as a stale number, in words."""
+    console = _console_watch(page)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    _toggle(page).click()                                      # hide handled ON
+    page.locator("#filters button").filter(has_text="ORBIS").click()
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 2")
+
+    page.locator(".tosup-bulk").click()                        # work THIS supplier down
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 0")
+
+    empty = page.locator("#empty")
+    assert empty.is_visible()
+    assert empty.inner_text() == "Tento dodávateľ je vybavený — poriešené riadky sú skryté"
+    assert "ORBIS: ostáva vybaviť 0 položiek z 2" in page.locator("#toToolbar").inner_text()
+
+    # back to „Všetci": the rest of the day is still there, so no success wording at all
+    page.locator("#filters button").filter(has_text="Všetci").click()
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 5")
+    assert not empty.is_visible()
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_the_empty_box_keeps_the_default_wording_while_work_remains(page, toorder_server):
-    """The success wording is ONLY for „hidden because handled". A supplier filter that
-    genuinely matches nothing, or the toggle switched off, keeps the neutral text."""
+    """The success wording is ONLY for „hidden because handled": with no orders at all
+    there was never anything to do, in either toggle state. (A finished SUPPLIER gets its
+    own, narrower wording — test_a_finished_supplier_does_not_claim_the_whole_day_is_done.)
+    """
     console = _console_watch(page)
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
