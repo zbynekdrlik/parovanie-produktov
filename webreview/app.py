@@ -3937,13 +3937,16 @@ def run_posta_uncollected() -> dict:
                         st.setdefault("escalation", {})[r["orderCode"]] = r["new_state_value"]
                         _save_posta_state(st)
                 except Exception as e:  # noqa: BLE001 — full disk / permissions
-                    # The mail ALREADY went out but its record is lost, so tomorrow's run would
-                    # re-send it. Surface the order code loudly for manual follow-up and keep
-                    # going — aborting here would leave the remaining shipments unchecked too.
-                    log.error("posta: mail pre obj. %s (%s) ODIŠIEL, ale zápis stavu ZLYHAL "
-                              "(%r) — hrozí duplicitný mail v ďalšom behu, skontroluj ručne",
+                    # The mail ALREADY went out. Surface the order code loudly for manual
+                    # follow-up and keep going — aborting here would leave the remaining
+                    # shipments unchecked. NOTE: do NOT `continue` — the shipment still has to
+                    # reach the „Nevyzdvihnuté" tab below (it is exactly the row this log tells
+                    # the manager to check), and the in-memory `esc` bump above is re-persisted
+                    # by the run's final save, so the record is not lost by this failure alone.
+                    log.error("posta: mail pre obj. %s (%s) ODIŠIEL, ale okamžitý zápis stavu "
+                              "ZLYHAL (%r) — ak zlyhá aj finálny zápis, hrozí duplicitný mail "
+                              "v ďalšom behu; skontroluj ručne",
                               r["orderCode"], r["packageNumber"], e)
-                    continue
             else:
                 failed += 1          # state NOT bumped → retried next run
                 prev_count, prev_last = posta_uncollected.parse_notified(
@@ -4811,11 +4814,19 @@ def run_orders_reminder() -> dict:
             red.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
                                           "itemName", "days", "admin_link")})
             continue
-        if _reminder_claim_active(done.get(code)):
+        # Decide from the CURRENT record on disk, never from `done` (the start-of-run
+        # snapshot): this run spends minutes in OpenAI + SMTP, and an override the manager
+        # made in that window — resolving the order, or claiming it for a manual send — must
+        # be seen here, or the run mails a customer who was just handled. This is the READ
+        # side of the same lost update whose WRITE side the final save fixes.
+        with _lock:
+            prev = (_load_orders_reminder().get("orders") or {}).get(code)
+        if prev is not None:
+            done[code] = prev                       # keep the snapshot consistent with disk
+        if _reminder_claim_active(prev):
             # a manual override is talking to SMTP for this order RIGHT NOW — don't race it
             log.info("orders_reminder: obj. %s má rozrobené ručné odoslanie — preskakujem", code)
             continue
-        prev = done.get(code)
         if _reminder_is_terminal(prev):             # already resolved — reflect its status
             row = {k: o[k] for k in ("code", "billFullName", "email", "itemName",
                                      "shopRemark", "days", "admin_link")}
@@ -5458,9 +5469,12 @@ def api_orders_reminder_override():
         with _lock:
             st = _load_orders_reminder()
             done = st.setdefault("orders", {})
-            if done.get(code, {}).get("status"):   # lost the race meanwhile — stay correct
+            cur = done.get(code)
+            # the same test as the first gate — an EXPIRED claim (orphaned by a restart between
+            # claim and send) must NOT permanently block resolving the order
+            if _reminder_is_terminal(cur) or _reminder_claim_active(cur):
                 return jsonify({"ok": False, "error": "objednávka je už vybavená",
-                                "status": done[code]["status"]}), 409
+                                "status": (cur or {}).get("status")}), 409
             done[code] = {**base, "status": "skipped_contacted"}
             _pop_row(st, "red", code)
             _pop_row(st, "skipped", code)
@@ -5481,19 +5495,30 @@ def api_orders_reminder_override():
         _release_claim()
         return jsonify({"ok": False, "error": "odoslanie e-mailu zlyhalo"}), 502
 
-    with _lock:
-        st = _load_orders_reminder()
-        done = st.setdefault("orders", {})
-        if done.get(code, {}).get("status") == "emailed":
-            # a concurrent request already recorded this send while we were talking to SMTP —
-            # the e-mail landed (this one too, unlikely double-click race), state is correct either way.
-            return jsonify({"ok": True, "status": "emailed"})
-        done[code] = {**base, "status": "emailed"}
-        _pop_row(st, "red", code)
-        _pop_row(st, "skipped", code)
-        _pop_row(st, "orange", code)
-        st.setdefault("orange", []).append({**row, "sent_date": now_iso})
-        _save_orders_reminder(st)
+    try:
+        with _lock:
+            st = _load_orders_reminder()
+            done = st.setdefault("orders", {})
+            if done.get(code, {}).get("status") == "emailed":
+                # a concurrent request already recorded this send while we were talking to SMTP —
+                # the e-mail landed (this one too, unlikely double-click race), state is correct either way.
+                return jsonify({"ok": True, "status": "emailed"})
+            done[code] = {**base, "status": "emailed"}
+            _pop_row(st, "red", code)
+            _pop_row(st, "skipped", code)
+            _pop_row(st, "orange", code)
+            st.setdefault("orange", []).append({**row, "sent_date": now_iso})
+            _save_orders_reminder(st)
+    except Exception as e:  # noqa: BLE001 — full disk / permissions
+        # The mail ALREADY reached the customer. Reporting a plain failure would invite the
+        # manager to click again (= a second mail), so say plainly what happened, log the code
+        # for manual follow-up, and leave the claim in place — it blocks a re-click until it
+        # expires, by which time the manager has been told to check it by hand.
+        log.error("orders_reminder: mail pre obj. %s ODIŠIEL na %s, ale zápis stavu ZLYHAL "
+                  "(%r) — NEposielaj znova, skontroluj ručne", code, email, e)
+        return jsonify({"ok": False, "error": (
+            f"E-mail zákazníkovi ODIŠIEL, ale stav objednávky {code} sa nepodarilo uložiť. "
+            "NEklikaj znova (poslal by si druhý mail) — nahlás to na kontrolu.")}), 500
     log.info("orders_reminder: manual send %s -> %s (user %s)", code, email, session.get("user"))
     return jsonify({"ok": True, "status": "emailed"})
 
