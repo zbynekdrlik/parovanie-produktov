@@ -423,9 +423,14 @@ nevmestí. Čerstvý read vyššie len rozhoduje, či sa objednávkou vôbec opl
   ich cez `_relocate` prilej do `skipped` (ten riadok nesie poznámku AJ „▶ Poslať pripomienku");
   každý riadok nesie pole `pending` = dôvod, ktorý appka vypíše. Týka sa: stratený claim race,
   nezapísaný claim, `_release` po zlyhanej klasifikácii/sende, chýbajúce `MAIL_BCC`, chýbajúci
-  `OPENAI_API_KEY`. **`pending` MUSÍŠ pri vyriešení zmazať** (`_relocate` kopíruje riadok cez
-  `{**r}` a inkrementálna rýchla cesta cez `dict(prev_row)`) — inak varovanie visí na vybavenom
-  riadku navždy a nafukuje počítadlo nedokončených každý beh (nález revízie PR #224). A tieto
+  `OPENAI_API_KEY`. **`pending` MUSÍŠ zmazať vo VŠETKÝCH TROCH cestách, ktorými sa objednávka
+  vyrieši** — `_relocate` (kopíruje cez `{**r}`), inkrementálna rýchla cesta (`dict(prev_row)`)
+  **A ručný override endpoint** (`api_orders_reminder_override` mal `append({**row, …})` na OBOCH
+  miestach — `skipped` pri `contact` aj `orange` pri `send`; teraz `row_done`). Inak varovanie
+  „automat to nestihol" visí na vybavenom riadku a nafukuje počítadlo nedokončených až do
+  ďalšieho behu (≤24 h) — override je práve tá cesta, kde ho manažér ručne odstraňuje, takže
+  tam bolo najviditeľnejšie (nálezy revízie PR #224, dva samostatné fixy). Pri PRIDANÍ ďalšej
+  cesty, ktorá objednávku uzatvára, strippni `pending` hneď — je to per-BEH pole, nie stav. A tieto
   `pending` riadky renderuj vo VLASTNEJ sekcii, nie pod hlavičkou „AI usúdilo, že zákazník je
   už kontaktovaný" — pri chýbajúcom `MAIL_BCC` AI vôbec nebežala, takže by hlavička tvrdila
   niečo, čo sa nestalo.
@@ -552,9 +557,20 @@ Vzor `orders_reminder.prune_done` + terminálna cache v `run_posta_uncollected`:
   adversariálnej revízie PR #224, reprodukovaný). Skrátený/čiastočný export spraví okno malé,
   takže záznamy ŽIVÝCH objednávok vypadnú „mimo okna" — a strop ich potom zahodí len preto, že
   ich je veľa → duplicitný mail. Bezpečné je iba VEKOVÉ kritérium, a to preto, že retention
-  (180 d) je **dvojnásobok 90-dňového okna orders exportu** (`_fetch_orders_csv`): záznam dosť
-  starý na zmazanie nemôže patriť objednávke, ktorá je ešte v exporte — ani v skrátenom. Strop
-  ostáva len pre záznamy BEZ použiteľného dátumu (tie nikdy nevypršia sami).
+  (180 d) je **dvojnásobok okna orders exportu** — `ORDERS_EXPORT_WINDOW_DAYS = 90`
+  (`_fetch_orders_csv`): záznam dosť starý na zmazanie nemôže patriť objednávke, ktorá je ešte
+  v exporte — ani v skrátenom. Strop ostáva len pre záznamy BEZ použiteľného dátumu (tie nikdy
+  nevypršia sami). **Tá väzba je PINNUTÁ testom** (`test_retention_stays_at_least_twice_the_
+  orders_export_window`) — okno bolo holá `90` bez čohokoľvek, čo ju spája s retentiou, takže
+  rozšírenie exportu nad 180 d by ticho začalo mazať záznamy živých objednávok. Keď meníš okno,
+  meň konštantu (nie literál) a rešpektuj `>= 2×`. **Ako testovať anti-strop správne:** test
+  s `max_undated=3` chytí len strop, ktorý recykluje `max_undated` — proti stropu s vlastným
+  konštantom (napr. 500) treba probe s TISÍCAMI datovaných záznamov mimo okna, všetkými vnútri
+  retentie (`test_prune_never_drops_a_dated_record_on_count_at_ANY_scale`).
+  **A `SHOPTET_ORDERS_URL` je ručne editovaná konfigurácia** — `_fetch_orders_csv` preto z nej
+  `_strip_date_params()`-om odstráni prípadné vlastné `dateFrom`/`dateUntil` (dva rovnaké
+  parametre = o okne rozhoduje server a väzba neplatí). Strip je TEXTOVÝ (split po `&`), nie
+  `parse_qsl`+`urlencode` — URL nesie `hash` token, ktorý sa NESMIE pre-encodovať.
 - **Zmazanie dedup záznamu LOGUJ** (kódy + dôvod). Keď zákazník dostane druhý mail, je to
   jediné miesto, kde sa dá zistiť, či za to mohol prune.
 - **Cache terminálneho stavu (#222)** je prunovaná tým istým oknom, takže rásť ani nemôže:
@@ -564,6 +580,14 @@ Vzor `orders_reminder.prune_done` + terminálna cache v `run_posta_uncollected`:
   píšu ručne — preklep/recyklované číslo nesmie stiahnuť cudzí verdikt), `at` staršie než
   `POSTA_TERMINAL_RECHECK_DAYS` (7 — jedno chybné čítanie sa zahojí do týždňa, nie až po 30
   dňoch), a vyvrátený verdikt sa z cache **maže** (nie iba ignoruje).
+  **GOTCHA — dátum v store porovnávaj OHRANIČENE Z OBOCH STRÁN, nie len `>= cutoff`.** `at` je
+  obyčajný reťazec, takže čokoľvek, čo lexikograficky prevyšuje cutoff (`"zzz"` z poškodeného
+  zápisu, budúci dátum po skoku hodín), robilo záznam **navždy čerstvým** — zásielka sa
+  preskakovala celé 30-dňové okno a 7-dňová sebauzdravovacia poistka bola ticho vypnutá
+  (nález revízie PR #224). Správne: `recheck_before <= str(cached.get("at") or "") <= today_iso`.
+  Platí pre KAŽDÝ „čerstvosť z uloženého ISO dátumu" test v tejto appke: horná hranica
+  (`<= dnes`) je to, čo drží pravidlo „poškodené/nejednoznačné → over to", inak sa smetie
+  tvári ako najčerstvejší možný záznam.
 - **Do `TERMINAL_STATE_CODES` daj LEN live overené kódy.** Live probe api.posta.sk
   (2026-07-25) vrátil presne štyri: `received`, `transit`, `notified`, `delivered` — a
   ukázal, že `delivered` pokrýva OBA konce eskalácie: „Doručená" (OK) aj **„Prevzatá na pošte"
