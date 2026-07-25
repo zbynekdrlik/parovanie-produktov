@@ -261,3 +261,17 @@ def test_prune_at_production_defaults_never_drops_a_live_record_at_scale():
     assert set(dropped) == {f"GONE{i}" for i in range(50)}
     # …and the orders the run would actually act on are all still protected
     assert {o["code"] for o in ordrem.select_orders(raw, now=now)} <= set(kept)
+
+
+def test_prune_never_drops_a_dated_record_on_count_at_ANY_scale():
+    """The count-cap ban has to hold for a cap of ANY size, not just one that reuses
+    `max_undated`. test_prune_never_drops_a_dated_record_on_COUNT_alone drives ten records
+    against max_undated=3, and the at-scale test's 900 records are all still INSIDE the window —
+    a re-introduced cap with its own constant (a hard 500, say) slips past both, and every
+    record it drops for a live order costs a duplicate customer mail. This one bites regardless
+    of the constant chosen: thousands of records, all dated well inside retention, none of them
+    in the window. (PR #224 adversarial review.)"""
+    done = {f"C{i}": _rec("2026-04-27T08:00:00+02:00") for i in range(5000)}
+    kept, dropped = ordrem.prune_done(done, {"ONE-SURVIVING-CODE"}, now=datetime(2026, 7, 25))
+    assert dropped == []
+    assert len(kept) == 5000
