@@ -562,3 +562,36 @@ def test_the_same_failing_write_is_reported_only_once(page, toorder_server):
         timeout=3000)
     assert len(posts) == 2, posts
     assert page.evaluate("() => window.__alerts.length") == 1
+
+
+def test_a_comment_SAVED_empty_collapses_instead_of_sticking_open(page, toorder_server):
+    """The other side of the „opened box is his" exception: once he has COMMITTED the
+    value, the repaint that follows must be free to collapse the editor back to the
+    💬 Komentár button — including when he deliberately saved it EMPTY to delete the note.
+    Otherwise the box he just finished with reopens itself and, being re-stamped as
+    „opened", never closes on any later repaint either."""
+    _open(page, toorder_server)
+    c1 = page.locator(".toorder-row[data-code='C1']")
+    c1.locator(".to-comadd").click()
+    c1.locator(".to-cominput").fill("docasna poznamka")
+    with page.expect_response("**/api/order-comment"):
+        c1.locator(".to-comsave").click()
+    page.wait_for_selector(".toorder-row[data-code='C1'] .to-comment", timeout=3000)
+
+    # now clear it and save again — the note is deleted
+    page.locator(".toorder-row[data-code='C1'] .to-comedit").click()
+    page.locator(".toorder-row[data-code='C1'] .to-cominput").fill("")
+    with page.expect_response("**/api/order-comment"):
+        page.locator(".toorder-row[data-code='C1'] .to-comsave").click()
+
+    page.wait_for_selector(".toorder-row[data-code='C1'] .to-comadd", timeout=3000)
+    assert page.locator(".toorder-row[data-code='C1'] .to-cominput").count() == 0, \
+        'a SAVED-empty editor reopened itself instead of collapsing'
+
+    # …and it stays collapsed across a later, unrelated repaint
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='N1'] .to-instock").click()
+    _wait_alert(page)
+    page.wait_for_timeout(300)
+    assert page.locator(".toorder-row[data-code='C1'] .to-cominput").count() == 0, \
+        'the consumed „opened“ claim came back on a later repaint'

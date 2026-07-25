@@ -117,6 +117,10 @@ def test_a_non_http_stored_pair_url_never_renders_as_a_clickable_link(page, toor
         evil_decision_has_span: !!evilDec.querySelector('span.to-badlink'),
         evil_pair_title_leak: poisoned(evilPair),
         evil_decision_title_leak: poisoned(evilDec),
+        // the inert span must not answer a bare `.to-link` selector either — app.js and
+        // half a dozen assertions use one, and a non-anchor silently counted as a link
+        // is how „no dead links" quietly stops being true
+        evil_decision_to_link: evilDec.querySelectorAll('.to-link').length,
         good_pair: href({pairUrl: 'https://dodavatel.test/x'}),
         good_decision: href({supplierUrl: 'https://dodavatel.test/y'}),
       };
@@ -125,5 +129,35 @@ def test_a_non_http_stored_pair_url_never_renders_as_a_clickable_link(page, toor
                  "evil_pair_anchors": 0, "evil_decision_anchors": 0,
                  "evil_pair_has_box": True, "evil_decision_has_span": True,
                  "evil_pair_title_leak": False, "evil_decision_title_leak": False,
+                 "evil_decision_to_link": 0,
                  "good_pair": "https://dodavatel.test/x",
                  "good_decision": "https://dodavatel.test/y"}, r
+
+
+def test_the_inert_bad_link_is_not_link_coloured_in_either_theme(page, toorder_server):
+    """A grey struck-through span in light theme but live-link BLUE in dark theme would
+    put the „this is clickable" signal straight back on a value that is not clickable.
+    The dark-theme `.to-link` rule outranks a plain `.to-badlink` one, so it needs its
+    own override — compare the two against a REAL link rendered beside it."""
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    colours = page.evaluate("""() => {
+      const mk = (o) => renderOrderRow(Object.assign(
+        {key: 'X|W1', itemCode: 'W1', orderCode: 'X', name: 'T', supplier: 'S',
+         qty: '1', size: '', orderDate: '2026-05-20 09:00:00'}, o));
+      const list = document.getElementById('list');
+      list.appendChild(mk({supplierUrl: 'javascript:alert(1)'}));
+      list.appendChild(mk({supplierUrl: 'https://dodavatel.test/y'}));
+      const read = () => ({
+        bad: getComputedStyle(document.querySelector('.to-badlink')).color,
+        good: getComputedStyle(document.querySelector('a.to-link')).color,
+      });
+      const prev = document.body.dataset.theme;
+      document.body.dataset.theme = 'light'; const light = read();
+      document.body.dataset.theme = 'dark';  const dark = read();
+      if (prev) document.body.dataset.theme = prev; else delete document.body.dataset.theme;
+      return {light, dark};
+    }""")
+    for theme in ("light", "dark"):
+        assert colours[theme]["bad"] != colours[theme]["good"], (theme, colours[theme])
+        assert colours[theme]["bad"] == "rgb(156, 163, 175)", (theme, colours[theme])
