@@ -18,6 +18,8 @@ while it is up — and the DOM *at alert time* is exactly what pins the "roll th
 BEFORE telling him" ordering (an error message over a row that still shows the refused
 flag is the half-fix). The spy records the message together with that snapshot.
 """
+import json
+
 import pytest
 
 # Records every alert together with the DOM state AT THE MOMENT it fired.
@@ -595,3 +597,205 @@ def test_a_comment_SAVED_empty_collapses_instead_of_sticking_open(page, toorder_
     page.wait_for_timeout(300)
     assert page.locator(".toorder-row[data-code='C1'] .to-cominput").count() == 0, \
         'the consumed „opened“ claim came back on a later repaint'
+
+
+# ── PR #233 final verdict: the bulk write must not steal a LATER click's row ──
+
+# Holds POSTs to SEVERAL paths in ONE shared queue, so the order in which the test
+# releases them is exactly the order the server itself would answer in. Entries carry
+# their path: release with `window.__held[i].go(status, passthrough)` (same semantics as
+# `_hold`: `(200, true)` replays against the real server, `(200)` only fakes success).
+_HOLD_MULTI_TEMPLATE = """
+window.__held = [];
+window.__settled = [];
+window.__realFetch = window.fetch.bind(window);
+window.fetch = (url, opts) => {
+  const p = new URL(String(url), location.href).pathname;
+  if (__PATHS__.indexOf(p) >= 0 && opts && opts.method === 'POST') {
+    return new Promise((resolve, reject) => window.__held.push({path: p, go: (status, passthrough) => {
+      if (status === 200 && passthrough) {
+        window.__realFetch(url, opts).then(
+          (r) => { window.__settled.push(p + ':' + r.status); resolve(r); },
+          (e) => { window.__settled.push(p + ':err'); reject(e); });
+        return;
+      }
+      window.__settled.push(p + ':' + status);
+      resolve(new Response(status === 200 ? '{"ok": true}' : '{"ok": false}',
+                           {status: status || 500,
+                            headers: {'Content-Type': 'application/json'}}));
+    }}));
+  }
+  return window.__realFetch(url, opts);
+};
+"""
+
+
+def _hold_multi(*paths):
+    return _HOLD_MULTI_TEMPLATE.replace("__PATHS__", json.dumps(list(paths)))
+
+
+def _click_group_bulk(page):
+    """Click „✔ Označiť skupinu objednané" on the '—' group (N1 is alone in it)."""
+    page.evaluate("""() => {
+      const h = [...document.querySelectorAll('.toorder-supplier')]
+        .find(x => x.querySelector('.tosup-label').textContent.trim().startsWith('—'));
+      h.querySelector('.tosup-bulk').click();
+    }""")
+
+
+def test_a_per_row_write_issued_DURING_the_bulk_flight_is_not_inverted(page, toorder_server):
+    """The mirror of `test_a_bulk_write_supersedes_an_in_flight_per_row_write`, and the
+    direction that inverts the manager's click: he marks the group, then — while that POST
+    is still flying — ticks a row twice, ending on OFF. Those two writes are NEWER intent
+    and commit LATER on the server (they queue behind the bulk's `with _lock:`), so the
+    server ends up holding the row un-ordered. Crowning the bulk at RESPONSE time made it
+    supersede them anyway: the tab painted the row ordered, `_reconcileFlag` forced the map
+    to the bulk's value on settle, and not one alert said anything happened."""
+    page.add_init_script(_ALERT_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    page.evaluate(_hold_multi("/api/ordered", "/api/ordered/bulk"))
+
+    _click_group_bulk(page)                      # bulk: ordered = true  (held)
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+
+    cb = page.locator(".toorder-row[data-code='N1'] input[type=checkbox]")
+    cb.click()      # per-row write A: ordered = true   (held)
+    cb.click()      # per-row write B: ordered = false  (held) ← his FINAL intent
+    page.wait_for_function("() => window.__held.length === 3", timeout=3000)
+
+    # released in REQUEST order — exactly how the server serialises them
+    for i in range(3):
+        page.evaluate(f"() => window.__held[{i}].go(200, true)")
+        page.wait_for_function(f"() => window.__settled.length === {i + 1}", timeout=5000)
+    page.wait_for_timeout(400)      # let every continuation (incl. reconcile) settle
+
+    server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
+    assert "20260001|N1" not in server["ordered"], server      # his last click won
+    assert page.evaluate("() => Object.keys(ORDERED)") == [], \
+        "the client map crowned the bulk over a per-row write issued AFTER it"
+    assert "done" not in (page.locator(".toorder-row[data-code='N1']")
+                          .get_attribute("class") or "").split(), \
+        "the row is painted ordered while the server holds it un-ordered"
+    assert page.evaluate("() => window.__alerts.length") == 0, \
+        page.evaluate("() => window.__alerts.map(a => a.msg)")
+
+
+def test_a_bulk_that_LANDED_still_owns_the_row_when_the_later_writes_all_fail(page, toorder_server):
+    """The other half of the same ordering rule, and the one a naive „snapshot the seq
+    before the POST and skip any row that moved" fix would break: the bulk is ACCEPTED and
+    both per-row writes that followed are REFUSED, so the server holds the row ordered.
+    The bulk's acceptance is the newest server truth for that row, so the rollback of the
+    last refused write must land on it — not on the pre-bulk baseline."""
+    page.add_init_script(_ALERT_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    page.evaluate(_hold_multi("/api/ordered", "/api/ordered/bulk"))
+
+    _click_group_bulk(page)
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+    cb = page.locator(".toorder-row[data-code='N1'] input[type=checkbox]")
+    cb.click()
+    cb.click()
+    page.wait_for_function("() => window.__held.length === 3", timeout=3000)
+
+    page.evaluate("() => window.__held[0].go(200, true)")     # bulk lands for real
+    page.wait_for_function("() => window.__settled.length === 1", timeout=5000)
+    page.evaluate("() => window.__held[1].go(500)")           # A refused
+    page.wait_for_function("() => window.__settled.length === 2", timeout=5000)
+    page.evaluate("() => window.__held[2].go(500)")           # B refused
+    page.wait_for_function("() => window.__settled.length === 3", timeout=5000)
+    _wait_alert(page)
+    page.wait_for_timeout(300)
+
+    server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
+    assert list(server["ordered"]) == ["20260001|N1"], server
+    assert page.evaluate("() => Object.keys(ORDERED)") == ["20260001|N1"], \
+        "the rollback discarded the bulk write the server had already accepted"
+    assert "done" in (page.locator(".toorder-row[data-code='N1']")
+                      .get_attribute("class") or "").split()
+
+
+# ── PR #233 final verdict: a write a reload disowned must still report itself ──
+
+def test_a_write_whose_bookkeeping_a_reload_dropped_still_reports_its_failure(page, toorder_server):
+    """`loadOrders()` voids every in-flight write's bookkeeping, so such a write has no
+    map left to roll back — but it still FAILED, and returning `false` in silence is the
+    exact silent-lost-write #214 exists to kill."""
+    _open(page, toorder_server)
+    page.evaluate(_hold("/api/instock"))
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+
+    page.evaluate("() => loadOrders()")          # disowns the write in flight
+    assert page.evaluate("() => Object.keys(_flagWrites).length") == 0
+
+    page.evaluate("() => window.__held[0](500)")
+    alerts = _wait_alert(page)
+    assert "nepodarilo" in alerts[0]["msg"].lower(), alerts[0]["msg"]
+
+
+def test_a_click_during_a_reload_cannot_bind_its_write_to_the_replaced_map(page, toorder_server):
+    """`loadOrders()` cleared `_flagWrites` five awaits BEFORE it replaced the map objects.
+    A click landing in that window seeded its baseline from a still-optimistic value and
+    bound its write to a map the reload was about to throw away — a rollback into thin
+    air. The clear belongs in the SAME synchronous block as the assignment."""
+    _open(page, toorder_server)
+    # hold the reload's own GET of the instock map (GET calls pass no `opts`)
+    page.evaluate("""() => {
+      window.__held = [];
+      window.__realFetch = window.fetch.bind(window);
+      window.fetch = (url, opts) => {
+        const p = new URL(String(url), location.href).pathname;
+        if (p === '/api/instock' && !(opts && opts.method === 'POST')) {
+          return new Promise((resolve) => window.__held.push(
+            () => window.__realFetch(url, opts).then(resolve)));
+        }
+        return window.__realFetch(url, opts);
+      };
+    }""")
+    page.evaluate("() => { window.__load = loadOrders(); window.__before = INSTOCK; }")
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()   # lands INSIDE the window
+    page.evaluate("() => window.__held[0]()")
+    page.evaluate("() => window.__load")
+
+    assert page.evaluate("() => INSTOCK !== window.__before"), "the reload never replaced the map"
+    assert page.evaluate("() => Object.keys(_flagWrites).length") == 0, \
+        "a write seeded during the reload survived it, bound to the map that was replaced"
+
+
+# ── PR #233 final verdict: a failed EMPTY commit must give the editor back ────
+
+def test_a_failed_EMPTY_comment_save_gives_the_open_editor_back(page, toorder_server):
+    """Saving CONSUMES the „he opened it himself" claim, so a repaint during an in-flight
+    EMPTY commit captures `{value:'', opened:false}` and restores nothing — the box is
+    gone. When that commit then FAILS, `delete wrap.dataset.editorSaving` hands the claim
+    back to a DETACHED node and the manager is told his deletion failed while the box he
+    was working in has vanished."""
+    _open(page, toorder_server)
+    c1 = page.locator(".toorder-row[data-code='C1']")
+    c1.locator(".to-comadd").click()
+    c1.locator(".to-cominput").fill("poznamka na zmazanie")
+    with page.expect_response("**/api/order-comment"):
+        c1.locator(".to-comsave").click()
+    page.wait_for_selector(".toorder-row[data-code='C1'] .to-comment", timeout=3000)
+
+    page.evaluate(_hold("/api/order-comment"))
+    page.locator(".toorder-row[data-code='C1'] .to-comedit").click()
+    page.locator(".toorder-row[data-code='C1'] .to-cominput").fill("")
+    page.locator(".toorder-row[data-code='C1'] .to-comsave").click()   # EMPTY commit, held
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+
+    _fail(page, "/api/instock")                    # an unrelated write fails…
+    page.locator(".toorder-row[data-code='N1'] .to-instock").click()
+    _wait_alert(page)                              # …and its rollback repaints the tab
+
+    page.evaluate("() => window.__held[0](500)")   # now the empty commit is refused
+    page.wait_for_function("() => window.__alerts.length === 2", timeout=3000)
+    page.wait_for_timeout(200)
+
+    box = page.locator(".toorder-row[data-code='C1'] .to-cominput")
+    assert box.count() == 1, "the editor the manager was working in was never given back"
+    assert box.input_value() == "", "his cleared box came back with the old text in it"
