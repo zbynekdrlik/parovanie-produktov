@@ -716,6 +716,43 @@ def test_a_bulk_that_LANDED_still_owns_the_row_when_the_later_writes_all_fail(pa
                       .get_attribute("class") or "").split()
 
 
+def test_a_refused_bulk_settling_LAST_clears_the_refused_per_row_value(page, toorder_server):
+    """The one owner that neither writes the map nor rolls it back: every `saveOrderFlag`
+    write mutates the map optimistically at ISSUE time, so its own value overwrites any
+    predecessor's residue and its error path rolls to `confirmed`. The bulk writes the map
+    only on SUCCESS — so when it is the FINAL settle AND errs, nothing reconciles: the
+    per-row write it superseded skipped its own reconcile (`inflight !== 0` at its settle),
+    and the bulk's error path returned. The row kept a flag BOTH writes were refused, the
+    per-row failure was silent, and only a manual reload could clear it — #214's phantom
+    flag, mirrored into the bulk path. The reverse settle order self-heals via
+    `_reconcileFlag`, which is why the two direction tests above pass around this."""
+    page.add_init_script(_ALERT_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    page.evaluate(_hold_multi("/api/ordered", "/api/ordered/bulk"))
+
+    # per-row FIRST (seq 1), bulk SECOND (seq 2 → it owns the row)
+    page.locator(".toorder-row[data-code='N1'] input[type=checkbox]").click()
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+    _click_group_bulk(page)
+    page.wait_for_function("() => window.__held.length === 2", timeout=3000)
+
+    page.evaluate("() => window.__held[0].go(500)")     # per-row refused FIRST …
+    page.wait_for_function("() => window.__settled.length === 1", timeout=5000)
+    page.evaluate("() => window.__held[1].go(500)")     # … refused bulk settles LAST
+    page.wait_for_function("() => window.__settled.length === 2", timeout=5000)
+    _wait_alert(page)
+    page.wait_for_timeout(300)
+
+    server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
+    assert list(server["ordered"]) == [], server
+    assert page.evaluate("() => Object.keys(ORDERED)") == [], \
+        "the client kept an „objednané“ flag the server refused twice"
+    assert "done" not in (page.locator(".toorder-row[data-code='N1']")
+                          .get_attribute("class") or "").split(), \
+        "the row is painted ordered while the server holds it un-ordered"
+
+
 # ── PR #233 final verdict: a write a reload disowned must still report itself ──
 
 def test_a_write_whose_bookkeeping_a_reload_dropped_still_reports_its_failure(page, toorder_server):
