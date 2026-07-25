@@ -282,6 +282,66 @@ def _copied_qty(page, sup):
     return sum(int(m.group(1)) for m in re.finditer(r"\|\s*(\d+) ks", copied[0])) if copied else 0
 
 
+# alert() is synchronous and blocks the page's JS thread, so the rollback test replaces it
+# with a recorder rather than driving a real dialog.
+_ALERT_SPY = """
+window.__alerts = [];
+window.alert = (m) => { window.__alerts.push(String(m)); };
+"""
+
+
+def _bulk(page, sup):
+    return page.locator(".toorder-supplier").filter(has_text=sup).locator(".tosup-bulk")
+
+
+def test_the_chip_follows_every_mutation_path(page, toorder_server):
+    """`refreshOrderTotals` rewrites the chips IN PLACE, and it is called from exactly ONE
+    place — `renderOrderFilters` — which is what the paths that must NOT repaint `#list`
+    (the four per-row flag toggles, pinned above) already call. Every OTHER mutation goes
+    through a full `renderToOrder`, which rebuilds the rows and their chips from the same
+    `totalChipSpec`. BOTH halves have to keep the chip honest, whatever the plumbing does:
+    pinned here for the two repainting mutations no other test covers — the group bulk
+    mark, and the rollback of a REFUSED write (the chip may never keep a number the server
+    turned down)."""
+    console = _console_watch(page)
+    page.add_init_script(_ALERT_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    assert [t["text"] for t in _totals(page)] == ["Σ spolu 3 ks"] * 2
+
+    # ── „✔ Označiť skupinu objednané" → markGroupOrdered → full repaint
+    _bulk(page, "ORBIS").click()
+    page.wait_for_function(
+        "() => /Zrušiť/.test([...document.querySelectorAll('.toorder-supplier')]"
+        ".find(h => /ORBIS/.test(h.textContent)).querySelector('.tosup-bulk').textContent)")
+    assert [t["text"] for t in _totals(page)] == ["Σ spolu 0 ks"] * 2
+    assert _chip_open_qty(page) == 0 and _remaining(page) == 5
+
+    _bulk(page, "ORBIS").click()                       # …and the undo brings the work back
+    page.wait_for_function(
+        "() => /Označiť/.test([...document.querySelectorAll('.toorder-supplier')]"
+        ".find(h => /ORBIS/.test(h.textContent)).querySelector('.tosup-bulk').textContent)")
+    assert [t["text"] for t in _totals(page)] == ["Σ spolu 3 ks"] * 2
+    assert _chip_open_qty(page) == 3 and _remaining(page) == 7
+
+    assert console == [], f"console not clean: {console}"
+
+    # ── a REFUSED write is rolled back — and the chip goes back with it
+    page.route("**/api/instock", lambda route: route.fulfill(
+        status=500, content_type="application/json", body='{"ok": false}'))
+    page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
+    page.wait_for_function("() => window.__alerts.length > 0", timeout=3000)
+
+    assert [t["text"] for t in _totals(page)] == ["Σ spolu 3 ks"] * 2, \
+        "the chip must not keep a number the server refused"
+    assert _chip_open_qty(page) == 3 and _remaining(page) == 7
+    assert page.locator(".toorder-row.instock").count() == 0
+
+    # the ONLY console entry allowed here is the 500 this test injected itself (the browser
+    # logs every failed request) — the app must add nothing of its own on the rollback path
+    assert [m for m in console if "500 (Internal Server Error)" not in m] == [], console
+
+
 def test_every_surface_agrees_when_a_group_is_parked(page, toorder_server):
     """THE invariant of the tab, and the one nothing pinned before: the #208 toolbar tally,
     the „Σ spolu" chip's „nevybavené" number, the supplier chip's colour and the number of
