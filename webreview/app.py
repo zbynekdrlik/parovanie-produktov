@@ -1206,6 +1206,13 @@ def _supplier_meta(html: str):
 ORDERS_CACHE = os.path.join(OUT, "orders_cache.csv")
 CUSTOMERS_CACHE = os.path.join(OUT, "customers_cache.csv")  # hourly Shoptet customer export (cp1250)
 ORDERS_MAXAGE = 1800  # s — refresh the cached orders export at most every 30 min (Marek: raz za pol hodinu stačí)
+# How far back the orders export is fetched. NAMED because the reminder dedup store's retention
+# (orders_reminder.DEDUP_RETENTION_DAYS, 180 d) is justified purely as „twice this window": a
+# record old enough to be pruned then cannot belong to an order the export still carries, not
+# even a truncated one — which is what makes an age-only prune safe from duplicate customer
+# mails (#220). Widening this past half the retention would silently break that argument, so
+# test_retention_stays_at_least_twice_the_orders_export_window pins the two together.
+ORDERS_EXPORT_WINDOW_DAYS = 90
 
 
 def _cred(key: str):
@@ -1258,12 +1265,28 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
     return rows
 
 
+def _strip_date_params(url: str) -> str:
+    """Remove any dateFrom/dateUntil the configured export URL already carries, so the window
+    _fetch_orders_csv appends is the one that actually applies (with the parameter present twice
+    it is the server that decides which wins, and ORDERS_EXPORT_WINDOW_DAYS would be a lie).
+    Every other parameter is kept BYTE-IDENTICAL — the URL carries a `hash` token, so it must
+    never be re-encoded by a parse/urlencode round-trip."""
+    head, sep, query = url.partition("?")
+    if not sep:
+        return url
+    kept = [p for p in query.split("&")
+            if p and p.split("=", 1)[0] not in ("dateFrom", "dateUntil")]
+    return head + ("?" + "&".join(kept) if kept else "")
+
+
 def _fetch_orders_csv() -> bytes:
     base = _cred("SHOPTET_ORDERS_URL")
     if not base:
         raise RuntimeError(f"SHOPTET_ORDERS_URL chýba v {CRED_PATH}")
+    base = _strip_date_params(base)
     today = time.strftime("%Y-%m-%d")
-    frm = time.strftime("%Y-%m-%d", time.localtime(time.time() - 90 * 86400))
+    frm = time.strftime("%Y-%m-%d",
+                        time.localtime(time.time() - ORDERS_EXPORT_WINDOW_DAYS * 86400))
     sep = "&" if "?" in base else "?"
     r = requests.get(f"{base}{sep}dateFrom={frm}&dateUntil={today}",
                      headers={"User-Agent": UA}, timeout=60)
