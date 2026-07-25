@@ -2385,6 +2385,7 @@ function renderPosta() {
         `Skontrolovaných zásielok: ${lr.checked ?? 0} · nevyzdvihnuté: ${lr.uncollected ?? 0}`
         + ` · odoslané e-maily: ${lr.emails_sent ?? 0}`
         + (lr.invalid ? ` · nesledovateľné: ${lr.invalid}` : '')
+        + (lr.api_skipped ? ` · už doručené/vrátené (nekontrolujú sa): ${lr.api_skipped}` : '')
         + (lr.errors ? ` · chyby pri kontrole: ${lr.errors}` : '')));
     }
     if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());

@@ -196,7 +196,7 @@ def test_prune_caps_the_number_of_out_of_window_records_newest_first():
     done = {f"C{i}": _rec(f"2026-07-{i:02d}T08:00:00+02:00") for i in range(1, 11)}
     kept = ordrem.prune_done(done, {"IRRELEVANT"}, now=datetime(2026, 7, 25),
                             retention_days=180, max_records=3)
-    assert set(kept) == {"C10", "C09", "C08"}          # the three newest survive
+    assert set(kept) == {"C10", "C9", "C8"}            # the three newest survive
 
 
 def test_prune_does_nothing_when_the_window_is_unknown():

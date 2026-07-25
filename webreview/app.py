@@ -3920,10 +3920,23 @@ def run_posta_uncollected() -> dict:
     csv_bytes = _orders_csv_cached()
     shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes)
     with _lock:
-        esc = dict(_load_posta_state().get("escalation") or {})
+        st0 = _load_posta_state()
+        esc = dict(st0.get("escalation") or {})
+        # #222 — packageNumber -> {state, at} for shipments already in a FINAL tracking state.
+        # Nothing about them can change, so they are skipped entirely on later runs instead of
+        # costing another sequential API round-trip (up to 180 s each on a bad day).
+        term_cache = dict(st0.get("terminal") or {})
     uncollected, invalid, errors = [], [], []
-    sent = failed = 0
+    sent = failed = api_skipped = 0
+    today_iso = datetime.now().date().isoformat()
     for s in shipments:
+        cached = term_cache.get(s["packageNumber"])
+        if isinstance(cached, dict) and cached.get("state"):
+            # delivered / returned — final, so there is nothing left to check or e-mail. A
+            # garbage cache entry (not a dict, no state) deliberately falls through to a real
+            # check: corruption must degrade to „check it", never to „ignore it forever".
+            api_skipped += 1
+            continue
         try:
             tj = _fetch_tracking(s["packageNumber"])
         except Exception as e:  # noqa: BLE001 — recorded per shipment, run continues
@@ -3932,6 +3945,9 @@ def run_posta_uncollected() -> dict:
             errors.append({"orderCode": s["code"],
                            "packageNumber": s["packageNumber"], "error": str(e)})
             continue
+        final = posta_uncollected.terminal_state(tj)
+        if final:
+            term_cache[s["packageNumber"]] = {"state": final, "at": today_iso}
         r = posta_uncollected.evaluate_shipment(s, tj, esc.get(s["code"], ""))
         if r["invalid"]:
             # The exact class of package numbers that silently broke the n8n
@@ -3990,9 +4006,18 @@ def run_posta_uncollected() -> dict:
     # prune escalation state for orders that left the 30-day source window
     codes = {s["code"] for s in shipments}
     esc = {k: v for k, v in esc.items() if k in codes}
+    # …and the terminal-tracking cache the same way, by package number — that keeps it bounded
+    # by the source window itself, so it can never grow the way the dedup store did (#220).
+    pkgs = {s["packageNumber"] for s in shipments}
+    term_cache = {k: v for k, v in term_cache.items() if k in pkgs}
+    if api_skipped:
+        log.info("posta: %d zásielok preskočených — tracking už hlásil konečný stav "
+                 "(doručené/vrátené), Pošta SK API sa pre ne nevolá", api_skipped)
     stats = {"checked": len(shipments), "uncollected": len(uncollected),
              "invalid": len(invalid), "errors": len(errors),
              "emails_sent": sent, "emails_failed": failed,
+             # how many API round-trips the terminal cache saved this run (#222)
+             "api_skipped": api_skipped,
              # „BCC vždy" is BINDING for these customer mails (require_bcc): with no MAIL_BCC not
              # one escalation goes out. Surfaced so the tab shows a dead automation as dead
              # instead of a healthy-looking run that quietly mailed nobody (ERROR log only).
@@ -4000,6 +4025,7 @@ def run_posta_uncollected() -> dict:
     with _lock:
         _save_posta_state({
             "escalation": esc,
+            "terminal": term_cache,
             "last_check": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "uncollected": uncollected, "invalid": invalid, "errors": errors,
             "stats": stats,
@@ -4801,6 +4827,9 @@ def run_orders_reminder() -> dict:
     run forever."""
     csv_bytes = _orders_csv_cached()
     orders = orders_reminder.select_orders(csv_bytes)
+    # Every code in the export (not just the >4d „Vybavuje sa" ones) — the window the dedup
+    # store is pruned against at the final save (#220). Empty = export unreadable → no pruning.
+    window_codes = orders_reminder.all_order_codes(csv_bytes)
     with _lock:
         state = _load_orders_reminder()
         prev_orders = state.get("orders")
@@ -5048,6 +5077,14 @@ def run_orders_reminder() -> dict:
         for c in failed_writes:
             if c in done and not _reminder_is_terminal(orders_map.get(c)):
                 orders_map[c] = done[c]
+
+        # …and only now bound the map (#220): it used to be written back whole on every run, so
+        # it only ever grew. Pruning happens AFTER the re-apply above so a just-written record
+        # is judged on its own merits, and it never touches a code the export still carries —
+        # dropping one of those is what would re-mail a customer. See orders_reminder.prune_done
+        # for the full rule set, including the deliberate REOPEN decision (a reopened order
+        # keeps its record and is not reminded twice; a manual send from the tab still works).
+        orders_map = orders_reminder.prune_done(orders_map, window_codes)
 
         # Display lists are computed from the start-of-run snapshot and written wholesale, so an
         # order the manager resolved WHILE the run was working would come back onto the tab as

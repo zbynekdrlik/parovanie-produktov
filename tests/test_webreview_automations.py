@@ -110,8 +110,12 @@ def test_toggle_unknown_automation_404(iso):
 # ── the full Pošta run (mocked edges) ─────────────────────────────────────────
 def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
     stats = webapp.run_posta_uncollected()
+    # api_skipped (#222) is 0 on a first run — nothing is in the terminal cache yet, so every
+    # shipment is genuinely fetched. Kept as an EXACT dict on purpose: a new stats key has to be
+    # a deliberate change, not something that quietly appears.
     assert stats == {"checked": 3, "uncollected": 1, "invalid": 1, "errors": 0,
-                     "emails_sent": 1, "emails_failed": 0, "bcc_missing": False}
+                     "emails_sent": 1, "emails_failed": 0, "bcc_missing": False,
+                     "api_skipped": 0}
     # exactly ONE customer mail, template #1. run_posta_uncollected no longer
     # passes an explicit bcc — _send_mail_html itself defaults it to MAIL_BCC
     # (tested directly below); here it's stubbed, so bcc arrives as None.
