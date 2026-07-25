@@ -871,3 +871,121 @@ def test_run_surfaces_missing_mail_bcc_in_its_stats(iso, monkeypatch):
 
 def test_run_stats_do_not_flag_bcc_when_it_is_configured(iso):
     assert webapp.run_orders_reminder()["bcc_missing"] is False
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# DÁVKA B1 — three holes the PR #223 verification found in the run's claim path.
+# All three share one symptom: the tab shows a healthy-looking run while an order
+# was silently dropped — the „ticho mŕtva automatizácia" MINOR 7 exists to prevent.
+# ═════════════════════════════════════════════════════════════════════════════════
+
+def _claim_writes_fail(monkeypatch, code="20261001"):
+    """Every attempt to persist the transient 'sending' claim for `code` fails (full disk)."""
+    real_save = webapp._save_orders_reminder
+
+    def no_claims(data):
+        entry = (data.get("orders") or {}).get(code) or {}
+        if isinstance(entry, dict) and entry.get("status") == "sending":
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", no_claims)
+
+
+def _display_codes(iso):
+    """Every code the tab can act on — the three lists the override endpoint searches."""
+    st = _store(iso)
+    return {r["code"] for section in ("red", "orange", "skipped")
+            for r in st.get(section) or []}
+
+
+# ── M1 — a claim that cannot be WRITTEN must be counted as an error ───────────────
+def test_a_claim_that_cannot_be_written_is_counted_as_an_error(iso, monkeypatch):
+    """A full disk makes every claim write fail, so the run mails nobody — and reported
+    `errors: 0`, i.e. the tab rendered „odoslané pripomienky teraz: 0" with no error count at
+    all. Indistinguishable from a quiet day with nothing to do."""
+    _claim_writes_fail(monkeypatch)
+    stats = webapp.run_orders_reminder()
+    assert stats["emailed_now"] == 0
+    assert all(m["to"] != "b@x.sk" for m in iso["sent"])     # nothing sent unclaimed
+    assert stats["errors"] >= 1                              # …and the run says so
+
+
+# ── M2 — an order the run gave up on mid-flight must stay ON the tab ──────────────
+def test_an_order_whose_send_failed_stays_actionable_on_the_tab(iso, monkeypatch):
+    """The run claims, SMTP fails, the claim is released — and the order appears in NO display
+    list, because those are rebuilt from scratch every run and this branch just `continue`s. The
+    manager cannot even see the failed order, and „▶ Poslať pripomienku" on the row they saw
+    before the run answers 404 „objednávka sa v aktuálnom zozname nenašla"."""
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    webapp.run_orders_reminder()
+    assert "20261001" in _display_codes(iso)
+    # …and the row is genuinely actionable, not just visible
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "contact"})
+    assert r.status_code == 200
+
+
+def test_an_order_whose_claim_could_not_be_written_stays_actionable_on_the_tab(iso, monkeypatch):
+    _claim_writes_fail(monkeypatch)
+    webapp.run_orders_reminder()
+    assert "20261001" in _display_codes(iso)
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "contact"})
+    assert r.status_code == 200
+
+
+def test_an_order_whose_classification_failed_stays_actionable_on_the_tab(iso, monkeypatch):
+    def boom(note):
+        raise RuntimeError("OpenAI 500")
+    monkeypatch.setattr(webapp, "_classify_contacted", boom)
+    webapp.run_orders_reminder()
+    assert {"20261001", "20261002"} <= _display_codes(iso)
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "send"})
+    assert r.status_code in (200, 409)                       # anything but 404
+
+
+def test_an_order_lost_to_a_concurrent_manual_send_stays_on_the_tab(iso, monkeypatch):
+    """The manager claims the order a heartbeat before the run reaches it: the run skips it (
+    correctly — it must not race the manual send) but then leaves it off the tab entirely."""
+    _seed(iso)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    st = webapp._load_orders_reminder()
+    st.setdefault("orders", {})["20261000"] = {
+        "status": "sending", "claim": "someone-else", "email": "a@x.sk",
+        "claimed_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")}
+    webapp._save_orders_reminder(st)
+    iso["sent"].clear()
+    webapp.run_orders_reminder()
+    assert all(m["to"] != "a@x.sk" for m in iso["sent"])      # the run did not race the click
+    assert "20261000" in _display_codes(iso)                  # …and did not hide the order
+
+
+# ── M3 — no MAIL_BCC disqualifies an order BEFORE the paid OpenAI call ────────────
+def test_without_mail_bcc_the_run_pays_for_no_classification(iso, monkeypatch):
+    """`bcc_missing` was computed and reported but never USED as a disqualifier: the run claimed
+    the order, paid OpenAI, and only then had the send refused by require_bcc — and since the
+    order never becomes terminal, it did that again on every single run, forever. The repo rule
+    is „expensive call only after the cheap disqualifiers"."""
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    classified = []
+    monkeypatch.setattr(webapp, "_classify_contacted",
+                        lambda note: classified.append(note) or False)
+    writes = {"n": 0}
+    real_save = webapp._save_orders_reminder
+
+    def counting_save(data):
+        writes["n"] += 1
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", counting_save)
+    stats = webapp.run_orders_reminder()
+    assert classified == []                     # not one paid classification
+    assert iso["sent"] == []
+    assert stats["bcc_missing"] is True
+    assert writes["n"] == 1                     # only the final save — no claim ever written
+    assert _store(iso).get("orders") == {}      # nothing recorded → retried once BCC is set
+    # the orders are still visible so the manager sees WHAT is stuck, next to the BCC warning
+    assert {"20261001", "20261002"} <= _display_codes(iso)
