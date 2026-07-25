@@ -764,26 +764,64 @@ async function loadOrders() {
   } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; ORDER_COMMENTS = {}; }
 }
 
-async function saveOrdered(key, ordered) {
-  if (ordered) ORDERED[key] = true; else delete ORDERED[key];
-  await fetch('/api/ordered', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, ordered })
-  });
+// #214 — every write on the „Na objednanie" tab reports its own failure. A silent
+// `if (!r.ok) return;` left the manager guessing whether his click landed (and, for the
+// optimistic flag toggles, showing a flag the server never stored). One message shape
+// for all of them, in the manager's language.
+function toOrderSaveFailed(what, detail) {
+  alert('⚠️ ' + what + ' sa nepodarilo uložiť' + (detail ? ' (' + detail + ')' : '')
+    + '. Skús to prosím znova.');
 }
+
+// Run one to-order write; returns true on success, false AFTER telling the manager why.
+// Callers that already changed the UI optimistically roll back in the false branch.
+async function postToOrder(path, payload, what) {
+  try {
+    const r = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (r.ok) return true;
+    toOrderSaveFailed(what, 'chyba ' + r.status);
+  } catch (_) {
+    toOrderSaveFailed(what, 'server neodpovedal');
+  }
+  return false;
+}
+
+// The four per-line flags (objednané / čaká sa / skladom / nedostupné) share one writer:
+// the flag map is set optimistically (the row + the supplier chips repaint synchronously
+// in the click handler), and on ANY failure it is rolled back and the tab re-rendered, so
+// what the manager sees is never a flag the server refused (#214).
+async function saveOrderFlag(path, field, map, key, on, what) {
+  const was = !!map[key];
+  if (on) map[key] = true; else delete map[key];
+  if (await postToOrder(path, { key, [field]: on }, what)) return true;
+  if (was) map[key] = true; else delete map[key];
+  renderToOrder();
+  return false;
+}
+
+const saveOrdered = (key, on) =>
+  saveOrderFlag('/api/ordered', 'ordered', ORDERED, key, on, 'Označenie „objednané“');
+const saveWaiting = (key, on) =>
+  saveOrderFlag('/api/waiting', 'waiting', WAITING, key, on, 'Označenie „čaká sa“');
+const saveInstock = (key, on) =>
+  saveOrderFlag('/api/instock', 'instock', INSTOCK, key, on, 'Označenie „skladom“');
+const saveUnavailable = (key, on) =>
+  saveOrderFlag('/api/unavailable', 'unavailable', UNAVAIL, key, on, 'Označenie „nedostupné“');
 
 // Označiť celú skupinu dodávateľa objednané naraz (manažér objedná od dodávateľa
 // všetko naraz). Pošle všetky per-riadkové kľúče cez bulk endpoint, updatne ORDERED
 // mapu a prekreslí. items = riadky skupiny (each carries o.key = orderCode|itemCode).
+// ORDERED sa mení až PO úspechu, takže pri zlyhaní netreba nič vracať — len to povedať.
 async function markGroupOrdered(items, ordered) {
   const keys = items.map(o => o.key);
-  const r = await fetch('/api/ordered/bulk', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ keys, ordered })
-  });
-  if (!r.ok) return;
+  if (!await postToOrder('/api/ordered/bulk', { keys, ordered },
+    'Hromadné označenie skupiny')) return false;
   for (const k of keys) { if (ordered) ORDERED[k] = true; else delete ORDERED[k]; }
   renderToOrder();
+  return true;
 }
 
 // ── Nedostupné tovary (#100) ───────────────────────────────────────────────
@@ -974,44 +1012,22 @@ function initNdModal() {
   if (send) send.onclick = ndSendNow;
 }
 
-async function saveWaiting(key, waiting) {
-  if (waiting) WAITING[key] = true; else delete WAITING[key];
-  await fetch('/api/waiting', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, waiting })
-  });
-}
-
-async function saveInstock(key, instock) {
-  if (instock) INSTOCK[key] = true; else delete INSTOCK[key];
-  await fetch('/api/instock', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, instock })
-  });
-}
-
-async function saveUnavailable(key, unavailable) {
-  if (unavailable) UNAVAIL[key] = true; else delete UNAVAIL[key];
-  await fetch('/api/unavailable', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, unavailable })
-  });
-}
-
 // Inline pairing: paste the supplier reorder URL straight onto an order line.
 // Persists per forestshop code (covers items outside the review dataset too).
 async function savePairUrl(o, url) {
-  if (url && !/^https?:\/\//.test(url)) return;   // ignore non-URL input
-  const r = await fetch('/api/order-pair', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code: o.itemCode, url })
-  });
-  if (!r.ok) return;
+  if (url && !/^https?:\/\//.test(url)) {
+    // #214 — the guard used to drop a typo'd URL on the floor with no explanation
+    alert('⚠️ Zadaj platnú adresu začínajúcu http:// alebo https:// — takto sa uložiť nedá.');
+    return false;
+  }
+  if (!await postToOrder('/api/order-pair', { code: o.itemCode, url },
+    'Párovacia URL')) return false;
   // the pairing is keyed by itemCode (a PRODUCT property) → /api/orders already serves
   // it on EVERY order line of that code, so mirror that client-side: without it the
   // sibling lines keep showing an empty paste box for a product that IS paired (#204).
   for (const x of ORDERS) if (x.itemCode === o.itemCode) x.pairUrl = url;
   renderToOrder();                       // re-render so the new link shows immediately
+  return true;
 }
 
 // inline-pairing editor (code + URL input + save) — used for an unpaired row and
@@ -1071,15 +1087,13 @@ function supplierSpellingIndex(orders) {
 // one. Persists per forestshop code; the row then regroups under that supplier and the
 // name is written back to the eshop `supplier` field by the nightly upload.
 async function saveSupplier(o, supplier) {
-  const r = await fetch('/api/order-supplier', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code: o.itemCode, supplier })
-  });
-  if (!r.ok) return;
+  if (!await postToOrder('/api/order-supplier', { code: o.itemCode, supplier },
+    'Priradenie dodávateľa')) return false;
   // assignment is keyed by itemCode (a product property) → apply to EVERY order line
   // of that code, so all sibling lines regroup together (not just the clicked one)
   for (const x of ORDERS) if (x.itemCode === o.itemCode) x.assignedSupplier = supplier;
   renderToOrder();                 // re-render: the row(s) move into the supplier group
+  return true;
 }
 
 // supplier editor (text input with known-supplier autocomplete + save) — used for an
@@ -1105,13 +1119,11 @@ function supplierEditor(o, focus) {
 // order → after a save re-render the whole tab so all sibling lines reflect it (same
 // per-shared-property propagation as saveSupplier).
 async function saveOrderComment(o, comment) {
-  const r = await fetch('/api/order-comment', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ orderCode: o.orderCode, comment })
-  });
-  if (!r.ok) return;
+  if (!await postToOrder('/api/order-comment', { orderCode: o.orderCode, comment },
+    'Komentár k objednávke')) return false;
   if (comment) ORDER_COMMENTS[o.orderCode] = comment; else delete ORDER_COMMENTS[o.orderCode];
   renderToOrder();
+  return true;
 }
 
 // comment editor (multi-line textarea + save) — opened from the 💬 button on a row.
