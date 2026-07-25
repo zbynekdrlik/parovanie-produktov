@@ -330,7 +330,7 @@ def test_override_send_does_not_hold_the_store_lock_during_smtp(iso, monkeypatch
     # notice the race and NOT append a second orange row / overwrite the concurrent result.
     c = _seed(iso)
 
-    def concurrent_send(to, subject, body, bcc=None):
+    def concurrent_send(to, subject, body, bcc=None, **kw):
         st = _store(iso)
         st["orders"]["20261000"] = {"status": "emailed", "email": to, "manual": True,
                                      "date": "concurrent"}
@@ -441,7 +441,9 @@ def test_manager_override_during_a_run_survives_the_final_save(iso, monkeypatch)
     SMTP. An override written meanwhile must NOT be lost by the final save — losing its
     terminal record means the next run e-mails that customer again."""
     def classify_and_override(note):
-        st = _store(iso)                           # the manager resolves 20261000 from the tab
+        # the manager resolves 20261000 from the tab while the run is mid-OpenAI/SMTP
+        # (the app loader, not _store — the store file may not exist yet this early in the run)
+        st = webapp._load_orders_reminder()
         st.setdefault("orders", {})["20261000"] = {
             "status": "skipped_contacted", "manual": True, "date": "during-run"}
         webapp._save_orders_reminder(st)

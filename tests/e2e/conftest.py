@@ -487,8 +487,15 @@ def automations_server(tmp_path_factory):
         "skipped": [{"code": "20261002", "billFullName": "Iva Stará", "email": "iva@example.com",
                     "itemName": "Čiapka Test Skipped", "shopRemark": "volané so zákazníkom", "days": 7,
                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261002&src=orders"}],
-        "stats": {"orders_4d": 3, "no_note": 1, "with_note": 2, "emailed_now": 0,
-                  "emailed_total": 1, "skipped_now": 0, "ai_unavailable": 0, "errors": 0},
+        # BUG 4 — an order whose customer has no e-mail on file: it can never be reminded, so
+        # the run surfaces it here INSTEAD of paying for an AI classification on every run.
+        "no_email": [{"code": "20261004", "billFullName": "Bez Mailu", "phone": "+421900999888",
+                      "email": "", "itemName": "Rukavice Test NoMail",
+                      "shopRemark": "treba doriešiť", "days": 6,
+                      "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261004&src=orders"}],
+        "stats": {"orders_4d": 4, "no_note": 1, "with_note": 3, "emailed_now": 0,
+                  "emailed_total": 1, "skipped_now": 0, "ai_unavailable": 0,
+                  "no_email": 1, "errors": 0},
     }, ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
