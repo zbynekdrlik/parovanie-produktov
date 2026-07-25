@@ -53,6 +53,11 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: ORDERS_CSV)
     monkeypatch.setattr(webapp, "_classify_contacted", lambda note: _CLASSIFY[note])
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")   # key present unless a test removes it
+    # MAIL_BCC must be PINNED, never inherited: app.py loads the repo's data/.mail_env into the
+    # environment, so a dev box (which has one) and CI (which does not) would otherwise take
+    # different „BCC vždy" branches — green here, red there. Tests that need the missing-BCC
+    # behaviour delenv it explicitly.
+    monkeypatch.setenv("MAIL_BCC", "owner@example.com")
     sent = []
     monkeypatch.setattr(webapp, "_send_mail_html",
                         lambda to, subject, body, bcc=None, **kw:
@@ -495,21 +500,46 @@ def test_order_without_email_stays_free_of_openai_on_every_run(iso, monkeypatch)
 
 
 # ── VYLEPŠENIE 3 — a failing store write must not crash the run ────────────────────
-def test_persist_failure_is_logged_and_the_run_continues(iso, monkeypatch, caplog):
+def _drop_first_emailed_write(monkeypatch):
+    """Make the IMMEDIATE dedup write for 20261001 fail exactly once (targeted by CONTENT, not by
+    call index — the run also writes its in-flight claims, so counting calls is brittle)."""
     real_save = webapp._save_orders_reminder
-    n = {"calls": 0}
+    dropped = {"once": False}
 
     def flaky_save(data):
-        n["calls"] += 1
-        if n["calls"] == 1:                        # the immediate-persist right after the send
+        entry = (data.get("orders") or {}).get("20261001") or {}
+        if not dropped["once"] and isinstance(entry, dict) and entry.get("status") == "emailed":
+            dropped["once"] = True
             raise OSError("[Errno 28] No space left on device")
         return real_save(data)
 
     monkeypatch.setattr(webapp, "_save_orders_reminder", flaky_save)
+    return real_save
+
+
+def test_persist_failure_is_logged_and_the_run_continues(iso, monkeypatch, caplog):
+    _drop_first_emailed_write(monkeypatch)
     with caplog.at_level("ERROR"):
         stats = webapp.run_orders_reminder()       # must NOT propagate
     assert stats["emailed_now"] == 1
     assert any("20261001" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+    # PR #223 review (IMPORTANT 2): the final save re-reads `orders` from disk, so a dropped
+    # immediate write is not merely logged — it is DISCARDED, and the record of a mail that
+    # really did go out disappears. The run must re-apply it on top of the fresh disk map.
+    assert _store(iso)["orders"]["20261001"]["status"] == "emailed"
+
+
+def test_a_dropped_immediate_write_does_not_remail_on_the_next_run(iso, monkeypatch):
+    """The whole point of the healing net: after a failed immediate write the customer must not
+    be e-mailed again by tomorrow's run."""
+    real_save = _drop_first_emailed_write(monkeypatch)
+    webapp.run_orders_reminder()
+    # restore ONLY the save (monkeypatch.undo() would drop the whole `iso` isolation too)
+    monkeypatch.setattr(webapp, "_save_orders_reminder", real_save)
+    iso["sent"].clear()
+    stats2 = webapp.run_orders_reminder()
+    assert stats2["emailed_now"] == 0
+    assert all(m["to"] != "b@x.sk" for m in iso["sent"])
 
 
 # ── VYLEPŠENIE 4 — „BCC vždy": no MAIL_BCC → the customer mail does not go out ─────
@@ -536,9 +566,11 @@ def test_override_send_does_not_email_the_customer_without_mail_bcc(iso, monkeyp
     c = _seed(iso)
     _real_smtp_path(monkeypatch, iso)
     r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
-    assert r.status_code == 502
+    # 503, not 502 (PR #223 review MINOR 6): the endpoint pre-flights the „BCC vždy" requirement
+    # so the manager is told it is a CONFIGURATION gap, not a transient send failure.
+    assert r.status_code == 503
     assert _FakeSMTP.last_rcpt is None
-    assert "20261000" not in _store(iso).get("orders", {})   # claim released, retry possible
+    assert "20261000" not in _store(iso).get("orders", {})   # no claim taken, retry possible
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -660,3 +692,164 @@ def test_run_survives_a_corrupt_order_record(iso):
     stats = webapp.run_orders_reminder()                    # must not raise
     assert stats["emailed_now"] == 1                        # re-processed, record repaired
     assert _store(iso)["orders"]["20261001"]["status"] == "emailed"
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #223 adversarial review — the RUN's own send window was still unclaimed, a dropped
+# write was silently discarded, and a failed post-send write only bought 10 minutes.
+# Symptom of all three: the SAME customer gets the SAME reminder twice.
+# ═════════════════════════════════════════════════════════════════════════════════
+def _csv_with_a_note_on_the_red_order():
+    """The RED order (nobody had touched it) picked up an internal note, so the NEXT run
+    classifies + e-mails it — while its RED row is still on the tab, i.e. the manager can click
+    „▶ Poslať pripomienku" on it at exactly that moment."""
+    return ORDERS_CSV.decode("cp1250").replace(
+        f"20261000;{OLD} 10:00:00;Vybavuje sa;;a@x.sk",
+        f"20261000;{OLD} 10:00:00;Vybavuje sa;volať zákazníka;a@x.sk").encode("cp1250")
+
+
+# ── IMPORTANT 1 — the run must CLAIM an order before its own OpenAI+SMTP window ────
+def test_manual_send_during_the_runs_own_send_window_is_blocked(iso, monkeypatch):
+    """The claim mechanism was one-sided: only the manual override claimed before SMTP. The run
+    did a fresh per-order read, RELEASED the lock, and then spent ~20 s in OpenAI + SMTP with no
+    in-flight marker on disk at all — so a click landing in that window passed the 409 gate,
+    claimed, and mailed, and the run mailed too."""
+    _seed(iso)                              # run 1: 20261000 sits in RED (no note yet)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    iso["sent"].clear()
+    clicked = {}
+
+    def classify_and_click(note):
+        if "r" not in clicked:              # the manager clicks while the run is in OpenAI
+            clicked["r"] = authed_client().post(
+                "/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+        return _CLASSIFY[note]
+
+    monkeypatch.setattr(webapp, "_classify_contacted", classify_and_click)
+    webapp.run_orders_reminder()
+    assert clicked["r"].status_code == 409                        # the run had claimed it
+    assert [m["to"] for m in iso["sent"] if m["to"] == "a@x.sk"] == ["a@x.sk"]   # ONE mail
+    assert _store(iso)["orders"]["20261000"]["status"] == "emailed"
+
+
+def test_the_runs_claim_is_released_when_its_own_send_fails(iso, monkeypatch):
+    """The claim has to be live ON DISK for the whole SMTP round-trip (that is what makes a
+    concurrent click 409) — and must never outlive the attempt, or a failed send would lock the
+    order until the TTL lapses."""
+    _seed(iso)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    seen = {}
+
+    def send_fails(to, subject, body, bcc=None, **kw):
+        seen["claim"] = (webapp._load_orders_reminder().get("orders") or {}).get("20261000")
+        return False
+
+    monkeypatch.setattr(webapp, "_send_mail_html", send_fails)
+    webapp.run_orders_reminder()
+    assert (seen.get("claim") or {}).get("status") == "sending"    # claimed before SMTP
+    assert "20261000" not in _store(iso).get("orders", {})         # …and released after
+
+
+def test_the_runs_claim_is_released_when_classification_fails(iso, monkeypatch):
+    _seed(iso)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    seen = {}
+
+    def boom(note):
+        seen["claim"] = (webapp._load_orders_reminder().get("orders") or {}).get("20261000")
+        raise RuntimeError("OpenAI 500")
+
+    monkeypatch.setattr(webapp, "_classify_contacted", boom)
+    webapp.run_orders_reminder()
+    assert (seen.get("claim") or {}).get("status") == "sending"    # claimed before the AI call
+    assert "20261000" not in _store(iso).get("orders", {})         # …and released after
+
+
+# ── IMPORTANT 3 — a failed post-send write must leave a NON-EXPIRING marker ────────
+def test_a_manual_send_whose_write_failed_is_not_remailed_by_the_next_run(iso, monkeypatch):
+    """When the post-send write fails the endpoint deliberately keeps the claim so a re-click is
+    blocked — but `sending` is TRANSIENT: after SENDING_CLAIM_TTL_S it is neither an active claim
+    nor terminal, so the next daily run treats the order as unprocessed and mails the customer a
+    second time. The mitigation may not depend on a human noticing within 10 minutes."""
+    c = _seed(iso)
+    real_save = webapp._save_orders_reminder
+    n = {"calls": 0}
+
+    def flaky_save(data):
+        n["calls"] += 1
+        if n["calls"] == 2:              # 1 = the claim, 2 = the post-send record
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", flaky_save)
+    iso["sent"].clear()
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 500
+    assert [m["to"] for m in iso["sent"]] == ["a@x.sk"]           # the mail DID go out
+    monkeypatch.setattr(webapp, "_save_orders_reminder", real_save)
+
+    # …10 minutes later the claim has lapsed and the order has picked up a note
+    monkeypatch.setattr(webapp, "SENDING_CLAIM_TTL_S", 0)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    iso["sent"].clear()
+    webapp.run_orders_reminder()
+    assert all(m["to"] != "a@x.sk" for m in iso["sent"])          # NO second mail
+    assert _reminder_terminal_on_disk(iso, "20261000")
+
+
+def _reminder_terminal_on_disk(iso, code) -> bool:
+    return webapp._reminder_is_terminal((_store(iso).get("orders") or {}).get(code))
+
+
+# ── MINOR 4 — a row resolved DURING the run must not be written back onto the tab ──
+def test_red_row_resolved_during_a_run_is_not_written_back_as_unhandled(iso, monkeypatch):
+    """`red` is built from the START-of-run snapshot and saved wholesale at the end, so an order
+    the manager resolved (✓ Kontaktované) mid-run reappears as red — and their next click on it
+    gets a 409 „už vybavená" they cannot explain."""
+    _seed(iso)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_midrun_order)
+    iso["sent"].clear()
+    done_click = {}
+
+    def classify_and_resolve(note):
+        if "r" not in done_click:        # resolved while the run sits in OpenAI on ANOTHER order
+            done_click["r"] = authed_client().post(
+                "/api/orders-reminder/override", json={"code": "20261000", "action": "contact"})
+        return _CLASSIFY[note]
+
+    monkeypatch.setattr(webapp, "_classify_contacted", classify_and_resolve)
+    webapp.run_orders_reminder()
+    assert done_click["r"].status_code == 200
+    st = _store(iso)
+    assert "20261000" not in {r["code"] for r in st["red"]}        # not resurrected
+    assert "20261000" in {r["code"] for r in st["skipped"]}        # shown where it belongs
+    assert st["orders"]["20261000"]["status"] == "skipped_contacted"
+
+
+# ── MINOR 6 — a missing MAIL_BCC is a CONFIG error, not a transient send failure ───
+def test_override_send_without_mail_bcc_reports_a_configuration_error(iso, monkeypatch):
+    """A generic 502 „odoslanie zlyhalo" reads like a transient glitch, so the manager keeps
+    clicking forever. Missing MAIL_BCC needs its own, actionable answer."""
+    c = _seed(iso)
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    iso["sent"].clear()
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 503
+    assert "MAIL_BCC" in r.get_json()["error"]
+    assert iso["sent"] == []                                       # no send even attempted
+    assert "20261000" not in _store(iso).get("orders", {})         # and no claim left behind
+    assert "20261000" in {r2["code"] for r2 in _store(iso)["red"]}  # row still actionable
+
+
+# ── MINOR 7 — a dead automation must be visible in the UI, not only in the log ─────
+def test_run_surfaces_missing_mail_bcc_in_its_stats(iso, monkeypatch):
+    """Without MAIL_BCC the customer automations refuse to send (VYLEPŠENIE 4) — but that is an
+    ERROR line in the log only, so the tab shows a healthy run that quietly mailed nobody."""
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    stats = webapp.run_orders_reminder()
+    assert stats["bcc_missing"] is True
+    assert _store(iso)["stats"]["bcc_missing"] is True
+
+
+def test_run_stats_do_not_flag_bcc_when_it_is_configured(iso):
+    assert webapp.run_orders_reminder()["bcc_missing"] is False

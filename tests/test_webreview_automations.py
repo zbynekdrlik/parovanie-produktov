@@ -53,6 +53,10 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "POSTA_STATE", str(tmp_path / "posta_uncollected.json"))
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: ORDERS_CSV)
     monkeypatch.setattr(webapp, "_fetch_tracking", lambda pkg: TRACKING[pkg])
+    # PIN MAIL_BCC: app.py loads the repo's data/.mail_env into the environment, so a dev box
+    # (which has one) and CI (which does not) would report a different `bcc_missing` — green
+    # here, red there. Tests that need the missing-BCC branch delenv it explicitly.
+    monkeypatch.setenv("MAIL_BCC", "owner@example.com")
     sent = []
     monkeypatch.setattr(webapp, "_send_mail_html",
                         lambda to, subject, body, bcc=None, **kw:
@@ -107,7 +111,7 @@ def test_toggle_unknown_automation_404(iso):
 def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
     stats = webapp.run_posta_uncollected()
     assert stats == {"checked": 3, "uncollected": 1, "invalid": 1, "errors": 0,
-                     "emails_sent": 1, "emails_failed": 0}
+                     "emails_sent": 1, "emails_failed": 0, "bcc_missing": False}
     # exactly ONE customer mail, template #1. run_posta_uncollected no longer
     # passes an explicit bcc — _send_mail_html itself defaults it to MAIL_BCC
     # (tested directly below); here it's stubbed, so bcc arrives as None.
@@ -293,6 +297,17 @@ def test_posta_run_does_not_email_the_customer_without_mail_bcc(iso, monkeypatch
     # escalation NOT bumped → the mail is retried once MAIL_BCC is configured
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert st.get("escalation", {}) == {}
+
+
+# ── PR #223 review, MINOR 7 — the dead automation must be visible in the UI ────────
+def test_posta_run_surfaces_missing_mail_bcc_in_its_stats(iso, monkeypatch):
+    """Refusing to send without MAIL_BCC is only an ERROR line in the log today, so the tab
+    shows a run that quietly mailed nobody. The tab needs the reason."""
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    stats = webapp.run_posta_uncollected()
+    assert stats["bcc_missing"] is True
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["stats"]["bcc_missing"] is True
 
 
 def test_posta_persist_failure_still_shows_the_shipment_in_the_tab(iso, monkeypatch):

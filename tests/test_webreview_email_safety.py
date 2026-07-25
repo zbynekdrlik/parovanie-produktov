@@ -155,3 +155,68 @@ def test_explicit_empty_bcc_opts_out_without_warning(smtp, monkeypatch, caplog):
         assert webapp._send_mail_html(CUSTOMER, "predmet", "<p>telo</p>", bcc="") is True
     assert smtp.calls[0]["rcpt"] == [CUSTOMER]
     assert not [r for r in caplog.records if "MAIL_BCC" in r.getMessage()]
+
+
+# ── PR #223 review, MINOR 5 — a raise before quit() must not leak the SMTP socket ──────────
+# `quit()` is only reached on the success path, so an exception out of starttls() / login() /
+# sendmail() used to leave the connection open until the garbage collector happened to run.
+# On a server that mails all day (two customer automations + resets) that is a slow file-
+# descriptor leak, and the sockets stay half-open on the SMTP relay too.
+class _ClosingSMTP(_StubSMTP):
+    closed = False
+
+    def close(self):
+        type(self).closed = True
+
+
+def _closing_stub(monkeypatch, **overrides):
+    cls = type("_Stub", (_ClosingSMTP,), overrides)
+    cls.closed = False
+    monkeypatch.setattr(webapp.smtplib, "SMTP", cls)
+    monkeypatch.setattr(webapp.smtplib, "SMTP_SSL", cls)
+    return cls
+
+
+def test_smtp_socket_is_closed_when_login_raises(smtp, monkeypatch):
+    def boom_login(self, user, pw):
+        raise smtplib.SMTPAuthenticationError(535, b"bad credentials")
+
+    cls = _closing_stub(monkeypatch, login=boom_login)
+    assert webapp._send_mail_html(CUSTOMER, "predmet", "<p>telo</p>") is False
+    assert cls.closed is True
+
+
+def test_smtp_socket_is_closed_when_sendmail_raises(smtp, monkeypatch):
+    def boom_send(self, sender, rcpt, msg):
+        raise smtplib.SMTPServerDisconnected("dropped mid-DATA")
+
+    cls = _closing_stub(monkeypatch, sendmail=boom_send)
+    assert webapp._send_mail_html(CUSTOMER, "predmet", "<p>telo</p>") is False
+    assert cls.closed is True
+
+
+def test_smtp_socket_is_closed_when_starttls_raises(smtp, monkeypatch):
+    def boom_tls(self):
+        raise smtplib.SMTPException("STARTTLS refused")
+
+    cls = _closing_stub(monkeypatch, starttls=boom_tls)
+    assert webapp._send_mail(CUSTOMER, "predmet", "telo") is False
+    assert cls.closed is True
+
+
+def test_smtp_socket_is_closed_when_quit_raises(smtp, monkeypatch):
+    """quit() itself failing still leaves the socket behind — the mail is already delivered
+    (BUG 1: still a success), but the connection must not be left to the GC either."""
+    def boom_quit(self):
+        raise smtplib.SMTPServerDisconnected("server closed the connection")
+
+    cls = _closing_stub(monkeypatch, quit=boom_quit)
+    assert webapp._send_mail_html(CUSTOMER, "predmet", "<p>telo</p>") is True
+    assert cls.closed is True
+
+
+def test_successful_quit_does_not_also_close(smtp, monkeypatch):
+    """The normal path stays exactly as it was: quit() alone, no extra close() on the wire."""
+    cls = _closing_stub(monkeypatch)
+    assert webapp._send_mail_html(CUSTOMER, "predmet", "<p>telo</p>") is True
+    assert cls.closed is False
