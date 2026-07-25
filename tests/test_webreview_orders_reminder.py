@@ -1472,3 +1472,73 @@ def test_reminder_preview_fails_closed_on_a_corrupt_store(iso):
     r = c.post("/api/orders-reminder/preview", json={"code": "20261000"})
     assert r.status_code == 503
     assert "poškoden" in r.get_json()["error"].lower()
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #228 adversarial review — the #225 guard only validated the OUTER dict, so the
+# wipe it was written to stop was still reachable one level down. Plus two smaller
+# holes in the same guard: the most likely real truncation is not a JSONDecodeError,
+# and a corrupt store looked like a quiet day on the tab.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_a_non_dict_orders_map_is_corruption_not_an_empty_store(iso):
+    """`{"orders": null}` parses, and the file IS a dict — so the outer guard passed it, the run
+    read „nobody was ever mailed", and the final save persisted that as fact. Reproduced: the
+    run after that mailed the same customer a second time."""
+    webapp.run_orders_reminder()                       # run 1: 20261001 gets its reminder
+    assert len(iso["sent"]) == 1
+    p = iso["tmp"] / "orders_reminder.json"
+    st = json.loads(p.read_text())
+    st["orders"] = None                                # the dedup MAP itself is gone
+    p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    iso["sent"].clear()
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+    # …and the store was NOT rewritten with an empty map, so a later run cannot re-mail either
+    assert json.loads(p.read_text())["orders"] is None
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+
+
+def test_a_truncated_multibyte_write_is_corruption_too(iso):
+    """These stores are written with ensure_ascii=False and are full of Slovak text, so a write
+    cut mid-character raises UnicodeDecodeError — NOT JSONDecodeError. It used to escape the
+    loader entirely: no quarantine copy, a raw traceback in last_error, and a 500 on the tab."""
+    p = iso["tmp"] / "orders_reminder.json"
+    p.write_bytes(b'{"orders": {"20261001": {"status": "emailed", "name": "Ja\xc3')
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+    assert len(list(iso["tmp"].glob("orders_reminder.json.corrupt-*"))) == 1   # preserved
+    # the read-only tab still degrades gracefully instead of 500ing
+    assert authed_client().get("/api/orders-reminder").status_code == 200
+
+
+def test_the_tab_says_the_store_is_corrupt_instead_of_looking_empty(iso):
+    """An empty red/orange/skipped payload is indistinguishable from a quiet day. A corruption
+    appearing BETWEEN runs would otherwise be invisible until the next run failed — the same
+    „ticho mŕtva automatizácia" that bcc_missing exists to prevent."""
+    c = _seed(iso)
+    assert c.get("/api/orders-reminder").get_json().get("store_corrupt") in (False, None)
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    j = c.get("/api/orders-reminder").get_json()
+    assert j["store_corrupt"] is True and j["red"] == []
+
+
+def test_the_fast_path_re_derives_manual_from_the_record(iso):
+    """#227 self-heal: a display row carried over from before the flag existed (or one whose
+    record was corrected) must be re-marked from the RECORD, not trusted as rendered."""
+    webapp.run_orders_reminder()
+    p = iso["tmp"] / "orders_reminder.json"
+    st = json.loads(p.read_text())
+    st["orders"]["20261002"]["manual"] = True           # the record says: a human decided
+    for r in st["skipped"]:                             # …but the rendered row does not
+        r.pop("manual", None)
+    p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+
+    webapp.run_orders_reminder()                        # unchanged fingerprint → fast path
+    (row,) = [r for r in json.loads(p.read_text())["skipped"] if r["code"] == "20261002"]
+    assert row.get("manual") is True

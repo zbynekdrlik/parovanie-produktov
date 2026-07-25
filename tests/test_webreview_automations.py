@@ -573,3 +573,47 @@ def test_posta_preview_rejects_a_missing_or_unknown_package(iso):
     assert c.post("/api/posta-uncollected/preview",
                   json={"package": "EF999999999SK"}).status_code == 404
     assert iso["sent"] == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #228 adversarial review — same class as the orders_reminder finding: the guard
+# only validated the OUTER dict, so `{"escalation": null}` still restarted every
+# escalation at count 0 and re-sent mail #1 to customers who already had it.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_a_non_dict_escalation_map_is_corruption_not_an_empty_store(iso):
+    webapp.run_posta_uncollected()                     # run 1: escalation mail #1 goes out
+    assert len(iso["sent"]) == 1
+    p = iso["tmp"] / "posta_uncollected.json"
+    st = json.loads(p.read_text())
+    st["escalation"] = None                            # the dedup MAP itself is gone
+    p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    iso["sent"].clear()
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_posta_uncollected()
+    assert iso["sent"] == []                           # would have re-sent mail #1
+    assert json.loads(p.read_text())["escalation"] is None      # not rewritten as empty
+
+
+def test_a_corrupt_terminal_cache_does_not_block_the_run(iso, monkeypatch):
+    """Deliberate scoping: `terminal` is a PERFORMANCE cache (it only ever saves an API call),
+    so losing it cannot cause a duplicate mail — while blocking the run on it WOULD stop a
+    genuine customer notification. Only `escalation`, the record of what was already sent, is
+    fail-closed."""
+    p = iso["tmp"] / "posta_uncollected.json"
+    p.write_text(json.dumps({"escalation": {}, "terminal": "kaboom"}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()             # must NOT raise
+    assert stats["emails_sent"] == 1                   # the customer IS notified
+    assert "EF000000002SK" in asked
+
+
+def test_the_posta_tab_says_the_store_is_corrupt(iso):
+    c = authed_client()
+    webapp.run_posta_uncollected()
+    assert c.get("/api/posta-uncollected").get_json().get("store_corrupt") in (False, None)
+    (iso["tmp"] / "posta_uncollected.json").write_text(_TRUNCATED, encoding="utf-8")
+    j = c.get("/api/posta-uncollected").get_json()
+    assert j["store_corrupt"] is True and j["uncollected"] == []
