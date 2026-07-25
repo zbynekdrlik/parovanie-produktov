@@ -430,3 +430,24 @@ def test_a_fresh_terminal_cache_entry_is_still_trusted(iso, monkeypatch):
                         lambda pkg: asked.append(pkg) or TRACKING[pkg])
     webapp.run_posta_uncollected()
     assert "EF000000001SK" not in asked
+
+
+@pytest.mark.parametrize("bad_at", ["zzz", "2099-01-01"])
+def test_a_non_date_at_value_does_not_freeze_a_shipment(iso, monkeypatch, bad_at):
+    """`at` is compared as a raw STRING, so ANY value sorting above the cutoff keeps the entry
+    „fresh" forever: „zzz" left by a partial write, or a future date after a clock jump. The
+    parcel would then be skipped for the whole 30-day source window with the weekly re-check net
+    silently switched off — and an uncollected parcel would never be escalated. Corruption,
+    ambiguity and age must ALL degrade to „check it" (the rule the block itself states), so the
+    trusted range is bounded from BOTH sides. (PR #224 adversarial review.)"""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000002SK": {"state": "delivered", "at": bad_at,
+                                       "code": "2026100"}}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000002SK" in asked                   # checked, not silently skipped
+    assert stats["emails_sent"] == 1                  # …and the customer IS told
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF000000002SK" not in st["terminal"]      # the bogus entry is dropped, not refreshed

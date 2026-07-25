@@ -1104,3 +1104,46 @@ def test_a_stale_pending_note_is_not_carried_forward_forever(iso, monkeypatch):
     st = _store(iso)
     stale = [r for r in st["skipped"] + st["orange"] if r.get("pending")]
     assert stale == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #224 review — `pending` („the run could not finish this order") is stripped when
+# the order resolves, in _relocate AND in the incremental fast path. The manual override
+# is the THIRD way an order resolves, and it re-appended the row verbatim: the manager
+# finished the job by hand, yet the row kept its „automat to nestihol" warning — and kept
+# inflating the „z toho N nedokončených" heading — until the next run rebuilt the lists
+# (up to 24 h later).
+# ═════════════════════════════════════════════════════════════════════════════════
+def _pending_row(iso, section, code):
+    return [r for r in _store(iso)[section] if r["code"] == code and r.get("pending")]
+
+
+def test_a_manual_contact_override_does_not_carry_a_stale_pending_note(iso, monkeypatch):
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    webapp.run_orders_reminder()                     # 20261001: send failed → rescued as pending
+    assert _pending_row(iso, "skipped", "20261001")
+
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "contact"})
+    assert r.status_code == 200
+    st = _store(iso)
+    assert st["orders"]["20261001"]["status"] == "skipped_contacted"
+    assert _pending_row(iso, "skipped", "20261001") == []
+
+
+def test_a_manual_send_override_does_not_carry_a_stale_pending_note(iso, monkeypatch):
+    """…and the same on the send path, which re-appends the row into `orange`."""
+    capturing_send = webapp._send_mail_html          # the fixture's stub (nothing leaves)
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    webapp.run_orders_reminder()
+    assert _pending_row(iso, "skipped", "20261001")
+
+    monkeypatch.setattr(webapp, "_send_mail_html", capturing_send)
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "send"})
+    assert r.status_code == 200
+    st = _store(iso)
+    assert st["orders"]["20261001"]["status"] == "emailed"
+    assert _pending_row(iso, "orange", "20261001") == []
