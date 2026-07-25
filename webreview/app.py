@@ -423,6 +423,15 @@ def _warn_missing_bcc_once(what: str) -> None:
                 "kópie pre majiteľa (konvencia BCC vzdy); doplň MAIL_BCC", what)
 
 
+def _mail_bcc():
+    """The owner's „BCC vždy" address, or None when it is not usable. ONE definition of
+    „configured", shared by every sender, by the override endpoint's pre-flight and by the
+    automations' `bcc_missing` stat — otherwise a blank `MAIL_BCC=` line in data/.mail_env
+    reads as configured to one of them and as missing to another, and the tab disagrees with
+    what the sender actually does."""
+    return (os.environ.get("MAIL_BCC") or "").strip() or None
+
+
 def _smtp_deliver(sender, rcpt, msg_str, to) -> bool:
     """Connect, hand the message over, disconnect. Returns True only when the PRIMARY recipient
     `to` was accepted by the server. Raises on a connection / handshake / send failure — every
@@ -493,7 +502,7 @@ def _send_mail(to, subject, body) -> bool:
     the owner. _send_mail_html already applies this; #127 closed the gap for
     this (reset-password) path. bcc is envelope-only (no header), matching
     _send_mail_html."""
-    bcc = os.environ.get("MAIL_BCC") or None
+    bcc = _mail_bcc()
     host = os.environ.get("MAIL_HOST")
     if not host:
         log.error("auth: SMTP not configured (data/.mail_env) — mail to %s NOT sent", to)
@@ -546,7 +555,7 @@ def _send_mail_html(to, subject, html_body, bcc=None, require_bcc=False) -> bool
     one-shot warning."""
     explicit_no_bcc = (bcc == "")
     if bcc is None:
-        bcc = os.environ.get("MAIL_BCC") or None
+        bcc = _mail_bcc()
     bcc = bcc or None
     host = os.environ.get("MAIL_HOST")
     if not host:
@@ -590,7 +599,7 @@ def _send_vystava_mail(to, subject, text_body):
     pass/from) and the same „BCC vždy" default (MAIL_BCC). From is „Forestshop.sk"
     <MAIL_FROM>. Returns the generated Message-ID on success, None on failure (the
     caller then leaves the výstava's state unchanged and can retry)."""
-    bcc = os.environ.get("MAIL_BCC") or None
+    bcc = _mail_bcc()
     host = os.environ.get("MAIL_HOST")
     if not host:
         log.error("vystavy mail: SMTP not configured (data/.mail_env) — '%s' to %s NOT sent",
@@ -3987,7 +3996,7 @@ def run_posta_uncollected() -> dict:
              # „BCC vždy" is BINDING for these customer mails (require_bcc): with no MAIL_BCC not
              # one escalation goes out. Surfaced so the tab shows a dead automation as dead
              # instead of a healthy-looking run that quietly mailed nobody (ERROR log only).
-             "bcc_missing": not (os.environ.get("MAIL_BCC") or "").strip()}
+             "bcc_missing": _mail_bcc() is None}
     with _lock:
         _save_posta_state({
             "escalation": esc,
@@ -4802,7 +4811,7 @@ def run_orders_reminder() -> dict:
     # „BCC vždy" is BINDING for these customer mails (require_bcc below): with no MAIL_BCC not a
     # single reminder goes out. Surfaced in the stats so the tab shows a dead automation as dead
     # instead of a healthy-looking run that quietly mailed nobody (only an ERROR line before).
-    bcc_missing = not (os.environ.get("MAIL_BCC") or "").strip()
+    bcc_missing = _mail_bcc() is None
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     run_token = secrets.token_hex(8)     # identifies THIS run's claims (never release a foreign one)
     red, orange, skipped, no_email = [], [], [], []
@@ -5571,7 +5580,7 @@ def api_orders_reminder_override():
                                 "status": "sending"}), 409
             if not (row.get("email") or ""):
                 return jsonify({"ok": False, "error": "objednávka nemá e-mail"}), 400
-            if not (os.environ.get("MAIL_BCC") or "").strip():
+            if _mail_bcc() is None:
                 # „BCC vždy" is BINDING for a customer mail, so _send_mail_html would refuse and
                 # the manager would get a generic 502 „odoslanie zlyhalo" — indistinguishable
                 # from a transient glitch, so they keep clicking forever. Pre-flight it BEFORE

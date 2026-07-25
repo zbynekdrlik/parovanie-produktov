@@ -138,6 +138,23 @@ def test_require_bcc_sends_normally_when_mail_bcc_present(smtp):
     assert smtp.calls[0]["rcpt"] == [CUSTOMER, OWNER]
 
 
+def test_a_blank_mail_bcc_counts_as_missing_everywhere(smtp, monkeypatch):
+    """A MAIL_BCC line left blank in data/.mail_env („MAIL_BCC=  ") is a misconfiguration that
+    LOOKS configured. Truthiness alone would accept it and then hand the relay a whitespace
+    recipient; worse, the endpoint pre-flight and the stats flag strip while the sender did not,
+    so the tab and the sender would disagree about whether the automation can send at all."""
+    monkeypatch.setenv("MAIL_BCC", "   ")
+    assert webapp._send_mail_html(CUSTOMER, "predmet", "<p>telo</p>", require_bcc=True) is False
+    assert smtp.calls == []                          # nothing reached the wire
+    # the best-effort paths still send — but never to a blank address
+    assert webapp._send_mail_html(CUSTOMER, "predmet", "<p>telo</p>") is True
+    assert smtp.calls[0]["rcpt"] == [CUSTOMER]
+    assert webapp._send_mail(CUSTOMER, "predmet", "telo") is True
+    assert smtp.calls[1]["rcpt"] == [CUSTOMER]
+    assert webapp._send_vystava_mail("org@vystava.sk", "predmet", "telo")
+    assert smtp.calls[2]["rcpt"] == ["org@vystava.sk"]
+
+
 def test_missing_mail_bcc_only_warns_on_non_automation_paths(smtp, monkeypatch, caplog):
     """Reset-password & co. keep working without MAIL_BCC — they only get a one-shot warning."""
     monkeypatch.delenv("MAIL_BCC", raising=False)
