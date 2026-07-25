@@ -17,6 +17,12 @@ button (narrowed at click time) already pastes the smaller one. And the chip bel
 product that spans SEVERAL order lines, so it survives a sibling being flagged: it then
 shows what is left, with the whole demand in the tooltip.
 
+SCOPE (review pass 3): „outstanding" is ONE predicate — `!isHandled` — behind ALL of it:
+the #205 hide filter, the supplier chip colour, the #208 toolbar tally, this chip, the
+copy and the empty-list wording. Pass 2's second, narrower scope (settled flags only, so
+„čaká sa" stayed in the order) made those surfaces contradict each other on screen; the
+last test here pins that they cannot again.
+
 `toorder_server` has exactly this shape: ORBIS's two lines share itemCode S1 with
 quantities 1 and 2 (→ spolu 3 ks), while CITRADE's four lines are four distinct codes.
 """
@@ -196,14 +202,12 @@ def test_quantity_parsing_matches_what_the_row_displays(page, toorder_server):
     assert console == [], f"console not clean: {console}"
 
 
-def test_outstanding_scope_reads_the_live_flag_maps(page, toorder_server):
-    """`outstandingOf` is the ONE scope both the chip and the copy use, and it reads the
-    LIVE flag maps (like isHandled) — never the o.* snapshot, never the rendered set.
-
-    It holds back only the three SETTLED flags. „čaká sa" is a SCHEDULING flag (the line is
-    still to be ordered — see test_a_waiting_line_still_goes_into_the_order), so it stays in
-    the scope even though `isHandled` — which drives the #205 hide filter and the chip
-    colours — counts it as dealt with."""
+def test_outstanding_scope_is_exactly_the_one_handled_predicate(page, toorder_server):
+    """`outstandingOf` is the ONE scope every surface of the tab uses, and it is exactly
+    `!isHandled` — no second, narrower predicate beside it. It reads the LIVE flag maps
+    (never the o.* snapshot, never the rendered set), and „čaká sa" counts as handled like
+    every other flag: it means „not today's work", so the line leaves the order until the
+    manager switches the flag back off."""
     console = _console_watch(page)
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
@@ -215,13 +219,145 @@ def test_outstanding_scope_reads_the_live_flag_maps(page, toorder_server):
       return { keys: outstandingOf(items).map(o => o.key),
                totals: groupQtyTotals(outstandingOf(items)),
                handled: items.map(o => isHandled(o)),
+               // the invariant itself: the two can never be defined apart again
+               agrees: items.every(o => outstandingOf([o]).length === (isHandled(o) ? 0 : 1)),
                empty: outstandingOf([]).length, nullish: outstandingOf(null).length };
     }""")
 
-    assert out["keys"] == ["b", "d"], 'a parked („čaká sa") line is still work to order'
-    assert out["totals"] == {"A": {"qty": 10, "lines": 2}}
-    # …while the wider `isHandled` predicate keeps treating it as dealt with
+    assert out["keys"] == ["b"], 'a parked („čaká sa") line is not today\'s work'
+    assert out["totals"] == {"A": {"qty": 2, "lines": 1}}
     assert out["handled"] == [True, False, True, True]
+    assert out["agrees"] is True, "outstandingOf must be exactly !isHandled"
     assert out["empty"] == 0 and out["nullish"] == 0
+
+    assert console == [], f"console not clean: {console}"
+
+
+def _sum_text(page):
+    return page.locator("#toToolbar .to-sum").inner_text()
+
+
+def _remaining(page):
+    """the „ostáva vybaviť N" number of the #208 toolbar, in whatever scope it is showing"""
+    m = re.search(r"stáva vybaviť (\d+) položi", _sum_text(page))   # „Ostáva" / „ostáva"
+    assert m, _sum_text(page)
+    return int(m.group(1))
+
+
+def _chip_class(page, label):
+    return page.evaluate(
+        "(l) => { const b = [...document.querySelectorAll('#filters button')]"
+        ".find(x => x.textContent.startsWith(l)); return b ? b.className : null; }", label)
+
+
+def _totals(page, code="S1"):
+    """the „Σ spolu" chips of a product: their text and the „nevybavené" number they carry"""
+    return page.evaluate(
+        "(c) => [...document.querySelectorAll('.toorder-row[data-code=\"' + c + '\"] "
+        ".to-total')].map(t => ({text: t.textContent, title: t.title}))", code)
+
+
+def _chip_open_qty(page, code="S1"):
+    tips = {t["title"] for t in _totals(page, code)}
+    if not tips:
+        return None                      # the product has no chip in this view
+    assert len(tips) == 1, tips           # …and every row of it must say the same thing
+    return int(re.search(r"nevybavené: (\d+) ks", tips.pop()).group(1))
+
+
+def _copied_qty(page, sup):
+    """the pieces the copy button actually hands over for `sup` — 0 when it refuses, and
+    0 when the group is not even on screen (nothing to reach, nothing owed)."""
+    grp = page.locator(".toorder-supplier").filter(has_text=sup)
+    if grp.count() == 0:
+        return 0
+    page.evaluate("() => { window.__copied = []; }")
+    grp.locator(".tosup-copy").click()
+    page.wait_for_function(
+        "() => window.__copied.length === 1 || [...document.querySelectorAll('.tosup-copy')]"
+        ".some(b => /Nič na objednanie/.test(b.textContent))")
+    copied = page.evaluate("() => window.__copied")
+    return sum(int(m.group(1)) for m in re.finditer(r"\|\s*(\d+) ks", copied[0])) if copied else 0
+
+
+def test_every_surface_agrees_when_a_group_is_parked(page, toorder_server):
+    """THE invariant of the tab, and the one nothing pinned before: the #208 toolbar tally,
+    the „Σ spolu" chip's „nevybavené" number, the supplier chip's colour and the number of
+    pieces the copy emits must all describe the SAME set of work — with the #205 filter on
+    and off, and under „Všetci" as well as the supplier's own chip.
+
+    A second, narrower scope for the copy/chip broke exactly this: with both ORBIS lines
+    parked („⏳ Počkať") the toolbar read „ostáva vybaviť 0 z 2" while the chip beside it
+    insisted „nevybavené: 3 ks", the chip was RED (done) over 3 ks the app still counted as
+    work, and with „skryť poriešené" on the whole group — copy button included — vanished
+    while those pieces were still supposedly outstanding.
+
+    NO `page.reload()` between a mutating click and an asserting one: a per-row toggle
+    deliberately does not repaint `#list`, and that window is where the surfaces drift."""
+    console = _console_watch(page)
+    page.add_init_script(_SPY)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    # ── park BOTH ORBIS lines (3 ks of one product across two orders)
+    for i in range(2):
+        page.locator(".toorder-row[data-code='S1']").nth(i).locator(".to-wait").click()
+    page.wait_for_function(
+        "() => /čaká sa 2/.test(document.querySelector('#toToolbar .to-sum').textContent)")
+
+    # „Všetci", filter OFF — same session, no repaint of `#list`
+    assert _remaining(page) == 5                    # 7 lines − the 2 parked
+    assert "done" in _chip_class(page, "ORBIS"), "nothing left to deal with → RED"
+    assert [t["text"] for t in _totals(page)] == ["Σ spolu 0 ks"] * 2
+    assert _chip_open_qty(page) == 0
+    assert "Spolu vo všetkých objednávkach: 3 ks" in _totals(page)[0]["title"]
+    assert _copied_qty(page, "ORBIS") == 0
+
+    # ORBIS's own chip — the tally narrows to what he is looking at, nothing else moves
+    page.get_by_role("button", name="ORBIS (2)").click()
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 2")
+    assert _sum_text(page).startswith("📋 ORBIS: ostáva vybaviť 0 položiek z 2")
+    assert "čaká sa 2" in _sum_text(page)
+    assert _remaining(page) == 0 and _chip_open_qty(page) == 0
+    assert _copied_qty(page, "ORBIS") == 0
+
+    # …and with „skryť poriešené" on, the group disappearing is now HONEST: it owes nothing
+    page.locator("#toToolbar .to-hidehandled").click()
+    page.wait_for_function("() => !document.querySelector('.toorder-row')")
+    assert _remaining(page) == 0
+    assert page.locator("#empty").inner_text() == \
+        "Tento dodávateľ je vybavený — poriešené riadky sú skryté"
+    assert _copied_qty(page, "ORBIS") == 0
+
+    page.get_by_role("button", name="Všetci (7)").click()
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 5")
+    assert _remaining(page) == 5
+    assert page.locator(".toorder-supplier").filter(has_text="ORBIS").count() == 0
+    assert _copied_qty(page, "ORBIS") == 0     # hidden AND owing nothing — not unreachable
+
+    # ── mixed group: un-park ONE line → it is today's work again, on every surface at once
+    page.locator("#toToolbar .to-hidehandled").click()
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 7")
+    page.locator(".toorder-row[data-code='S1']").first.locator(".to-wait").click()
+    page.wait_for_function(
+        "() => /čaká sa 1/.test(document.querySelector('#toToolbar .to-sum').textContent)")
+
+    assert _remaining(page) == 6
+    assert "todo" in _chip_class(page, "ORBIS"), "work is back → GREEN"
+    # the un-parked line is the newest ORBIS order (1 ks); the whole demand stays in the tooltip
+    assert [t["text"] for t in _totals(page)] == ["Σ spolu 1 ks"] * 2
+    assert _chip_open_qty(page) == 1
+    assert _copied_qty(page, "ORBIS") == 1
+
+    page.get_by_role("button", name="ORBIS (2)").click()
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 2")
+    assert _sum_text(page).startswith("📋 ORBIS: ostáva vybaviť 1 položku z 2")
+    assert _remaining(page) == 1 and _chip_open_qty(page) == 1
+    assert _copied_qty(page, "ORBIS") == 1
+
+    page.locator("#toToolbar .to-hidehandled").click()   # the parked sibling goes away…
+    page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 1")
+    assert _remaining(page) == 1 and _chip_open_qty(page) == 1
+    assert _copied_qty(page, "ORBIS") == 1               # …and it owed nothing anyway
 
     assert console == [], f"console not clean: {console}"

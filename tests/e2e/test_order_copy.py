@@ -10,10 +10,16 @@ was WYSIWYG („copy what the group shows"), which with the toggle OFF (the defa
 lines the manager had already ticked „objednané" straight into a supplier e-mail, and made
 the on-screen „Σ spolu" chip contradict the copied quantities.
 
-SCOPE (review pass 2): „outstanding" means NOT SETTLED — objednané / skladom / nedostupné.
-„čaká sa" is a scheduling flag on a line that still has to be ordered, so it stays IN the
-copy. And a group whose every line is settled copies NOTHING: an „Objednávka (0 položiek)"
-in a supplier's inbox is an order for nothing.
+SCOPE (review pass 3 — REVERSES pass 2): there is ONE predicate, `isHandled`. „Outstanding"
+= not flagged at all, and „⏳ Čaká sa" is a flag like any other: it means „this line is not
+today's work" in all three meanings its own tooltip lists (already at the supplier, parked
+to collect more items, deferred by agreement). Pass 2 narrowed the copy to the three
+SETTLED flags only, which made the tab contradict itself — the toolbar said „ostáva
+vybaviť 0", the chip beside it said „nevybavené: 3 ks", and with „skryť poriešené" on the
+group (and its copy button) vanished while the app still counted those pieces as work.
+When the manager decides to order a parked line he switches „⏳ Čaká sa" off and it
+re-enters the order — that toggle IS the workflow. A group whose every line is flagged
+copies NOTHING: an „Objednávka (0 položiek)" in a supplier's inbox is an order for nothing.
 
 The clipboard itself is asserted through a SPY installed before the page loads
 (`navigator.clipboard.writeText`): it pins the exact text the code hands over — which is
@@ -50,6 +56,23 @@ document.execCommand = (cmd) => {
   window.__copied.push(String(document.activeElement && document.activeElement.value));
   return true;
 };
+"""
+
+# First write lands, every later one is refused (and the legacy path throws) → two clicks
+# in one 2,5 s window end on DIFFERENT labels, which is what pins the reset timer.
+_SPY_SECOND_CLICK_FAILS = """
+window.__copied = [];
+window.__n = 0;
+Object.defineProperty(navigator, 'clipboard', {
+  configurable: true,
+  value: { writeText: (t) => {
+    window.__n += 1;
+    if (window.__n > 1) return Promise.reject(new Error('denied'));
+    window.__copied.push(String(t));
+    return Promise.resolve();
+  } },
+});
+document.execCommand = () => { throw new Error('no copy here'); };
 """
 
 # Both paths dead → the button must SAY so (and must not leave the order text lying in
@@ -144,21 +167,23 @@ def test_copy_is_the_outstanding_work_in_both_toggle_states(page, toorder_server
     assert console == [], f"console not clean: {console}"
 
 
-def test_a_waiting_line_still_goes_into_the_order(page, toorder_server):
-    """„čaká sa" is a SCHEDULING flag, not a done flag: `/api/orders` defines it as an
-    ACTIVE line that cannot be stocked yet — waiting on the supplier, BATCHING MORE ITEMS,
-    or deferred by agreement with the customer — and the row button's own tooltip repeats
-    „zbierame viac položiek". A line the manager parks until the order is worth placing is
-    therefore still work to order: dropping it from the pasted e-mail orders less than the
-    shop needs, while the row sits visibly on screen implying it went out. Only the three
-    SETTLED flags (objednané / skladom / nedostupné) are held back."""
+def test_a_parked_waiting_line_is_not_in_todays_order(page, toorder_server):
+    """„⏳ Čaká sa" is NOT today's work — in every meaning its own tooltip lists: the line
+    is already at the supplier, or deliberately parked until the order is worth placing, or
+    deferred by agreement with the customer. None of those belong in the order the manager
+    is placing right now, so the copy leaves them out — and when he decides to order a
+    parked line he switches the flag off, which puts it straight back in. That toggle IS
+    the workflow, and it keeps ONE predicate behind the hide filter, the chip colour, the
+    toolbar tally, the „Σ spolu" chip, the copy and the empty-list wording: a second,
+    narrower scope made the tab say „ostáva vybaviť 0" and „nevybavené: 3 ks" side by side
+    (review pass 3, reversing pass 2)."""
     console = _console_watch(page)
     page.add_init_script(_SPY)
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
 
-    page.locator(".toorder-row[data-code='C2'] .to-wait").click()      # parked, not done
-    page.locator(".toorder-row[data-code='C3'] .to-instock").click()   # genuinely settled
+    page.locator(".toorder-row[data-code='C2'] .to-wait").click()      # parked
+    page.locator(".toorder-row[data-code='C3'] .to-instock").click()   # stocked
     page.wait_for_function(
         "() => /čaká sa 1/.test(document.getElementById('toToolbar').textContent)"
         " && /skladom 1/.test(document.getElementById('toToolbar').textContent)")
@@ -167,13 +192,56 @@ def test_a_waiting_line_still_goes_into_the_order(page, toorder_server):
     page.wait_for_function("() => window.__copied.length === 1")
     text = page.evaluate("() => window.__copied[0]")
 
-    assert "C2 | Veľkosť: M | 1 ks" in text, "a parked line is still to be ordered"
+    assert "C2 |" not in text, "a parked line is not part of today's order"
     assert "C3 |" not in text, "a stocked line must not be re-ordered"
-    assert text.startswith("Objednávka — CITRADE (3 položky)"), text
+    for code in ("C1", "C4"):
+        assert f"{code} | Veľkosť: M | 1 ks" in text, text
+    assert text.startswith("Objednávka — CITRADE (2 položky)"), text
 
     # the button says which lines it takes, so the scope is not folklore
     title = _group(page, "CITRADE").locator(".tosup-copy").get_attribute("title")
-    assert "objednan" in title and "skladov" in title and "nedostupn" in title, title
+    assert "objednan" in title and "čakaj" in title, title
+    assert "skladov" in title and "nedostupn" in title, title
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_later_copy_outcome_survives_the_earlier_click_timer(page, toorder_server):
+    """Every outcome label („✓ Skopírované" / „⚠️ Schránka nedostupná" / „Nič na
+    objednanie") goes back to the default after 2,5 s. A SECOND click inside that window
+    used to inherit the FIRST click's remaining time, because the timer was fired and
+    forgotten: the manager copied ORBIS, clicked again ~2,3 s later, that write failed, the
+    warning showed for 200 ms and the stale timer wiped it — he read the default label,
+    assumed the copy had landed, and pasted the PREVIOUS supplier's order (still in the
+    clipboard) into this supplier's mail. Each click must own its own timer."""
+    console = _console_watch(page)
+    page.add_init_script(_SPY_SECOND_CLICK_FAILS)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    copy = _group(page, "CITRADE").locator(".tosup-copy")
+    copy.click()
+    page.wait_for_function(
+        "() => /Skopírované/.test(document.querySelector('.tosup-copy').textContent)")
+
+    # …well inside the first click's 2,5 s window, so its timer is still pending
+    page.wait_for_timeout(1200)
+    assert "Skopírované" in copy.inner_text(), "precondition: the first timer has not fired"
+    copy.click()
+    page.wait_for_function(
+        "() => /Schránka nedostupná/.test(document.querySelector('.tosup-copy').textContent)")
+
+    # past the FIRST click's deadline (~t0+2,5 s) but well inside the SECOND click's own
+    page.wait_for_timeout(1500)
+    assert "Schránka nedostupná" in copy.inner_text(), \
+        "the earlier click's timer must not wipe a later outcome"
+    assert page.evaluate("() => window.__copied.length") == 1, \
+        "only the first write reached the clipboard — the second one was refused"
+
+    # …and the label does come back on the SECOND click's own timer
+    page.wait_for_function(
+        "(lbl) => document.querySelector('.tosup-copy').textContent === lbl",
+        arg=COPY_LABEL, timeout=6000)
 
     assert console == [], f"console not clean: {console}"
 
