@@ -552,6 +552,39 @@ def test_a_dropped_immediate_write_does_not_remail_on_the_next_run(iso, monkeypa
     assert all(m["to"] != "b@x.sk" for m in iso["sent"])
 
 
+def test_a_store_that_vanishes_mid_run_keeps_the_dedup_history(iso, monkeypatch):
+    """PR #228 review (F3): the final save re-reads `orders` from DISK, so when the store file
+    disappears while the run is in flight — deleted by hand (the corrupt-store message used to
+    tell the manager to do exactly that), a cleanup job, a botched restore — an `or {}` fallback
+    writes an EMPTY dedup map back. Every previously mailed order loses its record and the next
+    run mails those customers a SECOND time. The run's own `done` (start-of-run snapshot PLUS
+    the records this run persisted) is never less complete than a missing map, so it is the only
+    safe fallback here. The loader's dedup_keys guard already raises on a non-dict map, so this
+    fallback is purely protective — it can only fire when the map is absent."""
+    webapp.run_orders_reminder()                      # run 1: mails go out and are recorded
+    recorded = set(_store(iso).get("orders", {}))
+    assert recorded, "precondition: run 1 must leave dedup records behind"
+
+    real_load = webapp._load_orders_reminder
+    path = iso["tmp"] / "orders_reminder.json"
+
+    def vanishing_load():
+        data = real_load()
+        path.unlink(missing_ok=True)                  # the file is gone right after the read
+        return data
+
+    monkeypatch.setattr(webapp, "_load_orders_reminder", vanishing_load)
+    webapp.run_orders_reminder()                      # run 2: nothing new, but it saves display
+    monkeypatch.setattr(webapp, "_load_orders_reminder", real_load)
+
+    assert set(_store(iso).get("orders", {})) >= recorded, "run 2 wiped the dedup history"
+
+    iso["sent"].clear()
+    stats3 = webapp.run_orders_reminder()             # run 3 must not re-mail anybody
+    assert stats3["emailed_now"] == 0
+    assert iso["sent"] == []
+
+
 # ── VYLEPŠENIE 4 — „BCC vždy": no MAIL_BCC → the customer mail does not go out ─────
 def _real_smtp_path(monkeypatch, iso):
     """Swap the capturing stub for the REAL _send_mail_html behind a fake smtplib."""
