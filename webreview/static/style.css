@@ -147,7 +147,11 @@ body.toorder-wide .filters button.active{background:#DDA43C;border-color:#DDA43C
    mimo #list, takže ho neprekresľuje repaint zoznamu. */
 .to-toolbar{grid-column:1 / -1;display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:6px}
 .to-toolbar .to-sum{font-size:13px;font-weight:600;color:var(--muted)}
-.to-toolbar .to-sum.alldone{color:#6CAB68}
+/* „všetko vybavené“ = odvodená tmavšia zelená (var(--accent)); #6CAB68 mal na svetlom
+   topbare kontrast 2.56:1, AA žiada 4.5:1 — a je to riadok, ktorý šéf číta najradšej.
+   V dark theme sa prepne sám. Paleta čipov (#143) sa NEMENÍ — meria ju
+   tests/e2e/test_order_chips.py. */
+.to-toolbar .to-sum.alldone{color:var(--accent)}
 .to-toolbar .to-hidehandled{margin-left:auto;background:var(--panel);color:var(--muted);
   border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:12.5px;
   font-weight:600;cursor:pointer;white-space:nowrap}
