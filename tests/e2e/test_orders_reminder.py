@@ -106,9 +106,35 @@ def test_mark_red_order_as_contacted_moves_it_to_skipped(page, automations_serve
         "() => document.querySelectorAll('[data-testid=ordrem-red]"
         " tr[data-code=\"20261000\"]').length === 0")
     assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 0
-    skipped = page.locator('[data-testid="ordrem-skipped"]')
-    assert skipped.is_visible()
-    assert "20261000" in skipped.inner_text()
+    # …into the MANUAL section (#227), never under the „AI usúdilo…" heading: this order had no
+    # internal note at all, so the classifier never ran — the manager decided.
+    manual = page.locator('[data-testid="ordrem-manual"]')
+    assert manual.is_visible()
+    assert "20261000" in manual.inner_text()
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261000"]').count() == 0
+
+    assert console == [], f"console not clean: {console}"
+
+
+# ── #227 — a hand-resolved row must not be presented as an AI verdict ──────────────
+def test_manually_handled_row_renders_in_its_own_section(page, automations_server):
+    """Both kinds of row live in the backend's one `skipped` list (so the override endpoint finds
+    them the same way), but they mean opposite things: „⚪ AI usúdilo, že zákazník je už
+    kontaktovaný" is a claim about a classification that, for a manually-handled row, never
+    happened (no note, or no OPENAI_API_KEY / MAIL_BCC — the AI is deliberately not called)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    manual = page.locator('[data-testid="ordrem-manual"]')
+    assert manual.is_visible()
+    row = manual.locator('tr[data-code="20261007"]')
+    assert row.count() == 1
+    assert "Termoska Test Manual" in row.inner_text()
+    assert "ručne" in page.locator(".warnhead", has_text="ručne").inner_text().lower()
+
+    # …and it is NOT in the AI-verdict table, while the AI's own row still is
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261007"]').count() == 0
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261002"]').count() == 1
 
     assert console == [], f"console not clean: {console}"
 

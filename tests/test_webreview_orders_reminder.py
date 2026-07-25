@@ -1338,3 +1338,77 @@ def test_the_tab_still_renders_with_a_corrupt_store(iso):
     r = c.get("/api/orders-reminder")
     assert r.status_code == 200
     assert r.get_json()["red"] == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #227 — a row the MANAGER resolved by hand must not be presented as an AI verdict.
+# The backend already writes `manual: True` onto the RECORD, but never onto the DISPLAY
+# row, so the tab renders every skipped row under „⚪ AI usúdilo, že zákazník je už
+# kontaktovaný" — including rows where the classifier provably never ran (no note at all,
+# no OPENAI_API_KEY, no MAIL_BCC). Unlike `pending` (a per-RUN note, stripped everywhere),
+# `manual` is a property of the RECORD and has to survive every later rebuild.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_manual_contact_marks_the_display_row_manual(iso):
+    c = _seed(iso)
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "contact"}).status_code == 200
+    st = _store(iso)
+    (row,) = [r for r in st["skipped"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
+    # …and the AI's OWN verdict must stay unmarked, or the split would be meaningless
+    (ai_row,) = [r for r in st["skipped"] if r["code"] == "20261002"]
+    assert "manual" not in ai_row
+
+
+def test_manual_send_marks_the_display_row_manual(iso):
+    c = _seed(iso)
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "send"}).status_code == 200
+    (row,) = [r for r in _store(iso)["orange"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
+
+
+def test_the_manual_flag_survives_a_rebuild_by_the_next_run(iso, monkeypatch):
+    """The run rebuilds the display lists from scratch. A manually-handled order that gets
+    re-processed (its fingerprint changed) must come back marked — otherwise the tab silently
+    re-attributes the manager's decision to the AI on the very next run."""
+    c = _seed(iso)
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "contact"}).status_code == 200
+    # the note appears → the order's fingerprint changes → it is fully re-processed, not carried
+    # forward by the incremental fast path
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    webapp.run_orders_reminder()
+    (row,) = [r for r in _store(iso)["skipped"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
+
+
+def _csv_with_one_more_note_order():
+    """A fresh >4d order WITH a note, so the next run really goes through OpenAI/SMTP for it —
+    while 20261000 stays note-free (RED) and remains clickable by the manager."""
+    return (ORDERS_CSV.decode("cp1250").rstrip("\r\n") + "\r\n"
+            + f"20261005;{OLD} 07:00:00;Vybavuje sa;volať zákazníka;e@x.sk;;Nový Zákazník;"
+              "Batoh;1;70,00\r\n").encode("cp1250")
+
+
+def test_a_row_resolved_by_hand_during_the_run_is_marked_manual(iso, monkeypatch):
+    """The third row-producing path (`_relocate`): the manager resolves the RED order WHILE the
+    run is busy classifying/mailing ANOTHER one, so the run moves its freshly-built red row into
+    `skipped` at the final save. That row must carry the manager's mark too."""
+    _seed(iso)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_one_more_note_order)
+    clicked = {}
+
+    def classify_and_click(note):
+        if "r" not in clicked:      # the manager handles the RED order mid-run
+            clicked["r"] = authed_client().post(
+                "/api/orders-reminder/override", json={"code": "20261000", "action": "contact"})
+        return _CLASSIFY[note]
+
+    monkeypatch.setattr(webapp, "_classify_contacted", classify_and_click)
+    webapp.run_orders_reminder()
+    assert clicked["r"].status_code == 200
+    st = _store(iso)
+    assert not [r for r in st["red"] if r["code"] == "20261000"]     # relocated out of red
+    (row,) = [r for r in st["skipped"] if r["code"] == "20261000"]
+    assert row.get("manual") is True
