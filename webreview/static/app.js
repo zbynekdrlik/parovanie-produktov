@@ -1000,20 +1000,23 @@ async function saveUnavailable(key, unavailable) {
 
 // Inline pairing: paste the supplier reorder URL straight onto an order line.
 // Persists per forestshop code (covers items outside the review dataset too).
-async function savePairUrl(o, url, row) {
+async function savePairUrl(o, url) {
   if (url && !/^https?:\/\//.test(url)) return;   // ignore non-URL input
   const r = await fetch('/api/order-pair', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code: o.itemCode, url })
   });
   if (!r.ok) return;
-  o.pairUrl = url;                       // re-render so the new link shows immediately
-  row.replaceWith(renderOrderRow(o));
+  // the pairing is keyed by itemCode (a PRODUCT property) → /api/orders already serves
+  // it on EVERY order line of that code, so mirror that client-side: without it the
+  // sibling lines keep showing an empty paste box for a product that IS paired (#204).
+  for (const x of ORDERS) if (x.itemCode === o.itemCode) x.pairUrl = url;
+  renderToOrder();                       // re-render so the new link shows immediately
 }
 
 // inline-pairing editor (code + URL input + save) — used for an unpaired row and
 // when ✏️-editing an already-paired one
-function pairEditor(o, row, focus) {
+function pairEditor(o, focus) {
   const pair = el('div', 'to-pair');
   pair.appendChild(el('span', 'to-pcode', escapeHtml(o.itemCode || '')));
   const inp = el('input', 'to-pairurl'); inp.type = 'url';
@@ -1021,7 +1024,7 @@ function pairEditor(o, row, focus) {
   inp.value = o.pairUrl || '';
   const save = el('button', 'to-pairsave', '💾 Spárovať');
   save.title = 'Uložiť párovaciu URL — objaví sa ako odkaz a pôjde do importu';
-  const doSave = () => savePairUrl(o, inp.value.trim(), row);
+  const doSave = () => savePairUrl(o, inp.value.trim());
   save.onclick = doSave;
   inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
   pair.appendChild(inp); pair.appendChild(save);
@@ -1067,7 +1070,7 @@ function supplierSpellingIndex(orders) {
 // Inline supplier assign: fill in the supplier for an order line that arrived WITHOUT
 // one. Persists per forestshop code; the row then regroups under that supplier and the
 // name is written back to the eshop `supplier` field by the nightly upload.
-async function saveSupplier(o, supplier, row) {
+async function saveSupplier(o, supplier) {
   const r = await fetch('/api/order-supplier', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code: o.itemCode, supplier })
@@ -1081,7 +1084,7 @@ async function saveSupplier(o, supplier, row) {
 
 // supplier editor (text input with known-supplier autocomplete + save) — used for an
 // unassigned no-supplier row and when ✏️-editing an already-assigned one
-function supplierEditor(o, row, focus) {
+function supplierEditor(o, focus) {
   const wrap = el('div', 'to-supplier');
   const inp = el('input', 'to-supinput'); inp.type = 'text';
   inp.placeholder = o.assignedSupplier ? 'upraviť dodávateľa…' : 'doplniť dodávateľa…';
@@ -1089,7 +1092,7 @@ function supplierEditor(o, row, focus) {
   inp.setAttribute('list', 'known-suppliers');   // autocomplete from existing suppliers
   const save = el('button', 'to-supsave', '💾 Uložiť');
   save.title = 'Priradiť dodávateľa — položka sa zaradí pod neho a zapíše sa do eshopu';
-  const doSave = () => saveSupplier(o, inp.value.trim(), row);
+  const doSave = () => saveSupplier(o, inp.value.trim());
   save.onclick = doSave;
   inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
   wrap.appendChild(inp); wrap.appendChild(save);
@@ -1101,7 +1104,7 @@ function supplierEditor(o, row, focus) {
 // Shoptet "Poznámka e-shopu"). Keyed by orderCode, so it applies to every line of that
 // order → after a save re-render the whole tab so all sibling lines reflect it (same
 // per-shared-property propagation as saveSupplier).
-async function saveOrderComment(o, comment, row) {
+async function saveOrderComment(o, comment) {
   const r = await fetch('/api/order-comment', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ orderCode: o.orderCode, comment })
@@ -1113,7 +1116,7 @@ async function saveOrderComment(o, comment, row) {
 
 // comment editor (multi-line textarea + save) — opened from the 💬 button on a row.
 // Ctrl/⌘+Enter saves (plain Enter keeps the note multi-line, like the admin textarea).
-function commentEditor(o, row, focus) {
+function commentEditor(o, focus) {
   const wrap = el('div', 'to-comment-edit');
   const inp = el('textarea', 'to-cominput');
   inp.rows = 2;
@@ -1121,7 +1124,7 @@ function commentEditor(o, row, focus) {
   inp.value = ORDER_COMMENTS[o.orderCode] || '';
   const save = el('button', 'to-comsave', '💾 Uložiť');
   save.title = 'Uložiť komentár k objednávke (Ctrl+Enter)';
-  const doSave = () => saveOrderComment(o, inp.value.trim(), row);
+  const doSave = () => saveOrderComment(o, inp.value.trim());
   save.onclick = doSave;
   inp.onkeydown = (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSave(); }
@@ -1152,11 +1155,11 @@ function renderOrderRow(o) {
     row.appendChild(a);
     const edit = el('button', 'to-pairedit', '✏️');
     edit.title = 'Zmeniť / opraviť párovaciu URL';
-    edit.onclick = () => { a.replaceWith(pairEditor(o, row, true)); edit.remove(); };
+    edit.onclick = () => { a.replaceWith(pairEditor(o, true)); edit.remove(); };
     row.appendChild(edit);
   } else {
     // nenapárované → políčko na vloženie URL (otvára produkt pri objednávaní)
-    row.appendChild(pairEditor(o, row, false));
+    row.appendChild(pairEditor(o, false));
   }
   // GRUBE per-veľkosť kód: kopírovateľný čip + .de objednávacia linka. GRUBE nemá B2B
   // auto-objednávanie, takže manažér skopíruje presný veľkostný kód do e-mailu.
@@ -1185,10 +1188,10 @@ function renderOrderRow(o) {
       row.appendChild(tag);
       const sed = el('button', 'to-supedit', '✏️');
       sed.title = 'Zmeniť / opraviť dodávateľa';
-      sed.onclick = () => { tag.replaceWith(supplierEditor(o, row, true)); sed.remove(); };
+      sed.onclick = () => { tag.replaceWith(supplierEditor(o, true)); sed.remove(); };
       row.appendChild(sed);
     } else {
-      row.appendChild(supplierEditor(o, row, false));
+      row.appendChild(supplierEditor(o, false));
     }
   }
   if (o.orderDate) {
@@ -1231,12 +1234,12 @@ function renderOrderRow(o) {
     row.appendChild(tag);
     const ce = el('button', 'to-comedit', '✏️');
     ce.title = 'Upraviť komentár k objednávke';
-    ce.onclick = () => { tag.replaceWith(commentEditor(o, row, true)); ce.remove(); };
+    ce.onclick = () => { tag.replaceWith(commentEditor(o, true)); ce.remove(); };
     row.appendChild(ce);
   } else {
     const add = el('button', 'to-comadd', '💬 Komentár');
     add.title = 'Pridať komentár k objednávke';
-    add.onclick = () => { add.replaceWith(commentEditor(o, row, true)); };
+    add.onclick = () => { add.replaceWith(commentEditor(o, true)); };
     row.appendChild(add);
   }
   // 'čaká sa' — aktívna objednávka, ktorú zatiaľ neobjednávame/naskladňujeme
