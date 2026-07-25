@@ -315,6 +315,42 @@ def test_a_refused_second_write_rolls_back_to_what_the_server_ACCEPTED(page, too
     assert "on" in (row.locator(".to-instock").get_attribute("class") or "").split()
 
 
+def test_an_accepted_write_survives_a_refusal_that_answers_FIRST(page, toorder_server):
+    """The same double-click, with the responses arriving in the OTHER order — which is
+    exactly what a partial outage produces: a write that 500s/401s fast overtakes one that
+    succeeds slowly behind the app's `with _lock:` + atomic file replace.
+
+    #1 (on) is ACCEPTED but slow, #2 (off) is REFUSED and answers first. The refusal owns
+    the row, so it rolls back to `confirmed` (still false) and alerts. When #1's success
+    finally lands it updates `confirmed` to true — and then, being superseded, returned
+    without touching the map. The manager was told „nepodarilo sa uložiť", the row showed
+    the flag OFF, and the server held it ON: his accepted click was silently gone until
+    the next reload. The client must reconcile with what the server confirmed once the
+    last response for that row has settled."""
+    _open(page, toorder_server)
+    page.evaluate(_HOLD_INSTOCK)
+
+    btn = page.locator(".toorder-row[data-code='N1'] .to-instock")
+    btn.click()                      # write #1: on  — ACCEPTED, answers LAST
+    btn.click()                      # write #2: off — REFUSED, answers FIRST
+    page.wait_for_function("() => window.__held.length === 2", timeout=3000)
+
+    page.evaluate("() => window.__held[1](500)")          # the refusal overtakes …
+    _wait_alert(page)
+    page.evaluate("() => window.__held[0](200, true)")    # … and #1 really lands after it
+    page.wait_for_function("() => window.__settled.length === 2", timeout=5000)
+    page.wait_for_timeout(300)                            # let the continuation settle
+
+    server = page.evaluate(
+        "() => window.__realFetch('/api/instock').then(r => r.json())")
+    assert list(server["instock"]) == ["20260001|N1"], server
+    assert page.evaluate("() => Object.keys(INSTOCK)") == ["20260001|N1"], \
+        "the accepted write was dropped because its success landed last"
+    row = page.locator(".toorder-row[data-code='N1']")
+    assert "instock" in (row.get_attribute("class") or "").split()
+    assert "on" in (row.locator(".to-instock").get_attribute("class") or "").split()
+
+
 def test_a_straggler_from_an_older_burst_cannot_poison_a_later_click(page, toorder_server):
     """Sequencing that DELETES its bookkeeping when a burst settles leaves a generation
     hole. Click on / click off (both in flight) → the OFF write is accepted and the entry
@@ -440,6 +476,55 @@ def test_an_unsaved_supplier_and_pair_edit_survive_a_repaint_too(page, toorder_s
         == "Nedopisany Dodava"
     assert page.locator(".toorder-row[data-code='C1'] .to-pairurl").input_value() \
         == "https://dodavatel.test/roz"
+
+
+def test_an_editor_opened_on_a_row_with_NOTHING_stored_survives_a_repaint(page, toorder_server):
+    """💬 Komentár on a row that has no stored comment: the box is empty and so is the
+    stored value, so the „value equals what is stored" skip fired BEFORE the „the manager
+    opened this one himself" exception ever got a chance — and the repaint silently closed
+    the box under him while he was about to type into it."""
+    _open(page, toorder_server)
+    c1 = page.locator(".toorder-row[data-code='C1']")
+    c1.locator(".to-comadd").click()
+    c1.locator(".to-cominput").wait_for(timeout=3000)
+
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='N1'] .to-instock").click()
+    _wait_alert(page)
+    page.wait_for_timeout(300)
+
+    assert page.locator(".toorder-row[data-code='C1'] .to-cominput").count() == 1, \
+        "the empty box the manager opened himself was destroyed by the repaint"
+
+
+# ── PR #233 review: a poisoned stored URL must not render a clickable link ────
+
+def test_a_non_http_stored_url_never_renders_a_self_navigating_link(page, toorder_server):
+    """`safeHttpUrl` correctly refuses a non-http(s) value — but the caller still built an
+    <a> around the '' it returns, and `href=""` resolves to the PAGE ITSELF: one click
+    reloads the tab and takes every open editor (and the unsaved typing in it) with it.
+    The poisoned value was echoed back into the link's tooltip on top of that."""
+    _open(page, toorder_server)
+    page.evaluate("""() => {
+      for (const o of ORDERS) {
+        if (o.itemCode === 'C1') o.pairUrl = 'javascript:alert(1)';
+        if (o.itemCode === 'C2') o.supplierUrl = 'javascript:alert(2)';
+      }
+      renderToOrder();
+    }""")
+    page.wait_for_selector(".toorder-row[data-code='C1']")
+
+    for code in ("C1", "C2"):
+        hrefs = page.evaluate(
+            "(c) => [...document.querySelectorAll(`.toorder-row[data-code='${c}'] a`)]"
+            ".map(a => a.getAttribute('href'))", code)
+        assert "" not in hrefs, (code, hrefs)
+        assert page.evaluate(
+            "(c) => [...document.querySelectorAll(`.toorder-row[data-code='${c}'] *`)]"
+            ".some(e => String(e.title || '').includes('javascript:'))", code) is False, code
+
+    # the manager can still repair the bad pairing — the row falls back to the paste box
+    assert page.locator(".toorder-row[data-code='C1'] .to-pairurl").count() == 1
 
 
 # ── PR #233 review: one message per failed WRITE, not per prose ──────────────
