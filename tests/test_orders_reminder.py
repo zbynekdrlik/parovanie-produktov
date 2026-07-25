@@ -166,3 +166,60 @@ def test_partition_retries_not_yet_terminal_even_if_unchanged():
     to_process, unchanged, fp = ordrem.partition_incremental([o], prev_fp, set())
     assert [x["code"] for x in to_process] == ["pending"]
     assert unchanged == []
+
+
+# ── #220 — the dedup store must stay bounded, and must never lose a live record ────
+def _rec(date_str, status="emailed"):
+    return {"status": status, "date": date_str, "email": "x@y.sk"}
+
+
+def test_prune_keeps_every_code_still_in_the_source_window():
+    """The one invariant that must never bend: a code the export still carries can come back
+    round as „Vybavuje sa" at any moment, so dropping its dedup record means the customer gets a
+    SECOND reminder. Age is irrelevant for those."""
+    done = {"IN": _rec("2019-01-01T08:00:00+02:00"), "OUT": _rec("2019-01-01T08:00:00+02:00")}
+    kept = ordrem.prune_done(done, {"IN"}, now=datetime(2026, 7, 25))
+    assert set(kept) == {"IN"}
+
+
+def test_prune_keeps_recent_records_that_left_the_window():
+    """A grace period after an order leaves the export — a partial/short export must not
+    instantly forget that the customer was already mailed."""
+    done = {"OLD": _rec("2019-01-01T08:00:00+02:00"),
+            "RECENT": _rec("2026-07-01T08:00:00+02:00")}
+    kept = ordrem.prune_done(done, {"SOMETHING-ELSE"}, now=datetime(2026, 7, 25),
+                             retention_days=180)
+    assert set(kept) == {"RECENT"}
+
+
+def test_prune_caps_the_number_of_out_of_window_records_newest_first():
+    done = {f"C{i}": _rec(f"2026-07-{i:02d}T08:00:00+02:00") for i in range(1, 11)}
+    kept = ordrem.prune_done(done, {"IRRELEVANT"}, now=datetime(2026, 7, 25),
+                            retention_days=180, max_records=3)
+    assert set(kept) == {"C10", "C09", "C08"}          # the three newest survive
+
+
+def test_prune_does_nothing_when_the_window_is_unknown():
+    """Fail-closed: an empty/unreadable export gives an EMPTY window set, and pruning against it
+    would drop records for orders that are very much still live. Same shape as the fail-closed
+    supplier upload — no source of truth, no destructive action."""
+    done = {"A": _rec("2019-01-01T08:00:00+02:00")}
+    assert ordrem.prune_done(done, set(), now=datetime(2026, 7, 25)) == done
+
+
+def test_prune_survives_garbage_records():
+    done = {"IN": "not-a-dict", "OUT": {"status": "emailed"}, "TRANSIT": {"status": "sending",
+            "claimed_at": "2026-07-25T08:00:00+02:00"}}
+    kept = ordrem.prune_done(done, {"IN"}, now=datetime(2026, 7, 25))
+    assert kept["IN"] == "not-a-dict"                   # window codes are kept verbatim
+    assert "TRANSIT" in kept                            # a fresh claim is not garbage-collected
+
+
+def test_all_order_codes_returns_every_code_in_the_export():
+    """The window set is EVERY code in the export — not just the ones select_orders picks.
+    A „Vybavená" order can be reopened to „Vybavuje sa" tomorrow; its record must survive."""
+    csv_text = ("code;date;statusName;shopRemark;email;phone;billFullName;itemName\r\n"
+                "111;2026-07-01 10:00:00;Vybavuje sa;;a@x.sk;;A;X\r\n"
+                "111;2026-07-01 10:00:00;Vybavuje sa;;a@x.sk;;A;Y\r\n"
+                "222;2026-07-02 10:00:00;Vybavená;;b@x.sk;;B;X\r\n")
+    assert ordrem.all_order_codes(csv_text.encode("cp1250")) == {"111", "222"}

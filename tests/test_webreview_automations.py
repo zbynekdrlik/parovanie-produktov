@@ -329,3 +329,54 @@ def test_posta_persist_failure_still_shows_the_shipment_in_the_tab(iso, monkeypa
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert [u["orderCode"] for u in st["uncollected"]] == ["2026100"]
     assert st["escalation"] == {"2026100": f"1|{TODAY.isoformat()}"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #222 — the daily run re-fetched tracking for EVERY shipment in the 30-day window,
+# including long-delivered ones, sequentially at up to 180 s each (60 s timeout ×
+# 3 tries). A delivered/returned parcel can never change again, so that call buys
+# nothing and on a slow Pošta SK day it is what makes the 09:00 run drag on.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_delivered_shipment_is_recorded_as_terminal_and_not_tracked_again(iso, monkeypatch):
+    webapp.run_posta_uncollected()
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["terminal"]["EF000000001SK"]["state"] == "delivered"
+
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000001SK" not in asked               # the delivered parcel: no API call
+    assert "EF000000002SK" in asked                   # the uncollected one: still checked daily
+    assert stats["api_skipped"] == 1
+    assert stats["checked"] == 3                      # every shipment is still accounted for
+
+
+def test_an_uncollected_shipment_is_never_cached_as_terminal(iso):
+    """'notified' is precisely the state the automation chases — caching it would freeze the
+    escalation and the customer would never get mails #2-#4."""
+    webapp.run_posta_uncollected()
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF000000002SK" not in (st.get("terminal") or {})
+    assert "06565700348274" not in (st.get("terminal") or {})   # invalid_format is not final
+
+
+def test_terminal_cache_is_pruned_when_the_shipment_leaves_the_window(iso):
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF999999999SK": {"state": "delivered", "at": "2026-01-01"}}}),
+        encoding="utf-8")
+    webapp.run_posta_uncollected()
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF999999999SK" not in st["terminal"]      # bounded by the 30-day source window
+    assert "EF000000001SK" in st["terminal"]
+
+
+def test_a_corrupt_terminal_cache_does_not_skip_the_shipment(iso, monkeypatch):
+    """Garbage in the cache must degrade to 'check it', never to 'silently ignore it'."""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000001SK": "nonsense"}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    webapp.run_posta_uncollected()
+    assert "EF000000001SK" in asked

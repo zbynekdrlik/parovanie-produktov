@@ -989,3 +989,50 @@ def test_without_mail_bcc_the_run_pays_for_no_classification(iso, monkeypatch):
     assert _store(iso).get("orders") == {}      # nothing recorded → retried once BCC is set
     # the orders are still visible so the manager sees WHAT is stuck, next to the BCC warning
     assert {"20261001", "20261002"} <= _display_codes(iso)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #220 — the dedup store grew forever: every resolved order stayed in it for good.
+# Pruning is the easy half; the DANGEROUS half is pruning a record for an order the
+# export still carries — that customer would be reminded a second time.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_dedup_records_of_orders_long_gone_from_the_export_are_pruned(iso):
+    ancient = {"status": "emailed", "date": "2019-01-01T08:00:00+02:00", "email": "old@x.sk"}
+    (iso["tmp"] / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"19990000": ancient}}), encoding="utf-8")
+    webapp.run_orders_reminder()
+    assert "19990000" not in _store(iso)["orders"]
+
+
+def test_a_dedup_record_is_never_pruned_while_its_order_is_still_in_the_export(iso):
+    """20261003 is in the export but too FRESH to be selected (<4d), so it is not in this run's
+    working set at all — and it is exactly the kind of code an age-only prune would drop. It
+    crosses the 4-day line in a few days; if its record is gone by then, the customer is mailed
+    again."""
+    ancient = {"status": "emailed", "date": "2019-01-01T08:00:00+02:00", "email": "d@x.sk"}
+    (iso["tmp"] / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"20261003": ancient}}), encoding="utf-8")
+    webapp.run_orders_reminder()
+    assert _store(iso)["orders"]["20261003"] == ancient
+
+
+def test_an_ancient_but_still_live_record_does_not_cause_a_second_mail(iso):
+    webapp.run_orders_reminder()                       # 20261001 gets its one reminder
+    st = _store(iso)
+    st["orders"]["20261001"]["date"] = "2019-01-01T08:00:00+02:00"   # far outside any retention
+    (iso["tmp"] / "orders_reminder.json").write_text(json.dumps(st), encoding="utf-8")
+    iso["sent"].clear()
+    webapp.run_orders_reminder()
+    assert all(m["to"] != "b@x.sk" for m in iso["sent"])   # NOT re-mailed
+    assert _store(iso)["orders"]["20261001"]["status"] == "emailed"   # record survived
+
+
+def test_prune_is_skipped_when_the_export_is_unreadable(iso, monkeypatch):
+    """No export = no idea which orders are live, so pruning could only guess. Fail closed."""
+    (iso["tmp"] / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"19990000": {"status": "emailed",
+                                            "date": "2019-01-01T08:00:00+02:00"}}}),
+        encoding="utf-8")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: b"")
+    webapp.run_orders_reminder()
+    assert "19990000" in _store(iso)["orders"]
