@@ -4949,6 +4949,26 @@ def _reminder_is_terminal(entry) -> bool:
     return isinstance(entry, dict) and entry.get("status") in REMINDER_TERMINAL_STATUSES
 
 
+def _mark_manual(row: dict, entry) -> dict:
+    """Carry the RECORD's `manual` flag onto its DISPLAY row (#227).
+
+    A row the manager resolved by hand and one the AI ruled on both land in `skipped`, but they
+    mean opposite things — and the tab used to render the whole list under „AI usúdilo, že
+    zákazník je už kontaktovaný". For a manual row the classifier often never ran at all (no
+    internal note, no OPENAI_API_KEY, no MAIL_BCC), so that heading stated something that never
+    happened. The flag is what lets the tab split the two.
+
+    Unlike `pending` — a per-RUN note that every resolving path strips — `manual` is a property
+    of the RECORD, so it is re-derived from the record on every rebuild rather than carried
+    along: that keeps it correct no matter which path produced the row, and self-heals a row
+    copied forward from before the flag existed."""
+    if isinstance(entry, dict) and entry.get("manual"):
+        row["manual"] = True
+    else:
+        row.pop("manual", None)
+    return row
+
+
 def _reminder_claim_active(entry, now=None) -> bool:
     """True while a manual send for this order is genuinely IN FLIGHT (fresh 'sending' claim).
     An unparseable, expired or future-dated claim returns False — abandoned claims must be
@@ -5127,12 +5147,14 @@ def run_orders_reminder() -> dict:
     # — no re-classification, no OpenAI/SMTP call, no CSV-field rebuild (the incremental fast path).
     for o in already_seen:
         code = o["code"]
-        status = done.get(code, {}).get("status")
+        entry = done.get(code) or {}
+        status = entry.get("status")
         prev_row = (prev_orange if status == "emailed" else prev_skipped).get(code)
         row = dict(prev_row) if prev_row else {k: o[k] for k in
                                                ("code", "billFullName", "email", "itemName",
                                                 "shopRemark", "days", "admin_link")}
         row["days"] = o["days"]
+        _mark_manual(row, entry)        # who resolved it (#227) — re-derived, never assumed
         # An order only reaches the fast path once it is TERMINAL, so a „run could not finish
         # it" note from an earlier run is stale by definition — carried forward it would warn
         # about a resolved order forever (found in the PR #224 adversarial review).
@@ -5161,6 +5183,7 @@ def run_orders_reminder() -> dict:
             row = {k: o[k] for k in ("code", "billFullName", "email", "itemName",
                                      "shopRemark", "days", "admin_link")}
             row["sent_date"] = prev.get("date", "")
+            _mark_manual(row, prev)                 # …and BY WHOM (#227)
             (orange if prev.get("status") == "emailed" else skipped).append(row)
             continue
         if not o["has_note"]:
@@ -5304,8 +5327,11 @@ def run_orders_reminder() -> dict:
                     # drop `pending`: the order IS resolved now, so carrying the „run could not
                     # finish it" note across would leave a permanent warning on a finished row
                     # (and keep inflating the „z toho N nedokončených" heading every run).
-                    dest.append({k: v for k, v in r.items() if k != "pending"}
-                                | {"sent_date": ent.get("date", "")})
+                    # `manual` is the opposite kind of field — a property of the RECORD — so it
+                    # is (re)applied from the entry that resolved the order (#227).
+                    dest.append(_mark_manual(
+                        {k: v for k, v in r.items() if k != "pending"}
+                        | {"sent_date": ent.get("date", "")}, ent))
             return keep
 
         red = _relocate(red)
@@ -5895,7 +5921,11 @@ def api_orders_reminder_override():
     # _relocate and the incremental fast path strip it for the same reason; re-appending the row
     # verbatim would leave the warning (and its „z toho N nedokončených" count) sitting on a
     # finished row until the next run rebuilds the lists — up to 24 h (PR #224 review).
-    row_done = {k: v for k, v in row.items() if k != "pending"}
+    # …and it gains `manual` (#227): the record already carried it, but the DISPLAY row did not,
+    # so the tab kept listing hand-resolved orders under „AI usúdilo, že zákazník je už
+    # kontaktovaný" — a verdict the classifier never made (a red row has no note to classify,
+    # and a pending one was skipped precisely because the AI was not called).
+    row_done = _mark_manual({k: v for k, v in row.items() if k != "pending"}, base)
 
     def _release_claim() -> None:
         """Undo OUR claim (only ours — never a concurrent winner's terminal record)."""

@@ -3345,14 +3345,21 @@ function renderOrdersReminder() {
     wrap.appendChild(tbl);
   }
 
-  // The backend keeps both kinds of row in one `skipped` list (so the override endpoint finds
-  // them the same way), but they mean very different things to the manager, so they render as
-  // TWO sections: the AI's „already contacted" verdicts, and the orders the run STARTED but
-  // could not finish (`pending` — failed send, failed classification, unwritable claim, missing
-  // config). Putting the latter under the „AI usúdilo…" heading would state something that
-  // never happened — with no MAIL_BCC the AI does not run at all.
-  _ordremSkippedTable(wrap, skipped.filter(o => !o.pending), _ordremAction,
+  // The backend keeps all three kinds of row in one `skipped` list (so the override endpoint
+  // finds them the same way), but they mean very different things to the manager, so they render
+  // as THREE sections — and every row lands in exactly one of them:
+  //   • `pending`  — the run STARTED the order but could not finish it (failed send, failed
+  //     classification, unwritable claim, missing config);
+  //   • `manual`   — the MANAGER resolved it by hand (#227);
+  //   • the rest   — the AI's own „already contacted" verdicts.
+  // Only the last group may carry the „AI usúdilo…" heading: for the other two the classifier
+  // frequently never ran at all (a red row has no note; with no MAIL_BCC or no OPENAI_API_KEY
+  // the AI is deliberately not called), so that heading would state something that never
+  // happened and hide the fact that a HUMAN decided.
+  _ordremSkippedTable(wrap, skipped.filter(o => !o.pending && !o.manual), _ordremAction,
     `⚪ %n — AI usúdilo, že zákazník je už kontaktovaný`, 'ordrem-skipped');
+  _ordremSkippedTable(wrap, skipped.filter(o => !o.pending && o.manual), _ordremAction,
+    `✋ %n — vybavené ručne manažérom`, 'ordrem-manual');
   _ordremSkippedTable(wrap, skipped.filter(o => o.pending), _ordremAction,
     `⚠️ %n — automat ich nestihol vybaviť (pošli ručne)`, 'ordrem-pending');
 }

@@ -130,7 +130,7 @@ def test_manually_handled_row_renders_in_its_own_section(page, automations_serve
     row = manual.locator('tr[data-code="20261007"]')
     assert row.count() == 1
     assert "Termoska Test Manual" in row.inner_text()
-    assert "ručne" in page.locator(".warnhead", has_text="ručne").inner_text().lower()
+    assert page.locator(".warnhead", has_text="vybavené ručne manažérom").count() == 1
 
     # …and it is NOT in the AI-verdict table, while the AI's own row still is
     assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261007"]').count() == 0
