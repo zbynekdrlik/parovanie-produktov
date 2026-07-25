@@ -4132,6 +4132,21 @@ def run_posta_uncollected() -> dict:
             # silence a customer notification.
             api_skipped += 1
             continue
+        esc_val = esc.get(s["code"], "")
+        if esc_val != "" and not isinstance(esc_val, str):
+            # The escalation value („<count>|<date>") is what says how many warnings this
+            # customer already got. `parse_notified` degrades ANY non-string to (0, None), so a
+            # partial write here used to restart the cadence and re-send warning #1 to someone
+            # who already had it (PR #228 review). We cannot prove what was sent → we send
+            # nothing and surface the shipment, exactly as #225 decided for the whole store.
+            # Checked BEFORE the tracking call: a free local disqualifier comes first.
+            log.error("posta: obj. %s (%s) má POŠKODENÝ záznam o odoslaných upozorneniach "
+                      "(%r) — NEposielam nič, aby zákazník nedostal duplicitné upozornenie",
+                      s["code"], s["packageNumber"], esc_val)
+            errors.append({"orderCode": s["code"], "packageNumber": s["packageNumber"],
+                           "error": "poškodený záznam o odoslaných upozorneniach — "
+                                    "neposielam, over ručne"})
+            continue
         try:
             tj = _fetch_tracking(s["packageNumber"])
         except Exception as e:  # noqa: BLE001 — recorded per shipment, run continues
@@ -5013,6 +5028,24 @@ def _mark_manual(row: dict, entry) -> dict:
     return row
 
 
+def _reminder_unreadable(orders, code: str) -> bool:
+    """True when a record for `code` EXISTS in the map but cannot be read (a partial write left a
+    string / number / list / null under it).
+
+    Takes the MAP, not the value: `orders.get(code)` returns None both for „no record" (the
+    normal case for every new order) and for a JSON `null` record — and those two must never be
+    confused. Only key PRESENCE tells them apart.
+
+    An unreadable record is NOT „no record" and must never be treated as one: the order got a
+    record because something happened to it, so reading it as „never mailed" is what
+    re-classified and re-MAILED a customer who had already been reminded (PR #228 review). #225
+    settled the direction for these stores — we cannot prove the mail did NOT go out, so the
+    automation does not send and hands the row to the manager instead. A manual override on that
+    row is still allowed: that is an explicit human decision with the order on screen."""
+    return (isinstance(orders, dict) and code in orders
+            and not isinstance(orders[code], dict))
+
+
 def _reminder_claim_active(entry, now=None) -> bool:
     """True while a manual send for this order is genuinely IN FLIGHT (fresh 'sending' claim).
     An unparseable, expired or future-dated claim returns False — abandoned claims must be
@@ -5066,8 +5099,8 @@ def run_orders_reminder() -> dict:
     with _lock:
         state = _load_orders_reminder()
         # `orders` is dict-or-absent (the loader raises on a non-dict MAP — losing it means
-        # mailing everyone twice). A garbage value UNDER a single code stays tolerated: that
-        # costs at most one extra classification and can never lose a record we could honour.
+        # mailing everyone twice). A garbage value UNDER a single code does NOT crash the run
+        # either, but it is not read as „never mailed" — see _reminder_unreadable.
         done = dict(state.get("orders") or {})                              # code -> {status,…}
     csv_bytes = _orders_csv_cached()
     orders = orders_reminder.select_orders(csv_bytes)
@@ -5151,8 +5184,12 @@ def run_orders_reminder() -> dict:
         try:
             with _lock:
                 st = _load_orders_reminder()
-                cur = (st.get("orders") or {}).get(code)
-                if _reminder_claim_active(cur) or _reminder_is_terminal(cur):
+                cur_map = st.get("orders") or {}
+                cur = cur_map.get(code)
+                # …_reminder_unreadable too: defence in depth. The caller already skips such an
+                # order, but a claim must never overwrite a record we could not read.
+                if (_reminder_claim_active(cur) or _reminder_is_terminal(cur)
+                        or _reminder_unreadable(cur_map, code)):
                     return None
                 st.setdefault("orders", {})[code] = entry
                 _save_orders_reminder(st)
@@ -5215,9 +5252,23 @@ def run_orders_reminder() -> dict:
         # It sits ABOVE the no-note (RED) branch on purpose: an order resolved mid-run must not
         # be re-listed as unhandled either, or the manager's next click on that row 409s.
         with _lock:
-            prev = (_load_orders_reminder().get("orders") or {}).get(code)
+            orders_now = _load_orders_reminder().get("orders") or {}
+        prev = orders_now.get(code)
         if prev is not None:
             done[code] = prev                       # keep the snapshot consistent with disk
+        if _reminder_unreadable(orders_now, code):
+            # A record exists but is garbage → we cannot prove this customer was NOT already
+            # reminded, so we do not remind them (#225's rule, applied per RECORD). Surfaced as
+            # pending so the row stays on the tab WITH „▶ Poslať pripomienku" — the manager
+            # decides, the automation does not guess.
+            log.error("orders_reminder: obj. %s má POŠKODENÝ záznam v evidencii (%r) — "
+                      "pripomienku NEposielam (mohla by byť druhá), skontroluj ručne",
+                      code, prev)
+            errors += 1
+            pending.append(_pending_row(
+                o, "poškodený záznam v evidencii — neposielam, aby zákazník nedostal "
+                   "druhý mail; over ručne"))
+            continue
         if _reminder_claim_active(prev):
             # a manual override is talking to SMTP for this order RIGHT NOW — don't race it
             log.info("orders_reminder: obj. %s má rozrobené ručné odoslanie — preskakujem", code)

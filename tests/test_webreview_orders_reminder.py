@@ -727,14 +727,20 @@ def test_override_survives_a_corrupt_order_record(iso):
 
 
 def test_run_survives_a_corrupt_order_record(iso):
+    """INTENT CORRECTED (PR #228 review, second pass). This test used to assert the run
+    RE-PROCESSED and RE-MAILED an order whose record was garbage („re-processed, record
+    repaired"). That was the bug: an unreadable record does not mean „never mailed", it means
+    „we cannot tell" — and this customer HAD already been mailed, so the repair sent them a
+    second reminder. #225 settled the direction for these stores: rather not send than send
+    twice. What the test still guards is its original point — the run must not CRASH."""
     webapp.run_orders_reminder()
     st = _store(iso)
     st["orders"]["20261001"] = "kaboom"
     webapp._save_orders_reminder(st)
     iso["sent"].clear()
     stats = webapp.run_orders_reminder()                    # must not raise
-    assert stats["emailed_now"] == 1                        # re-processed, record repaired
-    assert _store(iso)["orders"]["20261001"]["status"] == "emailed"
+    assert stats["emailed_now"] == 0                        # …and must not re-mail
+    assert iso["sent"] == []
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -1575,3 +1581,44 @@ def test_the_fast_path_re_derives_manual_from_the_record(iso):
     webapp.run_orders_reminder()                        # unchanged fingerprint → fast path
     (row,) = [r for r in json.loads(p.read_text())["skipped"] if r["code"] == "20261002"]
     assert row.get("manual") is True
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #228 review, second pass — the guard reached the dedup MAP but not its ENTRIES.
+# A garbage value under one code (`null`, a string, a number, a list) is not terminal,
+# so the run classified and MAILED that customer again — the same duplicate the whole
+# #225 guard exists to stop, one level further down. #225 settled the direction:
+# „Fail-closed: radšej neposlať než poslať duplikát." An unreadable record means we
+# cannot prove the customer was NOT mailed, so the automation must not mail — it hands
+# the row to the manager instead (a manual override on the row stays allowed: that is
+# an explicit human decision with the order in front of them).
+# ═════════════════════════════════════════════════════════════════════════════════
+@pytest.mark.parametrize("garbage", [None, "emailed", 42, ["emailed"]])
+def test_an_unreadable_record_is_not_treated_as_never_mailed(iso, garbage):
+    webapp.run_orders_reminder()                       # run 1: 20261001 gets its reminder
+    assert [m["to"] for m in iso["sent"]] == ["b@x.sk"]
+    p = iso["tmp"] / "orders_reminder.json"
+    st = json.loads(p.read_text())
+    st["orders"]["20261001"] = garbage                 # its record is now unreadable
+    p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    iso["sent"].clear()
+
+    stats = webapp.run_orders_reminder()               # must not raise, must not re-mail
+    assert iso["sent"] == []
+    assert stats["emailed_now"] == 0
+    # …and the row is surfaced so the manager can finish it by hand instead of it vanishing
+    (row,) = [r for r in _store(iso)["skipped"] if r["code"] == "20261001"]
+    assert "poškoden" in (row.get("pending") or "").lower()
+
+
+def test_a_manual_override_on_an_unreadable_record_is_still_allowed(iso):
+    """The AUTOMATION must not guess, but the manager looking at the row may decide — that is
+    the existing #153 override contract and it stays."""
+    c = _seed(iso)
+    st = _store(iso)
+    st["orders"]["20261000"] = "kaboom"
+    webapp._save_orders_reminder(st)
+    iso["sent"].clear()
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200
+    assert [m["to"] for m in iso["sent"]] == ["a@x.sk"]
