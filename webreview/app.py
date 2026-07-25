@@ -3940,15 +3940,19 @@ def run_posta_uncollected() -> dict:
         cached = term_cache.get(s["packageNumber"])
         if (isinstance(cached, dict) and cached.get("state")
                 and cached.get("code") == s["code"]
-                and cached.get("at", "") >= recheck_before):
+                and recheck_before <= str(cached.get("at") or "") <= today_iso):
             # Delivered (at home or collected at the post office) — final, so there is nothing
-            # left to check or e-mail. Three ways this deliberately falls through to a REAL
+            # left to check or e-mail. Four ways this deliberately falls through to a REAL
             # check instead: a garbage entry (not a dict, no state); a package number that now
             # belongs to a DIFFERENT order — tracking numbers are typed into Shoptet by hand, so
             # a reused/mistyped one must not let a stale „delivered" silence a genuinely
-            # uncollected parcel; and an entry older than POSTA_TERMINAL_RECHECK_DAYS, so one
+            # uncollected parcel; an entry older than POSTA_TERMINAL_RECHECK_DAYS, so one
             # wrong or freak reading self-heals within a week instead of sticking for the whole
-            # 30-day window. Corruption, ambiguity and age all degrade to „check it", never to
+            # 30-day window; and — the reason `at` is bounded from BOTH sides — a value that is
+            # not a real past date at all. `at` is compared as a plain string, so anything
+            # sorting above the cutoff („zzz" from a partial write, a future date after a clock
+            # jump) would otherwise stay „fresh" for good, switching the weekly re-check net off
+            # without a trace. Corruption, ambiguity and age all degrade to „check it", never to
             # „ignore it forever" — a cached verdict may only ever save an API call, never
             # silence a customer notification.
             api_skipped += 1
@@ -5739,6 +5743,12 @@ def api_orders_reminder_override():
     base = {"name": row.get("billFullName", ""), "email": row.get("email", ""),
             "itemName": row.get("itemName", ""), "note": row.get("shopRemark", ""),
             "date": now_iso, "manual": True}
+    # The row this override RESOLVES must not carry the run's „nedokončené" note: `pending`
+    # means „a run gave up on this order", which is exactly what the manager is undoing here.
+    # _relocate and the incremental fast path strip it for the same reason; re-appending the row
+    # verbatim would leave the warning (and its „z toho N nedokončených" count) sitting on a
+    # finished row until the next run rebuilds the lists — up to 24 h (PR #224 review).
+    row_done = {k: v for k, v in row.items() if k != "pending"}
 
     def _release_claim() -> None:
         """Undo OUR claim (only ours — never a concurrent winner's terminal record)."""
@@ -5767,7 +5777,7 @@ def api_orders_reminder_override():
             done[code] = {**base, "status": "skipped_contacted"}
             _pop_row(st, "red", code)
             _pop_row(st, "skipped", code)
-            st.setdefault("skipped", []).append({**row, "sent_date": now_iso})
+            st.setdefault("skipped", []).append({**row_done, "sent_date": now_iso})
             _save_orders_reminder(st)
         log.info("orders_reminder: manual override %s -> kontaktované (user %s)",
                  code, session.get("user"))
@@ -5797,7 +5807,7 @@ def api_orders_reminder_override():
             _pop_row(st, "red", code)
             _pop_row(st, "skipped", code)
             _pop_row(st, "orange", code)
-            st.setdefault("orange", []).append({**row, "sent_date": now_iso})
+            st.setdefault("orange", []).append({**row_done, "sent_date": now_iso})
             _save_orders_reminder(st)
     except Exception as e:  # noqa: BLE001 — full disk / permissions
         # The mail ALREADY reached the customer. Reporting a plain failure would invite the
