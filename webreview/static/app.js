@@ -1034,6 +1034,36 @@ function pairEditor(o, row, focus) {
 // a stale assignment must never prebiehať the real supplier / clobber the eshop).
 const effSup = (o) => (o.supplier || o.assignedSupplier || '—');
 
+// #203 — the supplier name is free text the manager types by hand, so the SAME supplier
+// keeps arriving spelled differently ('CITRADE' / 'Citrade' / 'Citrade  s.r.o.'). Group,
+// colour and filter by a case+whitespace-insensitive key so one supplier is ONE chip and
+// ONE group; the stored value is never touched (it goes verbatim into the eshop).
+const supKey = (s) => String(s == null ? '' : s).trim().replace(/\s+/g, ' ').toLocaleLowerCase('sk');
+// Chip/filter keys are namespaced so a supplier literally named "All" can never collide
+// with the 'all' (Všetci) sentinel — with case-folding that collision got likelier.
+const supFilterKey = (o) => 's:' + supKey(effSup(o));
+// The spelling to SHOW for a normalised key: the one used most often (ties → alphabetical,
+// so the label never flickers between renders).
+const supCanonPick = (counts) => Object.keys(counts).sort(
+  (a, b) => (counts[b] - counts[a]) || (a < b ? -1 : a > b ? 1 : 0))[0];
+
+// One pass over ORDERS → { canon, known }:
+//   canon: chip/group key ('s:'+normalised) → the spelling to display
+//   known: every distinct supplier seen in EITHER column, deduped case-insensitively,
+//          canonical spelling, alphabetical — the `known-suppliers` autocomplete list
+//          (which exists precisely to stop typo/case fragmentation at the source).
+function supplierSpellingIndex(orders) {
+  const bump = (m, k, raw) => { const b = (m[k] = m[k] || {}); b[raw] = (b[raw] || 0) + 1; };
+  const grp = {}, all = {};
+  for (const o of orders || []) {
+    bump(grp, supFilterKey(o), effSup(o));
+    for (const raw of [o.supplier, o.assignedSupplier]) if (raw) bump(all, supKey(raw), raw);
+  }
+  const canon = {};
+  for (const k of Object.keys(grp)) canon[k] = supCanonPick(grp[k]);
+  return { canon, known: Object.keys(all).sort().map(k => supCanonPick(all[k])) };
+}
+
 // Inline supplier assign: fill in the supplier for an order line that arrived WITHOUT
 // one. Persists per forestshop code; the row then regroups under that supplier and the
 // name is written back to the eshop `supplier` field by the nightly upload.
@@ -1265,15 +1295,19 @@ function renderOrderFilters() {
   const fbar = document.getElementById('filters');
   if (!fbar || ACTIVE_TAB !== 'toorder') return;
   const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
+  // keyed by the NORMALISED supplier (#203) so case variants share one chip/count/colour
+  const { canon } = supplierSpellingIndex(ORDERS);
   const cnt = {}, newest = {}, unhandled = {};
   for (const o of ORDERS) {
-    const s = effSup(o);
+    const s = supFilterKey(o);
     cnt[s] = (cnt[s] || 0) + 1;
     if (!isHandled(o)) unhandled[s] = (unhandled[s] || 0) + 1;
     newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
   }
   const allHandledGlobal = ORDERS.length > 0 && ORDERS.every(isHandled);
-  const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
+  const lbl = (k) => canon[k] || k;   // sort/compare on the DISPLAYED spelling
+  const byPriority = (a, b) => (newest[b] - newest[a])
+    || (lbl(a) < lbl(b) ? -1 : lbl(a) > lbl(b) ? 1 : 0);
   fbar.innerHTML = '';
   const mk = (key, lbl, done) => {
     const cls = (ORDER_SUPPLIER === key ? 'active ' : '') + (done ? 'done' : 'todo');
@@ -1284,7 +1318,9 @@ function renderOrderFilters() {
   fbar.appendChild(mk('all', `Všetci (${ORDERS.length})`, allHandledGlobal));
   // escapeHtml: a supplier name is manually assignable (free text) → never trust it in
   // the innerHTML-based el() helper. done (RED) = no un-flagged line left; todo (GREEN) = some.
-  for (const s of Object.keys(cnt).sort(byPriority)) fbar.appendChild(mk(s, `${escapeHtml(s)} (${cnt[s]})`, !unhandled[s]));
+  for (const s of Object.keys(cnt).sort(byPriority)) {
+    fbar.appendChild(mk(s, `${escapeHtml(lbl(s))} (${cnt[s]})`, !unhandled[s]));
+  }
 }
 
 function renderToOrder() {
@@ -1292,33 +1328,36 @@ function renderToOrder() {
   // chronologické (vyššie = novšie); dodávateľ s NAJNOVŠOU objednávkou hore, v rámci
   // dodávateľa od najnovšej. Ne-číselné orderCode = -Infinity (nikdy nedominuje vrch).
   const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
-  // datalist of known supplier names (avoid typo-fragmented groups) — distinct real
-  // suppliers seen across orders, both order-given and manually assigned
-  const known = [...new Set(ORDERS.flatMap(o => [o.supplier, o.assignedSupplier]).filter(Boolean))].sort();
+  // #203 — one entry per REAL supplier: grouping keys and the datalist of known supplier
+  // names (which exists to avoid typo/case-fragmented groups) both come from the
+  // case+whitespace-insensitive index, labelled with the manager's most-used spelling.
+  const { canon, known } = supplierSpellingIndex(ORDERS);
   let dl = document.getElementById('known-suppliers');
   if (!dl) { dl = el('datalist'); dl.id = 'known-suppliers'; document.body.appendChild(dl); }
   dl.innerHTML = '';
   for (const s of known) { const opt = document.createElement('option'); opt.value = s; dl.appendChild(opt); }
   const newest = {};
   for (const o of ORDERS) {
-    const s = effSup(o);
+    const s = supFilterKey(o);
     newest[s] = Math.max(newest[s] ?? -Infinity, oNum(o));
   }
-  // dodávateľ s NAJNOVŠOU objednávkou hore; zhoda → abecedne
-  const byPriority = (a, b) => (newest[b] - newest[a]) || (a < b ? -1 : a > b ? 1 : 0);
+  // dodávateľ s NAJNOVŠOU objednávkou hore; zhoda → abecedne (podľa zobrazenej menovky)
+  const lbl = (k) => canon[k] || k;
+  const byPriority = (a, b) => (newest[b] - newest[a])
+    || (lbl(a) < lbl(b) ? -1 : lbl(a) > lbl(b) ? 1 : 0);
   renderOrderFilters();   // live-coloured supplier chips (recomputed from the flag maps)
   const list = document.getElementById('list'); list.innerHTML = '';
-  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || effSup(o) === ORDER_SUPPLIER);
+  const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || supFilterKey(o) === ORDER_SUPPLIER);
   document.getElementById('empty').hidden = shown.length > 0;
   const groups = {};
-  for (const o of shown) { const s = effSup(o); (groups[s] = groups[s] || []).push(o); }
+  for (const o of shown) { const s = supFilterKey(o); (groups[s] = groups[s] || []).push(o); }
   for (const sup of Object.keys(groups).sort(byPriority)) {
     const items = groups[sup];
     items.sort((a, b) => oNum(b) - oNum(a));   // v rámci dodávateľa: najnovšia objednávka prvá
     // header = escapovaná menovka (label FIRST → startsWith(sup) kontrakt) + hromadné
     // tlačidlo „označiť skupinu objednané". Ak je UŽ všetko objednané, tlačidlo prepína späť.
     const head = el('div', 'toorder-supplier');
-    head.appendChild(el('span', 'tosup-label', `${escapeHtml(sup)} — ${items.length} položiek`));
+    head.appendChild(el('span', 'tosup-label', `${escapeHtml(lbl(sup))} — ${items.length} položiek`));
     const allOrdered = items.every(o => ORDERED[o.key]);
     const bulk = el('button', 'tosup-bulk', allOrdered ? '↺ Zrušiť objednané' : '✔ Označiť skupinu objednané');
     bulk.title = allOrdered ? 'Odznačiť „objednané" pre celú skupinu'
@@ -3646,7 +3685,11 @@ async function init() {
   PRODUCTS.sort((a, b) =>
     ((a.ai_status === 'unmatched') ? 1 : 0) - ((b.ai_status === 'unmatched') ? 1 : 0) || a.idx - b.idx);
   FILTER = localStorage.getItem('filter') || 'unreviewed';
-  ORDER_SUPPLIER = localStorage.getItem('orderSupplier') || 'all';
+  // #203 — chip keys are now 's:'+normalised supplier. Migrate a value stored by an
+  // older build (the raw supplier name) so the manager keeps his selected supplier.
+  const savedSup = localStorage.getItem('orderSupplier') || 'all';
+  ORDER_SUPPLIER = (savedSup === 'all' || savedSup.startsWith('s:'))
+    ? savedSup : 's:' + supKey(savedSup);
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
   if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes'
