@@ -880,9 +880,14 @@ async function saveOrderFlag(path, field, map, key, on, what) {
   const st = _flagEntry(field, key, map);
   const seq = ++st.seq;
   st.inflight += 1;
-  if (on) map[key] = true; else delete map[key];
-  const err = await postToOrder(path, { key, [field]: on });
-  st.inflight -= 1;
+  let err;
+  // the decrement must be unskippable: postToOrder swallows every throw today, but a
+  // leaked counter would permanently disable reconciliation for this (flag, row) —
+  // the entry is never deleted, so it would never reach 0 again for the page's lifetime
+  try {
+    if (on) map[key] = true; else delete map[key];
+    err = await postToOrder(path, { key, [field]: on });
+  } finally { st.inflight -= 1; }
   // `loadOrders()` drops the whole map when it re-reads the server, so an entry that is
   // no longer the live one for its key must not roll anything back over fresh data
   const live = _flagWrites[st.wk] === st;
@@ -1154,7 +1159,7 @@ function pairEditor(o, focus) {
   inp.value = o.pairUrl || '';
   const save = el('button', 'to-pairsave', '💾 Spárovať');
   save.title = 'Uložiť párovaciu URL — objaví sa ako odkaz a pôjde do importu';
-  const doSave = () => savePairUrl(o, inp.value.trim());
+  const doSave = () => commitEditor(pair, () => savePairUrl(o, inp.value.trim()));
   save.onclick = doSave;
   inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
   pair.appendChild(inp); pair.appendChild(save);
@@ -1180,6 +1185,17 @@ function openRowEditor(node, editor, alsoRemove) {
   editor.dataset.editorOpened = '1';
   node.replaceWith(editor);
   if (alsoRemove) alsoRemove.remove();
+}
+
+// Saving CONSUMES the „he opened it himself" claim: once the manager has committed the
+// value, the repaint that follows must be free to collapse the editor back to the link /
+// tag / add-button — including when he deliberately saved it EMPTY to delete the note
+// (value and stored are then both '', so only this marker tells the two apart from the
+// „opened, nothing typed yet" box that MUST survive). A save that FAILED gives the claim
+// straight back: that box still holds his unsaved work.
+async function commitEditor(wrap, save) {
+  wrap.dataset.editorSaving = '1';
+  if (!(await save())) delete wrap.dataset.editorSaving;
 }
 
 // effective supplier for grouping: the order's OWN supplier (from Shoptet) wins;
@@ -1267,7 +1283,7 @@ function supplierEditor(o, focus) {
   inp.setAttribute('list', 'known-suppliers');   // autocomplete from existing suppliers
   const save = el('button', 'to-supsave', '💾 Uložiť');
   save.title = 'Priradiť dodávateľa — položka sa zaradí pod neho a zapíše sa do eshopu';
-  const doSave = () => saveSupplier(o, inp.value.trim());
+  const doSave = () => commitEditor(wrap, () => saveSupplier(o, inp.value.trim()));
   save.onclick = doSave;
   inp.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); doSave(); } };
   wrap.appendChild(inp); wrap.appendChild(save);
@@ -1298,7 +1314,7 @@ function commentEditor(o, focus) {
   inp.value = ORDER_COMMENTS[o.orderCode] || '';
   const save = el('button', 'to-comsave', '💾 Uložiť');
   save.title = 'Uložiť komentár k objednávke (Ctrl+Enter)';
-  const doSave = () => saveOrderComment(o, inp.value.trim());
+  const doSave = () => commitEditor(wrap, () => saveOrderComment(o, inp.value.trim()));
   save.onclick = doSave;
   inp.onkeydown = (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); doSave(); }
@@ -1328,7 +1344,7 @@ function renderOrderRow(o) {
     row.appendChild(a);
   } else if (o.supplierUrl) {
     // read-only slot with an unusable value — say so instead of faking a link
-    const bad = el('span', 'to-link to-badlink', '🔗 ' + escapeHtml(o.itemCode || 'link'));
+    const bad = el('span', 'to-badlink', '🔗 ' + escapeHtml(o.itemCode || 'link'));
     bad.title = 'Uložená adresa nie je platný http(s) odkaz — oprav ju v párovacom tabe';
     row.appendChild(bad);
   } else if (pairHref) {
@@ -1528,7 +1544,7 @@ const _EDITORS = Object.assign(Object.create(null), {
     stored: (o) => o.pairUrl || '',
     same: (a, b) => a.trim() === b.trim(),
     open: (o, row) => {
-      const a = row.querySelector('.to-link'), edit = row.querySelector('.to-pairedit');
+      const a = row.querySelector('a.to-link'), edit = row.querySelector('.to-pairedit');
       if (!a || !edit) return null;
       const ed = pairEditor(o, false); a.replaceWith(ed); edit.remove(); return ed;
     },
@@ -1571,7 +1587,7 @@ function captureOpenEditors() {
     try { sel = [inp.selectionStart, inp.selectionEnd]; } catch (_) { /* no selection API */ }
     out.push({
       kind: w.dataset.editor, key: row.dataset.key, value: inp.value,
-      opened: w.dataset.editorOpened === '1',
+      opened: w.dataset.editorOpened === '1' && w.dataset.editorSaving !== '1',
       focused: document.activeElement === inp, sel,
     });
   }
