@@ -1158,6 +1158,23 @@ manažér nastaví VLASTNÝ link pre KAŽDÚ veľkosť.
   Test „zrušené" = `d.dismiss()` → over že sa akcia NEvykonala (editor otvorený, žiadny `.badge.split`).
   Test „bez dialógu" = `dialogs == []`. (Pri `prompt()` rename je zaužívaný `page.once("dialog", d =>
   d.accept("text"))` — jednorazový; `confirm()` warning s viac klikmi radšej `page.on`.)
+- **Keď potrebuješ overiť DOM V MOMENTE hlášky, `page.on("dialog")` NEPOUŽI — spy-uj `window.alert`
+  cez `page.add_init_script` (#214).** Natívny `alert()` **blokuje JS thread**, takže `page.evaluate`
+  (ani `locator.get_attribute`, ktoré tiež beží injektovaný skript) vnútri dialog handlera NIKDY
+  nedobehne — deadlock, nie flake. Vzor: `page.add_init_script("window.__alerts=[]; window.alert=(m)=>
+  window.__alerts.push({msg:String(m), cls:(document.querySelector(sel)||{}).className});")` PRED
+  `page.goto`, potom `page.wait_for_function("() => window.__alerts.length > 0")` (deterministické,
+  žiadny `wait_for_timeout`) a čítaj `page.evaluate("() => window.__alerts")`. Bonus: overí sa AJ text
+  hlášky AJ stav DOM v tej sekunde — presne to pinuje pravidlo „najprv rollback + prekreslenie, až
+  potom hláška". `page.on("dialog")` nechaj na `confirm()`/`prompt()`, kde len odpovedáš.
+- **Chybové cesty testuj Playwright request-interception, nie zmrzačeným serverom:**
+  `page.route("**/api/instock", lambda r: r.fulfill(status=500, content_type="application/json",
+  body='{"ok": false}'))` pre odmietnutý zápis, `route.abort()` pre mŕtvu sieť, a `body` s reálnym
+  `{"error": "..."}` na overenie, že sa dôvod zo servera dostane až k manažérovi.
+- **Assert, ktorý NEVIE padnúť, je vata — over to.** „chip musí ostať zelený" na skupine so 4 riadkami
+  je vždy pravda (ostatné 3 sú neoznačené), nech sa rollback deje alebo nie; treba **jednoriadkovú
+  skupinu** (v `toorder_server` je to `—`/N1), kde by chýbajúci rollback chip naozaj prefarbil. Kto
+  píše regresný test na poradie operácií, nech si ho overí dočasným prehodením poradia v kóde.
 - **Pure JS helper sa dá unit-testnúť v prehliadačovom realme cez `page.evaluate` — žiadny JS toolchain
   netreba.** `app.js` je plain `<script>` (nie module), takže top-level `function foo(){}` sú GLOBÁLNE
   (na `window`) a `let` globály (`VARIANT_LINKS`, …) sú dosiahnuteľné/priraditeľné holým menom v
