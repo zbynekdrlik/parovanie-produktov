@@ -17,6 +17,10 @@ import app as webapp  # noqa: E402
 
 from tests.conftest import authed_client  # noqa: E402
 
+# the UNPATCHED helper — the „BCC vždy" wiring test needs the real SMTP path (behind a fake
+# smtplib), not the capturing stub the `iso` fixture installs.
+_REAL_SEND_MAIL_HTML = webapp._send_mail_html
+
 FIX = os.path.join(os.path.dirname(__file__), "fixtures", "posta")
 
 
@@ -51,9 +55,9 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "_fetch_tracking", lambda pkg: TRACKING[pkg])
     sent = []
     monkeypatch.setattr(webapp, "_send_mail_html",
-                        lambda to, subject, body, bcc=None:
-                        sent.append({"to": to, "subject": subject,
-                                     "body": body, "bcc": bcc}) or True)
+                        lambda to, subject, body, bcc=None, **kw:
+                        sent.append({"to": to, "subject": subject, "body": body,
+                                     "bcc": bcc, **kw}) or True)
     return {"tmp": tmp_path, "sent": sent}
 
 
@@ -138,7 +142,7 @@ def test_posta_run_same_day_does_not_remail(iso):
 
 def test_posta_run_smtp_failure_keeps_state_for_retry(iso, monkeypatch):
     monkeypatch.setattr(webapp, "_send_mail_html",
-                        lambda to, subject, body, bcc=None: False)
+                        lambda to, subject, body, bcc=None, **kw: False)
     stats = webapp.run_posta_uncollected()
     assert stats["emails_sent"] == 0 and stats["emails_failed"] == 1
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
@@ -245,3 +249,47 @@ def test_send_mail_html_no_mail_bcc_env_sends_without_bcc(monkeypatch):
     monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTP)
     webapp._send_mail_html("zak@example.com", "predmet", "<p>telo</p>")
     assert _FakeSMTP.last_rcpt == ["zak@example.com"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# DÁVKA A — e-mail safety of the Pošta run (VYLEPŠENIE 3/4). Both failures below end
+# the same way: the customer gets the escalation mail a second time tomorrow.
+# ═════════════════════════════════════════════════════════════════════════════════
+
+# ── VYLEPŠENIE 3 — a failing store write must not blow up the whole run ────────────
+def test_posta_persist_failure_is_logged_and_the_run_continues(iso, monkeypatch, caplog):
+    """The escalation bump is persisted IMMEDIATELY after each successful send. If that write
+    fails (full disk / permissions) the run must log the order code for manual follow-up and
+    keep going — not abort and leave the remaining shipments unchecked."""
+    real_save = webapp._save_posta_state
+    n = {"calls": 0}
+
+    def flaky_save(data):
+        n["calls"] += 1
+        if n["calls"] == 1:                        # the immediate-persist right after the send
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_posta_state", flaky_save)
+    with caplog.at_level("ERROR"):
+        stats = webapp.run_posta_uncollected()     # must NOT propagate
+    assert stats["checked"] == 3                   # every shipment still processed
+    assert stats["emails_sent"] == 1
+    assert any("2026100" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+
+
+# ── VYLEPŠENIE 4 — „BCC vždy": no MAIL_BCC → the customer mail does not go out ─────
+def test_posta_run_does_not_email_the_customer_without_mail_bcc(iso, monkeypatch):
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.setenv("MAIL_PORT", "587")
+    monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTP)
+    monkeypatch.setattr(webapp.smtplib, "SMTP_SSL", _FakeSMTP)
+    monkeypatch.setattr(webapp, "_send_mail_html", _REAL_SEND_MAIL_HTML)
+    _FakeSMTP.last_rcpt = None
+    stats = webapp.run_posta_uncollected()
+    assert _FakeSMTP.last_rcpt is None             # nothing reached the wire
+    assert stats["emails_sent"] == 0 and stats["emails_failed"] == 1
+    # escalation NOT bumped → the mail is retried once MAIL_BCC is configured
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st.get("escalation", {}) == {}

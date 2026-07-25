@@ -43,7 +43,7 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "_resolve_alternatives", _resolve)
     sent = []
     monkeypatch.setattr(webapp, "_send_mail_html",
-                        lambda to, subject, body, bcc=None:
+                        lambda to, subject, body, bcc=None, **kw:
                         sent.append({"to": to, "subject": subject, "body": body}) or True)
     # one product flagged unavailable (order-line key from the to-order tab)
     (tmp_path / "unavailable_items.json").write_text(

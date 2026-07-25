@@ -7,7 +7,7 @@ path is redirected to tmp. Mirrors test_webreview_automations.py.
 import json
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -15,6 +15,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
 from tests.conftest import authed_client  # noqa: E402
+
+# the UNPATCHED helper — the „BCC vždy" wiring tests need the real SMTP path (behind a fake
+# smtplib), not the capturing stub the `iso` fixture installs.
+_REAL_SEND_MAIL_HTML = webapp._send_mail_html
 
 TODAY = date.today()
 OLD = (TODAY - timedelta(days=10)).isoformat()      # >4d → in scope
@@ -51,9 +55,9 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")   # key present unless a test removes it
     sent = []
     monkeypatch.setattr(webapp, "_send_mail_html",
-                        lambda to, subject, body, bcc=None:
-                        sent.append({"to": to, "subject": subject,
-                                     "body": body, "bcc": bcc}) or True)
+                        lambda to, subject, body, bcc=None, **kw:
+                        sent.append({"to": to, "subject": subject, "body": body,
+                                     "bcc": bcc, **kw}) or True)
     return {"tmp": tmp_path, "sent": sent}
 
 
@@ -146,7 +150,7 @@ def test_classification_error_recorded_not_emailed(iso, monkeypatch):
 
 def test_smtp_failure_keeps_order_for_retry(iso, monkeypatch):
     monkeypatch.setattr(webapp, "_send_mail_html",
-                        lambda to, subject, body, bcc=None: False)
+                        lambda to, subject, body, bcc=None, **kw: False)
     stats = webapp.run_orders_reminder()
     assert stats["emailed_now"] == 0
     assert stats["errors"] >= 1
@@ -367,3 +371,169 @@ def test_reminder_mail_bccs_mail_bcc_on_the_wire(iso, monkeypatch):
     monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTP)
     webapp.run_orders_reminder()
     assert _FakeSMTP.last_rcpt == ["b@x.sk", "owner@example.com"]
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# DÁVKA A — e-mail safety (BUG 2/3/4 + VYLEPŠENIE 3/4).
+# Every mail here goes to a REAL customer, so the whole class of failures locked
+# below has exactly one symptom: the same customer gets the same mail twice.
+# ═════════════════════════════════════════════════════════════════════════════════
+
+# ── BUG 2 — a double-clicked manual „send" must e-mail exactly ONCE ────────────────
+def test_override_send_double_click_sends_only_one_email(iso, monkeypatch):
+    """The pre-check runs under `_lock`, the SMTP round-trip (~20s) does NOT — so without an
+    in-flight claim TWO concurrent 'send' requests both pass the check and both e-mail the
+    customer. The second one must be rejected while the first is still talking to SMTP."""
+    c = _seed(iso)
+    calls, second = [], {}
+
+    def send_with_a_second_click(to, subject, body, bcc=None, **kw):
+        calls.append(to)
+        if len(calls) == 1:                       # the double-click lands mid-SMTP
+            second["r"] = authed_client().post(
+                "/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+        return True
+
+    monkeypatch.setattr(webapp, "_send_mail_html", send_with_a_second_click)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200
+    assert second["r"].status_code == 409          # blocked by the in-flight claim
+    assert calls == ["a@x.sk"]                     # exactly ONE mail left the app
+    st = _store(iso)
+    assert st["orders"]["20261000"]["status"] == "emailed"
+    assert len([o for o in st["orange"] if o["code"] == "20261000"]) == 1
+
+
+def test_override_send_failure_releases_the_claim_for_a_retry(iso, monkeypatch):
+    """The transient claim must never become a permanent lock: a failed send restores the
+    previous state so the manager can simply click again."""
+    c = _seed(iso)
+    monkeypatch.setattr(webapp, "_send_mail_html", lambda *a, **kw: False)
+    assert c.post("/api/orders-reminder/override",
+                  json={"code": "20261000", "action": "send"}).status_code == 502
+    st = _store(iso)
+    assert "20261000" not in st.get("orders", {})          # claim released
+    assert "20261000" in {r["code"] for r in st["red"]}    # still actionable
+
+    monkeypatch.setattr(webapp, "_send_mail_html", lambda to, s, b, bcc=None, **kw: True)
+    r2 = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r2.status_code == 200 and r2.get_json()["status"] == "emailed"
+
+
+def test_stale_sending_claim_does_not_block_a_new_attempt(iso):
+    """A crash between claim and send leaves a 'sending' record behind — after the TTL a new
+    attempt must be allowed (otherwise the order is stuck forever)."""
+    c = _seed(iso)
+    st = _store(iso)
+    stale = (datetime.now(timezone.utc).astimezone() - timedelta(hours=2)).isoformat()
+    st.setdefault("orders", {})["20261000"] = {"status": "sending", "claimed_at": stale}
+    webapp._save_orders_reminder(st)
+    iso["sent"].clear()
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200
+    assert [m["to"] for m in iso["sent"]] == ["a@x.sk"]
+    assert _store(iso)["orders"]["20261000"]["status"] == "emailed"
+
+
+# ── BUG 3 — the final wholesale save must not clobber an override written mid-run ──
+def test_manager_override_during_a_run_survives_the_final_save(iso, monkeypatch):
+    """`done` is snapshotted at the START of the run; the run then spends minutes in OpenAI +
+    SMTP. An override written meanwhile must NOT be lost by the final save — losing its
+    terminal record means the next run e-mails that customer again."""
+    def classify_and_override(note):
+        st = _store(iso)                           # the manager resolves 20261000 from the tab
+        st.setdefault("orders", {})["20261000"] = {
+            "status": "skipped_contacted", "manual": True, "date": "during-run"}
+        webapp._save_orders_reminder(st)
+        return _CLASSIFY[note]
+
+    monkeypatch.setattr(webapp, "_classify_contacted", classify_and_override)
+    webapp.run_orders_reminder()
+    st = _store(iso)
+    assert st["orders"].get("20261000", {}).get("status") == "skipped_contacted"
+    assert st["orders"]["20261000"]["date"] == "during-run"    # untouched by the run
+    assert st["orders"]["20261001"]["status"] == "emailed"     # the run's own record survives too
+
+
+# ── BUG 4 — an order with no e-mail must never burn a paid OpenAI call ─────────────
+NOEMAIL_ROW = ("20261098;" + OLD + " 06:00:00;Vybavuje sa;treba doriešiť;;;"
+               "Bez Mailu;Rukavice;1;10,00")
+
+
+def _csv_with_noemail_order():
+    return (ORDERS_CSV.decode("cp1250").rstrip("\r\n") + "\r\n" + NOEMAIL_ROW + "\r\n"
+            ).encode("cp1250")
+
+
+def test_order_without_email_is_not_classified_and_is_surfaced(iso, monkeypatch):
+    """No e-mail → the reminder can never be sent → the order never becomes terminal → today it
+    is re-classified (paid OpenAI call) on EVERY run, forever. Skip the call and show the order
+    so the manager can fill the address in."""
+    classified = []
+    monkeypatch.setattr(webapp, "_classify_contacted",
+                        lambda note: classified.append(note) or _CLASSIFY[note])
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_noemail_order)
+    stats = webapp.run_orders_reminder()
+    assert "treba doriešiť" not in classified          # 0 OpenAI calls for the no-e-mail order
+    assert stats["no_email"] == 1
+    st = _store(iso)
+    assert {r["code"] for r in st["no_email"]} == {"20261098"}
+    assert "20261098" not in st["orders"]              # not terminal — resolved by adding the mail
+    assert all(m["to"] for m in iso["sent"])           # nothing addressed to nobody
+
+
+def test_order_without_email_stays_free_of_openai_on_every_run(iso, monkeypatch):
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_noemail_order)
+    webapp.run_orders_reminder()
+    classified = []
+    monkeypatch.setattr(webapp, "_classify_contacted",
+                        lambda note: classified.append(note) or _CLASSIFY[note])
+    webapp.run_orders_reminder()
+    assert "treba doriešiť" not in classified
+
+
+# ── VYLEPŠENIE 3 — a failing store write must not crash the run ────────────────────
+def test_persist_failure_is_logged_and_the_run_continues(iso, monkeypatch, caplog):
+    real_save = webapp._save_orders_reminder
+    n = {"calls": 0}
+
+    def flaky_save(data):
+        n["calls"] += 1
+        if n["calls"] == 1:                        # the immediate-persist right after the send
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", flaky_save)
+    with caplog.at_level("ERROR"):
+        stats = webapp.run_orders_reminder()       # must NOT propagate
+    assert stats["emailed_now"] == 1
+    assert any("20261001" in r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+
+
+# ── VYLEPŠENIE 4 — „BCC vždy": no MAIL_BCC → the customer mail does not go out ─────
+def _real_smtp_path(monkeypatch, iso):
+    """Swap the capturing stub for the REAL _send_mail_html behind a fake smtplib."""
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    monkeypatch.setenv("MAIL_HOST", "smtp.example.test")
+    monkeypatch.setenv("MAIL_PORT", "587")
+    monkeypatch.setattr(webapp.smtplib, "SMTP", _FakeSMTP)
+    monkeypatch.setattr(webapp.smtplib, "SMTP_SSL", _FakeSMTP)
+    monkeypatch.setattr(webapp, "_send_mail_html", _REAL_SEND_MAIL_HTML)
+    _FakeSMTP.last_rcpt = None
+
+
+def test_run_does_not_email_the_customer_without_mail_bcc(iso, monkeypatch):
+    _real_smtp_path(monkeypatch, iso)
+    stats = webapp.run_orders_reminder()
+    assert _FakeSMTP.last_rcpt is None             # nothing reached the wire
+    assert stats["emailed_now"] == 0
+    assert "20261001" not in _store(iso).get("orders", {})   # retried once BCC is configured
+
+
+def test_override_send_does_not_email_the_customer_without_mail_bcc(iso, monkeypatch):
+    c = _seed(iso)
+    _real_smtp_path(monkeypatch, iso)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 502
+    assert _FakeSMTP.last_rcpt is None
+    assert "20261000" not in _store(iso).get("orders", {})   # claim released, retry possible
