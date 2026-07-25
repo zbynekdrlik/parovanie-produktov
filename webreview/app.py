@@ -4743,6 +4743,13 @@ def _classify_contacted(shop_remark: str) -> bool:
 REMINDER_TERMINAL_STATUSES = ("emailed", "skipped_contacted")
 SENDING_CLAIM_TTL_S = 600          # 10 min — far above the ~20 s SMTP timeout
 
+# _claim's two failure modes are NOT the same event and must not share a return value (M1):
+# None = somebody else legitimately owns the order right now (a manual send, or a verdict that
+# landed meanwhile) — an ordinary skip; this sentinel = the claim could not be WRITTEN (full
+# disk / permissions), which means the run mailed nobody for a reason the manager has to fix.
+# Collapsing both into None is what let a completely dead run report `errors: 0`.
+_CLAIM_WRITE_FAILED = object()
+
 
 def _reminder_is_terminal(entry) -> bool:
     """True for a finally-resolved order — never re-classified, never re-mailed.
@@ -4815,8 +4822,22 @@ def run_orders_reminder() -> dict:
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     run_token = secrets.token_hex(8)     # identifies THIS run's claims (never release a foreign one)
     red, orange, skipped, no_email = [], [], [], []
+    # Orders this run started on but could NOT finish (M2). Every such branch used to just
+    # `continue`, and because the display lists are rebuilt from scratch on every run, the order
+    # vanished from the tab for the whole day — while the override endpoint, which only searches
+    # red/orange/skipped, answered 404 „objednávka sa v aktuálnom zozname nenašla" for the row
+    # the manager still had on screen. The next run heals it, but the manager has no way to act
+    # meanwhile — on exactly the orders that need a human most. Collected here and merged into
+    # `skipped` (the list whose row carries the note AND the „▶ Poslať pripomienku" action).
+    pending = []
     failed_writes = set()                # codes whose immediate dedup write did not reach disk
     emailed_now = skipped_now = ai_unavailable = errors = 0
+
+    def _pending_row(o: dict, why: str) -> dict:
+        row = {k: o[k] for k in ("code", "billFullName", "email", "itemName",
+                                 "shopRemark", "days", "admin_link")}
+        row["pending"] = why             # rendered on the row so the tab explains itself
+        return row
 
     def _persist_done(code: str, entry: dict) -> None:
         # persist the dedup record IMMEDIATELY — a crash later in the run must never lose a
@@ -4843,10 +4864,12 @@ def run_orders_reminder() -> dict:
         same lock as the fresh per-order read. Without it the run is invisible on disk for the
         whole ~20 s round-trip, so a manual „▶ Poslať pripomienku" click landing in that window
         passes the 409 gate, claims, and mails — and the run mails too (PR #223 review).
-        Returns the claim entry, or None when the order must be left alone — either someone else
-        won it meanwhile, or the claim could not be written. A claim that did not reach disk is
-        no protection at all, so the order is SKIPPED (retried next run) rather than mailed
-        unclaimed: for a customer mail, sending nothing beats sending twice."""
+        Returns the claim entry, None when someone else legitimately won the order meanwhile, or
+        _CLAIM_WRITE_FAILED when the claim could not be written. A claim that did not reach disk
+        is no protection at all, so the order is SKIPPED (retried next run) rather than mailed
+        unclaimed: for a customer mail, sending nothing beats sending twice — but the caller
+        counts that as an ERROR (M1), because a run whose claims all fail mails nobody and must
+        never look like a healthy, quiet day on the tab."""
         entry = {"status": "sending",
                  # a FRESH timestamp per claim — `now_iso` is the start of the run, and a long
                  # run would hand out claims that already look expired
@@ -4863,7 +4886,7 @@ def run_orders_reminder() -> dict:
         except Exception as e:  # noqa: BLE001 — full disk / permissions; never crash the run
             log.error("orders_reminder: nárok na obj. %s sa nepodarilo zapísať (%r) — "
                       "objednávku preskakujem, skúsim ju v ďalšom behu", code, e)
-            return None
+            return _CLAIM_WRITE_FAILED
         done[code] = entry
         return entry
 
@@ -4919,6 +4942,7 @@ def run_orders_reminder() -> dict:
         if _reminder_claim_active(prev):
             # a manual override is talking to SMTP for this order RIGHT NOW — don't race it
             log.info("orders_reminder: obj. %s má rozrobené ručné odoslanie — preskakujem", code)
+            pending.append(_pending_row(o, "práve prebieha ručné odoslanie"))
             continue
         if _reminder_is_terminal(prev):             # already resolved — reflect its status
             row = {k: o[k] for k in ("code", "billFullName", "email", "itemName",
@@ -4939,15 +4963,36 @@ def run_orders_reminder() -> dict:
             no_email.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
                                                "itemName", "shopRemark", "days", "admin_link")})
             continue
+        if bcc_missing:
+            # „BCC vždy" is BINDING for this customer mail (require_bcc below), so the send WILL
+            # be refused — and the order never becomes terminal, so it would be claimed and
+            # classified again on every run, forever, for a mail that can never go out. That is
+            # exactly the „drahé volanie až po lacných diskvalifikátoroch" rule: a missing
+            # config line is free to check, an OpenAI call is not. The tab already renders the
+            # bcc_missing warning; the row below says which orders are waiting on it (M3).
+            log.warning("orders_reminder: obj. %s — MAIL_BCC nie je nastavené (data/.mail_env), "
+                        "pripomienku nemožno odoslať; AI klasifikáciu preskakujem", code)
+            pending.append(_pending_row(
+                o, "chýba MAIL_BCC v data/.mail_env — pripomienka sa neodošle"))
+            continue                                # no claim, no OpenAI call, nothing recorded
         if not have_key:
             ai_unavailable += 1
             log.warning("orders_reminder: obj. %s má poznámku, ale OPENAI_API_KEY nie je "
                         "nastavený — AI nedostupné, pripomienku neposielam (skúsim ďalší beh)", code)
+            pending.append(_pending_row(
+                o, "AI klasifikácia nedostupná — chýba OPENAI_API_KEY"))
             continue                                # do NOT record → retried when key is present
         # From here the run talks to OpenAI + SMTP for this order — claim it first so a manual
         # send clicked in that window is rejected (409) instead of mailing the customer twice.
-        if _claim(code, o["email"]) is None:
+        claimed = _claim(code, o["email"])
+        if claimed is _CLAIM_WRITE_FAILED:
+            errors += 1                             # a run that claims nothing mails nobody (M1)
+            pending.append(_pending_row(
+                o, "nárok na odoslanie sa nepodarilo zapísať — skúsim v ďalšom behu"))
+            continue
+        if claimed is None:
             log.info("orders_reminder: obj. %s si medzitým vzal niekto iný — preskakujem", code)
+            pending.append(_pending_row(o, "objednávku si medzitým vzal niekto iný"))
             continue
         try:
             contacted = _classify_contacted(o["shopRemark"])
@@ -4955,6 +5000,7 @@ def run_orders_reminder() -> dict:
             errors += 1
             _release(code, prev)                    # claim must not outlive the attempt
             log.error("orders_reminder: klasifikácia obj. %s zlyhala: %r", code, e)
+            pending.append(_pending_row(o, "AI klasifikácia zlyhala — skúsim v ďalšom behu"))
             continue
         base = {"name": o["billFullName"], "email": o["email"],
                 "itemName": o["itemName"], "note": o["shopRemark"], "date": now_iso}
@@ -4981,6 +5027,7 @@ def run_orders_reminder() -> dict:
         else:
             errors += 1                             # SMTP failed → not recorded → retried next run
             _release(code, prev)                    # claim must not outlive the attempt
+            pending.append(_pending_row(o, "odoslanie e-mailu zlyhalo — skúsim v ďalšom behu"))
 
     with _lock:
         # `done` is a snapshot taken at the START of the run and this run spends minutes in
@@ -5023,6 +5070,11 @@ def run_orders_reminder() -> dict:
 
         red = _relocate(red)
         no_email = _relocate(no_email)
+        # Orders the run could not finish (M2) join `skipped` — the list whose row shows the
+        # note AND offers „▶ Poslať pripomienku", so the manager can finish the job by hand.
+        # Through _relocate first: one of them may have been resolved by an override in the very
+        # window that made the run give up, and then it belongs in orange/skipped by its status.
+        skipped.extend(_relocate(pending))
 
         stats = {"orders_4d": len(orders), "no_note": len(red),
                  "with_note": len(orders) - len(red),

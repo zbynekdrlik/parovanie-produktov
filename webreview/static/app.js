@@ -3343,9 +3343,14 @@ function renderOrdersReminder() {
 
   // SKIPPED — AI classified the note as 'already contacted', so no e-mail went out. Shown so the
   // manager can correct a wrong AI read (#153) — the only override here is 'send anyway'.
+  // Also carries the orders the run STARTED but could not finish (`pending` — failed send,
+  // failed classification, unwritable claim, missing MAIL_BCC): they used to disappear from the
+  // tab entirely for that run. The heading says so, and each such row states its reason.
   if (skipped.length) {
+    const pend = skipped.filter(o => o.pending).length;
     wrap.appendChild(el('div', 'warnhead',
-      `⚪ ${skipped.length} — AI usúdilo, že zákazník je už kontaktovaný`));
+      `⚪ ${skipped.length} — AI usúdilo, že zákazník je už kontaktovaný`
+      + (pend ? ` (z toho ${pend} nedokončených — automat ich nestihol vybaviť)` : '')));
     const tbl = el('table', 'posta-table');
     tbl.dataset.testid = 'ordrem-skipped';
     tbl.innerHTML = '<thead><tr><th>Objednávka</th><th>Zákazník</th><th>Položka</th>'
@@ -3357,7 +3362,9 @@ function renderOrdersReminder() {
         `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
         + `<td>${escapeHtml(o.billFullName || '')}<div class="sub2">${escapeHtml(o.email || '')}</div></td>`
         + `<td>${escapeHtml(o.itemName || '')}<div class="sub2">${o.days || 0} ${dniLabel(o.days || 0)} v stave</div></td>`
-        + `<td class="sub2">${escapeHtml(o.shopRemark || '—')}</td>`;
+        + `<td class="sub2">${escapeHtml(o.shopRemark || '—')}`
+        + (o.pending ? `<div class="sub2">⚠️ ${escapeHtml(o.pending)}</div>` : '')
+        + `</td>`;
       const actTd = el('td', 'ordrem-actions');
       const sendBtn = el('button', 'btn sm ghost ordrem-act-send', '▶ Poslať pripomienku');
       _ordremAction(sendBtn, o.code, 'send');
