@@ -1244,3 +1244,97 @@ def test_a_future_claim_does_not_block_a_manual_send(iso):
     assert r.status_code == 200
     assert [m["to"] for m in iso["sent"]] == ["a@x.sk"]
     assert _store(iso)["orders"]["20261000"]["status"] == "emailed"
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #225 — a CORRUPT dedup store must never be degraded to {}.
+# Every other store in this app uses the „SAFE loader" pattern (unparseable → {}) because
+# losing a display flag is cosmetic. This file is different: it IS the record of which
+# customers were already mailed. Swallow a partial write here and the very next `_claim` /
+# `_persist_done` persists a brand-new ONE-entry map — the whole dedup history is gone and
+# every open order gets a SECOND reminder. So it fails CLOSED: copy the corrupt bytes aside,
+# abort the run, mail nobody, and let a human repair the file. A MISSING file stays a
+# legitimate first run and must not be blocked.
+# ═════════════════════════════════════════════════════════════════════════════════
+_TRUNCATED = '{"orders": {"20261001": {"status": "emai'      # partial write / full disk
+
+
+def test_corrupt_dedup_store_aborts_the_run_and_mails_nobody(iso):
+    webapp.run_orders_reminder()                       # run 1: 20261001 gets its reminder
+    assert len(iso["sent"]) == 1
+    p = iso["tmp"] / "orders_reminder.json"
+    p.write_text(_TRUNCATED, encoding="utf-8")
+    iso["sent"].clear()
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+
+    assert iso["sent"] == []                           # NOTHING was mailed
+    # the corrupt bytes are still there (never silently replaced by a fresh empty store)…
+    assert p.read_text(encoding="utf-8") == _TRUNCATED
+    # …and a copy is preserved for repair
+    backups = list(iso["tmp"].glob("orders_reminder.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == _TRUNCATED
+
+
+def test_a_json_list_in_the_store_is_corruption_too(iso):
+    """`isinstance(d, dict) else {}` was the second silent-wipe path: a store that parses but
+    is not a dict used to become {} exactly like an unreadable one."""
+    (iso["tmp"] / "orders_reminder.json").write_text('["not", "a", "store"]', encoding="utf-8")
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_orders_reminder()
+    assert iso["sent"] == []
+
+
+def test_a_missing_store_is_a_normal_first_run(iso):
+    """The guard must distinguish „no file yet" (nothing was ever sent — nothing to lose) from
+    „unreadable file". Blocking the first run would break every fresh deploy."""
+    assert not (iso["tmp"] / "orders_reminder.json").exists()
+    stats = webapp.run_orders_reminder()               # must NOT raise
+    assert stats["emailed_now"] == 1
+
+
+def test_repeated_runs_do_not_pile_up_identical_corrupt_copies(iso):
+    """A daily automation would otherwise leave one backup per run until someone notices."""
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    for _ in range(3):
+        with pytest.raises(webapp.DedupStoreCorrupt):
+            webapp.run_orders_reminder()
+    assert len(list(iso["tmp"].glob("orders_reminder.json.corrupt-*"))) == 1
+
+
+def test_corrupt_store_surfaces_as_an_automation_error(iso):
+    """The manager must SEE why nothing was sent — a dead automation that looks like a quiet
+    day is the exact failure `bcc_missing` / `· chyby: N` exist to prevent."""
+    c = authed_client()
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    assert c.post("/api/automations/orders_reminder/run").get_json()["started"] is True
+    webapp.RUNNER._threads["orders_reminder"].join(timeout=15)
+    (a,) = [x for x in c.get("/api/automations").get_json()["automations"]
+            if x["key"] == "orders_reminder"]
+    assert a["last_status"] == "error"
+    assert "poškoden" in a["last_error"].lower()
+    assert iso["sent"] == []
+
+
+def test_manual_override_refuses_to_send_from_a_corrupt_store(iso):
+    """The endpoint writes into the SAME dedup map, so it must fail closed too — otherwise the
+    manual send is recorded into a fresh empty store and the wipe happens anyway."""
+    c = _seed(iso)
+    iso["sent"].clear()
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 503
+    assert "poškoden" in r.get_json()["error"].lower()
+    assert iso["sent"] == []
+
+
+def test_the_tab_still_renders_with_a_corrupt_store(iso):
+    """Read-only DISPLAY must keep degrading gracefully (never a 500) — the fail-closed rule is
+    about SENDING, not about rendering."""
+    c = _seed(iso)
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    r = c.get("/api/orders-reminder")
+    assert r.status_code == 200
+    assert r.get_json()["red"] == []

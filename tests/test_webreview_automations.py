@@ -451,3 +451,62 @@ def test_a_non_date_at_value_does_not_freeze_a_shipment(iso, monkeypatch, bad_at
     assert stats["emails_sent"] == 1                  # …and the customer IS told
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert "EF000000002SK" not in st["terminal"]      # the bogus entry is dropped, not refreshed
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #225 — the ESCALATION store is a dedup store too: it records how many mails each
+# uncollected shipment already got. Degrading a corrupt one to {} restarts every
+# escalation at count 0, so every customer with a parcel at the post office is mailed
+# AGAIN. Same fail-closed rule as data/out/orders_reminder.json: preserve the bytes,
+# abort the run, mail nobody. A MISSING file remains a legitimate first run.
+# ═════════════════════════════════════════════════════════════════════════════════
+_TRUNCATED = '{"escalation": {"2026100": "1|2026-0'          # partial write / full disk
+
+
+def test_corrupt_escalation_store_aborts_the_run_and_mails_nobody(iso, monkeypatch):
+    webapp.run_posta_uncollected()                     # run 1: one escalation mail goes out
+    assert len(iso["sent"]) == 1
+    p = iso["tmp"] / "posta_uncollected.json"
+    p.write_text(_TRUNCATED, encoding="utf-8")
+    iso["sent"].clear()
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+
+    with pytest.raises(webapp.DedupStoreCorrupt):
+        webapp.run_posta_uncollected()
+
+    assert iso["sent"] == []                           # NOTHING was mailed…
+    assert asked == []                                 # …and the run stopped before any API call
+    assert p.read_text(encoding="utf-8") == _TRUNCATED  # corrupt bytes preserved
+    backups = list(iso["tmp"].glob("posta_uncollected.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == _TRUNCATED
+
+
+def test_missing_posta_store_is_a_normal_first_run(iso):
+    assert not (iso["tmp"] / "posta_uncollected.json").exists()
+    stats = webapp.run_posta_uncollected()             # must NOT raise
+    assert stats["emails_sent"] == 1
+
+
+def test_corrupt_escalation_store_surfaces_as_an_automation_error(iso):
+    c = authed_client()
+    (iso["tmp"] / "posta_uncollected.json").write_text(_TRUNCATED, encoding="utf-8")
+    assert c.post("/api/automations/posta_uncollected/run").get_json()["started"] is True
+    webapp.RUNNER._threads["posta_uncollected"].join(timeout=15)
+    (a,) = [x for x in c.get("/api/automations").get_json()["automations"]
+            if x["key"] == "posta_uncollected"]
+    assert a["last_status"] == "error"
+    assert "poškoden" in a["last_error"].lower()
+    assert iso["sent"] == []
+
+
+def test_the_posta_tab_still_renders_with_a_corrupt_store(iso):
+    """Read-only DISPLAY keeps degrading gracefully — fail-closed is about SENDING."""
+    c = authed_client()
+    webapp.run_posta_uncollected()
+    (iso["tmp"] / "posta_uncollected.json").write_text(_TRUNCATED, encoding="utf-8")
+    r = c.get("/api/posta-uncollected")
+    assert r.status_code == 200
+    assert r.get_json()["uncollected"] == []
