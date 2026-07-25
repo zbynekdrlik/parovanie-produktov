@@ -539,3 +539,94 @@ def test_override_send_does_not_email_the_customer_without_mail_bcc(iso, monkeyp
     assert r.status_code == 502
     assert _FakeSMTP.last_rcpt is None
     assert "20261000" not in _store(iso).get("orders", {})   # claim released, retry possible
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #223 review — the READ side of the lost update (BUG 3 fixed only the WRITE side)
+# plus two claim-lifecycle holes. Same symptom every time: a duplicate customer mail.
+# ═════════════════════════════════════════════════════════════════════════════════
+MIDRUN_ROW = ("20261005;" + OLD + " 05:00:00;Vybavuje sa;volať zákazníka;mid@x.sk;;"
+              "Stred Behu;Čelovka;1;15,00")
+
+
+def _csv_with_midrun_order():
+    return (ORDERS_CSV.decode("cp1250").rstrip("\r\n") + "\r\n" + MIDRUN_ROW + "\r\n"
+            ).encode("cp1250")
+
+
+def _override_store_on_first_classify(monkeypatch, entry):
+    """Write `entry` for 20261005 into the store during the FIRST classification of the run —
+    i.e. exactly while the run is busy in OpenAI/SMTP, the window an override lands in."""
+    seen = []
+
+    def classify(note):
+        seen.append(note)
+        if len(seen) == 1:
+            st = webapp._load_orders_reminder()
+            st.setdefault("orders", {})["20261005"] = entry
+            webapp._save_orders_reminder(st)
+        return _CLASSIFY[note]
+
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_midrun_order)
+    monkeypatch.setattr(webapp, "_classify_contacted", classify)
+    return seen
+
+
+def test_override_resolved_during_a_run_is_not_remailed_by_that_run(iso, monkeypatch):
+    """The run decided from `done` — the START-of-run snapshot — so an order the manager
+    resolved minutes ago (while the run sat in OpenAI/SMTP) was still classified and mailed."""
+    _override_store_on_first_classify(
+        monkeypatch, {"status": "emailed", "manual": True, "date": "during-run"})
+    webapp.run_orders_reminder()
+    assert all(m["to"] != "mid@x.sk" for m in iso["sent"])        # no duplicate mail
+    assert _store(iso)["orders"]["20261005"]["date"] == "during-run"   # record untouched
+
+
+def test_run_does_not_race_a_manual_send_claimed_during_the_run(iso, monkeypatch):
+    """Same read-side hole for the in-flight claim: a manual send claimed WHILE the run is
+    working was invisible to it, so both mailed the same customer."""
+    fresh = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    _override_store_on_first_classify(
+        monkeypatch, {"status": "sending", "claimed_at": fresh, "claim": "abc123"})
+    webapp.run_orders_reminder()
+    assert all(m["to"] != "mid@x.sk" for m in iso["sent"])        # left to the manual send
+    assert _store(iso)["orders"]["20261005"]["status"] == "sending"   # claim not clobbered
+
+
+def test_abandoned_claim_does_not_block_marking_the_order_contacted(iso):
+    """A claim orphaned by a restart/500 between claim and send must not permanently 409 the
+    'contact' action — the manager would have no way to resolve that order, ever."""
+    c = _seed(iso)
+    st = _store(iso)
+    stale = (datetime.now(timezone.utc).astimezone() - timedelta(hours=2)).isoformat()
+    st.setdefault("orders", {})["20261000"] = {"status": "sending", "claimed_at": stale}
+    webapp._save_orders_reminder(st)
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "contact"})
+    assert r.status_code == 200 and r.get_json()["status"] == "skipped_contacted"
+    assert _store(iso)["orders"]["20261000"]["status"] == "skipped_contacted"
+
+
+def test_override_send_reports_honestly_when_the_mail_left_but_the_write_failed(iso, monkeypatch,
+                                                                                caplog):
+    """The mail ALREADY went out — reporting a plain failure would invite the manager to click
+    again (duplicate mail). The response must say so explicitly and the order code must be
+    logged for manual follow-up."""
+    c = _seed(iso)
+    real_save = webapp._save_orders_reminder
+    n = {"calls": 0}
+
+    def flaky_save(data):
+        n["calls"] += 1
+        if n["calls"] == 2:            # 1 = the claim, 2 = the post-send record
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", flaky_save)
+    iso["sent"].clear()
+    with caplog.at_level("ERROR"):
+        r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.get_json()["error"]                       # a handled JSON error, not a bare 500 page
+    assert "odišiel" in r.get_json()["error"].lower()  # tells the manager NOT to click again
+    assert len([m for m in iso["sent"] if m["to"] == "a@x.sk"]) == 1     # sent exactly once
+    assert any("20261000" in rec.getMessage() for rec in caplog.records
+               if rec.levelname == "ERROR")

@@ -293,3 +293,24 @@ def test_posta_run_does_not_email_the_customer_without_mail_bcc(iso, monkeypatch
     # escalation NOT bumped → the mail is retried once MAIL_BCC is configured
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert st.get("escalation", {}) == {}
+
+
+def test_posta_persist_failure_still_shows_the_shipment_in_the_tab(iso, monkeypatch):
+    """A failed immediate-persist must not hide the shipment from „Nevyzdvihnuté" — that row is
+    exactly the one the error log tells the manager to check by hand. (The escalation bump also
+    survives: it is held in memory and re-persisted by the run's final save.)"""
+    real_save = webapp._save_posta_state
+    n = {"calls": 0}
+
+    def flaky_save(data):
+        n["calls"] += 1
+        if n["calls"] == 1:
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_posta_state", flaky_save)
+    stats = webapp.run_posta_uncollected()
+    assert stats["uncollected"] == 1
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert [u["orderCode"] for u in st["uncollected"]] == ["2026100"]
+    assert st["escalation"] == {"2026100": f"1|{TODAY.isoformat()}"}
