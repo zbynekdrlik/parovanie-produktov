@@ -5326,11 +5326,15 @@ def run_orders_reminder() -> dict:
         # immediately, so the on-disk `orders` map is the authoritative one: re-read it and
         # replace only the DISPLAY fields.
         st = _load_orders_reminder()
-        # `orders` is guaranteed dict-or-absent by the loader's dedup_keys guard. It used to fall
-        # back to `dict(done)` here, and THAT was the last silent-wipe path: with a non-dict map
-        # on disk, `done` (which the run had also read as empty) was written back as the whole
-        # dedup history (PR #228 review). Now the load raises long before this point.
-        orders_map = st.get("orders") or {}
+        # `orders` is guaranteed dict-or-absent by the loader's dedup_keys guard — a non-dict map
+        # raises long before this point, so the fallback below can only fire when the map is
+        # ABSENT (the file vanished mid-run: deleted by hand, a cleanup job, a botched restore).
+        # It MUST fall back to `dict(done)` and never to `{}`: `done` is the start-of-run snapshot
+        # PLUS every record this run persisted, so it is never less complete than a missing map,
+        # while `{}` would write an empty dedup history back and make the next run re-mail every
+        # customer served so far (PR #228 review F3, regression test in
+        # test_a_store_that_vanishes_mid_run_keeps_the_dedup_history).
+        orders_map = st.get("orders") or dict(done)
         # …but a record whose immediate write FAILED never reached that map, so re-apply it ON
         # TOP — otherwise the lost-update fix silently throws away the proof that a mail really
         # was sent, and the next run re-sends it. Only a record that is still non-terminal on
