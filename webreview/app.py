@@ -437,7 +437,13 @@ def _smtp_deliver(sender, rcpt, msg_str, to) -> bool:
     * `sendmail()` only RAISES when EVERY recipient is refused; a PARTIAL refusal comes back as
       a plain dict. So a refused CUSTOMER address must be reported as a failure (state not
       bumped → retried next run), while a refused BCC-only address must not throw away the
-      fact that the customer's copy did go out (BUG 5)."""
+      fact that the customer's copy did go out (BUG 5).
+
+    The connection is closed on EVERY exit path (PR #223 review): `quit()` is only reached on
+    the success path, so a raise out of starttls()/login()/sendmail() — or out of quit()
+    itself — used to leave the socket open until the garbage collector happened to run. This
+    box mails all day (two customer automations + password resets), so that is a slow
+    file-descriptor leak here and a pile of half-open connections on the SMTP relay."""
     host = os.environ.get("MAIL_HOST")
     port = int(os.environ.get("MAIL_PORT", "587"))
     user = os.environ.get("MAIL_USER", "")
@@ -446,15 +452,27 @@ def _smtp_deliver(sender, rcpt, msg_str, to) -> bool:
         smtp = smtplib.SMTP_SSL(host, port, timeout=20)
     else:
         smtp = smtplib.SMTP(host, port, timeout=20)
-        smtp.starttls()
-    if user:
-        smtp.login(user, pw)
-    refused = smtp.sendmail(sender, rcpt, msg_str) or {}
-    try:          # handed over — from here on NOTHING may turn this into a reported failure
-        smtp.quit()
-    except Exception as e:  # noqa: BLE001 — the mail already left; closing politely is optional
-        log.warning("mail: SMTP quit() zlyhalo PO úspešnom odoslaní na %s (mail UŽ odišiel, "
-                    "beriem to ako úspech): %r", to, e)
+    closed = False
+    try:
+        if port != 465:
+            smtp.starttls()
+        if user:
+            smtp.login(user, pw)
+        refused = smtp.sendmail(sender, rcpt, msg_str) or {}
+        try:      # handed over — from here on NOTHING may turn this into a reported failure
+            smtp.quit()
+            closed = True
+        except Exception as e:  # noqa: BLE001 — the mail already left; a polite close is optional
+            log.warning("mail: SMTP quit() zlyhalo PO úspešnom odoslaní na %s (mail UŽ odišiel, "
+                        "beriem to ako úspech): %r", to, e)
+    finally:
+        if not closed:
+            # best-effort teardown of a connection quit() never got to (or failed on); it must
+            # never mask the original failure, nor turn a delivered mail into a reported one
+            try:
+                smtp.close()
+            except Exception as e:  # noqa: BLE001
+                log.debug("mail: SMTP close() po zlyhaní: %r", e)
     if refused:
         if str(to).strip().lower() in {str(a).strip().lower() for a in refused}:
             log.error("mail: server ODMIETOL príjemcu %s (%r) — mail mu NEODIŠIEL, stav "
@@ -3965,7 +3983,11 @@ def run_posta_uncollected() -> dict:
     esc = {k: v for k, v in esc.items() if k in codes}
     stats = {"checked": len(shipments), "uncollected": len(uncollected),
              "invalid": len(invalid), "errors": len(errors),
-             "emails_sent": sent, "emails_failed": failed}
+             "emails_sent": sent, "emails_failed": failed,
+             # „BCC vždy" is BINDING for these customer mails (require_bcc): with no MAIL_BCC not
+             # one escalation goes out. Surfaced so the tab shows a dead automation as dead
+             # instead of a healthy-looking run that quietly mailed nobody (ERROR log only).
+             "bcc_missing": not (os.environ.get("MAIL_BCC") or "").strip()}
     with _lock:
         _save_posta_state({
             "escalation": esc,
@@ -4753,12 +4775,14 @@ def run_orders_reminder() -> dict:
     not-yet-terminal order is always fully (re)processed).
 
     Duplicate-mail safety: the dedup record of every send is persisted IMMEDIATELY (a failed
-    write is logged with the order code and the run continues), the final save re-reads the
-    `orders` map from disk instead of writing back the start-of-run snapshot (so a manual
-    override written mid-run is never discarded), and an order the manager is manually sending
-    right now (a live 'sending' claim) is skipped. An order with no customer e-mail is surfaced
-    in `no_email` WITHOUT an AI call — it can never be mailed, so classifying it would buy a
-    paid OpenAI call on every run forever."""
+    write is logged with the order code, re-applied by the final save, and the run continues),
+    the final save re-reads the `orders` map from disk instead of writing back the start-of-run
+    snapshot (so a manual override written mid-run is never discarded), and the run CLAIMS each
+    order it is about to classify+mail — the same transient 'sending' record the manual override
+    takes — so a click landing in its OpenAI+SMTP window is rejected instead of mailing the
+    customer a second time. An order with no customer e-mail is surfaced in `no_email` WITHOUT
+    an AI call — it can never be mailed, so classifying it would buy a paid OpenAI call on every
+    run forever."""
     csv_bytes = _orders_csv_cached()
     orders = orders_reminder.select_orders(csv_bytes)
     with _lock:
@@ -4775,8 +4799,14 @@ def run_orders_reminder() -> dict:
     to_process, already_seen, fingerprints = orders_reminder.partition_incremental(
         orders, prev_fp, {c for c, v in done.items() if _reminder_is_terminal(v)})
     have_key = bool(os.environ.get("OPENAI_API_KEY"))
+    # „BCC vždy" is BINDING for these customer mails (require_bcc below): with no MAIL_BCC not a
+    # single reminder goes out. Surfaced in the stats so the tab shows a dead automation as dead
+    # instead of a healthy-looking run that quietly mailed nobody (only an ERROR line before).
+    bcc_missing = not (os.environ.get("MAIL_BCC") or "").strip()
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    run_token = secrets.token_hex(8)     # identifies THIS run's claims (never release a foreign one)
     red, orange, skipped, no_email = [], [], [], []
+    failed_writes = set()                # codes whose immediate dedup write did not reach disk
     emailed_now = skipped_now = ai_unavailable = errors = 0
 
     def _persist_done(code: str, entry: dict) -> None:
@@ -4789,12 +4819,68 @@ def run_orders_reminder() -> dict:
                 st.setdefault("orders", {})[code] = entry
                 _save_orders_reminder(st)
         except Exception as e:  # noqa: BLE001 — full disk / permissions
-            # The mail ALREADY went out but its record is lost, so the next run would re-send
-            # it. Surface the order code loudly for manual follow-up and keep the run going —
-            # aborting here would leave the remaining orders unprocessed too.
+            # The mail ALREADY went out but its record did not reach disk. Remember the code:
+            # the final save re-reads `orders` from disk (the lost-update fix), so without a
+            # re-apply this record would be silently DISCARDED and the next run would e-mail the
+            # same customer again. Log it for manual follow-up and keep the run going — aborting
+            # here would leave the remaining orders unprocessed too.
+            failed_writes.add(code)
             log.error("orders_reminder: obj. %s vybavená (%s), ale zápis stavu ZLYHAL (%r) — "
-                      "hrozí duplicitný mail v ďalšom behu, skontroluj ručne",
+                      "skúsim ho znova pri záverečnom uložení, skontroluj ručne",
                       code, entry.get("status"), e)
+
+    def _claim(code: str, email: str):
+        """Take the transient 'sending' claim BEFORE this run's own OpenAI+SMTP window, in the
+        same lock as the fresh per-order read. Without it the run is invisible on disk for the
+        whole ~20 s round-trip, so a manual „▶ Poslať pripomienku" click landing in that window
+        passes the 409 gate, claims, and mails — and the run mails too (PR #223 review).
+        Returns the claim entry, or None when the order must be left alone — either someone else
+        won it meanwhile, or the claim could not be written. A claim that did not reach disk is
+        no protection at all, so the order is SKIPPED (retried next run) rather than mailed
+        unclaimed: for a customer mail, sending nothing beats sending twice."""
+        entry = {"status": "sending",
+                 # a FRESH timestamp per claim — `now_iso` is the start of the run, and a long
+                 # run would hand out claims that already look expired
+                 "claimed_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                 "claim": run_token, "email": email, "run": True}
+        try:
+            with _lock:
+                st = _load_orders_reminder()
+                cur = (st.get("orders") or {}).get(code)
+                if _reminder_claim_active(cur) or _reminder_is_terminal(cur):
+                    return None
+                st.setdefault("orders", {})[code] = entry
+                _save_orders_reminder(st)
+        except Exception as e:  # noqa: BLE001 — full disk / permissions; never crash the run
+            log.error("orders_reminder: nárok na obj. %s sa nepodarilo zapísať (%r) — "
+                      "objednávku preskakujem, skúsim ju v ďalšom behu", code, e)
+            return None
+        done[code] = entry
+        return entry
+
+    def _release(code: str, prev) -> None:
+        """Give the order back after OUR claim produced no result (a failed classification or
+        send) — only when the claim on disk is still ours, so a concurrent manual override that
+        resolved the order meanwhile is never clobbered. Without this a transient failure would
+        lock the order until the TTL lapses."""
+        try:
+            with _lock:
+                st = _load_orders_reminder()
+                cur = (st.get("orders") or {}).get(code)
+                if not isinstance(cur, dict) or cur.get("claim") != run_token:
+                    return
+                if isinstance(prev, dict):
+                    st["orders"][code] = prev
+                else:
+                    st.get("orders", {}).pop(code, None)
+                _save_orders_reminder(st)
+        except Exception as e:  # noqa: BLE001 — full disk / permissions; the TTL is the backstop
+            log.error("orders_reminder: uvoľnenie nároku na obj. %s zlyhalo (%r) — vyprší "
+                      "sám o %s s", code, e, SENDING_CLAIM_TTL_S)
+        if isinstance(prev, dict):
+            done[code] = prev
+        else:
+            done.pop(code, None)
 
     # unchanged + already-terminal orders: reuse the last computed display row (days refreshed)
     # — no re-classification, no OpenAI/SMTP call, no CSV-field rebuild (the incremental fast path).
@@ -4810,15 +4896,13 @@ def run_orders_reminder() -> dict:
 
     for o in to_process:
         code = o["code"]
-        if not o["has_note"]:
-            red.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
-                                          "itemName", "days", "admin_link")})
-            continue
         # Decide from the CURRENT record on disk, never from `done` (the start-of-run
         # snapshot): this run spends minutes in OpenAI + SMTP, and an override the manager
         # made in that window — resolving the order, or claiming it for a manual send — must
         # be seen here, or the run mails a customer who was just handled. This is the READ
         # side of the same lost update whose WRITE side the final save fixes.
+        # It sits ABOVE the no-note (RED) branch on purpose: an order resolved mid-run must not
+        # be re-listed as unhandled either, or the manager's next click on that row 409s.
         with _lock:
             prev = (_load_orders_reminder().get("orders") or {}).get(code)
         if prev is not None:
@@ -4832,6 +4916,10 @@ def run_orders_reminder() -> dict:
                                      "shopRemark", "days", "admin_link")}
             row["sent_date"] = prev.get("date", "")
             (orange if prev.get("status") == "emailed" else skipped).append(row)
+            continue
+        if not o["has_note"]:
+            red.append({k: o[k] for k in ("code", "billFullName", "phone", "email",
+                                          "itemName", "days", "admin_link")})
             continue
         if not o["email"]:
             # No address → the reminder can NEVER be sent → the order never becomes terminal.
@@ -4847,10 +4935,16 @@ def run_orders_reminder() -> dict:
             log.warning("orders_reminder: obj. %s má poznámku, ale OPENAI_API_KEY nie je "
                         "nastavený — AI nedostupné, pripomienku neposielam (skúsim ďalší beh)", code)
             continue                                # do NOT record → retried when key is present
+        # From here the run talks to OpenAI + SMTP for this order — claim it first so a manual
+        # send clicked in that window is rejected (409) instead of mailing the customer twice.
+        if _claim(code, o["email"]) is None:
+            log.info("orders_reminder: obj. %s si medzitým vzal niekto iný — preskakujem", code)
+            continue
         try:
             contacted = _classify_contacted(o["shopRemark"])
         except Exception as e:  # noqa: BLE001 — recorded per order, run continues
             errors += 1
+            _release(code, prev)                    # claim must not outlive the attempt
             log.error("orders_reminder: klasifikácia obj. %s zlyhala: %r", code, e)
             continue
         base = {"name": o["billFullName"], "email": o["email"],
@@ -4877,12 +4971,8 @@ def run_orders_reminder() -> dict:
             orange.append(row)
         else:
             errors += 1                             # SMTP failed → not recorded → retried next run
+            _release(code, prev)                    # claim must not outlive the attempt
 
-    stats = {"orders_4d": len(orders), "no_note": len(red),
-             "with_note": len(orders) - len(red),
-             "emailed_now": emailed_now, "emailed_total": 0,
-             "skipped_now": skipped_now, "ai_unavailable": ai_unavailable,
-             "no_email": len(no_email), "errors": errors}
     with _lock:
         # `done` is a snapshot taken at the START of the run and this run spends minutes in
         # OpenAI + SMTP — writing it back wholesale would DISCARD every dedup record the
@@ -4894,6 +4984,43 @@ def run_orders_reminder() -> dict:
         orders_map = st.get("orders")
         if not isinstance(orders_map, dict):
             orders_map = dict(done)
+        # …but a record whose immediate write FAILED never reached that map, so re-apply it ON
+        # TOP — otherwise the lost-update fix silently throws away the proof that a mail really
+        # was sent, and the next run re-sends it. Only a record that is still non-terminal on
+        # disk (typically our own 'sending' claim, or nothing at all) is overwritten: a
+        # concurrent override that reached a terminal verdict meanwhile keeps winning.
+        for c in failed_writes:
+            if c in done and not _reminder_is_terminal(orders_map.get(c)):
+                orders_map[c] = done[c]
+
+        # Display lists are computed from the start-of-run snapshot and written wholesale, so an
+        # order the manager resolved WHILE the run was working would come back onto the tab as
+        # unhandled — and their next click on it would 409. Move any such row to the list its
+        # new status belongs to. (`no_email` rows are not reachable from the override endpoint
+        # today; filtering them too costs nothing and keeps the two lists consistent.)
+        resolved = {c: v for c, v in orders_map.items() if _reminder_is_terminal(v)}
+
+        def _relocate(rows):
+            keep = []
+            for r in rows:
+                ent = resolved.get(r.get("code"))
+                if ent is None:
+                    keep.append(r)
+                    continue
+                dest = orange if ent.get("status") == "emailed" else skipped
+                if r.get("code") not in {x.get("code") for x in dest}:
+                    dest.append({**r, "sent_date": ent.get("date", "")})
+            return keep
+
+        red = _relocate(red)
+        no_email = _relocate(no_email)
+
+        stats = {"orders_4d": len(orders), "no_note": len(red),
+                 "with_note": len(orders) - len(red),
+                 "emailed_now": emailed_now, "emailed_total": 0,
+                 "skipped_now": skipped_now, "ai_unavailable": ai_unavailable,
+                 "no_email": len(no_email), "errors": errors,
+                 "bcc_missing": bcc_missing}
         stats["emailed_total"] = sum(1 for v in orders_map.values()
                                      if isinstance(v, dict) and v.get("status") == "emailed")
         st.update({
@@ -5444,6 +5571,15 @@ def api_orders_reminder_override():
                                 "status": "sending"}), 409
             if not (row.get("email") or ""):
                 return jsonify({"ok": False, "error": "objednávka nemá e-mail"}), 400
+            if not (os.environ.get("MAIL_BCC") or "").strip():
+                # „BCC vždy" is BINDING for a customer mail, so _send_mail_html would refuse and
+                # the manager would get a generic 502 „odoslanie zlyhalo" — indistinguishable
+                # from a transient glitch, so they keep clicking forever. Pre-flight it BEFORE
+                # the claim: no wasted claim, and an answer that says what to actually fix.
+                log.error("orders_reminder: manual send obj. %s odmietnutý — MAIL_BCC nie je "
+                          "nastavené (data/.mail_env)", code)
+                return jsonify({"ok": False, "error": (
+                    "Chýba MAIL_BCC v data/.mail_env — mail sa neodošle, doplň konfiguráciu.")}), 503
             # CLAIM the send before releasing the lock — a concurrent double-click now 409s
             st.setdefault("orders", {})[code] = {
                 "status": "sending", "claimed_at": now_iso, "claim": claim_token,
@@ -5515,9 +5651,25 @@ def api_orders_reminder_override():
             _save_orders_reminder(st)
     except Exception as e:  # noqa: BLE001 — full disk / permissions
         # The mail ALREADY reached the customer. Reporting a plain failure would invite the
-        # manager to click again (= a second mail), so say plainly what happened, log the code
-        # for manual follow-up, and leave the claim in place — it blocks a re-click until it
-        # expires, by which time the manager has been told to check it by hand.
+        # manager to click again (= a second mail), so say plainly what happened and log the
+        # code for manual follow-up.
+        #
+        # Leaving the transient claim in place is NOT enough (PR #223 review): `sending` expires
+        # after SENDING_CLAIM_TTL_S and is not terminal, so ten minutes later the daily run sees
+        # an unprocessed order and mails the customer AGAIN — the mitigation would depend on a
+        # human reacting within those ten minutes. Write a NON-EXPIRING terminal marker instead,
+        # in its own minimal transaction (no display-list work, which is what most likely failed
+        # above). If even that write fails nothing is worse off than before.
+        try:
+            with _lock:
+                st = _load_orders_reminder()
+                st.setdefault("orders", {})[code] = {**base, "status": "emailed",
+                                                     "persist_failed": True}
+                _save_orders_reminder(st)
+        except Exception as e2:  # noqa: BLE001 — then the TTL is all that is left
+            log.error("orders_reminder: ani núdzový zápis stavu obj. %s neprešiel (%r) — po "
+                      "vypršaní nároku (%s s) hrozí duplicitný mail v ďalšom behu",
+                      code, e2, SENDING_CLAIM_TTL_S)
         log.error("orders_reminder: mail pre obj. %s ODIŠIEL na %s, ale zápis stavu ZLYHAL "
                   "(%r) — NEposielaj znova, skontroluj ručne", code, email, e)
         return jsonify({"ok": False, "error": (

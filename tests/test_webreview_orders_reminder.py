@@ -750,6 +750,24 @@ def test_the_runs_claim_is_released_when_its_own_send_fails(iso, monkeypatch):
     assert "20261000" not in _store(iso).get("orders", {})         # …and released after
 
 
+def test_a_claim_that_cannot_be_written_skips_the_order_instead_of_mailing_it(iso, monkeypatch):
+    """A claim that never reached disk protects nothing, so the run must NOT proceed to send
+    unclaimed — and it must not crash either (VYLEPŠENIE 3): the order is simply retried."""
+    real_save = webapp._save_orders_reminder
+
+    def no_claims(data):
+        entry = (data.get("orders") or {}).get("20261001") or {}
+        if isinstance(entry, dict) and entry.get("status") == "sending":
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", no_claims)
+    stats = webapp.run_orders_reminder()                     # must not raise
+    assert stats["emailed_now"] == 0
+    assert all(m["to"] != "b@x.sk" for m in iso["sent"])     # nothing sent unclaimed
+    assert "20261001" not in _store(iso).get("orders", {})   # not recorded → retried next run
+
+
 def test_the_runs_claim_is_released_when_classification_fails(iso, monkeypatch):
     _seed(iso)
     monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)

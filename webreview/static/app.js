@@ -2330,6 +2330,15 @@ function fmtDt(iso) {
 
 function dniLabel(n) { return n === 1 ? 'deň' : (n >= 2 && n <= 4 ? 'dni' : 'dní'); }
 
+// „BCC vždy" is BINDING for the two CUSTOMER automations (Pošta escalation + order reminders):
+// with no MAIL_BCC configured they refuse to send anything at all. That used to be an ERROR line
+// in the log only, so the tab showed a healthy run that had quietly mailed nobody — a silently
+// dead automation. The run now reports `bcc_missing` and both tabs surface it.
+function bccMissingWarning() {
+  return el('div', 'autoerr', '⚠️ Chýba MAIL_BCC v data/.mail_env — automatizácia NEPOSIELA '
+    + 'žiadne e-maily zákazníkom, kým sa nedoplní konfigurácia.');
+}
+
 function renderPosta() {
   const wrap = document.getElementById('tab-posta');
   if (!wrap) return;
@@ -2378,6 +2387,7 @@ function renderPosta() {
         + (lr.invalid ? ` · nesledovateľné: ${lr.invalid}` : '')
         + (lr.errors ? ` · chyby pri kontrole: ${lr.errors}` : '')));
     }
+    if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
   }
   wrap.appendChild(st);
 
@@ -3223,6 +3233,7 @@ function renderOrdersReminder() {
       + (lr.no_email ? ` · chýba e-mail: ${lr.no_email}` : '')
       + (lr.errors ? ` · chyby: ${lr.errors}` : '')));
   }
+  if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
   wrap.appendChild(st);
 
   const d = ORDERS_REMINDER || {};

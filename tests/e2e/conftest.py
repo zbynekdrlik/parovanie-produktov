@@ -511,6 +511,10 @@ def automations_server(tmp_path_factory):
         # ALREADY-SET key, so pinning MAIL_HOST="" here forces the deterministic
         # not-configured/no-network branch on every machine, CI included.
         "MAIL_HOST": "",
+        # Same reasoning for MAIL_BCC: the runs report `bcc_missing` in their stats and both
+        # customer-automation tabs render a ⚠ line from it, so an inherited value would make the
+        # tab look different on a dev box (has data/.mail_env) than on CI (does not).
+        "MAIL_BCC": "owner@example.com",
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
