@@ -239,7 +239,9 @@ def _sum_text(page):
 
 def _remaining(page):
     """the „ostáva vybaviť N" number of the #208 toolbar, in whatever scope it is showing"""
-    m = re.search(r"stáva vybaviť (\d+) položi", _sum_text(page))   # „Ostáva" / „ostáva"
+    # „Ostáva" / „ORBIS: ostáva", and the noun is declined (1 položku / 2-4 položky / 5+
+    # položiek), so the prefix stops before the ending
+    m = re.search(r"stáva vybaviť (\d+) polož", _sum_text(page))
     assert m, _sum_text(page)
     return int(m.group(1))
 
