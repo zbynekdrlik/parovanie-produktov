@@ -753,19 +753,30 @@ async function switchTab(tab) {
   if (tab === 'search') { const b = document.getElementById('searchBox'); if (b) b.focus(); }
 }
 
+// The flag maps are replaced by the server's own state, so every in-flight write's
+// bookkeeping becomes void — dropping it stops a late failure from rolling FRESH data
+// back to a baseline that predates the reload (the `live` check in saveOrderFlag).
+// Fetch first, then drop the bookkeeping and install the new maps in ONE synchronous
+// block: clearing `_flagWrites` five awaits BEFORE the maps were swapped left a window in
+// which a click seeded its baseline from a still-optimistic value AND bound its write to
+// a map object about to be thrown away — a rollback into thin air.
 async function loadOrders() {
-  // the flag maps are about to be replaced by the server's own state, so every in-flight
-  // write's bookkeeping is void — dropping it stops a late failure from rolling FRESH
-  // data back to a baseline that predates the reload (the `live` check in saveOrderFlag)
-  for (const k of Object.keys(_flagWrites)) delete _flagWrites[k];
+  const _wipe = () => { for (const k of Object.keys(_flagWrites)) delete _flagWrites[k]; };
   try {
-    ORDERS = (await (await fetch('/api/orders')).json()).orders || [];
-    ORDERED = (await (await fetch('/api/ordered')).json()).ordered || {};
-    WAITING = (await (await fetch('/api/waiting')).json()).waiting || {};
-    INSTOCK = (await (await fetch('/api/instock')).json()).instock || {};
-    UNAVAIL = (await (await fetch('/api/unavailable')).json()).unavailable || {};
-    ORDER_COMMENTS = (await (await fetch('/api/order-comment')).json()).comments || {};
-  } catch (_) { ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; ORDER_COMMENTS = {}; }
+    const [orders, ordered, waiting, instock, unavail, comments] = await Promise.all(
+      ['/api/orders', '/api/ordered', '/api/waiting', '/api/instock', '/api/unavailable',
+       '/api/order-comment'].map(u => fetch(u).then(r => r.json())));
+    _wipe();
+    ORDERS = orders.orders || [];
+    ORDERED = ordered.ordered || {};
+    WAITING = waiting.waiting || {};
+    INSTOCK = instock.instock || {};
+    UNAVAIL = unavail.unavailable || {};
+    ORDER_COMMENTS = comments.comments || {};
+  } catch (_) {
+    _wipe();
+    ORDERS = []; ORDERED = {}; WAITING = {}; INSTOCK = {}; UNAVAIL = {}; ORDER_COMMENTS = {};
+  }
 }
 
 // #214 — every write on the „Na objednanie" tab reports its own failure. A silent
@@ -894,6 +905,11 @@ async function saveOrderFlag(path, field, map, key, on, what) {
   if (!err && live && seq >= st.confirmedSeq) { st.confirmed = on; st.confirmedSeq = seq; }
   if (!live || seq !== st.seq) {              // superseded: the newest write owns the row
     if (live && st.inflight === 0) _reconcileFlag(st, map, key);
+    // A write the reload DISOWNED has no map left to roll back — but it still failed, and
+    // returning `false` in silence is the very silent-lost-write #214 exists to kill. A
+    // write superseded by a NEWER one on the same row stays quiet on purpose: that newer
+    // write owns the row and does the reporting.
+    if (!live && err) toOrderSaveFailed(what, err, toOrderRowLabel(key), on);
     return !err;
   }
   if (!err) return true;
@@ -901,18 +917,6 @@ async function saveOrderFlag(path, field, map, key, on, what) {
   renderToOrder();              // roll the tab back BEFORE the message, never after
   toOrderSaveFailed(what, err, toOrderRowLabel(key), on);
   return false;
-}
-
-// A write that did NOT go through saveOrderFlag (the bulk „označiť skupinu objednané")
-// still changes the same rows on the server, so it must join the same bookkeeping —
-// otherwise a slow per-row toggle that fails afterwards rolls the row back to a value the
-// bulk write has since replaced, and alerts about it. Bumping `seq` supersedes any
-// per-row write still in flight for that row.
-function noteFlagConfirmed(field, map, keys, on) {
-  for (const key of keys) {
-    const st = _flagEntry(field, key, map);
-    st.seq += 1; st.confirmed = on; st.confirmedSeq = st.seq;
-  }
 }
 
 const saveOrdered = (key, on) =>
@@ -928,16 +932,51 @@ const saveUnavailable = (key, on) =>
 // všetko naraz). Pošle všetky per-riadkové kľúče cez bulk endpoint, updatne ORDERED
 // mapu a prekreslí. items = riadky skupiny (each carries o.key = orderCode|itemCode).
 // ORDERED sa mení až PO úspechu, takže pri zlyhaní netreba nič vracať — len to povedať.
+//
+// A write that does not go through saveOrderFlag still changes the same rows, so it joins
+// the same `_flagWrites` bookkeeping — and it takes its sequence numbers when it is
+// ISSUED, exactly like a per-row write. Claiming them at RESPONSE time was the bug: the
+// bulk then outranked per-row writes the manager issued AFTER clicking it (newer intent,
+// and committed LATER on the server behind the bulk's own `with _lock:`), so his last
+// click was silently inverted — the tab painted the row the bulk's way, `_reconcileFlag`
+// forced the map to match on settle, and nothing was reported. Issue-time sequencing puts
+// the bulk where it belongs in the order and keeps the mirror case right too: a bulk that
+// was ACCEPTED is the newest server truth for its rows, so a later refused write rolls
+// back onto it, not onto the pre-bulk baseline.
 async function markGroupOrdered(items, ordered) {
   const keys = items.map(o => o.key);
-  const err = await postToOrder('/api/ordered/bulk', { keys, ordered });
+  const sts = keys.map(k => _flagEntry('ordered', k, ORDERED));
+  const seqs = sts.map(st => ++st.seq);
+  sts.forEach(st => { st.inflight += 1; });
+  let err;
+  // unskippable, for the same reason as in saveOrderFlag: a leaked counter would disable
+  // reconciliation for those rows for the lifetime of the page
+  try {
+    err = await postToOrder('/api/ordered/bulk', { keys, ordered });
+  } finally { sts.forEach(st => { st.inflight -= 1; }); }
+  let repaint = false;
+  keys.forEach((key, i) => {
+    const st = sts[i], seq = seqs[i];
+    if (_flagWrites[st.wk] !== st) return;      // loadOrders() disowned this write
+    if (!err && seq >= st.confirmedSeq) { st.confirmed = ordered; st.confirmedSeq = seq; }
+    if (seq !== st.seq) {                       // a later write owns this row now
+      // …and once nothing else is out for it, the map owes the server's own last word
+      if (st.inflight === 0 && !!ORDERED[key] !== st.confirmed) {
+        if (st.confirmed) ORDERED[key] = true; else delete ORDERED[key];
+        repaint = true;
+      }
+      return;
+    }
+    if (err) return;
+    if (ordered) ORDERED[key] = true; else delete ORDERED[key];
+    repaint = true;
+  });
   if (err) {
+    if (repaint) renderToOrder();        // roll the tab back BEFORE the message, never after
     toOrderSaveFailed('Hromadné označenie skupiny', err,
                       items.length ? 'skupina ' + effSup(items[0]) : '', ordered);
     return false;
   }
-  noteFlagConfirmed('ordered', ORDERED, keys, ordered);   // supersede in-flight per-row writes
-  for (const k of keys) { if (ordered) ORDERED[k] = true; else delete ORDERED[k]; }
   renderToOrder();
   return true;
 }
@@ -1195,7 +1234,39 @@ function openRowEditor(node, editor, alsoRemove) {
 // straight back: that box still holds his unsaved work.
 async function commitEditor(wrap, save) {
   wrap.dataset.editorSaving = '1';
-  if (!(await save())) delete wrap.dataset.editorSaving;
+  if (await save()) return;
+  delete wrap.dataset.editorSaving;
+  // …but a repaint during the flight (a failed flag write, a sibling's successful save)
+  // has already dropped this node, and an EMPTY commit leaves captureOpenEditors nothing
+  // to carry over (value '' with the „he opened it himself" claim consumed) — so the box
+  // simply vanished, and the claim just went back to a DETACHED node. He is being told
+  // his save failed while the editor holding that work is gone: give it back.
+  if (!wrap.isConnected) reopenDetachedEditor(wrap);
+}
+
+// Re-open the editor `wrap` used to be, on the freshly rendered row, with the text it
+// held. The old subtree is detached but intact, so it still carries both the row key and
+// the value. Deliberately mirrors restoreOpenEditors' mechanics (same `_EDITORS` spec) —
+// this is the same job, just one repaint too late to be caught by the snapshot.
+function reopenDetachedEditor(wrap) {
+  const spec = _EDITORS[wrap.dataset.editor];
+  const oldRow = wrap.closest('.toorder-row');
+  const key = oldRow && oldRow.dataset.key;
+  const opened = wrap.dataset.editorOpened === '1';
+  const inpOld = spec && wrap.querySelector(spec.input);
+  if (!spec || !key || !inpOld) return;
+  const value = inpOld.value;
+  if (!value.trim() && !opened) return;      // nothing of his to give back
+  const row = [...document.querySelectorAll('#list .toorder-row')]
+    .find(r => r.dataset.key === key);
+  const o = row && ORDERS.find(x => x.key === key);
+  if (!o) return;                            // row filtered out / gone — nowhere to put it
+  let inp = row.querySelector(spec.input), ed = null;
+  if (!inp) { ed = spec.open(o, row); inp = ed && ed.querySelector(spec.input); }
+  if (!inp) return;
+  if (opened && ed) ed.dataset.editorOpened = '1';   // the claim comes back with the box
+  inp.value = value;
+  inp.focus();
 }
 
 // effective supplier for grouping: the order's OWN supplier (from Shoptet) wins;
