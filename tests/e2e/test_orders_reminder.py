@@ -239,3 +239,38 @@ def test_preview_button_shows_the_email_without_sending(page, automations_server
     modal.locator("#emClose").click()
     page.wait_for_selector("#emModal", state="hidden")
     assert console == [], f"console not clean: {console}"
+
+
+# ── #225 — a corrupt store must be ANNOUNCED, on every render path ────────────────
+def test_corrupt_store_banner_renders_on_both_paths(page, automations_server):
+    """A corrupt dedup store makes the automation refuse to send, and the tab's lists come back
+    empty — indistinguishable from a quiet day unless the tab says so. Both render paths must
+    announce it: the normal one AND the early return taken when /api/automations is unavailable
+    (renderPosta handles that case inline, so the asymmetry silently swallowed the banner here).
+
+    Driven through the real page globals — app.js is a plain <script>, so its functions and
+    `let` globals are reachable from page.evaluate (the playbook's pure-JS-helper pattern)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    def render(with_automation):
+        return page.evaluate(
+            """(withAuto) => {
+                 const savedAuto = AUTOMATIONS, savedData = ORDERS_REMINDER;
+                 AUTOMATIONS = withAuto ? savedAuto : [];
+                 ORDERS_REMINDER = { store_corrupt: true, red: [], orange: [],
+                                     skipped: [], no_email: [] };
+                 renderOrdersReminder();
+                 const txt = document.getElementById('tab-orders_reminder').innerText;
+                 AUTOMATIONS = savedAuto; ORDERS_REMINDER = savedData; renderOrdersReminder();
+                 return txt;
+               }""", with_automation)
+
+    for path, txt in (("normal", render(True)), ("no-automation", render(False))):
+        assert "Poškodená evidencia" in txt, f"{path}: banner missing"
+        assert "orders_reminder.json" in txt, f"{path}: file name missing"
+        assert "NEMAZAŤ" in txt, f"{path}: must not invite deleting the store"
+
+    # …and it is NOT shown on a healthy store
+    assert "Poškodená evidencia" not in page.locator("#tab-orders_reminder").inner_text()
+    assert console == [], f"console not clean: {console}"

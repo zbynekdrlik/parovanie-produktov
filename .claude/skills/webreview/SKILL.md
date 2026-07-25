@@ -598,9 +598,22 @@ DRUHÝ mail. Vzor, ktorý drž pri každom novom dedup store:
   plné slovenčiny → zápis prerezaný uprostred viacbajtového znaku hodí `UnicodeDecodeError`
   (najpravdepodobnejšia reálna korupcia). Ten guardu unikal: žiadna záloha, 500 na tabe, raw
   traceback v `last_error`. Oba sú podtriedy `ValueError`.
-- **Po zavedení guardu VYHĎ všetky zvyšné fail-openy na tej ceste**, inak liečiš jednu úroveň a
-  druhá ostane: `if not isinstance(orders_map, dict): orders_map = dict(done)` vo finálnom save
-  bola posledná wipe cesta (zapísala prázdne `done` ako celú evidenciu).
+- **Guard musí ísť až na ÚROVEŇ ZÁZNAMU, nie len mapy.** Ne-dict hodnota POD jedným kódom
+  (`null` / string / číslo / list) nie je terminálna → beh ju čítal ako „nikdy sme neposlali" a
+  zákazníkovi poslal DRUHÝ mail (u pošty `parse_notified` degraduje čokoľvek ne-stringové na
+  `(0, None)` → kadencia začne od upozornenia #1). Nečitateľný záznam ≠ žiadny záznam: **nevieme
+  dokázať, že mail NEodišiel → neposielaj** a riadok vypíš (pending riadok / `errors`), nech to
+  dorieši človek. Ručný override na tom riadku ostáva povolený — to je vedomé rozhodnutie
+  manažéra, nie odhad automatu.
+- **Prítomnosť KĽÚČA, nie hodnotu `None`.** `orders.get(code)` vráti `None` aj pre „žiadny
+  záznam" (normálny stav každej novej objednávky) aj pre JSON `null` záznam. Rozlíšiť ich vie iba
+  `code in orders` — inak buď prehliadneš `null` korupciu, alebo (horšie) vyhlásiš za poškodenú
+  každú novú objednávku a neodošle sa NIČ.
+- **NEZRUŠ fail-open, kým si neoveril, čo ešte kryje.** `if not isinstance(orders_map, dict):
+  orders_map = dict(done)` vo finálnom save vyzeral po zavedení guardu ako mŕtvy kód — lenže
+  kryl aj prípad „mapa CHÝBA" (súbor zmizol počas behu), kde `{}` zapíše prázdnu evidenciu a
+  ďalší beh mailuje všetkých znova. Správne je `st.get("orders") or dict(done)`: `done` je
+  snapshot zo štartu + záznamy tohto behu, teda nikdy nie menej úplný než chýbajúca mapa.
 - **Hláška NESMIE radiť „zmaž súbor"** — prázdny/chýbajúci súbor je „prvý beh", teda presne ten
   wipe. Píš „oprav podľa zálohy, NEMAŽ ho".
 - **Záloha je KÓPIA, nie presun.** Presunutý originál = ďalší load vidí „súbor neexistuje" =
@@ -613,6 +626,10 @@ DRUHÝ mail. Vzor, ktorý drž pri každom novom dedup store:
   `storeCorruptWarning()`. Bez toho poškodený store vyzerá ako pokojný deň (prázdne zoznamy) a
   korupcia, čo vznikne MEDZI behmi, je neviditeľná — tá istá „ticho mŕtva automatizácia", proti
   ktorej existuje `bcc_missing`.
+- Banner vykresli na **KAŽDEJ** render ceste — `renderOrdersReminder` má skorý `return`, keď
+  `/api/automations` nevráti stav; `renderPosta` ten prípad rieši inline. Asymetria = banner sa
+  na jednej ceste ticho stratí. Testuje sa cez `page.evaluate` nad globálmi (`AUTOMATIONS = []`,
+  `ORDERS_REMINDER = {store_corrupt:true}` → `renderOrdersReminder()`), obnov globály po teste.
 - Zálohu rob **idempotentne per (path, obsah)**: `hashlib.sha256` memo + VLASTNÝ malý zámok
   (`_quarantine_lock`, NIE globálny `_lock` — nie je reentrantný a volajúci ho často už drží).
   Poškodený store sa číta aj pri KAŽDOM display requeste (tab poll-uje počas behu), takže bez
@@ -621,8 +638,9 @@ DRUHÝ mail. Vzor, ktorý drž pri každom novom dedup store:
   `last_error`, tab ju vykreslí ako `.autoerr`. **Endpointy rieši jeden `@app.errorhandler(
   DedupStoreCorrupt)` → 503** (nie 500 — manažér má vidieť, čo opraviť, nie klikať dokola).
 - Store čítaj **PRED** exportom/sieťou (lacný lokálny diskvalifikátor pred drahou prácou).
-- Ne-dict hodnota POD jedným kódom ostáva tolerovaná (stojí max. jednu klasifikáciu navyše) —
-  fail-closed je o CELOM súbore. Nemýliť si tie dve veci (`test_run_survives_a_corrupt_order_record`).
+- **Revízny agent píše scratch súbory do repa** — po každom review skontroluj `git status` a
+  `git ls-files | grep -i probe` PRED `git add -A`. Do vetvy sa takto omylom dostali tri dočasné
+  `test_zzprobe_*.py` s testami bez asertov (vždy zelené, falošné pokrytie).
 
 ### Rastúci stav automatizácie — prunuj proti SOURCE OKNU, nikdy len podľa veku (#220, #222)
 

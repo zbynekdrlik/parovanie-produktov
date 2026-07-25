@@ -3284,10 +3284,14 @@ function renderOrdersReminder() {
   if (!wrap) return;
   wrap.innerHTML = '';
   const a = autoByKey('orders_reminder');
+  const d = ORDERS_REMINDER || {};
   const st = el('div', 'autostatus');
   if (!a) {
     st.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
     wrap.appendChild(st);
+    // …but a corrupt store must still be announced on THIS path too (renderPosta handles the
+    // same case inline and never returned early — the asymmetry hid the banner here).
+    if (d.store_corrupt) wrap.appendChild(storeCorruptWarning('orders_reminder.json'));
     return;
   }
   const head = el('div', 'autohead');
@@ -3335,7 +3339,6 @@ function renderOrdersReminder() {
   if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
   wrap.appendChild(st);
 
-  const d = ORDERS_REMINDER || {};
   if (d.store_corrupt) wrap.appendChild(storeCorruptWarning('orders_reminder.json'));
   const red = d.red || [];
   const orange = d.orange || [];
