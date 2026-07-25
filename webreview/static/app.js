@@ -1445,6 +1445,35 @@ function groupQtyTotals(items) {
   return t;
 }
 
+// #206 — what the „Σ spolu" chip says for one product, or `null` when it gets no chip.
+// ONE place, because TWO paths render it: the full repaint (renderOrderRow) and the
+// in-place refresh after a flag toggle (refreshOrderTotals), which must never disagree.
+// The chip appears when the product genuinely spans SEVERAL of this supplier's order
+// lines — counted on the WHOLE group, not on the outstanding rest: with 1 of 2 lines
+// flagged the manager still needs the full demand, and „it is one hover away" is only
+// true while the chip carrying that tooltip is on screen. On a product with a single
+// order line there is nothing to add up and the chip would just repeat the qty beside it.
+// The TEXT is the work LEFT — the same set „Kopírovať objednávku" pastes, so screen and
+// e-mail always agree; the full demand rides in the tooltip instead of as a second number
+// the manager would have to choose between.
+function totalChipSpec(totals, code) {
+  const all = totals && totals.all && totals.all[code];
+  if (!all || all.lines < 2) return null;
+  const open = (totals.open && totals.open[code]) || null;
+  const openQty = open ? open.qty : 0;      // every line settled → 0 ks left to order
+  return { text: `Σ spolu ${openQty} ks`,
+           title: `Spolu vo všetkých objednávkach: ${all.qty} ks · nevybavené: ${openQty} ks` };
+}
+
+// …rendered as a node (.textContent/.title are property writes — the numbers are derived,
+// but the chip is built in one place so no caller can reintroduce an innerHTML path).
+function totalChip(spec) {
+  const sum = el('span', 'to-total');
+  sum.textContent = spec.text;
+  sum.title = spec.title;
+  return sum;
+}
+
 // Slovenské skloňovanie po číslovke — 1 → položka (v akuzatíve „vybaviť 1 položku"),
 // 2–4 → položky, 0 a 5+ → položiek. Jeden helper pre hlavičku kopírovaného e-mailu
 // (nominatív) aj pre súhrn nad zoznamom (akuzatív po „vybaviť"); líšia sa len v
@@ -1454,15 +1483,32 @@ function itemsWord(n, acc) {
   return (n >= 2 && n <= 4) ? 'položky' : 'položiek';
 }
 
-// The lines of a supplier group that are still WORK: nothing flagged on them yet.
-// ONE scope for the „Σ spolu" chip (#206) and for the copied order (#207), so the number
-// on screen and the number in the supplier's e-mail can never disagree — and DELIBERATELY
-// independent of the „skryť poriešené" view filter (#205): what has to be ordered is the
-// outstanding demand, whether or not the manager currently hides the rest. Reads the LIVE
-// flag maps through isHandled (never the o.* snapshot), like everything else here.
-const outstandingOf = (items) => (items || []).filter(o => !isHandled(o));
+// A line whose fate is SETTLED: already ordered, already in stock, or the supplier cannot
+// deliver it — nothing left to ask the supplier for.
+// Deliberately NARROWER than `isHandled`, which also counts „čaká sa". That one is a
+// SCHEDULING flag, not a done flag: /api/orders defines it as an ACTIVE line that cannot
+// be stocked yet — waiting on the supplier, BATCHING MORE ITEMS, or deferred by agreement
+// with the customer — and the row button's own tooltip repeats „zbierame viac položiek".
+// A line the manager parks until the order is worth placing STILL has to be ordered, so
+// dropping it from the pasted e-mail would order less than the shop needs while the row
+// sits visibly on screen implying it went out. `isHandled` stays wider on purpose: it
+// drives the #205 hide filter and the chip colours, where „čaká sa" IS dealt with (he
+// decided to wait). Same LIVE flag maps, never the o.* snapshot.
+const isSettled = (o) => !!(ORDERED[o.key] || INSTOCK[o.key] || UNAVAIL[o.key]);
+
+// The lines of a supplier group that are still WORK. ONE scope for the „Σ spolu" chip
+// (#206) and for the copied order (#207), so the number on screen and the number in the
+// supplier's e-mail can never disagree — and DELIBERATELY independent of the „skryť
+// poriešené" view filter (#205): what has to be ordered is the outstanding demand, whether
+// or not the manager currently hides the rest.
+const outstandingOf = (items) => (items || []).filter(o => !isSettled(o));
 
 const TO_COPY_LABEL = '📋 Kopírovať objednávku';
+const TO_COPY_EMPTY_LABEL = 'Nič na objednanie';
+// what the button takes, spelled out — the scope is a rule, not folklore
+const TO_COPY_TITLE = 'Skopíruje nevybavené riadky tohto dodávateľa (kód, veľkosť, ks, '
+  + 'odkaz) — bez už objednaných, skladových a nedostupných; riadok „čaká sa" ide do '
+  + 'objednávky tiež';
 
 // The link to paste for a line, in the same precedence the ROW itself renders: the
 // reviewed decision link, then the inline pairing, then the grube .de order page. Only
@@ -1606,19 +1652,8 @@ function renderOrderRow(o, totals) {
   }
   row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
   row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
-  // #206 — only when this product really is on MORE than one OUTSTANDING line of this
-  // supplier's group; on a single line the chip would just repeat the quantity next to
-  // it. The number shown is the work LEFT (the same set „Kopírovať objednávku" pastes),
-  // so screen and e-mail always agree; the full demand rides in the tooltip instead of
-  // as a second number the manager would have to choose between.
-  const tot = totals && totals.open && totals.open[o.itemCode || ''];
-  const totAll = (totals && totals.all && totals.all[o.itemCode || '']) || tot;
-  if (tot && tot.lines > 1) {
-    const sum = el('span', 'to-total', `Σ spolu ${tot.qty} ks`);
-    sum.title = `Spolu vo všetkých objednávkach: ${totAll.qty} ks`
-      + ` · nevybavené: ${tot.qty} ks`;
-    row.appendChild(sum);
-  }
+  const spec = totalChipSpec(totals, o.itemCode || '');
+  if (spec) row.appendChild(totalChip(spec));
   row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));
   // supplier assign — ONLY for order lines that arrived WITHOUT a supplier. Same shape
   // as the URL pairing: doplniť → svieti názov + malá ✏️ na opravu.
@@ -1764,6 +1799,23 @@ function toOrderSummaryText(s, label) {
     + (bits.length ? ' · ' + bits.join(' · ') : '');
 }
 
+// #205 follow-up — the wording for the shared `#empty` box, or `null` for the neutral
+// default. An empty list because the day is DONE is a success, not missing data: the box
+// said „Žiadne produkty v tomto filtri." under a toolbar reading „ostáva 0 z 7", which
+// reads like the orders failed to load.
+// But „Všetko vybavené" is a claim about the WHOLE day, so it may only be printed while
+// the manager is looking at the whole day: with a supplier chip selected the OTHER
+// suppliers' lines are out of VIEW, not done — the shared box announced the day finished
+// over five still-outstanding lines. A chip therefore gets the narrower wording, scoped to
+// what he is actually looking at (the same rule the #208 toolbar tally follows).
+// Every other case (no orders at all, the toggle off) keeps the neutral wording, and the
+// review tab — which shares this box — gets the default back on its own paint.
+function toOrderEmptyText(hidden, total, shown, supplier) {
+  if (!(hidden && total > 0 && shown === 0)) return null;
+  return supplier === 'all' ? 'Všetko vybavené — poriešené riadky sú skryté'
+                            : 'Tento dodávateľ je vybavený — poriešené riadky sú skryté';
+}
+
 // The toolbar lives in the top bar, NOT in `#list` — a summary inside the list would be
 // wiped by (and would have to be rebuilt through) the editor capture/restore repaint, and
 // the per-line toggles deliberately do NOT repaint the list. Rendered from
@@ -1793,6 +1845,46 @@ function renderOrderToolbar(canon) {
     renderToOrder();     // the ONE repaint path — carries open editors across (#233)
   };
   bar.appendChild(hide);
+}
+
+// #206 — rewrite the „Σ spolu" chips of the ALREADY RENDERED rows, in place.
+// A per-row flag toggle deliberately does NOT repaint `#list` (#205/#233 — a row the
+// manager is typing in must never vanish under him), so the chips would otherwise keep the
+// quantity from the last full paint while „Kopírovať objednávku", narrowed at CLICK time,
+// already pastes the smaller one: the screen said „Σ spolu 3 ks" (tooltip: „nevybavené:
+// 3 ks") over a clipboard asking for 2 ks — two numbers for one supplier order, which is
+// exactly what #206/#207 exist to remove. Same `outstandingOf` scope as both of them, and
+// deliberately NOT a repaint: it only touches `.to-total`, so no open editor is disturbed.
+function refreshOrderTotals() {
+  const rows = document.querySelectorAll('#list .toorder-row');
+  if (!rows.length) return;
+  // null-prototype: the keys are supplier names / row keys straight out of the export
+  const bySup = Object.create(null), byKey = Object.create(null), totals = Object.create(null);
+  for (const o of ORDERS) {
+    const s = supFilterKey(o);
+    (bySup[s] = bySup[s] || []).push(o);
+    byKey[o.key] = o;
+  }
+  for (const row of rows) {
+    const o = byKey[row.dataset.key];
+    if (!o) continue;                       // a row whose line is gone → next paint drops it
+    const s = supFilterKey(o);
+    // the totals are per SUPPLIER, over the supplier's OWN lines (a sibling hidden by
+    // #205 belongs to the same product) — computed once per supplier, not once per row
+    const t = totals[s] || (totals[s] = { open: groupQtyTotals(outstandingOf(bySup[s])),
+                                          all: groupQtyTotals(bySup[s]) });
+    const spec = totalChipSpec(t, o.itemCode || '');
+    let sum = row.querySelector('.to-total');
+    if (!spec) { if (sum) sum.remove(); continue; }
+    if (!sum) {
+      sum = totalChip(spec);
+      const qty = row.querySelector('.to-qty');   // same slot renderOrderRow puts it in
+      if (qty) qty.after(sum); else row.appendChild(sum);
+      continue;
+    }
+    sum.textContent = spec.text;
+    sum.title = spec.title;
+  }
 }
 
 // Build the supplier filter chips for the Na-objednanie tab, coloured by resolved state:
@@ -1833,6 +1925,9 @@ function renderOrderFilters(idx) {
     fbar.appendChild(mk(s, `${escapeHtml(lbl(s))} (${cnt[s]})`, !unhandled[s]));
   }
   renderOrderToolbar(canon);   // #208 — the tally rides along with every chip repaint
+  refreshOrderTotals();        // …and so do the per-product „Σ spolu" chips (#206): this
+                               // is the ONE call every flag toggle already makes, and the
+                               // chips live in `#list`, which a toggle must not repaint
 }
 
 // A whole-tab repaint (a failed flag's rollback, a saved pair URL / supplier / comment)
@@ -2004,13 +2099,7 @@ function renderToOrder() {
   const shown = ORDERS.filter(o => (ORDER_SUPPLIER === 'all' || supFilterKey(o) === ORDER_SUPPLIER)
     && !(HIDE_HANDLED && isHandled(o) && !busy.has(o.key)));
   document.getElementById('empty').hidden = shown.length > 0;
-  // An empty list because the day is DONE is a success, not missing data: the shared
-  // `#empty` box said „Žiadne produkty v tomto filtri." under a toolbar reading
-  // „ostáva 0 z 7", which reads like the orders failed to load. Every other case (no
-  // orders at all, a supplier filter that matches nothing) keeps the neutral wording,
-  // and the review tab — which shares this box — gets the default back on its own paint.
-  setEmptyText(HIDE_HANDLED && ORDERS.length > 0 && shown.length === 0
-    ? 'Všetko vybavené — poriešené riadky sú skryté' : null);
+  setEmptyText(toOrderEmptyText(HIDE_HANDLED, ORDERS.length, shown.length, ORDER_SUPPLIER));
   const groups = Object.create(null);
   for (const o of shown) { const s = supFilterKey(o); (groups[s] = groups[s] || []).push(o); }
   // #206/#207 — the per-product totals and the copied order are computed over the
@@ -2043,15 +2132,29 @@ function renderToOrder() {
     // the number he sends, in either toggle state.
     const supLines = linesBySup[sup] || items;
     const copy = el('button', 'tosup-copy', TO_COPY_LABEL);
-    copy.title = 'Skopírovať NEVYBAVENÉ položky tohto dodávateľa (kód, veľkosť, ks, odkaz)';
+    copy.title = TO_COPY_TITLE;
+    // the node may be gone by then (a repaint) — harmless, the next paint is correct
+    const resetCopy = () => setTimeout(() => {
+      copy.textContent = TO_COPY_LABEL; copy.classList.remove('ok');
+    }, 2500);
     // narrowed at CLICK time, not at paint time: a per-row flag toggle deliberately does
     // not repaint the list, so a set frozen here would paste a line he ticked meanwhile.
     copy.onclick = async () => {
-      const ok = await copyPlainText(orderCopyText(lbl(sup), outstandingOf(supLines)));
+      const lines = outstandingOf(supLines);
+      // With the #205 filter OFF (the default) a group whose every line is settled stays
+      // on screen, copy button and all — and used to hand over a bare header. An
+      // „Objednávka — ORBIS (0 položiek)" pasted into a supplier's inbox is an order for
+      // nothing, reported as „✓ Skopírované". Refuse, say so, write nothing.
+      if (!lines.length) {
+        copy.textContent = TO_COPY_EMPTY_LABEL;
+        copy.classList.remove('ok');
+        resetCopy();
+        return;
+      }
+      const ok = await copyPlainText(orderCopyText(lbl(sup), lines));
       copy.textContent = ok ? '✓ Skopírované' : '⚠️ Schránka nedostupná';
       copy.classList.toggle('ok', ok);
-      // the node may be gone by then (a repaint) — harmless, the next paint is correct
-      setTimeout(() => { copy.textContent = TO_COPY_LABEL; copy.classList.remove('ok'); }, 2500);
+      resetCopy();
     };
     head.appendChild(copy);
     list.appendChild(head);
