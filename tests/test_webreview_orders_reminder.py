@@ -1203,3 +1203,32 @@ def test_a_date_window_configured_in_the_url_does_not_survive(monkeypatch):
     assert url.count("dateFrom=") == 1 and "dateFrom=2020-01-01" not in url
     assert url.count("dateUntil=") == 1 and "dateUntil=2020-02-01" not in url
     assert "hash=aB+cD%2F1" in url                     # byte-identical, never re-encoded
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Same bug class as the terminal-cache `at` (PR #224 review, second round): a stored
+# timestamp must be bounded from BOTH sides. `_reminder_claim_active` only asked „is it
+# younger than the TTL", so a claimed_at stamped in the FUTURE — the very clock-jump
+# premise the `at` fix was written for, or a partial write — reads as a live claim until
+# real time catches up. The manager's „▶ Poslať pripomienku" then 409s („práve sa
+# odosiela") and the daily run skips the order as pending: the customer's reminder is
+# silently never sent, and the TTL that exists so a claim can never lock an order forever
+# is defeated.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_a_claim_stamped_in_the_future_does_not_lock_the_order():
+    ahead = (datetime.now(timezone.utc).astimezone() + timedelta(days=1)).isoformat()
+    assert webapp._reminder_claim_active({"status": "sending", "claimed_at": ahead}) is False
+
+
+def test_a_future_claim_does_not_block_a_manual_send(iso):
+    """…end to end: the order must stay actionable from the tab."""
+    c = _seed(iso)
+    st = _store(iso)
+    ahead = (datetime.now(timezone.utc).astimezone() + timedelta(days=1)).isoformat()
+    st.setdefault("orders", {})["20261000"] = {"status": "sending", "claimed_at": ahead}
+    webapp._save_orders_reminder(st)
+    iso["sent"].clear()
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200
+    assert [m["to"] for m in iso["sent"]] == ["a@x.sk"]
+    assert _store(iso)["orders"]["20261000"]["status"] == "emailed"
