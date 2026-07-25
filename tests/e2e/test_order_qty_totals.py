@@ -14,6 +14,8 @@ FULL demand (handled lines included) stays readable in the chip's tooltip.
 quantities 1 and 2 (→ spolu 3 ks), while CITRADE's four lines are four distinct codes.
 """
 
+import re
+
 _SPY = """
 window.__copied = [];
 Object.defineProperty(navigator, 'clipboard', {
@@ -93,8 +95,11 @@ def test_the_screen_number_equals_the_copied_number(page, toorder_server):
             ".tosup-copy").click()
         page.wait_for_function(f"() => window.__copied.length === {idx + 1}")
         copied = page.evaluate(f"() => window.__copied[{idx}]")
-        qty = sum(int(ln.split("|")[-2].strip().split(" ")[0])
-                  for ln in copied.split("\n")[1:] if ln.startswith("S1 |"))
+        # the „N ks" column, wherever it sits (empty columns are dropped, so its index
+        # depends on whether the line carries a grube code / a link)
+        qty = sum(int(re.fullmatch(r"(\d+) ks", part.strip()).group(1))
+                  for ln in copied.split("\n")[1:] if ln.startswith("S1 |")
+                  for part in ln.split("|") if re.fullmatch(r"\d+ ks", part.strip()))
         chips = page.locator(".toorder-row[data-code='S1'] .to-total").all_inner_texts()
         if chips:                       # a chip exists → it must state that same number
             assert chips == [f"Σ spolu {qty} ks"] * len(chips), (chips, copied)

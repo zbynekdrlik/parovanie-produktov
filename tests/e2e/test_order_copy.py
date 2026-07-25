@@ -178,7 +178,8 @@ def test_item_count_is_declined_the_slovak_way(page, toorder_server):
     out = page.evaluate("""() => {
       const mk = (n) => Array.from({length: n}, (_, i) => ({itemCode: 'K' + i, qty: '1'}));
       return {
-        nom: [0, 1, 2, 4, 5, 11].map(itemsWord),
+        nom: [0, 1, 2, 4, 5, 11].map(n => itemsWord(n)),   // NOT .map(itemsWord) — the
+                                                           // index would land in `acc`
         acc: [0, 1, 2, 4, 5, 11].map(n => itemsWord(n, true)),
         heads: [1, 2, 5].map(n => orderCopyText('X', mk(n)).split('\\n')[0]),
       };

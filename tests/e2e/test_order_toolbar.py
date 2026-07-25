@@ -172,7 +172,8 @@ def test_all_done_summary_is_readable_on_the_light_background(page, toorder_serv
     for i in range(page.locator(".tosup-bulk").count()):
         page.locator(".tosup-bulk").nth(i).click()
         page.wait_for_function(
-            "(i) => /Zrušiť/.test(document.querySelectorAll('.tosup-bulk')[i].textContent)", i)
+            "(i) => /Zrušiť/.test(document.querySelectorAll('.tosup-bulk')[i].textContent)",
+            arg=i)
     page.wait_for_function(
         "() => /Ostáva vybaviť 0 položiek z 7/.test("
         "document.getElementById('toToolbar').textContent)")

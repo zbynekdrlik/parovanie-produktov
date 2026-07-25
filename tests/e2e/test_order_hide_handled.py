@@ -113,7 +113,7 @@ def test_everything_handled_reads_as_success_not_as_missing_data(page, toorder_s
         n = page.locator(".tosup-bulk").count()
         page.locator(".tosup-bulk").first.click()
         page.wait_for_function(
-            "(n) => document.querySelectorAll('.tosup-bulk').length < n", n)
+            "(n) => document.querySelectorAll('.tosup-bulk').length < n", arg=n)
     page.wait_for_function(
         "() => document.querySelectorAll('.toorder-row').length === 0")
 
