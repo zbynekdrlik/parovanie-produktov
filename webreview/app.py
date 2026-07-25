@@ -3909,12 +3909,109 @@ POSTA_TERMINAL_RECHECK_DAYS = 7
 ORDERS_REMINDER_STATE = os.path.join(OUT, "orders_reminder.json")   # #105 dedup + display
 
 
-def _load_posta_state() -> dict:
+class DedupStoreCorrupt(RuntimeError):
+    """An unreadable DEDUP/ESCALATION store — the two customer-mail automations refuse to run.
+
+    Every other store in this app uses the „SAFE loader" pattern (unparseable → `{}`) because
+    losing a display flag is cosmetic. These two are different in kind: the file IS the proof of
+    which customers have already been mailed. Degrade a partial write to `{}` and the very next
+    `_claim` / `_persist_done` / escalation bump persists a brand-new ONE-entry map — the whole
+    dedup history is gone, so every open order gets a SECOND reminder and every parcel at the post
+    office a duplicate escalation (#225). So they fail CLOSED: the corrupt bytes are copied aside,
+    the run aborts having mailed nobody, and a human repairs or deletes the file. Rather not send
+    than send twice. A MISSING file is NOT corruption — it is a legitimate first run (nothing was
+    ever sent, so there is nothing to lose) and must never be blocked.
+    """
+
+
+def _quarantine_corrupt_store(path: str) -> str:
+    """Preserve an unreadable store as `<path>.corrupt-<ts>` and return that path (or "").
+
+    The ORIGINAL is deliberately left in place: moving it away would make the very next load see
+    „no file" = a legitimate first run, and the automation would happily start a fresh EMPTY dedup
+    store — exactly the silent wipe this whole guard exists to prevent. The file therefore keeps
+    failing loudly until a human fixes it.
+
+    Backups are de-duplicated by CONTENT, so a daily automation hitting the same corrupt file does
+    not leave one copy per run; a DIFFERENT corruption later still gets its own copy.
+    """
     try:
-        with open(POSTA_STATE, encoding="utf-8") as f:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:  # noqa: BLE001 — the caller is already failing closed; best effort only
+        log.error("dedup store %s sa nepodarilo zazálohovať (%r)", path, e)
+        return ""
+    folder = os.path.dirname(path) or "."
+    prefix = os.path.basename(path) + ".corrupt-"
+    try:
+        for name in sorted(os.listdir(folder)):
+            if not name.startswith(prefix):
+                continue
+            with open(os.path.join(folder, name), "rb") as f:
+                if f.read() == raw:
+                    return os.path.join(folder, name)      # these exact bytes are already kept
+    except OSError as e:  # noqa: BLE001 — an unreadable folder must not hide the real error
+        log.warning("dedup store %s: existujúce zálohy sa nepodarilo prezrieť (%r)", path, e)
+    dest = f"{path}.corrupt-{datetime.now().strftime('%Y%m%dT%H%M%S%f')}"
+    try:
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+    except OSError as e:  # noqa: BLE001 — full disk / permissions; the original still stands
+        log.error("dedup store %s: zálohu %s sa nepodarilo zapísať (%r)", path, dest, e)
+        return ""
+    return dest
+
+
+def _load_dedup_store(path: str, label: str) -> dict:
+    """Strict loader for a dedup/escalation store — see DedupStoreCorrupt.
+
+    Missing file → `{}` (first run). Unparseable, or parsed into something that is not a dict →
+    a copy is preserved and DedupStoreCorrupt is raised. Any other OSError (permissions…)
+    propagates as before, which is fail-closed too.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        raise DedupStoreCorrupt(_corrupt_msg(path, label)) from e
+    if not isinstance(d, dict):
+        # parses, but is not a store — the old `else {}` made this the second silent-wipe path
+        raise DedupStoreCorrupt(_corrupt_msg(path, label))
+    return d
+
+
+def _corrupt_msg(path: str, label: str) -> str:
+    backup = _quarantine_corrupt_store(path)
+    log.error("orders/posta: POŠKODENÁ evidencia %s (%s) — automatizácia neposiela nič, "
+              "aby zákazníci nedostali duplicitné maily; kópia: %s", label, path, backup or "-")
+    return (f"Poškodená evidencia {label} (data/out/{os.path.basename(path)}) — "
+            "neposielam žiadne e-maily, hrozili by duplicitné maily zákazníkom. "
+            + (f"Kópia poškodeného súboru: {os.path.basename(backup)}. " if backup else "")
+            + "Oprav alebo zmaž súbor a spusti znova.")
+
+
+@app.errorhandler(DedupStoreCorrupt)
+def _handle_dedup_store_corrupt(e: DedupStoreCorrupt):
+    """Any endpoint that touches a dedup store fails closed with a 503 that says what to FIX —
+    a bare 500 would look like a transient glitch and invite the manager to keep clicking.
+    Registered app-wide on purpose: a future endpoint reaching one of these stores inherits it."""
+    return jsonify({"ok": False, "error": str(e)}), 503
+
+
+def _load_posta_state() -> dict:
+    """Fail-CLOSED (#225): a corrupt escalation store aborts the run instead of restarting every
+    escalation at count 0. Display-only callers use _load_posta_state_display()."""
+    return _load_dedup_store(POSTA_STATE, "nevyzdvihnutých zásielok")
+
+
+def _load_posta_state_display() -> dict:
+    """Read-only DISPLAY variant — a corrupt store renders an empty tab, never a 500."""
+    try:
+        return _load_posta_state()
+    except DedupStoreCorrupt:
         return {}
 
 
@@ -3949,8 +4046,10 @@ def run_posta_uncollected() -> dict:
     orders export → Pošta SK tracking per shipment → escalation e-mails to
     customers per the n8n cadence → full display state for the tab persisted
     to data/out/posta_uncollected.json. Returns the summary the runner stores."""
-    csv_bytes = _orders_csv_cached()
-    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes)
+    # The escalation store is read FIRST — before the orders export and long before the first
+    # Pošta SK round-trip. It is a free local check that can disqualify the whole run (#225: a
+    # corrupt store means we cannot know who was already notified, so nothing may be sent), and
+    # the „lacné diskvalifikátory pred drahými volaniami" rule puts it ahead of the paid work.
     with _lock:
         st0 = _load_posta_state()
         esc = dict(st0.get("escalation") or {})
@@ -3958,6 +4057,8 @@ def run_posta_uncollected() -> dict:
         # Nothing about them can change, so they are skipped entirely on later runs instead of
         # costing another sequential API round-trip (up to 180 s each on a bad day).
         term_cache = dict(st0.get("terminal") or {})
+    csv_bytes = _orders_csv_cached()
+    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes)
     uncollected, invalid, errors = [], [], []
     sent = failed = api_skipped = 0
     today = datetime.now().date()
@@ -4782,11 +4883,18 @@ def run_stock_skladom() -> dict:
 # SENDS real customer e-mails + costs OpenAI → starts DISABLED (#93 contract).
 # --------------------------------------------------------------------------- #
 def _load_orders_reminder() -> dict:
+    """Fail-CLOSED (#225): a corrupt dedup store aborts the run instead of quietly starting a new
+    empty one (which would re-mail every open order). Display-only callers use the _display()
+    variant below. Fail-closed is the DEFAULT on purpose — a call site added later inherits the
+    safe behaviour rather than the dangerous one."""
+    return _load_dedup_store(ORDERS_REMINDER_STATE, "odoslaných pripomienok")
+
+
+def _load_orders_reminder_display() -> dict:
+    """Read-only DISPLAY variant — a corrupt store renders an empty tab, never a 500."""
     try:
-        with open(ORDERS_REMINDER_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-        return d if isinstance(d, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError):
+        return _load_orders_reminder()
+    except DedupStoreCorrupt:
         return {}
 
 
@@ -4887,17 +4995,21 @@ def run_orders_reminder() -> dict:
     customer a second time. An order with no customer e-mail is surfaced in `no_email` WITHOUT
     an AI call — it can never be mailed, so classifying it would buy a paid OpenAI call on every
     run forever."""
+    # The dedup store is read FIRST — before the orders export and long before any OpenAI/SMTP
+    # call. It is a free local check that can disqualify the whole run (#225: an unreadable store
+    # means we cannot know who was already reminded, so nothing may be sent), and the „lacné
+    # diskvalifikátory pred drahými volaniami" rule puts it ahead of the paid work.
+    with _lock:
+        state = _load_orders_reminder()
+        prev_orders = state.get("orders")
+        # A garbage value UNDER a code (not the whole file) stays tolerated — that costs at most
+        # one extra classification, it can never lose a dedup record we could have honoured.
+        done = dict(prev_orders) if isinstance(prev_orders, dict) else {}   # code -> {status,…}
     csv_bytes = _orders_csv_cached()
     orders = orders_reminder.select_orders(csv_bytes)
     # Every code in the export (not just the >4d „Vybavuje sa" ones) — the window the dedup
     # store is pruned against at the final save (#220). Empty = export unreadable → no pruning.
     window_codes = orders_reminder.all_order_codes(csv_bytes)
-    with _lock:
-        state = _load_orders_reminder()
-        prev_orders = state.get("orders")
-        # a corrupt/partial store must not crash the automation — treat it as 'nothing resolved
-        # yet' (worst case one extra classification, never a lost dedup record we could honour)
-        done = dict(prev_orders) if isinstance(prev_orders, dict) else {}   # code -> {status,…}
     prev_fp = state.get("fingerprints") or {}
     prev_orange = {r["code"]: r for r in state.get("orange") or []}
     prev_skipped = {r["code"]: r for r in state.get("skipped") or []}
@@ -5683,7 +5795,7 @@ def api_posta_uncollected():
     """Display data for the 'Nevyzdvihnuté zásielky' tab — the last run's full
     result (uncollected + invalid-format + per-shipment errors)."""
     with _lock:
-        st = _load_posta_state()
+        st = _load_posta_state_display()
     return jsonify({
         "last_check": st.get("last_check", ""),
         "uncollected": st.get("uncollected") or [],
@@ -5879,7 +5991,7 @@ def api_orders_reminder():
     """Display data for the „Pripomienky objednávok" tab (#105) — the last run's red list (no-note
     >4d orders), orange list (reminder e-mail sent) + summary stats."""
     with _lock:
-        st = _load_orders_reminder()
+        st = _load_orders_reminder_display()
     return jsonify({
         "last_check": st.get("last_check", ""),
         "red": st.get("red") or [],
