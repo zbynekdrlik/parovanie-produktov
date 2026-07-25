@@ -173,3 +173,65 @@ def test_known_supplier_datalist_is_deduped_case_insensitively(page, toorder_ser
     page.wait_for_selector(".toorder-row")
     opts = page.locator("#known-suppliers option").evaluate_all("els => els.map(e => e.value)")
     assert sorted(opts) == ["CITRADE", "ORBIS"], opts
+
+
+# ── PR #233 review ───────────────────────────────────────────────────────────
+
+def test_chip_label_and_datalist_pick_the_same_spelling(page, toorder_server):
+    """The chip counted one vote per ROW (effSup → the order's own supplier wins), while
+    the datalist counted a vote for `supplier` AND for `assignedSupplier` on every row —
+    so a stale assignment could outvote the chip and the autocomplete offered a DIFFERENT
+    spelling than the tab shows. The manager then types the datalist's spelling and ends
+    up looking at a name the group header spells another way."""
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    r = page.evaluate("""() => {
+      const idx = supplierSpellingIndex([
+        {supplier: 'CITRADE', assignedSupplier: 'Citrade'},
+        {supplier: 'CITRADE', assignedSupplier: 'Citrade'},
+        {supplier: 'Citrade', assignedSupplier: ''},
+        {supplier: 'citrade', assignedSupplier: ''},
+      ]);
+      return {chip: idx.canon['s:citrade'], known: idx.known};
+    }""")
+    assert r["chip"] == "CITRADE", r
+    assert r["known"] == ["CITRADE"], r
+
+
+def test_the_datalist_offers_the_spelling_the_chip_shows(page, toorder_server):
+    """Same divergence end-to-end, through real stored assignments: C1 and C3 carry a
+    stale per-product assignment spelled 'Citrade' that their own Shoptet supplier
+    ('CITRADE') shadows — it still votes in the autocomplete tally."""
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    for code in ("C1", "C3"):
+        page.evaluate("""(code) => fetch('/api/order-supplier', {method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({code, supplier: 'Citrade'})}).then(r => r.status)""", code)
+    page.reload()
+    page.wait_for_selector(".toorder-row")
+
+    chips = page.locator("#filters button").evaluate_all("els => els.map(e => e.textContent)")
+    label = next(c for c in chips if "itrade" in c.lower()).rsplit(" (", 1)[0]
+    opts = page.locator("#known-suppliers option").evaluate_all("els => els.map(e => e.value)")
+    assert label in opts, (label, opts)
+
+
+def test_a_whitespace_only_shoptet_supplier_still_gets_the_assign_editor(page, toorder_server):
+    """`effSup` trims both columns, so a supplier of only spaces groups under '—'; the
+    row-level gate did not, so such a row would sit in the placeholder group with NO
+    inline supplier-assign editor — the one place the manager could fix it."""
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+    r = page.evaluate("""() => {
+      const mk = (sup) => renderOrderRow({
+        key: 'X|W1', itemCode: 'W1', orderCode: 'X', name: 'Test', supplier: sup,
+        assignedSupplier: '', qty: '1', size: '', orderDate: '2026-05-20 09:00:00'});
+      return {
+        blank: !!mk('   ').querySelector('.to-supinput'),
+        empty: !!mk('').querySelector('.to-supinput'),
+        real: !!mk('CITRADE').querySelector('.to-supinput'),
+        group: effSup({supplier: '   ', assignedSupplier: ''}),
+      };
+    }""")
+    assert r == {"blank": True, "empty": True, "real": False, "group": "—"}, r

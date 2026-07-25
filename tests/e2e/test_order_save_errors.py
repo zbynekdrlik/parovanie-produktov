@@ -56,6 +56,23 @@ def _chip(alert, label):
     return next(c for c in alert["chips"] if c.startswith(label))
 
 
+# Holds every /api/instock POST open until the test releases it, so two writes for the
+# SAME row are genuinely in flight at once (a stubbed route answers too fast to race).
+# `__realFetch` stays available so the test can still read the server's real state.
+_HOLD_INSTOCK = """
+window.__held = [];
+window.__realFetch = window.fetch.bind(window);
+window.fetch = (url, opts) => {
+  if (String(url).indexOf('/api/instock') !== -1 && opts && opts.method === 'POST') {
+    return new Promise((resolve) => window.__held.push(() => resolve(
+      new Response('{"ok": false}',
+                   {status: 500, headers: {'Content-Type': 'application/json'}}))));
+  }
+  return window.__realFetch(url, opts);
+};
+"""
+
+
 def test_failed_bulk_mark_tells_the_manager_and_marks_nothing(page, toorder_server):
     _open(page, toorder_server)
     _fail(page, "/api/ordered/bulk")
@@ -192,3 +209,116 @@ def test_failed_supplier_assign_is_reported(page, toorder_server):
     alerts = _wait_alert(page)
     assert "nepodarilo" in alerts[0]["msg"].lower(), alerts[0]["msg"]
     assert page.locator(".toorder-row[data-code='N1'] .to-suptag").count() == 0
+
+
+# ── PR #233 review: two in-flight writes for one row ─────────────────────────
+
+def test_double_click_never_leaves_a_flag_the_server_refused(page, toorder_server):
+    """A plain double-click on „✓ Skladom" during an outage fires TWO writes for the same
+    row. Each used to roll back to its OWN captured snapshot, and the second one's
+    snapshot was the OPTIMISTIC value the first had just written — so the later rollback
+    restored a flag the server had explicitly refused. The manager was told the save
+    failed and then looked at a row (and a RED „everything resolved" chip) claiming it
+    succeeded — the exact silent loss #214 exists to remove.
+
+    N1 is the only line of its '—' group, so its chip really does flip colour when the
+    flag survives; without the fix the assertions below fail on the client map, the
+    server map, the row, the button and the chip alike."""
+    _open(page, toorder_server)
+    page.evaluate(_HOLD_INSTOCK)
+
+    btn = page.locator(".toorder-row[data-code='N1'] .to-instock")
+    btn.click()                      # write #1: on  — POST held open
+    btn.click()                      # write #2: off — fired before #1 resolved
+    page.wait_for_function("() => window.__held.length === 2", timeout=3000)
+
+    page.evaluate("() => window.__held[0]()")      # #1 is refused first …
+    page.evaluate("() => window.__held[1]()")      # … then #2
+    alerts = _wait_alert(page)
+    page.wait_for_timeout(300)                     # let both continuations settle
+
+    assert page.evaluate("() => Object.keys(INSTOCK)") == [], "client kept a refused flag"
+    server = page.evaluate(
+        "() => window.__realFetch('/api/instock').then(r => r.json())")
+    assert server["instock"] == {}, server
+    row = page.locator(".toorder-row[data-code='N1']")
+    assert "instock" not in (row.get_attribute("class") or "").split()
+    assert "on" not in (row.locator(".to-instock").get_attribute("class") or "").split()
+    chip = page.locator("#filters button").filter(has_text="—").first
+    assert "todo" in (chip.get_attribute("class") or "").split(), "chip must stay un-resolved"
+    # one refused row, one message — the superseded write is not a second outage
+    assert len(alerts) == 1, [a["msg"] for a in alerts]
+
+
+# ── PR #233 review: a repaint must not eat unsaved typing ────────────────────
+
+def test_a_failed_flag_save_keeps_another_rows_unsaved_comment(page, toorder_server):
+    """The rollback repaints the WHOLE tab, which silently threw away whatever the
+    manager had typed into any open inline editor — and the message he got talked only
+    about the flag, so the lost note was invisible."""
+    _open(page, toorder_server)
+    c1 = page.locator(".toorder-row[data-code='C1']")
+    c1.locator(".to-comadd").click()
+    c1.locator(".to-cominput").fill("rozpisany komentar manazera")
+
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='N1'] .to-instock").click()
+    _wait_alert(page)
+
+    box = page.locator(".toorder-row[data-code='C1'] .to-cominput")
+    assert box.count() == 1, "the open comment editor was destroyed by the rollback repaint"
+    assert box.input_value() == "rozpisany komentar manazera"
+
+
+def test_a_successful_pair_save_keeps_another_rows_unsaved_comment(page, toorder_server):
+    """#204 turned savePairUrl's `row.replaceWith(...)` into a whole-tab renderToOrder(),
+    so even a SUCCESSFUL save now wipes an editor open on a different row."""
+    _open(page, toorder_server)
+    c2 = page.locator(".toorder-row[data-code='C2']")
+    c2.locator(".to-comadd").click()
+    c2.locator(".to-cominput").fill("nedokoncena poznamka")
+
+    c1 = page.locator(".toorder-row[data-code='C1']")
+    c1.locator(".to-pairurl").fill("https://dodavatel.test/c1")
+    c1.locator(".to-pairsave").click()
+    page.wait_for_selector(".toorder-row[data-code='C1'] .to-link")
+
+    box = page.locator(".toorder-row[data-code='C2'] .to-cominput")
+    assert box.count() == 1, "the open comment editor was destroyed by the save repaint"
+    assert box.input_value() == "nedokoncena poznamka"
+    # the row that WAS saved shows its link — a saved value is not "unsaved typing"
+    assert page.locator(".toorder-row[data-code='C1'] .to-pairurl").count() == 0
+
+
+def test_an_unsaved_supplier_and_pair_edit_survive_a_repaint_too(page, toorder_server):
+    """Not just comments: the inline supplier and pair-URL editors carry the same
+    half-typed work, and each is restored with the text the manager left in it."""
+    _open(page, toorder_server)
+    page.locator(".toorder-row[data-code='N1'] .to-supinput").fill("Nedopisany Dodava")
+    page.locator(".toorder-row[data-code='C1'] .to-pairurl").fill("https://dodavatel.test/roz")
+
+    _fail(page, "/api/waiting")
+    page.locator(".toorder-row[data-code='C4'] .to-wait").click()
+    _wait_alert(page)
+
+    assert page.locator(".toorder-row[data-code='N1'] .to-supinput").input_value() \
+        == "Nedopisany Dodava"
+    assert page.locator(".toorder-row[data-code='C1'] .to-pairurl").input_value() \
+        == "https://dodavatel.test/roz"
+
+
+# ── PR #233 review: one message per failed WRITE, not per prose ──────────────
+
+def test_the_same_failing_write_is_reported_only_once(page, toorder_server):
+    """alert() blocks the thread, so re-clicking the same refused toggle during one
+    outage must not queue a second modal."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    _wait_alert(page)
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()   # same write again
+    page.wait_for_timeout(400)
+
+    assert page.evaluate("() => window.__alerts.length") == 1
+    assert page.locator(".toorder-row.instock").count() == 0
