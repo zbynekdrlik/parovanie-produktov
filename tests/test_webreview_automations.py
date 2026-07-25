@@ -617,3 +617,30 @@ def test_the_posta_tab_says_the_store_is_corrupt(iso):
     (iso["tmp"] / "posta_uncollected.json").write_text(_TRUNCATED, encoding="utf-8")
     j = c.get("/api/posta-uncollected").get_json()
     assert j["store_corrupt"] is True and j["uncollected"] == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #228 review, second pass — same class on the escalation store. `parse_notified`
+# degrades ANY non-string to (0, None), so a garbage value under one order code read
+# as „never notified" and re-sent escalation mail #1 to a customer who already had it.
+# ═════════════════════════════════════════════════════════════════════════════════
+@pytest.mark.parametrize("garbage", [None, 42, {"count": 2}, ["2|2026-07-18"]])
+def test_an_unreadable_escalation_record_does_not_restart_the_cadence(iso, monkeypatch, garbage):
+    webapp.run_posta_uncollected()                     # run 1: escalation mail #1 goes out
+    assert len(iso["sent"]) == 1
+    p = iso["tmp"] / "posta_uncollected.json"
+    st = json.loads(p.read_text())
+    st["escalation"]["2026100"] = garbage              # its record is now unreadable
+    p.write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+    iso["sent"].clear()
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+
+    stats = webapp.run_posta_uncollected()             # must not raise, must not re-mail
+    assert iso["sent"] == []
+    assert stats["emails_sent"] == 0
+    assert "EF000000002SK" not in asked                # …and not even pay for the API round-trip
+    # surfaced on the tab instead of vanishing silently
+    (err,) = [e for e in json.loads(p.read_text())["errors"] if e["orderCode"] == "2026100"]
+    assert "poškoden" in err["error"].lower()
