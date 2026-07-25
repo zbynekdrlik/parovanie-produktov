@@ -116,3 +116,31 @@ def test_run_now_executes_and_reports_result(page, automations_server):
     assert "Skontrolovaných zásielok: 0" in page.locator(".autostatus").inner_text()
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #217 — náhľad eskalačného e-mailu PRED odoslaním ──────────────────────────────
+def test_posta_preview_button_shows_the_escalation_mail_without_sending(page, automations_server):
+    """Read-only preview of the NEXT escalation mail for an uncollected shipment. The endpoint
+    writes nothing and makes no Pošta SK call, and the dialog has no „Odoslať" button — so
+    opening it can never mail a customer."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    row = page.locator('[data-testid="posta-table"] tr[data-pkg="EF000000002SK"]')
+    assert row.count() == 1
+    with page.expect_response("**/api/posta-uncollected/preview") as resp:
+        row.locator('[data-testid="posta-preview-EF000000002SK"]').click()
+    assert resp.value.status == 200
+
+    modal = page.locator("#emModal")
+    modal.wait_for(state="visible")
+    assert "jan@example.com" in page.locator("#emRecipient").inner_text()
+    # the seeded shipment already had 2 of the 4 mails → the preview is #3, the „last warning"
+    assert "Posledné upozornenie" in page.locator("#emRecipient").inner_text()
+    body = page.frame_locator("#emPreview").locator("body").inner_text()
+    assert "EF000000002SK" in body and "Skalica 1" in body
+
+    assert modal.locator("button").count() == 1          # no way to send from here
+    modal.locator("#emClose").click()
+    page.wait_for_selector("#emModal", state="hidden")
+    assert console == [], f"console not clean: {console}"

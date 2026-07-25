@@ -210,3 +210,32 @@ def test_an_unfinished_order_shows_its_reason_and_stays_actionable(page, automat
     assert "nestihol vybaviť" in page.locator(".warnhead", has_text="automat").inner_text()
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #217 — náhľad e-mailu PRED odoslaním ──────────────────────────────────────────
+def test_preview_button_shows_the_email_without_sending(page, automations_server):
+    """The manager could not see what a customer gets until the automation had already sent it.
+    The preview dialog is inert BY CONSTRUCTION — it has no „Odoslať" button at all — so this
+    test can safely open it (it never clicks a send)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    row = page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]')
+    with page.expect_response("**/api/orders-reminder/preview") as resp:
+        row.locator('[data-testid="ordrem-preview-20261000"]').click()
+    assert resp.value.status == 200
+
+    modal = page.locator("#emModal")
+    modal.wait_for(state="visible")
+    assert "Ján Bez" in page.locator("#emRecipient").inner_text()
+    assert "jan@example.com" in page.locator("#emRecipient").inner_text()
+    assert "20261000" in page.locator("#emHead").inner_text()
+    # the rendered mail really is in the sandboxed iframe
+    assert "Ján Bez" in page.frame_locator("#emPreview").locator("body").inner_text()
+    # …and this dialog can never send: there is no send control in it
+    assert modal.locator("button").count() == 1
+    assert modal.locator("button").inner_text().strip() == "Zavrieť"
+
+    modal.locator("#emClose").click()
+    page.wait_for_selector("#emModal", state="hidden")
+    assert console == [], f"console not clean: {console}"

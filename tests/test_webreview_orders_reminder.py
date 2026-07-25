@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
+from parovanie import orders_reminder  # noqa: E402
 from tests.conftest import authed_client  # noqa: E402
 
 # the UNPATCHED helper — the „BCC vždy" wiring tests need the real SMTP path (behind a fake
@@ -1412,3 +1413,62 @@ def test_a_row_resolved_by_hand_during_the_run_is_marked_manual(iso, monkeypatch
     assert not [r for r in st["red"] if r["code"] == "20261000"]     # relocated out of red
     (row,) = [r for r in st["skipped"] if r["code"] == "20261000"]
     assert row.get("manual") is True
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #217 — e-mail preview before sending. The manager could not see what the customer
+# gets until the automation had already sent it (blind send). The preview endpoint is
+# deliberately SEPARATE from the override 'send' action and must be provably inert:
+# no SMTP call, and not one byte written to the dedup store.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_reminder_preview_requires_login(iso):
+    anon = webapp.app.test_client()
+    assert anon.post("/api/orders-reminder/preview",
+                     json={"code": "20261000"}).status_code == 401
+
+
+def test_reminder_preview_returns_the_real_email_and_sends_nothing(iso):
+    c = _seed(iso)
+    iso["sent"].clear()
+    before = (iso["tmp"] / "orders_reminder.json").read_bytes()
+
+    r = c.post("/api/orders-reminder/preview", json={"code": "20261000"})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["ok"] is True
+    assert j["recipient"] == "a@x.sk"
+    # the SAME builder the automation and the manual send use — not a lookalike template
+    subject, html = orders_reminder.build_reminder_email("Ján Bez", "20261000")
+    assert (j["subject"], j["html"]) == (subject, html)
+    assert "Ján Bez" in j["html"] and "20261000" in j["html"]
+
+    assert iso["sent"] == []                                            # nothing was e-mailed
+    assert (iso["tmp"] / "orders_reminder.json").read_bytes() == before  # nothing was written
+    assert "20261000" not in (_store(iso).get("orders") or {})          # no claim, no record
+
+
+def test_reminder_preview_works_over_get_too(iso):
+    c = _seed(iso)
+    iso["sent"].clear()
+    r = c.get("/api/orders-reminder/preview?code=20261002")
+    assert r.status_code == 200 and r.get_json()["recipient"] == "c@x.sk"
+    assert iso["sent"] == []
+
+
+def test_reminder_preview_rejects_a_missing_or_unknown_code(iso):
+    c = _seed(iso)
+    iso["sent"].clear()
+    assert c.post("/api/orders-reminder/preview", json={}).status_code == 400
+    r = c.post("/api/orders-reminder/preview", json={"code": "99999999"})
+    assert r.status_code == 404
+    assert iso["sent"] == []
+
+
+def test_reminder_preview_fails_closed_on_a_corrupt_store(iso):
+    """It reads the same dedup store, so it inherits the #225 answer: a plain „not found" would
+    be misleading — the row may well exist, we just cannot read the file."""
+    c = _seed(iso)
+    (iso["tmp"] / "orders_reminder.json").write_text(_TRUNCATED, encoding="utf-8")
+    r = c.post("/api/orders-reminder/preview", json={"code": "20261000"})
+    assert r.status_code == 503
+    assert "poškoden" in r.get_json()["error"].lower()

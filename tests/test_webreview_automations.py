@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
+from parovanie import posta_uncollected  # noqa: E402
 from tests.conftest import authed_client  # noqa: E402
 
 # the UNPATCHED helper — the „BCC vždy" wiring test needs the real SMTP path (behind a fake
@@ -510,3 +511,65 @@ def test_the_posta_tab_still_renders_with_a_corrupt_store(iso):
     r = c.get("/api/posta-uncollected")
     assert r.status_code == 200
     assert r.get_json()["uncollected"] == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #217 — e-mail preview before sending, for the escalation mails too. Read-only by
+# construction: no tracking call, no escalation bump, no SMTP, no write.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_posta_preview_requires_login(iso):
+    anon = webapp.app.test_client()
+    assert anon.post("/api/posta-uncollected/preview",
+                     json={"package": "EF000000002SK"}).status_code == 401
+
+
+def test_posta_preview_returns_the_next_escalation_mail_and_sends_nothing(iso, monkeypatch):
+    webapp.run_posta_uncollected()                 # one uncollected shipment, mail #1 sent
+    c = authed_client()
+    iso["sent"].clear()
+    before = (iso["tmp"] / "posta_uncollected.json").read_bytes()
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+
+    r = c.post("/api/posta-uncollected/preview", json={"package": "EF000000002SK"})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["recipient"] == "jan@example.com"
+    assert j["already_sent"] == 1 and j["count"] == 2 and j["max_reached"] is False
+    # the SAME builder the run uses, fed the shipment's REAL office / retention values — not a
+    # lookalike template that could drift away from what is actually sent
+    (row,) = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())["uncollected"]
+    subject, html = posta_uncollected.build_email(
+        2, row["name"], row["packageNumber"], row["office_name"], row["office_addr"],
+        row["retained_till"])
+    assert (j["subject"], j["html"]) == (subject, html)
+    assert j["subject"].startswith("Pripomienka")   # mail #2 of the cadence
+
+    assert iso["sent"] == []                        # nothing e-mailed
+    assert asked == []                              # no Pošta SK round-trip
+    assert (iso["tmp"] / "posta_uncollected.json").read_bytes() == before   # nothing written
+
+
+def test_posta_preview_flags_an_exhausted_cadence(iso):
+    """After the 4th mail the automation sends no more, so previewing a „5th" would be a lie —
+    the endpoint shows the LAST one that went out and says the cadence is exhausted."""
+    webapp.run_posta_uncollected()
+    c = authed_client()
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    st["uncollected"][0]["count"] = 4
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps(st, ensure_ascii=False),
+                                                       encoding="utf-8")
+    j = c.post("/api/posta-uncollected/preview",
+               json={"package": "EF000000002SK"}).get_json()
+    assert j["count"] == 4 and j["max_reached"] is True
+
+
+def test_posta_preview_rejects_a_missing_or_unknown_package(iso):
+    webapp.run_posta_uncollected()
+    c = authed_client()
+    iso["sent"].clear()
+    assert c.post("/api/posta-uncollected/preview", json={}).status_code == 400
+    assert c.post("/api/posta-uncollected/preview",
+                  json={"package": "EF999999999SK"}).status_code == 404
+    assert iso["sent"] == []

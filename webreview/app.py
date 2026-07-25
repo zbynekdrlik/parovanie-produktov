@@ -5831,6 +5831,42 @@ def api_posta_uncollected():
     })
 
 
+@app.route("/api/posta-uncollected/preview", methods=["GET", "POST"])
+def api_posta_uncollected_preview():
+    """#217 — show the manager EXACTLY what the customer would receive, BEFORE anything goes out.
+
+    Strictly READ-ONLY: no claim, no escalation bump, no SMTP, not a single write. It renders
+    posta_uncollected.build_email from the shipment's CURRENT display row, so the count, post
+    office and retention date are the real ones the automation would use.
+
+    The number shown is the NEXT escalation mail (already sent + 1). Once the cadence is
+    exhausted there is no next mail, so it previews the LAST one that went out and says so
+    (`max_reached`) — inventing a 5th mail the automation will never send would be a lie."""
+    body = request.get_json(silent=True) or {}
+    pkg = str(body.get("package") or request.values.get("package") or "").strip()
+    if not pkg:
+        return jsonify({"ok": False, "error": "chýba číslo zásielky"}), 400
+    with _lock:
+        st = _load_posta_state()
+    row = next((r for r in st.get("uncollected") or []
+                if isinstance(r, dict) and r.get("packageNumber") == pkg), None)
+    if row is None:
+        return jsonify({"ok": False, "error": "zásielka sa v aktuálnom zozname nenašla"}), 404
+    try:
+        already = int(row.get("count") or 0)
+    except (TypeError, ValueError):     # a partial write must not 500 a read-only preview
+        already = 0
+    max_reached = already >= posta_uncollected.MAX_EMAILS
+    count = min(already + 1, posta_uncollected.MAX_EMAILS)
+    subject, html = posta_uncollected.build_email(
+        count, row.get("name", ""), pkg, row.get("office_name", ""),
+        row.get("office_addr", ""), row.get("retained_till", ""))
+    return jsonify({"ok": True, "subject": subject, "html": html,
+                    "recipient": row.get("email", ""), "name": row.get("name", ""),
+                    "packageNumber": pkg, "orderCode": row.get("orderCode", ""),
+                    "count": count, "already_sent": already, "max_reached": max_reached})
+
+
 def _find_current_row(st: dict, code: str) -> dict | None:
     """Look up `code`'s row in the CURRENT red/orange/skipped snapshot (#153 manual override) —
     the display data already carries every field the override needs (billFullName, email,
@@ -6014,6 +6050,27 @@ def api_orders_reminder_override():
             "NEklikaj znova (poslal by si druhý mail) — nahlás to na kontrolu.")}), 500
     log.info("orders_reminder: manual send %s -> %s (user %s)", code, email, session.get("user"))
     return jsonify({"ok": True, "status": "emailed"})
+
+
+@app.route("/api/orders-reminder/preview", methods=["GET", "POST"])
+def api_orders_reminder_preview():
+    """#217 — the reminder e-mail this order would receive, rendered for review only.
+
+    Strictly READ-ONLY, exactly like the Pošta preview above: no claim, no dedup record, no SMTP.
+    It is deliberately a SEPARATE endpoint from the override 'send' action, so that looking can
+    never turn into sending by accident."""
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or request.values.get("code") or "").strip()
+    if not code:
+        return jsonify({"ok": False, "error": "chýba kód objednávky"}), 400
+    with _lock:
+        st = _load_orders_reminder()
+    row = _find_current_row(st, code)
+    if row is None:
+        return jsonify({"ok": False, "error": "objednávka sa v aktuálnom zozname nenašla"}), 404
+    subject, html = orders_reminder.build_reminder_email(row.get("billFullName", ""), code)
+    return jsonify({"ok": True, "code": code, "subject": subject, "html": html,
+                    "recipient": row.get("email", ""), "name": row.get("billFullName", "")})
 
 
 @app.route("/api/orders-reminder")
