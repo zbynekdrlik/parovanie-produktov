@@ -1483,32 +1483,19 @@ function itemsWord(n, acc) {
   return (n >= 2 && n <= 4) ? 'položky' : 'položiek';
 }
 
-// A line whose fate is SETTLED: already ordered, already in stock, or the supplier cannot
-// deliver it — nothing left to ask the supplier for.
-// Deliberately NARROWER than `isHandled`, which also counts „čaká sa". That one is a
-// SCHEDULING flag, not a done flag: /api/orders defines it as an ACTIVE line that cannot
-// be stocked yet — waiting on the supplier, BATCHING MORE ITEMS, or deferred by agreement
-// with the customer — and the row button's own tooltip repeats „zbierame viac položiek".
-// A line the manager parks until the order is worth placing STILL has to be ordered, so
-// dropping it from the pasted e-mail would order less than the shop needs while the row
-// sits visibly on screen implying it went out. `isHandled` stays wider on purpose: it
-// drives the #205 hide filter and the chip colours, where „čaká sa" IS dealt with (he
-// decided to wait). Same LIVE flag maps, never the o.* snapshot.
-const isSettled = (o) => !!(ORDERED[o.key] || INSTOCK[o.key] || UNAVAIL[o.key]);
-
-// The lines of a supplier group that are still WORK. ONE scope for the „Σ spolu" chip
-// (#206) and for the copied order (#207), so the number on screen and the number in the
-// supplier's e-mail can never disagree — and DELIBERATELY independent of the „skryť
-// poriešené" view filter (#205): what has to be ordered is the outstanding demand, whether
-// or not the manager currently hides the rest.
-const outstandingOf = (items) => (items || []).filter(o => !isSettled(o));
+// The lines of a supplier group that are still WORK — exactly `!isHandled`, and there may
+// never be a second, narrower predicate beside it (see the note there). ONE scope for the
+// „skryť poriešené" filter (#205), the supplier chip colours, the #208 toolbar tally, the
+// „Σ spolu" chip (#206), the copied order (#207) and the `#empty` wording, so no two of
+// them can ever describe different work — and DELIBERATELY independent of whether the
+// #205 filter currently HIDES the rest: what is left to order does not depend on the view.
+const outstandingOf = (items) => (items || []).filter(o => !isHandled(o));
 
 const TO_COPY_LABEL = '📋 Kopírovať objednávku';
 const TO_COPY_EMPTY_LABEL = 'Nič na objednanie';
 // what the button takes, spelled out — the scope is a rule, not folklore
-const TO_COPY_TITLE = 'Skopíruje nevybavené riadky tohto dodávateľa (kód, veľkosť, ks, '
-  + 'odkaz) — bez už objednaných, skladových a nedostupných; riadok „čaká sa" ide do '
-  + 'objednávky tiež';
+const TO_COPY_TITLE = 'Skopíruje riadky, ktoré ešte treba objednať (kód, veľkosť, ks, '
+  + 'odkaz) — bez objednaných, čakajúcich, skladových a nedostupných';
 
 // The link to paste for a line, in the same precedence the ROW itself renders: the
 // reviewed decision link, then the inline pairing, then the grube .de order page. Only
@@ -1761,6 +1748,19 @@ function renderOrderRow(o, totals) {
 // počkať / skladom / nedostupné. Read from the LIVE flag maps (ORDERED/WAITING/INSTOCK/
 // UNAVAIL), which the toggle handlers update in place — NOT the o.* snapshot, which is
 // frozen at /api/orders fetch time and would leave chips stale until a full reload (#86).
+//
+// THE ONE PREDICATE of the tab. Do NOT introduce a second, narrower one beside it: it was
+// tried (a „settled only" scope that kept „čaká sa" in the copy and the „Σ spolu" chip)
+// and it made the surfaces contradict each other on screen — the toolbar reading „ostáva
+// vybaviť 0 z 2" next to a chip insisting „nevybavené: 3 ks", a RED (done) supplier chip
+// over pieces the app still counted as work, and with „skryť poriešené" on the group and
+// its copy button gone while those pieces were supposedly outstanding.
+// „⏳ Čaká sa" means „this line is NOT today's work" in all three meanings the row
+// button's own tooltip lists — čaká sa na dodávateľa (already at the supplier), zbierame
+// viac položiek (parked on purpose), dohoda so zákazníkom (deferred). None of them belong
+// in the order the manager is placing right now. When he decides to order a parked line he
+// switches „⏳ Čaká sa" off and it re-enters the outstanding set — that toggle IS the
+// workflow, and it is what keeps one number for one supplier order.
 function isHandled(o) {
   return !!(ORDERED[o.key] || WAITING[o.key] || INSTOCK[o.key] || UNAVAIL[o.key]);
 }
@@ -2133,10 +2133,21 @@ function renderToOrder() {
     const supLines = linesBySup[sup] || items;
     const copy = el('button', 'tosup-copy', TO_COPY_LABEL);
     copy.title = TO_COPY_TITLE;
-    // the node may be gone by then (a repaint) — harmless, the next paint is correct
-    const resetCopy = () => setTimeout(() => {
-      copy.textContent = TO_COPY_LABEL; copy.classList.remove('ok');
-    }, 2500);
+    // Every outcome label goes back to the default after 2,5 s — and each click owns ITS
+    // timer: `resetT` is per copy BUTTON (one closure per supplier group), and a new click
+    // cancels the pending one. Fired and forgotten, the SECOND click inside the window
+    // inherited the FIRST one's remaining time — a copy that failed 2,3 s after a copy
+    // that worked showed „⚠️ Schránka nedostupná" for 200 ms before the stale timer wiped
+    // it, and the manager pasted the PREVIOUS supplier's order, still in the clipboard,
+    // into this supplier's mail. (The node may be gone when it fires — a repaint —
+    // which is harmless: the next paint renders the default label anyway.)
+    let resetT = 0;
+    const resetCopy = () => {
+      clearTimeout(resetT);
+      resetT = setTimeout(() => {
+        copy.textContent = TO_COPY_LABEL; copy.classList.remove('ok');
+      }, 2500);
+    };
     // narrowed at CLICK time, not at paint time: a per-row flag toggle deliberately does
     // not repaint the list, so a set frozen here would paste a line he ticked meanwhile.
     copy.onclick = async () => {
