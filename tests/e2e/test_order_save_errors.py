@@ -140,18 +140,27 @@ def test_failed_ordered_checkbox_is_reported_and_rolled_back(page, toorder_serve
     assert page.locator(".toorder-row[data-code='N1'] input[type=checkbox]").is_checked() is False
 
 
-def test_repeated_identical_failures_do_not_stack_modals(page, toorder_server):
-    """alert() blocks the thread — during an outage a manager rapid-firing toggles would
-    otherwise queue one modal per click."""
+def test_every_failing_row_is_reported_not_just_the_first(page, toorder_server):
+    """Working DOWN a supplier group is the whole point of this tab, so three rows failing
+    within a couple of seconds is the NORMAL shape of a partial outage — not a repeat of
+    one event. The dedup used to key on the message prose alone, which carries no row
+    identity, so every row produced a byte-identical string: the manager was told once,
+    the other flags quietly flipped back, and he could not tell which of his writes
+    landed. Each failed WRITE now reports itself, and names the row it lost."""
     _open(page, toorder_server)
     _fail(page, "/api/instock")
 
     for code in ("C1", "C2", "C3"):
         page.locator(f".toorder-row[data-code='{code}'] .to-instock").click()
-    _wait_alert(page)
-    page.wait_for_timeout(400)
-    assert page.evaluate("() => window.__alerts.length") == 1
-    # every one of them still rolled back — suppressing the MESSAGE never suppresses the fix
+        page.wait_for_function(
+            "n => window.__alerts.length === n", arg=("C1", "C2", "C3").index(code) + 1,
+            timeout=3000)
+
+    msgs = page.evaluate("() => window.__alerts.map(a => a.msg)")
+    assert len(msgs) == 3, msgs
+    for code in ("C1", "C2", "C3"):
+        assert sum(1 for m in msgs if code in m) == 1, (code, msgs)
+    # every one of them still rolled back — reporting never replaces the fix
     assert page.locator(".toorder-row.instock").count() == 0
 
 
