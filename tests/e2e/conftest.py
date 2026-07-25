@@ -486,7 +486,15 @@ def automations_server(tmp_path_factory):
         # AI marked 20261002 already-contacted — the row an override can 'poslať teraz' anyway.
         "skipped": [{"code": "20261002", "billFullName": "Iva Stará", "email": "iva@example.com",
                     "itemName": "Čiapka Test Skipped", "shopRemark": "volané so zákazníkom", "days": 7,
-                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261002&src=orders"}],
+                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261002&src=orders"},
+                    # B1 M2 — an order the RUN started but could not finish (its send failed).
+                    # It used to vanish from the tab until the next run, with the override
+                    # answering 404; now it is carried here WITH the reason, still actionable.
+                    {"code": "20261006", "billFullName": "Nedokončený Beh",
+                     "email": "pending@example.com", "itemName": "Čelovka Test Pending",
+                     "shopRemark": "volať zákazníka", "days": 5,
+                     "pending": "odoslanie e-mailu zlyhalo — skúsim v ďalšom behu",
+                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261006&src=orders"}],
         # BUG 4 — an order whose customer has no e-mail on file: it can never be reminded, so
         # the run surfaces it here INSTEAD of paying for an AI classification on every run.
         "no_email": [{"code": "20261004", "billFullName": "Bez Mailu", "phone": "+421900999888",

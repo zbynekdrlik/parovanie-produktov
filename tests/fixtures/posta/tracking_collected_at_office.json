@@ -1,0 +1,62 @@
+{
+  "results": [
+    {
+      "events": [
+        {
+          "detailCode": "PODOD",
+          "detailDescription": "Podaná Oblastný uzol Poprad",
+          "localDate": "2026-07-02T16:55:15",
+          "stateCode": "received"
+        },
+        {
+          "detailCode": "VDOIO",
+          "detailDescription": "V preprave",
+          "localDate": "2026-07-02T17:31:01",
+          "stateCode": "transit"
+        },
+        {
+          "detailCode": "VDOOK",
+          "detailDescription": "Prevzatá na doručenie",
+          "localDate": "2026-07-03T06:49:48",
+          "postOffice": {
+            "city": "Brezno",
+            "districtStamp": "901073",
+            "name": "Brezno 1",
+            "postcode": "97701",
+            "street": "Boženy Němcovej 29"
+          },
+          "stateCode": "transit"
+        },
+        {
+          "detailCode": "ZNP1AN",
+          "detailDescription": "Uložená na pošte Brezno 1 - adresát nezastihnutý",
+          "localDate": "2026-07-03T12:16:40",
+          "postOffice": {
+            "city": "Brezno",
+            "districtStamp": "901073",
+            "name": "Brezno 1",
+            "postcode": "97701",
+            "street": "Boženy Němcovej 29"
+          },
+          "stateCode": "notified"
+        },
+        {
+          "detailCode": "OKP",
+          "detailDescription": "Prevzatá na pošte Brezno 1",
+          "localDate": "2026-07-03T15:41:32",
+          "postOffice": {
+            "city": "Brezno",
+            "districtStamp": "901073",
+            "name": "Brezno 1",
+            "postcode": "97701",
+            "street": "Boženy Němcovej 29"
+          },
+          "stateCode": "delivered"
+        }
+      ],
+      "number": "EF000000003SK",
+      "status": "ok"
+    }
+  ],
+  "status": "ok"
+}

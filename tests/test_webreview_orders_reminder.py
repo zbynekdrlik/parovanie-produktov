@@ -7,6 +7,7 @@ path is redirected to tmp. Mirrors test_webreview_automations.py.
 import json
 import os
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -531,11 +532,19 @@ def test_persist_failure_is_logged_and_the_run_continues(iso, monkeypatch, caplo
 
 def test_a_dropped_immediate_write_does_not_remail_on_the_next_run(iso, monkeypatch):
     """The whole point of the healing net: after a failed immediate write the customer must not
-    be e-mailed again by tomorrow's run."""
+    be e-mailed again by tomorrow's run.
+
+    SENDING_CLAIM_TTL_S is forced to 0 for the second run, and that is what makes this test
+    test anything at all (B1 M4): the failed write leaves the run's own transient 'sending'
+    claim on disk, and while that claim is FRESH the next run skips the order as „someone is
+    mailing it right now" — so the test passed even with the re-apply net removed, for the
+    whole 10-minute TTL. Expiring the claim reproduces the real scenario: tomorrow's run, with
+    nothing on disk but a lapsed claim, must still not mail the customer a second time."""
     real_save = _drop_first_emailed_write(monkeypatch)
     webapp.run_orders_reminder()
     # restore ONLY the save (monkeypatch.undo() would drop the whole `iso` isolation too)
     monkeypatch.setattr(webapp, "_save_orders_reminder", real_save)
+    monkeypatch.setattr(webapp, "SENDING_CLAIM_TTL_S", 0)   # …a day later, no live claim left
     iso["sent"].clear()
     stats2 = webapp.run_orders_reminder()
     assert stats2["emailed_now"] == 0
@@ -791,11 +800,15 @@ def test_a_manual_send_whose_write_failed_is_not_remailed_by_the_next_run(iso, m
     second time. The mitigation may not depend on a human noticing within 10 minutes."""
     c = _seed(iso)
     real_save = webapp._save_orders_reminder
-    n = {"calls": 0}
 
     def flaky_save(data):
-        n["calls"] += 1
-        if n["calls"] == 2:              # 1 = the claim, 2 = the post-send record
+        # Target the post-send record by its CONTENT, never by call index (B1 M5): the endpoint
+        # writes the claim first and the emergency `persist_failed` marker afterwards, so an
+        # index would silently start hitting a different write the moment either changes — and
+        # the test would keep passing while testing something else entirely.
+        entry = (data.get("orders") or {}).get("20261000") or {}
+        if (isinstance(entry, dict) and entry.get("status") == "emailed"
+                and not entry.get("persist_failed")):
             raise OSError("[Errno 28] No space left on device")
         return real_save(data)
 
@@ -871,3 +884,363 @@ def test_run_surfaces_missing_mail_bcc_in_its_stats(iso, monkeypatch):
 
 def test_run_stats_do_not_flag_bcc_when_it_is_configured(iso):
     assert webapp.run_orders_reminder()["bcc_missing"] is False
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# DÁVKA B1 — three holes the PR #223 verification found in the run's claim path.
+# All three share one symptom: the tab shows a healthy-looking run while an order
+# was silently dropped — the „ticho mŕtva automatizácia" MINOR 7 exists to prevent.
+# ═════════════════════════════════════════════════════════════════════════════════
+
+def _claim_writes_fail(monkeypatch, code="20261001"):
+    """Every attempt to persist the transient 'sending' claim for `code` fails (full disk)."""
+    real_save = webapp._save_orders_reminder
+
+    def no_claims(data):
+        entry = (data.get("orders") or {}).get(code) or {}
+        if isinstance(entry, dict) and entry.get("status") == "sending":
+            raise OSError("[Errno 28] No space left on device")
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", no_claims)
+
+
+def _display_codes(iso):
+    """Every code the tab can act on — the three lists the override endpoint searches."""
+    st = _store(iso)
+    return {r["code"] for section in ("red", "orange", "skipped")
+            for r in st.get(section) or []}
+
+
+# ── M1 — a claim that cannot be WRITTEN must be counted as an error ───────────────
+def test_a_claim_that_cannot_be_written_is_counted_as_an_error(iso, monkeypatch):
+    """A full disk makes every claim write fail, so the run mails nobody — and reported
+    `errors: 0`, i.e. the tab rendered „odoslané pripomienky teraz: 0" with no error count at
+    all. Indistinguishable from a quiet day with nothing to do."""
+    _claim_writes_fail(monkeypatch)
+    stats = webapp.run_orders_reminder()
+    assert stats["emailed_now"] == 0
+    assert all(m["to"] != "b@x.sk" for m in iso["sent"])     # nothing sent unclaimed
+    assert stats["errors"] >= 1                              # …and the run says so
+
+
+# ── M2 — an order the run gave up on mid-flight must stay ON the tab ──────────────
+def test_an_order_whose_send_failed_stays_actionable_on_the_tab(iso, monkeypatch):
+    """The run claims, SMTP fails, the claim is released — and the order appears in NO display
+    list, because those are rebuilt from scratch every run and this branch just `continue`s. The
+    manager cannot even see the failed order, and „▶ Poslať pripomienku" on the row they saw
+    before the run answers 404 „objednávka sa v aktuálnom zozname nenašla"."""
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    webapp.run_orders_reminder()
+    assert "20261001" in _display_codes(iso)
+    # …and the row is genuinely actionable, not just visible
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "contact"})
+    assert r.status_code == 200
+
+
+def test_an_order_whose_claim_could_not_be_written_stays_actionable_on_the_tab(iso, monkeypatch):
+    _claim_writes_fail(monkeypatch)
+    webapp.run_orders_reminder()
+    assert "20261001" in _display_codes(iso)
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "contact"})
+    assert r.status_code == 200
+
+
+def test_an_order_whose_classification_failed_stays_actionable_on_the_tab(iso, monkeypatch):
+    def boom(note):
+        raise RuntimeError("OpenAI 500")
+    monkeypatch.setattr(webapp, "_classify_contacted", boom)
+    webapp.run_orders_reminder()
+    assert {"20261001", "20261002"} <= _display_codes(iso)
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "send"})
+    assert r.status_code in (200, 409)                       # anything but 404
+
+
+def test_an_order_lost_to_a_concurrent_manual_send_stays_on_the_tab(iso, monkeypatch):
+    """The manager claims the order a heartbeat before the run reaches it: the run skips it (
+    correctly — it must not race the manual send) but then leaves it off the tab entirely."""
+    _seed(iso)
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _csv_with_a_note_on_the_red_order)
+    st = webapp._load_orders_reminder()
+    st.setdefault("orders", {})["20261000"] = {
+        "status": "sending", "claim": "someone-else", "email": "a@x.sk",
+        "claimed_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")}
+    webapp._save_orders_reminder(st)
+    iso["sent"].clear()
+    webapp.run_orders_reminder()
+    assert all(m["to"] != "a@x.sk" for m in iso["sent"])      # the run did not race the click
+    assert "20261000" in _display_codes(iso)                  # …and did not hide the order
+
+
+# ── M3 — no MAIL_BCC disqualifies an order BEFORE the paid OpenAI call ────────────
+def test_without_mail_bcc_the_run_pays_for_no_classification(iso, monkeypatch):
+    """`bcc_missing` was computed and reported but never USED as a disqualifier: the run claimed
+    the order, paid OpenAI, and only then had the send refused by require_bcc — and since the
+    order never becomes terminal, it did that again on every single run, forever. The repo rule
+    is „expensive call only after the cheap disqualifiers"."""
+    monkeypatch.delenv("MAIL_BCC", raising=False)
+    classified = []
+    monkeypatch.setattr(webapp, "_classify_contacted",
+                        lambda note: classified.append(note) or False)
+    writes = {"n": 0}
+    real_save = webapp._save_orders_reminder
+
+    def counting_save(data):
+        writes["n"] += 1
+        return real_save(data)
+
+    monkeypatch.setattr(webapp, "_save_orders_reminder", counting_save)
+    stats = webapp.run_orders_reminder()
+    assert classified == []                     # not one paid classification
+    assert iso["sent"] == []
+    assert stats["bcc_missing"] is True
+    assert writes["n"] == 1                     # only the final save — no claim ever written
+    assert _store(iso).get("orders") == {}      # nothing recorded → retried once BCC is set
+    # the orders are still visible so the manager sees WHAT is stuck, next to the BCC warning
+    assert {"20261001", "20261002"} <= _display_codes(iso)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #220 — the dedup store grew forever: every resolved order stayed in it for good.
+# Pruning is the easy half; the DANGEROUS half is pruning a record for an order the
+# export still carries — that customer would be reminded a second time.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_dedup_records_of_orders_long_gone_from_the_export_are_pruned(iso):
+    ancient = {"status": "emailed", "date": "2019-01-01T08:00:00+02:00", "email": "old@x.sk"}
+    (iso["tmp"] / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"19990000": ancient}}), encoding="utf-8")
+    webapp.run_orders_reminder()
+    assert "19990000" not in _store(iso)["orders"]
+
+
+def test_a_dedup_record_is_never_pruned_while_its_order_is_still_in_the_export(iso):
+    """20261003 is in the export but too FRESH to be selected (<4d), so it is not in this run's
+    working set at all — and it is exactly the kind of code an age-only prune would drop. It
+    crosses the 4-day line in a few days; if its record is gone by then, the customer is mailed
+    again."""
+    ancient = {"status": "emailed", "date": "2019-01-01T08:00:00+02:00", "email": "d@x.sk"}
+    (iso["tmp"] / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"20261003": ancient}}), encoding="utf-8")
+    webapp.run_orders_reminder()
+    assert _store(iso)["orders"]["20261003"] == ancient
+
+
+def test_an_ancient_but_still_live_record_does_not_cause_a_second_mail(iso):
+    webapp.run_orders_reminder()                       # 20261001 gets its one reminder
+    st = _store(iso)
+    st["orders"]["20261001"]["date"] = "2019-01-01T08:00:00+02:00"   # far outside any retention
+    (iso["tmp"] / "orders_reminder.json").write_text(json.dumps(st), encoding="utf-8")
+    iso["sent"].clear()
+    webapp.run_orders_reminder()
+    assert all(m["to"] != "b@x.sk" for m in iso["sent"])   # NOT re-mailed
+    assert _store(iso)["orders"]["20261001"]["status"] == "emailed"   # record survived
+
+
+def test_prune_is_skipped_when_the_export_is_unreadable(iso, monkeypatch):
+    """No export = no idea which orders are live, so pruning could only guess. Fail closed."""
+    (iso["tmp"] / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"19990000": {"status": "emailed",
+                                            "date": "2019-01-01T08:00:00+02:00"}}}),
+        encoding="utf-8")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: b"")
+    webapp.run_orders_reminder()
+    assert "19990000" in _store(iso)["orders"]
+
+
+def test_pending_rows_do_not_pile_up_across_runs(iso, monkeypatch):
+    """The rescued rows must be TRANSIENT — the display lists are rebuilt every run, so a run
+    that keeps failing must re-list each order once, never accumulate duplicates the manager
+    then sees twice on the tab."""
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    for _ in range(3):
+        webapp.run_orders_reminder()
+    codes = [r["code"] for r in _store(iso)["skipped"]]
+    assert len(codes) == len(set(codes))
+
+
+def test_a_rescued_row_disappears_once_the_next_run_succeeds(iso, monkeypatch):
+    """…and the rescue must not become sticky: as soon as the send works, the order belongs in
+    orange with no „nedokončené" note left behind."""
+    calls = {"n": 0}
+    real_send = webapp._send_mail_html
+
+    def flaky_send(to, subject, body, bcc=None, **kw):
+        calls["n"] += 1
+        return False if calls["n"] == 1 else real_send(to, subject, body, bcc=bcc, **kw)
+
+    monkeypatch.setattr(webapp, "_send_mail_html", flaky_send)
+    webapp.run_orders_reminder()
+    assert any(r.get("pending") for r in _store(iso)["skipped"])
+    webapp.run_orders_reminder()
+    st = _store(iso)
+    assert not any(r.get("pending") for r in st["skipped"])
+    assert "20261001" in {r["code"] for r in st["orange"]}
+
+
+def test_a_stale_pending_note_is_not_carried_forward_forever(iso, monkeypatch):
+    """`pending` must not stick to a row once the order IS resolved: _relocate copies rows with
+    `{**r}` and the incremental fast path copies them with dict(prev_row), so an order whose
+    classification failed once would keep warning „AI klasifikácia zlyhala" — and keep inflating
+    the „z toho N nedokončených" heading — on every run from then on. Found in the PR #224
+    adversarial review."""
+    boom = {"n": 0}
+    real_classify = webapp._classify_contacted
+
+    def classify_once_failing(note):
+        boom["n"] += 1
+        if boom["n"] == 1:
+            raise RuntimeError("OpenAI 500")
+        return real_classify(note)
+
+    monkeypatch.setattr(webapp, "_classify_contacted", classify_once_failing)
+    webapp.run_orders_reminder()                     # run 1: one order ends up pending
+    assert any(r.get("pending") for r in _store(iso)["skipped"])
+    webapp.run_orders_reminder()                     # run 2: it is resolved…
+    webapp.run_orders_reminder()                     # run 3: …and takes the incremental path
+    st = _store(iso)
+    stale = [r for r in st["skipped"] + st["orange"] if r.get("pending")]
+    assert stale == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #224 review — `pending` („the run could not finish this order") is stripped when
+# the order resolves, in _relocate AND in the incremental fast path. The manual override
+# is the THIRD way an order resolves, and it re-appended the row verbatim: the manager
+# finished the job by hand, yet the row kept its „automat to nestihol" warning — and kept
+# inflating the „z toho N nedokončených" heading — until the next run rebuilt the lists
+# (up to 24 h later).
+# ═════════════════════════════════════════════════════════════════════════════════
+def _pending_row(iso, section, code):
+    return [r for r in _store(iso)[section] if r["code"] == code and r.get("pending")]
+
+
+def test_a_manual_contact_override_does_not_carry_a_stale_pending_note(iso, monkeypatch):
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    webapp.run_orders_reminder()                     # 20261001: send failed → rescued as pending
+    assert _pending_row(iso, "skipped", "20261001")
+
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "contact"})
+    assert r.status_code == 200
+    st = _store(iso)
+    assert st["orders"]["20261001"]["status"] == "skipped_contacted"
+    assert _pending_row(iso, "skipped", "20261001") == []
+
+
+def test_a_manual_send_override_does_not_carry_a_stale_pending_note(iso, monkeypatch):
+    """…and the same on the send path, which re-appends the row into `orange`."""
+    capturing_send = webapp._send_mail_html          # the fixture's stub (nothing leaves)
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda to, subject, body, bcc=None, **kw: False)
+    webapp.run_orders_reminder()
+    assert _pending_row(iso, "skipped", "20261001")
+
+    monkeypatch.setattr(webapp, "_send_mail_html", capturing_send)
+    r = authed_client().post("/api/orders-reminder/override",
+                             json={"code": "20261001", "action": "send"})
+    assert r.status_code == 200
+    st = _store(iso)
+    assert st["orders"]["20261001"]["status"] == "emailed"
+    assert _pending_row(iso, "orange", "20261001") == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# PR #224 review — the dedup prune (#220) drops old records on AGE ALONE, and the only
+# thing that makes that safe is „retention (180 d) is twice the orders export window
+# (90 d)": a record old enough to go cannot belong to an order the export still carries.
+# The 90 lived as a bare literal inside _fetch_orders_csv with nothing tying it to the
+# retention constant, so widening the export past 180 d would silently start dropping
+# records for live orders — one duplicate customer mail each.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_retention_stays_at_least_twice_the_orders_export_window():
+    assert (webapp.orders_reminder.DEDUP_RETENTION_DAYS
+            >= 2 * webapp.ORDERS_EXPORT_WINDOW_DAYS)
+
+
+def _captured_orders_url(monkeypatch, base):
+    seen = {}
+
+    class _Resp:
+        content = b""
+
+        def raise_for_status(self):
+            pass
+
+    def _get(url, **kw):
+        seen["url"] = url
+        return _Resp()
+
+    monkeypatch.setattr(webapp, "_cred", lambda key: base)
+    monkeypatch.setattr(webapp.requests, "get", _get)
+    webapp._fetch_orders_csv()
+    return seen["url"]
+
+
+def test_the_orders_export_window_is_the_named_constant(monkeypatch):
+    """…and the constant is not decoration: it is what actually reaches Shoptet."""
+    # `want` FIRST: computing it after the call would flake if midnight ticked in between.
+    want = time.strftime("%Y-%m-%d", time.localtime(
+        time.time() - webapp.ORDERS_EXPORT_WINDOW_DAYS * 86400))
+    url = _captured_orders_url(monkeypatch, "https://shop.test/export/orders.csv?patternId=-9")
+    assert f"dateFrom={want}" in url
+    assert "patternId=-9" in url                       # the configured parameters survive
+
+
+def test_a_date_window_configured_in_the_url_does_not_survive(monkeypatch):
+    """SHOPTET_ORDERS_URL is hand-edited config; if someone pastes a URL that already carries
+    dateFrom, appending ours would send the parameter twice and leave the effective window to
+    the server — with the retention coupling above silently invalidated. Ours must be the only
+    one, and every other parameter (the `hash` token!) must come through untouched."""
+    url = _captured_orders_url(
+        monkeypatch,
+        "https://shop.test/export/orders.csv?patternId=-9&dateFrom=2020-01-01"
+        "&hash=aB+cD%2F1&dateUntil=2020-02-01")
+    assert url.count("dateFrom=") == 1 and "dateFrom=2020-01-01" not in url
+    assert url.count("dateUntil=") == 1 and "dateUntil=2020-02-01" not in url
+    assert "hash=aB+cD%2F1" in url                     # byte-identical, never re-encoded
+
+
+def test_the_date_window_strip_matches_the_KEY_not_a_substring():
+    """Two ways the strip could misfire, both checked directly on the helper: it must not eat a
+    parameter that merely CONTAINS the word, and it must catch a differently-cased one (the
+    docstring promises our window is the only one that can apply)."""
+    kept = webapp._strip_date_params("https://s.test/e.csv?myDateFrom=1&x=2")
+    assert kept == "https://s.test/e.csv?myDateFrom=1&x=2"
+    assert webapp._strip_date_params("https://s.test/e.csv?a=1&DATEFROM=x&datefrom=y") == \
+        "https://s.test/e.csv?a=1"
+    assert webapp._strip_date_params("https://s.test/e.csv") == "https://s.test/e.csv"
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Same bug class as the terminal-cache `at` (PR #224 review, second round): a stored
+# timestamp must be bounded from BOTH sides. `_reminder_claim_active` only asked „is it
+# younger than the TTL", so a claimed_at stamped in the FUTURE — the very clock-jump
+# premise the `at` fix was written for, or a partial write — reads as a live claim until
+# real time catches up. The manager's „▶ Poslať pripomienku" then 409s („práve sa
+# odosiela") and the daily run skips the order as pending: the customer's reminder is
+# silently never sent, and the TTL that exists so a claim can never lock an order forever
+# is defeated.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_a_claim_stamped_in_the_future_does_not_lock_the_order():
+    ahead = (datetime.now(timezone.utc).astimezone() + timedelta(days=1)).isoformat()
+    assert webapp._reminder_claim_active({"status": "sending", "claimed_at": ahead}) is False
+
+
+def test_a_future_claim_does_not_block_a_manual_send(iso):
+    """…end to end: the order must stay actionable from the tab."""
+    c = _seed(iso)
+    st = _store(iso)
+    ahead = (datetime.now(timezone.utc).astimezone() + timedelta(days=1)).isoformat()
+    st.setdefault("orders", {})["20261000"] = {"status": "sending", "claimed_at": ahead}
+    webapp._save_orders_reminder(st)
+    iso["sent"].clear()
+    r = c.post("/api/orders-reminder/override", json={"code": "20261000", "action": "send"})
+    assert r.status_code == 200
+    assert [m["to"] for m in iso["sent"]] == ["a@x.sk"]
+    assert _store(iso)["orders"]["20261000"]["status"] == "emailed"

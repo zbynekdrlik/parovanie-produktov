@@ -2385,6 +2385,7 @@ function renderPosta() {
         `Skontrolovaných zásielok: ${lr.checked ?? 0} · nevyzdvihnuté: ${lr.uncollected ?? 0}`
         + ` · odoslané e-maily: ${lr.emails_sent ?? 0}`
         + (lr.invalid ? ` · nesledovateľné: ${lr.invalid}` : '')
+        + (lr.api_skipped ? ` · už doručené/vrátené (nekontrolujú sa): ${lr.api_skipped}` : '')
         + (lr.errors ? ` · chyby pri kontrole: ${lr.errors}` : '')));
     }
     if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
@@ -3228,7 +3229,10 @@ function renderOrdersReminder() {
     st.appendChild(el('div', 'muted',
       `Objednávky >4 dni: ${lr.orders_4d ?? 0} · bez poznámky: ${lr.no_note ?? 0}`
       + ` · odoslané pripomienky teraz: ${lr.emailed_now ?? 0}`
-      + (lr.emailed_total ? ` · spolu pripomenutých: ${lr.emailed_total}` : '')
+      // „v evidencii", not „spolu": the dedup store drops records for orders long gone from the
+      // export (#220), so this is the number still on record — not a lifetime total that would
+      // otherwise appear to shrink on its own.
+      + (lr.emailed_total ? ` · pripomenutých v evidencii: ${lr.emailed_total}` : '')
       + (lr.ai_unavailable ? ` · AI nedostupné: ${lr.ai_unavailable}` : '')
       + (lr.no_email ? ` · chýba e-mail: ${lr.no_email}` : '')
       + (lr.errors ? ` · chyby: ${lr.errors}` : '')));
@@ -3341,26 +3345,39 @@ function renderOrdersReminder() {
     wrap.appendChild(tbl);
   }
 
-  // SKIPPED — AI classified the note as 'already contacted', so no e-mail went out. Shown so the
-  // manager can correct a wrong AI read (#153) — the only override here is 'send anyway'.
-  if (skipped.length) {
-    wrap.appendChild(el('div', 'warnhead',
-      `⚪ ${skipped.length} — AI usúdilo, že zákazník je už kontaktovaný`));
+  // The backend keeps both kinds of row in one `skipped` list (so the override endpoint finds
+  // them the same way), but they mean very different things to the manager, so they render as
+  // TWO sections: the AI's „already contacted" verdicts, and the orders the run STARTED but
+  // could not finish (`pending` — failed send, failed classification, unwritable claim, missing
+  // config). Putting the latter under the „AI usúdilo…" heading would state something that
+  // never happened — with no MAIL_BCC the AI does not run at all.
+  _ordremSkippedTable(wrap, skipped.filter(o => !o.pending), _ordremAction,
+    `⚪ %n — AI usúdilo, že zákazník je už kontaktovaný`, 'ordrem-skipped');
+  _ordremSkippedTable(wrap, skipped.filter(o => o.pending), _ordremAction,
+    `⚠️ %n — automat ich nestihol vybaviť (pošli ručne)`, 'ordrem-pending');
+}
+
+// One „skipped-shaped" table (note + „▶ Poslať pripomienku"), rendered for both sections above.
+function _ordremSkippedTable(wrap, rows, actionWire, headTpl, testid) {
+  if (rows.length) {
+    wrap.appendChild(el('div', 'warnhead', headTpl.replace('%n', String(rows.length))));
     const tbl = el('table', 'posta-table');
-    tbl.dataset.testid = 'ordrem-skipped';
+    tbl.dataset.testid = testid;
     tbl.innerHTML = '<thead><tr><th>Objednávka</th><th>Zákazník</th><th>Položka</th>'
       + '<th>Interná poznámka</th><th>Akcia</th></tr></thead>';
     const tb = el('tbody');
-    for (const o of skipped) {
+    for (const o of rows) {
       const tr = el('tr', ''); tr.dataset.code = o.code;
       tr.innerHTML =
         `<td><a href="${escapeHtml(o.admin_link)}" target="_blank" rel="noopener">${escapeHtml(o.code)}</a></td>`
         + `<td>${escapeHtml(o.billFullName || '')}<div class="sub2">${escapeHtml(o.email || '')}</div></td>`
         + `<td>${escapeHtml(o.itemName || '')}<div class="sub2">${o.days || 0} ${dniLabel(o.days || 0)} v stave</div></td>`
-        + `<td class="sub2">${escapeHtml(o.shopRemark || '—')}</td>`;
+        + `<td class="sub2">${escapeHtml(o.shopRemark || '—')}`
+        + (o.pending ? `<div class="sub2">⚠️ ${escapeHtml(o.pending)}</div>` : '')
+        + `</td>`;
       const actTd = el('td', 'ordrem-actions');
       const sendBtn = el('button', 'btn sm ghost ordrem-act-send', '▶ Poslať pripomienku');
-      _ordremAction(sendBtn, o.code, 'send');
+      actionWire(sendBtn, o.code, 'send');
       actTd.appendChild(sendBtn);
       tr.appendChild(actTd);
       tb.appendChild(tr);

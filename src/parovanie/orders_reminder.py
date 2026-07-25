@@ -190,6 +190,105 @@ def parse_classification(content: str) -> bool:
     raise ValueError(f"klasifikátor nevrátil platnú kategóriu: {content!r}")
 
 
+def all_order_codes(orders_csv) -> set[str]:
+    """EVERY order code in the export — the „source window" the dedup store is pruned against
+    (#220). Deliberately NOT ``select_orders``' filtered output: a „Vybavená" order can be
+    reopened to „Vybavuje sa" tomorrow and a fresh order crosses the 4-day line in a few days,
+    so both are still live as far as the dedup store is concerned. An empty/unreadable export
+    yields an empty set, which the caller treats as „window unknown → prune nothing"."""
+    text = (orders_csv.decode("cp1250", errors="replace")
+            if isinstance(orders_csv, bytes) else (orders_csv or ""))
+    return {c for r in csv.DictReader(io.StringIO(text), delimiter=";")
+            if (c := (r.get("code") or "").strip())}
+
+
+# How long a dedup record survives after its order left the export (#220). This is the PRIMARY
+# bound and it is deliberately twice the orders-export window (webreview/app.py
+# ORDERS_EXPORT_WINDOW_DAYS, used by _fetch_orders_csv), so a record for an order that is still
+# in the export is ALWAYS inside retention — even if the export we happened to read was
+# truncated. That margin is what makes age-based pruning safe. Importing the constant here would
+# be circular (app.py imports this module), so the coupling is held by
+# test_retention_stays_at_least_twice_the_orders_export_window instead — change one, and it tells
+# you about the other.
+DEDUP_RETENTION_DAYS = 180
+# A backstop for records we cannot date at all (a partial write with no usable timestamp): those
+# can never age out, so they are capped. It is deliberately NOT applied to dated records — a
+# count-based cap would drop a record that is still protecting a live order, which costs a
+# duplicate customer mail. Retention bounds the dated ones, and the export window bounds how
+# many orders can even be resolved in that period.
+DEDUP_MAX_UNDATED_RECORDS = 500
+
+
+def _record_date(entry) -> datetime | None:
+    """When a dedup record was resolved (or claimed) — lenient, never raises. Handles the
+    ISO 'YYYY-MM-DDTHH:MM:SS+02:00' the run writes as well as a bare date."""
+    if not isinstance(entry, dict):
+        return None
+    for key in ("date", "claimed_at"):
+        d = _parse_dt(str(entry.get(key) or "").replace("T", " "))
+        if d is not None:
+            return d
+    return None
+
+
+def prune_done(done: dict, window_codes, now: datetime | None = None,
+               retention_days: int = DEDUP_RETENTION_DAYS,
+               max_undated: int = DEDUP_MAX_UNDATED_RECORDS) -> tuple[dict, list[str]]:
+    """Bound the per-order dedup map (#220) without ever losing a record that still matters.
+    Returns ``(kept_map, dropped_codes)`` — the caller logs what went, because a duplicate-mail
+    incident caused by a silent drop would be undebuggable.
+
+    A record is the ONLY thing that stops a customer being reminded a second time, so the rules
+    are asymmetric — cheap to keep, expensive to drop:
+
+    1. A code still present in the export (``window_codes``) is kept, whatever its age. Its
+       order can return to „Vybavuje sa" at any moment, and then a missing record = a duplicate
+       mail. This is the invariant; nothing overrides it.
+    2. ``window_codes`` EMPTY means the export was empty or unreadable — the window is unknown,
+       so nothing is pruned at all (fail closed, the same reflex as the supplier upload: no
+       source of truth, no destructive action).
+    3. Everything else is kept while it is younger than ``retention_days``. Age is the ONLY
+       criterion here, and it is safe because retention is twice the orders-export window: a
+       record old enough to be dropped belongs to an order that cannot be in the export at all,
+       not even a truncated one. A COUNT-based cap is deliberately NOT applied to dated records
+       — it would drop a record that is still protecting a live order the moment a short export
+       made the window look small (found in the PR #224 adversarial review).
+    4. Records with no usable timestamp cannot age out, so they alone are capped at
+       ``max_undated`` — the only unbounded-growth path left.
+
+    REOPEN — the deliberate decision this bounding does NOT change: an order that becomes
+    „Vybavuje sa" again keeps its terminal record and therefore never receives a second
+    reminder while it is still in the export. One reminder per order code is the safer default
+    (a duplicate mail is visible to the customer; a missing one is not), and the manager can
+    always send one by hand from the tab („▶ Poslať pripomienku" answers 409 only for an
+    already-emailed order — the record is the audit trail of that). Only once the order has
+    left the export AND the retention window does the record go, so a genuinely new order cycle
+    months later starts clean."""
+    if not isinstance(done, dict):
+        return {}, []
+    window = set(window_codes or ())
+    if not window:
+        return dict(done), []                   # window unknown → prune nothing (rule 2)
+    now = now or datetime.now()
+    cutoff = now - timedelta(days=retention_days)
+    kept, undated, dropped = {}, [], []
+    for c, v in done.items():
+        if c in window:                         # rule 1 — live order, never dropped
+            kept[c] = v
+            continue
+        ts = _record_date(v)
+        if ts is None:
+            undated.append((c, v))              # rule 4 — capped below
+        elif ts >= cutoff:
+            kept[c] = v                         # rule 3 — inside retention, kept on age alone
+        else:
+            dropped.append(c)
+    for c, v in undated[:max_undated]:
+        kept[c] = v
+    dropped.extend(c for c, _ in undated[max_undated:])
+    return kept, dropped
+
+
 def order_fingerprint(o: dict) -> str:
     """Stable per-code fingerprint of the fields that decide the AI/e-mail outcome (#153 —
     incremental processing) — the order date and the internal note. ``days`` is deliberately

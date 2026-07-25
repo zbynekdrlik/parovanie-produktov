@@ -166,3 +166,112 @@ def test_partition_retries_not_yet_terminal_even_if_unchanged():
     to_process, unchanged, fp = ordrem.partition_incremental([o], prev_fp, set())
     assert [x["code"] for x in to_process] == ["pending"]
     assert unchanged == []
+
+
+# ── #220 — the dedup store must stay bounded, and must never lose a live record ────
+def _rec(date_str, status="emailed"):
+    return {"status": status, "date": date_str, "email": "x@y.sk"}
+
+
+def test_prune_keeps_every_code_still_in_the_source_window():
+    """The one invariant that must never bend: a code the export still carries can come back
+    round as „Vybavuje sa" at any moment, so dropping its dedup record means the customer gets a
+    SECOND reminder. Age is irrelevant for those."""
+    done = {"IN": _rec("2019-01-01T08:00:00+02:00"), "OUT": _rec("2019-01-01T08:00:00+02:00")}
+    kept, dropped = ordrem.prune_done(done, {"IN"}, now=datetime(2026, 7, 25))
+    assert set(kept) == {"IN"}
+    assert dropped == ["OUT"]                          # …and the drop is reported, never silent
+
+
+def test_prune_keeps_recent_records_that_left_the_window():
+    """A grace period after an order leaves the export — a partial/short export must not
+    instantly forget that the customer was already mailed."""
+    done = {"OLD": _rec("2019-01-01T08:00:00+02:00"),
+            "RECENT": _rec("2026-07-01T08:00:00+02:00")}
+    kept, _ = ordrem.prune_done(done, {"SOMETHING-ELSE"}, now=datetime(2026, 7, 25),
+                                retention_days=180)
+    assert set(kept) == {"RECENT"}
+
+
+def test_prune_never_drops_a_dated_record_on_COUNT_alone():
+    """A count cap on dated records is what would re-mail a customer: a truncated export makes
+    the window look small, so records for orders that are very much still live fall „outside"
+    it — and a cap would then drop them purely because there are many. Retention is the only
+    criterion, and it is twice the 90-day export window, so a droppable record cannot belong to
+    an order still in the export. (PR #224 adversarial review, reproduced.)"""
+    done = {f"C{i}": _rec(f"2026-07-{i:02d}T08:00:00+02:00") for i in range(1, 11)}
+    kept, dropped = ordrem.prune_done(done, {"IRRELEVANT"}, now=datetime(2026, 7, 25),
+                                      retention_days=180, max_undated=3)
+    assert set(kept) == set(done)                      # all ten are inside retention → all stay
+    assert dropped == []
+
+
+def test_prune_caps_records_it_cannot_date_at_all():
+    """Undated records (a partial write) can never age out, so they are the one thing a count
+    cap must bound — otherwise the store still grows forever."""
+    done = {f"U{i}": {"status": "emailed"} for i in range(10)}
+    kept, dropped = ordrem.prune_done(done, {"IRRELEVANT"}, now=datetime(2026, 7, 25),
+                                      max_undated=3)
+    assert len(kept) == 3 and len(dropped) == 7
+
+
+def test_prune_does_nothing_when_the_window_is_unknown():
+    """Fail-closed: an empty/unreadable export gives an EMPTY window set, and pruning against it
+    would drop records for orders that are very much still live. Same shape as the fail-closed
+    supplier upload — no source of truth, no destructive action."""
+    done = {"A": _rec("2019-01-01T08:00:00+02:00")}
+    assert ordrem.prune_done(done, set(), now=datetime(2026, 7, 25)) == (done, [])
+
+
+def test_prune_survives_garbage_records():
+    done = {"IN": "not-a-dict", "OUT": {"status": "emailed"}, "TRANSIT": {"status": "sending",
+            "claimed_at": "2026-07-25T08:00:00+02:00"}}
+    kept, _ = ordrem.prune_done(done, {"IN"}, now=datetime(2026, 7, 25))
+    assert kept["IN"] == "not-a-dict"                   # window codes are kept verbatim
+    assert "TRANSIT" in kept                            # a fresh claim is not garbage-collected
+
+
+def test_all_order_codes_returns_every_code_in_the_export():
+    """The window set is EVERY code in the export — not just the ones select_orders picks.
+    A „Vybavená" order can be reopened to „Vybavuje sa" tomorrow; its record must survive."""
+    csv_text = ("code;date;statusName;shopRemark;email;phone;billFullName;itemName\r\n"
+                "111;2026-07-01 10:00:00;Vybavuje sa;;a@x.sk;;A;X\r\n"
+                "111;2026-07-01 10:00:00;Vybavuje sa;;a@x.sk;;A;Y\r\n"
+                "222;2026-07-02 10:00:00;Vybavená;;b@x.sk;;B;X\r\n")
+    assert ordrem.all_order_codes(csv_text.encode("cp1250")) == {"111", "222"}
+
+
+def test_prune_at_production_defaults_never_drops_a_live_record_at_scale():
+    """The shipped defaults (180 d / undated-only cap) are what actually runs, but the live store
+    holds ~24 records today, so pruning is a no-op there and a regression would stay invisible
+    for months. Drive the REAL defaults with a store far bigger than any cap: every code the
+    export still carries must survive, however ancient its record claims to be."""
+    now = datetime(2026, 7, 25, 9, 0, 0)
+    rows = ["code;date;statusName;shopRemark;email;phone;billFullName;itemName"]
+    live = [f"2026{i:04d}" for i in range(900)]          # far above any count cap
+    for c in live:
+        rows.append(f"{c};2026-05-20 08:00:00;Vybavuje sa;nota;x@y.sk;;Meno;Vec")
+    raw = ("\r\n".join(rows) + "\r\n").encode("cp1250")
+
+    done = {c: _rec("2019-01-01T08:00:00+02:00") for c in live}      # all ancient on paper
+    done.update({f"GONE{i}": _rec("2019-01-01T08:00:00+02:00") for i in range(50)})
+    kept, dropped = ordrem.prune_done(done, ordrem.all_order_codes(raw), now=now)
+
+    assert set(live) <= set(kept)                        # not one live record lost
+    assert set(dropped) == {f"GONE{i}" for i in range(50)}
+    # …and the orders the run would actually act on are all still protected
+    assert {o["code"] for o in ordrem.select_orders(raw, now=now)} <= set(kept)
+
+
+def test_prune_never_drops_a_dated_record_on_count_at_ANY_scale():
+    """The count-cap ban has to hold for a cap of ANY size, not just one that reuses
+    `max_undated`. test_prune_never_drops_a_dated_record_on_COUNT_alone drives ten records
+    against max_undated=3, and the at-scale test's 900 records are all still INSIDE the window —
+    a re-introduced cap with its own constant (a hard 500, say) slips past both, and every
+    record it drops for a live order costs a duplicate customer mail. This one bites regardless
+    of the constant chosen: thousands of records, all dated well inside retention, none of them
+    in the window. (PR #224 adversarial review.)"""
+    done = {f"C{i}": _rec("2026-04-27T08:00:00+02:00") for i in range(5000)}
+    kept, dropped = ordrem.prune_done(done, {"ONE-SURVIVING-CODE"}, now=datetime(2026, 7, 25))
+    assert dropped == []
+    assert len(kept) == 5000

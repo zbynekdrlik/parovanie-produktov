@@ -110,8 +110,12 @@ def test_toggle_unknown_automation_404(iso):
 # ── the full Pošta run (mocked edges) ─────────────────────────────────────────
 def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
     stats = webapp.run_posta_uncollected()
+    # api_skipped (#222) is 0 on a first run — nothing is in the terminal cache yet, so every
+    # shipment is genuinely fetched. Kept as an EXACT dict on purpose: a new stats key has to be
+    # a deliberate change, not something that quietly appears.
     assert stats == {"checked": 3, "uncollected": 1, "invalid": 1, "errors": 0,
-                     "emails_sent": 1, "emails_failed": 0, "bcc_missing": False}
+                     "emails_sent": 1, "emails_failed": 0, "bcc_missing": False,
+                     "api_skipped": 0}
     # exactly ONE customer mail, template #1. run_posta_uncollected no longer
     # passes an explicit bcc — _send_mail_html itself defaults it to MAIL_BCC
     # (tested directly below); here it's stubbed, so bcc arrives as None.
@@ -329,3 +333,121 @@ def test_posta_persist_failure_still_shows_the_shipment_in_the_tab(iso, monkeypa
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert [u["orderCode"] for u in st["uncollected"]] == ["2026100"]
     assert st["escalation"] == {"2026100": f"1|{TODAY.isoformat()}"}
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# #222 — the daily run re-fetched tracking for EVERY shipment in the 30-day window,
+# including long-delivered ones, sequentially at up to 180 s each (60 s timeout ×
+# 3 tries). A delivered/returned parcel can never change again, so that call buys
+# nothing and on a slow Pošta SK day it is what makes the 09:00 run drag on.
+# ═════════════════════════════════════════════════════════════════════════════════
+def test_delivered_shipment_is_recorded_as_terminal_and_not_tracked_again(iso, monkeypatch):
+    webapp.run_posta_uncollected()
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["terminal"]["EF000000001SK"]["state"] == "delivered"
+
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000001SK" not in asked               # the delivered parcel: no API call
+    assert "EF000000002SK" in asked                   # the uncollected one: still checked daily
+    assert stats["api_skipped"] == 1
+    assert stats["checked"] == 3                      # every shipment is still accounted for
+
+
+def test_an_uncollected_shipment_is_never_cached_as_terminal(iso):
+    """'notified' is precisely the state the automation chases — caching it would freeze the
+    escalation and the customer would never get mails #2-#4."""
+    webapp.run_posta_uncollected()
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF000000002SK" not in (st.get("terminal") or {})
+    assert "06565700348274" not in (st.get("terminal") or {})   # invalid_format is not final
+
+
+def test_terminal_cache_is_pruned_when_the_shipment_leaves_the_window(iso):
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF999999999SK": {"state": "delivered", "at": "2026-01-01"}}}),
+        encoding="utf-8")
+    webapp.run_posta_uncollected()
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF999999999SK" not in st["terminal"]      # bounded by the 30-day source window
+    assert "EF000000001SK" in st["terminal"]
+
+
+def test_a_corrupt_terminal_cache_does_not_skip_the_shipment(iso, monkeypatch):
+    """Garbage in the cache must degrade to 'check it', never to 'silently ignore it'."""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000001SK": "nonsense"}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    webapp.run_posta_uncollected()
+    assert "EF000000001SK" in asked
+
+
+def test_a_terminal_cache_entry_for_a_different_order_does_not_skip_the_shipment(iso, monkeypatch):
+    """Tracking numbers are typed into Shoptet by hand, so the same one can end up on a second
+    order. The cached verdict must prove it belongs to THIS order — otherwise a stale
+    „delivered" would silence a genuinely uncollected parcel and the customer would never be
+    told. The cache is an optimisation; when it cannot prove itself it must defer to the API."""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000002SK": {"state": "delivered", "at": "2026-07-01",
+                                       "code": "SOMEONE-ELSE"}}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000002SK" in asked                   # checked, not silently skipped
+    assert stats["emails_sent"] == 1                  # …and the customer IS told
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["terminal"]["EF000000001SK"]["code"] == "2026105"   # entries carry their order
+
+
+def test_a_stale_terminal_cache_entry_is_re_verified(iso, monkeypatch):
+    """A cached verdict is trusted for POSTA_TERMINAL_RECHECK_DAYS, then checked once more. It
+    may only ever save an API call — never silence a customer notice — so a single wrong or
+    freak reading has to self-heal within a week instead of sticking for the whole 30-day
+    source window (the `at` field was write-only before this)."""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000002SK": {"state": "delivered", "at": "2020-01-01",
+                                       "code": "2026100"}}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000002SK" in asked                   # stale verdict → re-verified
+    assert stats["emails_sent"] == 1                  # …and it was wrong: the customer IS told
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF000000002SK" not in st["terminal"]      # the wrong entry is gone, not refreshed
+
+
+def test_a_fresh_terminal_cache_entry_is_still_trusted(iso, monkeypatch):
+    """…and the re-check window must not defeat the optimisation itself."""
+    webapp.run_posta_uncollected()
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    webapp.run_posta_uncollected()
+    assert "EF000000001SK" not in asked
+
+
+@pytest.mark.parametrize("bad_at", ["zzz", "2099-01-01"])
+def test_a_non_date_at_value_does_not_freeze_a_shipment(iso, monkeypatch, bad_at):
+    """`at` is compared as a raw STRING, so ANY value sorting above the cutoff keeps the entry
+    „fresh" forever: „zzz" left by a partial write, or a future date after a clock jump. The
+    parcel would then be skipped for the whole 30-day source window with the weekly re-check net
+    silently switched off — and an uncollected parcel would never be escalated. Corruption,
+    ambiguity and age must ALL degrade to „check it" (the rule the block itself states), so the
+    trusted range is bounded from BOTH sides. (PR #224 adversarial review.)"""
+    (iso["tmp"] / "posta_uncollected.json").write_text(json.dumps({
+        "terminal": {"EF000000002SK": {"state": "delivered", "at": bad_at,
+                                       "code": "2026100"}}}), encoding="utf-8")
+    asked = []
+    monkeypatch.setattr(webapp, "_fetch_tracking",
+                        lambda pkg: asked.append(pkg) or TRACKING[pkg])
+    stats = webapp.run_posta_uncollected()
+    assert "EF000000002SK" in asked                   # checked, not silently skipped
+    assert stats["emails_sent"] == 1                  # …and the customer IS told
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert "EF000000002SK" not in st["terminal"]      # the bogus entry is dropped, not refreshed

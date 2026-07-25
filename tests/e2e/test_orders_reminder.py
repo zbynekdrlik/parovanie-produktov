@@ -157,3 +157,30 @@ def test_no_email_section_renders_and_offers_no_send_button(page, automations_se
     assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261004"]').count() == 0
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── B1 M2 — an order the run could not finish stays on the tab, with its reason ────
+def test_an_unfinished_order_shows_its_reason_and_stays_actionable(page, automations_server):
+    """Every branch where the run gives up mid-flight used to just skip the order, and because
+    the display lists are rebuilt from scratch each run the row DISAPPEARED from the tab until
+    the next one — while „▶ Poslať pripomienku" on the row the manager still had on screen
+    answered 404. The row must be visible, say WHY it is unfinished, and still be actionable."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    # its OWN section — putting it under „AI usúdilo, že zákazník je už kontaktovaný" would
+    # state something that never happened (with no MAIL_BCC the AI does not even run)
+    tbl = page.locator('[data-testid="ordrem-pending"]')
+    assert tbl.is_visible()
+    row = tbl.locator('tr[data-code="20261006"]')
+    assert row.count() == 1
+    body = row.inner_text()
+    assert "Čelovka Test Pending" in body and "Nedokončený Beh" in body
+    assert "odoslanie e-mailu zlyhalo" in body          # the reason, on the row itself
+    assert row.locator(".ordrem-act-send").count() == 1  # …and the manager can finish it by hand
+
+    # …and it is NOT mixed into the AI-verdict table
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261006"]').count() == 0
+    assert "nestihol vybaviť" in page.locator(".warnhead", has_text="automat").inner_text()
+
+    assert console == [], f"console not clean: {console}"
