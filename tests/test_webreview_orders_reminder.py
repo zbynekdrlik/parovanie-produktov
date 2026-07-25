@@ -531,11 +531,19 @@ def test_persist_failure_is_logged_and_the_run_continues(iso, monkeypatch, caplo
 
 def test_a_dropped_immediate_write_does_not_remail_on_the_next_run(iso, monkeypatch):
     """The whole point of the healing net: after a failed immediate write the customer must not
-    be e-mailed again by tomorrow's run."""
+    be e-mailed again by tomorrow's run.
+
+    SENDING_CLAIM_TTL_S is forced to 0 for the second run, and that is what makes this test
+    test anything at all (B1 M4): the failed write leaves the run's own transient 'sending'
+    claim on disk, and while that claim is FRESH the next run skips the order as „someone is
+    mailing it right now" — so the test passed even with the re-apply net removed, for the
+    whole 10-minute TTL. Expiring the claim reproduces the real scenario: tomorrow's run, with
+    nothing on disk but a lapsed claim, must still not mail the customer a second time."""
     real_save = _drop_first_emailed_write(monkeypatch)
     webapp.run_orders_reminder()
     # restore ONLY the save (monkeypatch.undo() would drop the whole `iso` isolation too)
     monkeypatch.setattr(webapp, "_save_orders_reminder", real_save)
+    monkeypatch.setattr(webapp, "SENDING_CLAIM_TTL_S", 0)   # …a day later, no live claim left
     iso["sent"].clear()
     stats2 = webapp.run_orders_reminder()
     assert stats2["emailed_now"] == 0
@@ -791,11 +799,15 @@ def test_a_manual_send_whose_write_failed_is_not_remailed_by_the_next_run(iso, m
     second time. The mitigation may not depend on a human noticing within 10 minutes."""
     c = _seed(iso)
     real_save = webapp._save_orders_reminder
-    n = {"calls": 0}
 
     def flaky_save(data):
-        n["calls"] += 1
-        if n["calls"] == 2:              # 1 = the claim, 2 = the post-send record
+        # Target the post-send record by its CONTENT, never by call index (B1 M5): the endpoint
+        # writes the claim first and the emergency `persist_failed` marker afterwards, so an
+        # index would silently start hitting a different write the moment either changes — and
+        # the test would keep passing while testing something else entirely.
+        entry = (data.get("orders") or {}).get("20261000") or {}
+        if (isinstance(entry, dict) and entry.get("status") == "emailed"
+                and not entry.get("persist_failed")):
             raise OSError("[Errno 28] No space left on device")
         return real_save(data)
 

@@ -4889,10 +4889,16 @@ def run_orders_reminder() -> dict:
                       code, entry.get("status"), e)
 
     def _claim(code: str, email: str):
-        """Take the transient 'sending' claim BEFORE this run's own OpenAI+SMTP window, in the
-        same lock as the fresh per-order read. Without it the run is invisible on disk for the
-        whole ~20 s round-trip, so a manual „▶ Poslať pripomienku" click landing in that window
-        passes the 409 gate, claims, and mails — and the run mails too (PR #223 review).
+        """Take the transient 'sending' claim BEFORE this run's own OpenAI+SMTP window. Without
+        it the run is invisible on disk for the whole ~20 s round-trip, so a manual „▶ Poslať
+        pripomienku" click landing in that window passes the 409 gate, claims, and mails — and
+        the run mails too (PR #223 review).
+
+        The claim is its OWN lock acquisition with its OWN re-read of the record inside (NOT a
+        continuation of the caller's fresh per-order read — that lock is already released by the
+        time we get here). That is what makes it correct: the state is re-checked under the same
+        lock that writes the claim, so nothing can slip in between the check and the write. The
+        caller's earlier read is only there to decide whether this order is worth working on.
         Returns the claim entry, None when someone else legitimately won the order meanwhile, or
         _CLAIM_WRITE_FAILED when the claim could not be written. A claim that did not reach disk
         is no protection at all, so the order is SKIPPED (retried next run) rather than mailed

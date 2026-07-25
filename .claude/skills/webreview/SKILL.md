@@ -395,9 +395,13 @@ akciu, a zlyhaný send claim uvoľní.
 Jednostranný claim (len endpoint) nechráni pred ničím: `run_orders_reminder` spraví čerstvý
 per-order read, **pustí `_lock`** a strávi ~20 s v OpenAI+SMTP **bez akéhokoľvek in-flight
 markera na disku** → manuálny klik v tom okne prejde 409 bránou, claimne a pošle — a beh pošle
-tiež (zákazník dostane dva maily). Beh preto nárokuje v TOM ISTOM `with _lock:` bloku ako
-čerstvý read, hneď PO claim/terminal checkoch a AŽ za lacnými diskvalifikátormi (no-note /
-no-email / no-key — tie žiadny claim nepotrebujú). Štyri veci, na ktorých to inak padne:
+tiež (zákazník dostane dva maily). Beh preto nárokuje hneď PO claim/terminal checkoch a AŽ za
+lacnými diskvalifikátormi (no-note / no-email / **no-BCC** / no-key — tie žiadny claim
+nepotrebujú). **Claim je VLASTNÁ akvizícia `_lock` s VLASTNÝM re-readom záznamu vnútri**, nie
+pokračovanie čerstvého per-order readu (ten zámok je už dávno pustený) — a práve to je správne:
+stav sa re-checkne pod tým istým zámkom, ktorý claim zapisuje, takže medzi check a zápis sa nič
+nevmestí. Čerstvý read vyššie len rozhoduje, či sa objednávkou vôbec oplatí zaoberať.
+Šesť vecí, na ktorých to inak padne:
 - **`claimed_at` ber ČERSTVO pri každom claime**, nie `now_iso` zo začiatku behu — dlhý beh by
   rozdával claimy, čo už vyzerajú expirované.
 - **`claim` token je per-BEH** (`secrets.token_hex`) a release obnoví `prev` **len keď sa token
@@ -406,6 +410,20 @@ no-email / no-key — tie žiadny claim nepotrebujú). Štyri veci, na ktorých 
   objednávka zamknutá do vypršania TTL.
 - **Claim, ktorý sa NEPODARILO zapísať, nechráni nič** → objednávku PRESKOČ (retry ďalší beh),
   neposielaj ju „nenárokovanú"; a zápis claimu obaľ `try/except`, inak plný disk zhodí celý beh.
+- **Nezapísaný claim je CHYBA, nie obyčajný skip (B1 M1)** — „niekto iný to vzal" (legitímne)
+  a „zápis zlyhal" (plný disk) NESMÚ zdieľať návratovú hodnotu. `_claim` vracia `None` pre prvé
+  a sentinel `_CLAIM_WRITE_FAILED` pre druhé; volajúci na sentineli robí `errors += 1`. Bez toho
+  beh, ktorému zlyhali VŠETKY claimy, neposlal nikomu nič a hlásil `emailed_now: 0, errors: 0` —
+  na tabe nerozoznateľné od pokojného dňa (presne tá „ticho mŕtva automatizácia", proti ktorej
+  je `bcc_missing`/`· chyby: N`).
+- **Každá vetva, čo objednávku vzdá uprostred, ju MUSÍ pridať do display listu (B1 M2)** —
+  display listy sa stavajú od nuly každý beh a `continue` znamená, že riadok na ten beh z tabu
+  ZMIZNE, a override endpoint (hľadá len v `red`/`orange`/`skipped`) na neho vráti **404
+  „objednávka sa v aktuálnom zozname nenašla"**. Zbieraj ich do `pending` a pri finálnom save
+  ich cez `_relocate` prilej do `skipped` (ten riadok nesie poznámku AJ „▶ Poslať pripomienku");
+  každý riadok nesie pole `pending` = dôvod, ktorý appka vypíše. Týka sa: stratený claim race,
+  nezapísaný claim, `_release` po zlyhanej klasifikácii/sende, chýbajúce `MAIL_BCC`, chýbajúci
+  `OPENAI_API_KEY`.
 
 **GOTCHA — tranzitný claim NIE JE mitigácia zlyhaného post-send zápisu (PR #223 review).**
 Nechať claim po zlyhaní zápisu (aby manažér neklikol znova) kupuje len `SENDING_CLAIM_TTL_S`;
@@ -476,6 +494,11 @@ nastavený → tab a sender by si protirečili).
 (OpenAI) bežalo pred kontrolou `if not o['email']` — taká objednávka sa nikdy nestane terminálnou,
 takže sa klasifikovala **každý beh donekonečna**. Pri každom novom AI/scrape kroku over poradie:
 najprv všetko, čo vie položku vylúčiť zadarmo, až potom platené volanie.
+**To isté platí pre KONFIGURAČNÝ diskvalifikátor, nielen pre dátový (B1 M3):** chýbajúce
+`MAIL_BCC` beh počítal do `bcc_missing`, ale NEPOUŽIL ho ako bránu — claimol, zaplatil OpenAI, a
+až `require_bcc` send odmietol; objednávka sa nikdy nestala terminálnou → to isté donekonečna.
+Endpoint to pre-flightoval správne (503 pred claimom), beh nie — **keď jedna cesta pre-flightuje
+konfiguráciu, druhá musí tiež**, inak sa asymetria prejaví ako tichý účet za OpenAI.
 
 **Test-pasca — monkeypatch stub `_send_mail_html` MUSÍ mať `**kw`.** Stuby po celom test-suite
 sú `lambda to, subject, body, bcc=None, **kw:` — bez `**kw` každé budúce rozšírenie signatúry
@@ -495,6 +518,43 @@ zapisuje aj claimy, `if n["calls"] == 1` netrafí priebežný `_persist_done`, a
 potom testuje niečo úplne iné a stále „prejde"). Podmieňuj zlyhanie tým, čo sa zapisuje
 (`data["orders"]["<kód>"]["status"] == "emailed"`). A `monkeypatch.undo()` v teste zhodí AJ celú
 `iso` izoláciu — na dočasné vrátenie jedného patchu si ulož originál a `setattr`-ni ho späť.
+**Pozor aj na „obsahovú" podmienku, čo trafí VIAC zápisov (B1 M5):** endpoint po zlyhanom
+post-send zápise píše núdzový `{status:'emailed', persist_failed:True}` marker — ten MUSÍ
+prejsť, takže podmienka je `status=='emailed' and not entry.get('persist_failed')`.
+
+**Test-pasca — zvyškový tranzitný `sending` claim MASKUJE chýbajúci dedup záznam celý TTL
+(B1 M4).** Test „po zlyhanom priebežnom zápise sa zajtra neposiela znova" prešiel AJ bez
+failed_writes re-aplikácie: zlyhal len `emailed` zápis, claim na disku ostal, a ďalší beh
+objednávku preskočil ako „práve sa posiela" — nie preto, že by bola vybavená. Test, čo overuje
+správanie NASLEDUJÚCEHO behu, preto MUSÍ claim nechať vypršať:
+`monkeypatch.setattr(webapp, "SENDING_CLAIM_TTL_S", 0)` pred druhým behom. Overenie, či test
+naozaj testuje: dočasne odstráň fix a pozri, či PADNE (bez TTL patchu prejde = vata).
+
+### Rastúci stav automatizácie — prunuj proti SOURCE OKNU, nikdy len podľa veku (#220, #222)
+
+Každý akumulovaný per-položkový store (dedup, cache) rastie donekonečna, kým ho niekto neohraničí.
+Vzor `orders_reminder.prune_done` + terminálna cache v `run_posta_uncollected`:
+
+- **Prunuj proti tomu, čo je ešte v ZDROJI, nie proti dátumu.** Kód/zásielka, ktorá je stále
+  v aktuálnom exporte (resp. v 30-dňovom okne), sa NIKDY nezmaže — pri dedupe by chýbajúci
+  záznam znamenal DRUHÝ mail zákazníkovi. Vek je až sekundárne kritérium pre to, čo zo zdroja
+  vypadlo. Okno pre `orders_reminder` je `all_order_codes()` = **VŠETKY** kódy exportu, nie len
+  tie, čo prejdú `select_orders` (objednávka sa vie vrátiť do „Vybavuje sa", čerstvá prekročí
+  4-dňový prah o pár dní).
+- **Prázdne okno = neprunuj vôbec** (fail-closed — rovnaký reflex ako fail-closed supplier
+  upload): prázdny/nečitateľný export nie je „nič nie je živé", je to „neviem".
+- Mimo okna: retention (180 d) + tvrdý strop N najnovších (500). Držať záznam stojí bajty,
+  zmazať ho priskoro stojí duplicitný mail — pravidlá sú preto zámerne asymetrické.
+- **Cache terminálneho stavu (#222)** je prunovaná tým istým oknom, takže rásť ani nemôže:
+  `terminal: {packageNumber: {state, at}}` v `posta_uncollected.json`. Terminálne =
+  `stateCode` posledného eventu v `TERMINAL_STATE_CODES` (`delivered` — live overené vo
+  fixtúre, `returned`); **`notified` tam NIE JE** (to je stav, ktorý automatizácia naháňa),
+  a neznámy kód / `invalid_format` / bez eventov je NEterminálny (fail-safe: radšej kontrolovať
+  ďalej než zmraziť zásielku mimo automatizácie). Poškodený záznam cache prepadne na reálnu
+  kontrolu — korupcia degraduje na „skontroluj", nikdy na „ignoruj navždy".
+- **Reopen (vedomé rozhodnutie #220):** reopenutá objednávka si ponechá terminálny záznam a
+  druhú AUTOMATICKÚ pripomienku nedostane, kým je v exporte (duplicitný mail zákazník vidí,
+  chýbajúci nie); manažér vie poslať ručne z tabu. Nový cyklus o mesiace neskôr už začne čistý.
 
 **GOTCHA — e2e fixtúra, čo klikne skutočnú `_send_mail_html`/`_send_mail` cestu, MUSÍ pripnúť
 `MAIL_HOST=""` do `env`.** `_load_env_file()` číta `data/.mail_env` podľa ABSOLÚTNEJ repo cesty
