@@ -768,25 +768,36 @@ async function loadOrders() {
 // `if (!r.ok) return;` left the manager guessing whether his click landed (and, for the
 // optimistic flag toggles, showing a flag the server never stored). One message shape
 // for all of them, in the manager's language.
+let _lastToOrderErr = { msg: '', at: 0 };
 function toOrderSaveFailed(what, detail) {
-  alert('⚠️ ' + what + ' sa nepodarilo uložiť' + (detail ? ' (' + detail + ')' : '')
-    + '. Skús to prosím znova.');
+  const msg = '⚠️ ' + what + ' sa nepodarilo uložiť' + (detail ? ' (' + detail + ')' : '')
+    + '. Skús to prosím znova.';
+  // alert() blocks: during a server outage a manager rapid-firing toggles would queue one
+  // modal per click. The same message within a few seconds is the same outage — say it once.
+  const now = Date.now();
+  if (msg === _lastToOrderErr.msg && now - _lastToOrderErr.at < 5000) return;
+  _lastToOrderErr = { msg, at: now };
+  alert(msg);
 }
 
-// Run one to-order write; returns true on success, false AFTER telling the manager why.
-// Callers that already changed the UI optimistically roll back in the false branch.
-async function postToOrder(path, payload, what) {
+// Run one to-order write. Returns '' on success, else a short human reason. Reporting is
+// left to the caller ON PURPOSE: a caller that changed the UI optimistically must roll
+// back FIRST, so the tab is already telling the truth when the message pops up.
+async function postToOrder(path, payload) {
   try {
     const r = await fetch(path, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (r.ok) return true;
-    toOrderSaveFailed(what, 'chyba ' + r.status);
+    if (r.ok) return '';
+    // surface the endpoint's own reason — 'comment too long' / 'invalid supplier' /
+    // 'unauthorized' are all deterministic, so a bare status code would have the manager
+    // retrying a write that can never succeed
+    const j = await r.json().catch(() => null);
+    return 'chyba ' + r.status + (j && j.error ? ': ' + j.error : '');
   } catch (_) {
-    toOrderSaveFailed(what, 'server neodpovedal');
+    return 'server neodpovedal';
   }
-  return false;
 }
 
 // The four per-line flags (objednané / čaká sa / skladom / nedostupné) share one writer:
@@ -796,9 +807,11 @@ async function postToOrder(path, payload, what) {
 async function saveOrderFlag(path, field, map, key, on, what) {
   const was = !!map[key];
   if (on) map[key] = true; else delete map[key];
-  if (await postToOrder(path, { key, [field]: on }, what)) return true;
+  const err = await postToOrder(path, { key, [field]: on });
+  if (!err) return true;
   if (was) map[key] = true; else delete map[key];
-  renderToOrder();
+  renderToOrder();              // roll the tab back BEFORE the message, never after
+  toOrderSaveFailed(what, err);
   return false;
 }
 
@@ -817,8 +830,8 @@ const saveUnavailable = (key, on) =>
 // ORDERED sa mení až PO úspechu, takže pri zlyhaní netreba nič vracať — len to povedať.
 async function markGroupOrdered(items, ordered) {
   const keys = items.map(o => o.key);
-  if (!await postToOrder('/api/ordered/bulk', { keys, ordered },
-    'Hromadné označenie skupiny')) return false;
+  const err = await postToOrder('/api/ordered/bulk', { keys, ordered });
+  if (err) { toOrderSaveFailed('Hromadné označenie skupiny', err); return false; }
   for (const k of keys) { if (ordered) ORDERED[k] = true; else delete ORDERED[k]; }
   renderToOrder();
   return true;
@@ -1020,8 +1033,8 @@ async function savePairUrl(o, url) {
     alert('⚠️ Zadaj platnú adresu začínajúcu http:// alebo https:// — takto sa uložiť nedá.');
     return false;
   }
-  if (!await postToOrder('/api/order-pair', { code: o.itemCode, url },
-    'Párovacia URL')) return false;
+  const err = await postToOrder('/api/order-pair', { code: o.itemCode, url });
+  if (err) { toOrderSaveFailed('Párovacia URL', err); return false; }
   // the pairing is keyed by itemCode (a PRODUCT property) → /api/orders already serves
   // it on EVERY order line of that code, so mirror that client-side: without it the
   // sibling lines keep showing an empty paste box for a product that IS paired (#204).
@@ -1051,13 +1064,18 @@ function pairEditor(o, focus) {
 // effective supplier for grouping: the order's OWN supplier (from Shoptet) wins;
 // a manual assignment only fills in a line that arrived WITHOUT a supplier (BUG 1 —
 // a stale assignment must never prebiehať the real supplier / clobber the eshop).
-const effSup = (o) => (o.supplier || o.assignedSupplier || '—');
+// .trim() on both: a Shoptet itemSupplier of only spaces is truthy but not a supplier —
+// without it, it would form its own invisible chip labelled '   ' instead of joining '—'.
+const effSup = (o) => ((o.supplier || '').trim() || (o.assignedSupplier || '').trim() || '—');
 
 // #203 — the supplier name is free text the manager types by hand, so the SAME supplier
 // keeps arriving spelled differently ('CITRADE' / 'Citrade' / 'Citrade  s.r.o.'). Group,
 // colour and filter by a case+whitespace-insensitive key so one supplier is ONE chip and
-// ONE group; the stored value is never touched (it goes verbatim into the eshop).
-const supKey = (s) => String(s == null ? '' : s).trim().replace(/\s+/g, ' ').toLocaleLowerCase('sk');
+// ONE group; the CASE of the stored value is never touched (it goes verbatim into the
+// eshop `supplier` column). normSupplierName mirrors the server's `" ".join(s.split())`
+// exactly, so the name the client shows is the name the server stored.
+const normSupplierName = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+const supKey = (s) => normSupplierName(s).toLocaleLowerCase('sk');
 // Chip/filter keys are namespaced so a supplier literally named "All" can never collide
 // with the 'all' (Všetci) sentinel — with case-folding that collision got likelier.
 const supFilterKey = (o) => 's:' + supKey(effSup(o));
@@ -1071,14 +1089,26 @@ const supCanonPick = (counts) => Object.keys(counts).sort(
 //   known: every distinct supplier seen in EITHER column, deduped case-insensitively,
 //          canonical spelling, alphabetical — the `known-suppliers` autocomplete list
 //          (which exists precisely to stop typo/case fragmentation at the source).
+// Object.create(null) everywhere the KEY comes from the manager's free text: a supplier
+// named '__proto__' silently swallows writes on a normal object literal (the chip would
+// render as its raw key and vanish from the datalist) and one named 'constructor' would
+// write the counter onto the global Object.
 function supplierSpellingIndex(orders) {
-  const bump = (m, k, raw) => { const b = (m[k] = m[k] || {}); b[raw] = (b[raw] || 0) + 1; };
-  const grp = {}, all = {};
+  const bump = (m, k, raw) => {
+    const b = (m[k] = m[k] || Object.create(null));
+    b[raw] = (b[raw] || 0) + 1;
+  };
+  const grp = Object.create(null), all = Object.create(null);
   for (const o of orders || []) {
-    bump(grp, supFilterKey(o), effSup(o));
-    for (const raw of [o.supplier, o.assignedSupplier]) if (raw) bump(all, supKey(raw), raw);
+    // the DISPLAYED spelling is whitespace-normalised (mirrors what the server stored),
+    // only the capitalisation the manager chose is preserved
+    bump(grp, supFilterKey(o), normSupplierName(effSup(o)));
+    for (const raw of [o.supplier, o.assignedSupplier]) {
+      const name = normSupplierName(raw);
+      if (name) bump(all, supKey(name), name);
+    }
   }
-  const canon = {};
+  const canon = Object.create(null);
   for (const k of Object.keys(grp)) canon[k] = supCanonPick(grp[k]);
   return { canon, known: Object.keys(all).sort().map(k => supCanonPick(all[k])) };
 }
@@ -1086,9 +1116,13 @@ function supplierSpellingIndex(orders) {
 // Inline supplier assign: fill in the supplier for an order line that arrived WITHOUT
 // one. Persists per forestshop code; the row then regroups under that supplier and the
 // name is written back to the eshop `supplier` field by the nightly upload.
-async function saveSupplier(o, supplier) {
-  if (!await postToOrder('/api/order-supplier', { code: o.itemCode, supplier },
-    'Priradenie dodávateľa')) return false;
+async function saveSupplier(o, raw) {
+  // normalise BEFORE sending, with the same rule the endpoint applies — otherwise the row
+  // (and the ✏️ editor reopened on it) would keep showing 'Citrade   s.r.o.' while the
+  // store, and the eshop `supplier` column it feeds, hold 'Citrade s.r.o.'
+  const supplier = normSupplierName(raw);
+  const err = await postToOrder('/api/order-supplier', { code: o.itemCode, supplier });
+  if (err) { toOrderSaveFailed('Priradenie dodávateľa', err); return false; }
   // assignment is keyed by itemCode (a product property) → apply to EVERY order line
   // of that code, so all sibling lines regroup together (not just the clicked one)
   for (const x of ORDERS) if (x.itemCode === o.itemCode) x.assignedSupplier = supplier;
@@ -1119,8 +1153,8 @@ function supplierEditor(o, focus) {
 // order → after a save re-render the whole tab so all sibling lines reflect it (same
 // per-shared-property propagation as saveSupplier).
 async function saveOrderComment(o, comment) {
-  if (!await postToOrder('/api/order-comment', { orderCode: o.orderCode, comment },
-    'Komentár k objednávke')) return false;
+  const err = await postToOrder('/api/order-comment', { orderCode: o.orderCode, comment });
+  if (err) { toOrderSaveFailed('Komentár k objednávke', err); return false; }
   if (comment) ORDER_COMMENTS[o.orderCode] = comment; else delete ORDER_COMMENTS[o.orderCode];
   renderToOrder();
   return true;
@@ -1306,12 +1340,14 @@ function isHandled(o) {
 // GREEN (todo) = at least one line still un-flagged, ORANGE (active) = the selected chip.
 // Called by renderToOrder AND by every per-line flag toggle so the chips recolour LIVE as
 // the manager works the list (each toggle updates a flag map, then re-renders this bar).
-function renderOrderFilters() {
+function renderOrderFilters(idx) {
   const fbar = document.getElementById('filters');
   if (!fbar || ACTIVE_TAB !== 'toorder') return;
   const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
-  // keyed by the NORMALISED supplier (#203) so case variants share one chip/count/colour
-  const { canon } = supplierSpellingIndex(ORDERS);
+  // keyed by the NORMALISED supplier (#203) so case variants share one chip/count/colour.
+  // renderToOrder passes its own index in (one pass per paint instead of two); a bare
+  // toggle-triggered call builds it itself.
+  const { canon } = idx || supplierSpellingIndex(ORDERS);
   const cnt = {}, newest = {}, unhandled = {};
   for (const o of ORDERS) {
     const s = supFilterKey(o);
@@ -1324,9 +1360,9 @@ function renderOrderFilters() {
   const byPriority = (a, b) => (newest[b] - newest[a])
     || (lbl(a) < lbl(b) ? -1 : lbl(a) > lbl(b) ? 1 : 0);
   fbar.innerHTML = '';
-  const mk = (key, lbl, done) => {
+  const mk = (key, text, done) => {         // `text`, not `lbl` — would shadow lbl() above
     const cls = (ORDER_SUPPLIER === key ? 'active ' : '') + (done ? 'done' : 'todo');
-    const b = el('button', cls, lbl);
+    const b = el('button', cls, text);
     b.onclick = () => { ORDER_SUPPLIER = key; localStorage.setItem('orderSupplier', key); window.scrollTo(0, 0); render(); };
     return b;
   };
@@ -1339,9 +1375,17 @@ function renderOrderFilters() {
 }
 
 function renderToOrder() {
+  // `#list`/`#empty` are SHARED with the review tab, and this now runs from async
+  // continuations (a failed save's rollback, a saved pair URL / supplier / comment) —
+  // without this guard a late re-render would wipe the review cards, and any open
+  // resolution panel with them, after the manager switched tabs. Same guard as
+  // renderOrderFilters; switchTab → render() repaints the tab on return anyway.
+  if (ACTIVE_TAB !== 'toorder') return;
   // Najnovšie objednávky hore — Marek je tak naučený zo Shoptetu. Čísla objednávok sú
   // chronologické (vyššie = novšie); dodávateľ s NAJNOVŠOU objednávkou hore, v rámci
   // dodávateľa od najnovšej. Ne-číselné orderCode = -Infinity (nikdy nedominuje vrch).
+  const keepY = window.scrollY;    // list.innerHTML='' collapses the page → the browser
+                                   // would clamp the scroll to 0 on every save/rollback
   const oNum = (o) => { const n = parseInt(o.orderCode, 10); return isNaN(n) ? -Infinity : n; };
   // #203 — one entry per REAL supplier: grouping keys and the datalist of known supplier
   // names (which exists to avoid typo/case-fragmented groups) both come from the
@@ -1360,11 +1404,19 @@ function renderToOrder() {
   const lbl = (k) => canon[k] || k;
   const byPriority = (a, b) => (newest[b] - newest[a])
     || (lbl(a) < lbl(b) ? -1 : lbl(a) > lbl(b) ? 1 : 0);
-  renderOrderFilters();   // live-coloured supplier chips (recomputed from the flag maps)
+  // a selection carried over from another day (or migrated from the old raw-name scheme)
+  // may match no supplier in today's orders → the manager would face an empty list with no
+  // active chip. Fall back to „Všetci"; never on an empty ORDERS (a transient /api/orders
+  // failure must not throw his filter away).
+  if (ORDERS.length > 0 && ORDER_SUPPLIER !== 'all' && !canon[ORDER_SUPPLIER]) {
+    ORDER_SUPPLIER = 'all';
+    localStorage.setItem('orderSupplier', 'all');
+  }
+  renderOrderFilters({ canon, known });   // live-coloured chips (recomputed from the flag maps)
   const list = document.getElementById('list'); list.innerHTML = '';
   const shown = ORDERS.filter(o => ORDER_SUPPLIER === 'all' || supFilterKey(o) === ORDER_SUPPLIER);
   document.getElementById('empty').hidden = shown.length > 0;
-  const groups = {};
+  const groups = Object.create(null);
   for (const o of shown) { const s = supFilterKey(o); (groups[s] = groups[s] || []).push(o); }
   for (const sup of Object.keys(groups).sort(byPriority)) {
     const items = groups[sup];
@@ -1382,6 +1434,7 @@ function renderToOrder() {
     list.appendChild(head);
     for (const o of items) list.appendChild(renderOrderRow(o));
   }
+  window.scrollTo(0, keepY);   // stay where the manager was working (same as renderCards)
 }
 
 // ---- Hľadať / opraviť (catalog search + re-pair) tab --------------------- //
@@ -3705,6 +3758,8 @@ async function init() {
   const savedSup = localStorage.getItem('orderSupplier') || 'all';
   ORDER_SUPPLIER = (savedSup === 'all' || savedSup.startsWith('s:'))
     ? savedSup : 's:' + supKey(savedSup);
+  // persist the migrated form, so the old value is converted once and not on every load
+  if (ORDER_SUPPLIER !== savedSup) localStorage.setItem('orderSupplier', ORDER_SUPPLIER);
   // ?tab=toorder — Discord posts a link straight to the to-order list
   const qTab = new URLSearchParams(location.search).get('tab');
   if (qTab === 'toorder' || qTab === 'review' || qTab === 'search' || qTab === 'notes'

@@ -130,6 +130,15 @@ Manažér si priamo na webe značí stav. Tieto súbory držia jeho ŽIVÚ prác
 
 **Živo-odvodený AGREGÁT (napr. farba supplier chip-ov podľa stavu) čítaj z FLAG MÁP, nie z `o.*`, a prekresli ho v KAŽDOM toggli.** Polia `o.ordered/waiting/instock/unavailable` v `ORDERS` sú zamrznuté v čase `/api/orders` fetchu — toggle handler updatuje globálne mapy (`ORDERED/WAITING/INSTOCK/UNAVAIL`, synchrónne PRED `await` v `saveX`) + lokálnu row triedu, ale `o.*` NIE. Preto agregát (chip `done`/`todo`) počítaj cez `isHandled(o)=!!(ORDERED[o.key]||WAITING[o.key]||…)` a po každom toggli zavolaj `renderOrderFilters()` (prekreslí LEN `#filters`, nie riadky) — inak sa chip prefarbí až po reloade (bug #86). E2e MUSÍ klikať reálne tlačidlo v session (nie seed-before-load), inak nezachytí tento bug.
 
+**Zoskupovanie podľa VOĽNÉHO TEXTU (meno dodávateľa) rob cez normalizovaný kľúč, ale ZOBRAZUJ pôvodné písanie (#203).** `effSup(o)` je voľný text, ktorý manažér píše ručne → ten istý dodávateľ príde raz `CITRADE`, raz `Citrade`, raz `Citrade  s.r.o.`; surový string ako grupovací kľúč = N chipov s vlastnými počtami a protichodnými farbami. Vzor: `supKey(s)` = `trim` + `replace(/\s+/g,' ')` + `toLocaleLowerCase('sk')` (slovenské locale kvôli diakritike), grupuj/farbi/filtruj podľa neho, a **zobraz kanonický variant = najčastejšie použité písanie** (`supCanonPick`, zhoda počtov → abecedne, inak label bliká medzi rendermi). Datalist `known-suppliers` deduplikuj rovnakým kľúčom — existuje presne na to, aby fragmentácia nevznikala. Tri veci, na ktorých to inak padne:
+- **Kľúč filtra PREFIXUJ** (`'s:' + supKey(...)`) — sentinel `'all'` („Všetci") je legitímny výstup `supKey` pre dodávateľa menom „All"/„ALL"; po case-foldingu je kolízia pravdepodobnejšia než predtým a klik na jeho chip by prepol filter na „všetko". `localStorage('orderSupplier')` zo staršieho buildu (surové meno) zmigruj pri načítaní, inak manažérovi po nasadení zmizne vybraný dodávateľ.
+- **Zoraďuj a porovnávaj podľa ZOBRAZENEJ menovky** (`canon[k]`), nie podľa kľúča — inak sa abecedný tie-break riadi lowercase kľúčom a poradie skupín sa nečakane preusporiada.
+- **NEnormalizuj case pri ZÁPISE.** `assignedSupplier` ide doslovne do `import_suppliers.csv` → Shoptet stĺpec `supplier`, takže lowercase by prepísal reálne meno dodávateľa v eshope. Na zápise rob LEN whitespace collapse (`" ".join(s.split())` v `/api/order-supplier`) — to je pre eshop bezpečné a rieši druhý reálny zdroj rozdvojenia. Case-insensitivita je DISPLAY vec a patrí do `app.js`.
+
+**Zlyhaný zápis MUSÍ byť vidieť — a optimistický príznak sa MUSÍ vrátiť späť (#214).** Vzor `postToOrder(path, payload)` → vráti `''` alebo krátky dôvod (`'chyba 500'` / `'server neodpovedal'`), **hlási až VOLAJÚCI** cez `toOrderSaveFailed(what, err)`. Prečo nie hlásenie priamo v posielacej funkcii: `alert()` blokuje, takže volajúci, ktorý zmenil UI optimisticky, musí **najprv vrátiť stav a prekresliť** a až potom hlásiť — inak manažér číta „nepodarilo sa uložiť" nad riadkom, ktorý stále svieti ako uložený. Štyri per-riadkové príznaky zdieľajú `saveOrderFlag(path, field, map, key, on, what)` (optimistický zápis → POST → rollback + `renderToOrder()` + hláška). Holé `if (!r.ok) return;` je tu horšie než chyba: mapa `ORDERED/WAITING/…` je už zmutovaná, takže tab ukazuje príznak, ktorý server nikdy neuložil (tichá strata manažérovej práce do najbližšieho reloadu). E2E sa to testuje **Playwright request-interception** — `page.route("**/api/instock", lambda r: r.fulfill(status=500, …))` pre odmietnutý zápis, `route.abort()` pre mŕtvu sieť; `alert` sa chytá `page.on("dialog", …)` + `d.accept()`.
+
+**Per-PRODUKT hodnota (`pairUrl`, `assignedSupplier`) sa po save propaguje na VŠETKY riadky toho `itemCode` — inak sa klient rozíde so serverom (#204).** `/api/orders` vracia `pairUrl` na každom riadku toho kódu, takže `savePairUrl`, ktorý updatol len kliknutý riadok (`row.replaceWith(...)`), nechal súrodencov s prázdnym vkladacím poľom pre produkt, ktorý JE spárovaný — manažér lepil URL znova pre každú objednávku. Vzor je rovnaký ako `saveSupplier`: `for (const x of ORDERS) if (x.itemCode === o.itemCode) x.pairUrl = url;` + `renderToOrder()`. Platí pre KAŽDÉ nové per-produktové pole; per-RIADKOVÉ (`ordered`/`waiting`) sa naopak propagovať NESMIE.
+
 **Per-ORDER (nie per-line) store — vzor `order_comments` (#101):** keď hodnota patrí celej OBJEDNÁVKE (nie riadku), kľúč je **`<orderCode>`** (NIE `<orderCode>|<itemCode>`). `data/out/order_comments.json`, endpoint `/api/order-comment` (GET mapu / POST `{orderCode, comment}`, dĺžkový cap `ORDER_COMMENT_MAX`, prázdny = clear, login-gated). `/api/orders` doplní `comment` na KAŽDÝ riadok tej objednávky. Frontend: `ORDER_COMMENTS[o.orderCode]`, editor = **textarea** (nie 1-riadkový input; Ctrl/⌘+Enter uloží, plain Enter je nový riadok), po save volaj **`renderToOrder()`** (nie len replace riadku) — komentár je zdieľaný medzi VŠETKÝMI riadkami objednávky, presne ako per-produktový `assignedSupplier`. Voľný text ide cez `.textContent` (auto-escape, žiadny `escapeHtml`/`innerHTML`). Na riadku sa read-only zobrazuje aj Shoptet `shopRemark` (`build_to_order_rows` číta stĺpec exportu; `.to-shopnote`). Zápis komentára späť do Shoptetu → skill `shoptet` (order `shopRemark` write-back), odložené na follow-up.
 
 Vstupy endpointov, čo píšu do CSV (kód/dodávateľ), MUSIA odmietnuť formula-injection: kód aj meno dodávateľa začínajúce `= + - @ \t \r` → 400; URL `^https?://`. **CSV sink prefixuje `'` cez `_csv_safe` — aj manuálny `/api/import` zip AJ nočný `upload-*` sink** (nočný píše naživo do eshopu, takže NESMIE byť slabšie chránený než zip).
@@ -994,6 +1003,19 @@ istého commitu = klasický race). **Fix: čakaj na vykreslený nav `page.wait_f
 #tabs button")`** (renderTabs beží v tom istom `render()` ako setPageHead) a/alebo
 `wait_for_function` na cieľový text titulku — až potom assertni. Platí pre KAŽDÝ shell test
 čítajúci post-init stav.
+
+## e2e — vlastný `toorder_server` fixture pre tab „Na objednanie" (#203/#204/#214)
+
+`live_server` je **session-scoped a zdieľaný** — jeho `orders_cache.csv` má hard-koduté
+počty/poradie, na ktoré sa viažu `test_order_chips`/`test_order_bulk_stale`/`test_shell`,
+takže PRIDANIE riadku kvôli novému testu rozbije cudzie asserty. Nový to-order test preto
+píš proti **function-scoped `toorder_server`** (vlastný out-dir → pairings/flagy z testu
+nikam nepresakujú a netreba po sebe upratovať). Fixtúra vedome nesie: case varianty
+dodávateľa (`CITRADE`/`Citrade`/`citrade`), DVA riadky s tým istým `itemCode` v RÔZNYCH
+objednávkach (súrodenci), a jeden riadok BEZ dodávateľa (inline supplier-assign editor sa
+zobrazí len takému). Nezabudni ju pridať do `_SERVER_FIXTURES` (auth cookie) a nastaviť
+`WEBREVIEW_PRODUCTS` na neexistujúci súbor — inak dev box ťahá reálny `data/products.csv`
+a test sa správa inak než na CI.
 
 ## Živé Playwright overenie bez znečistenia dát
 
