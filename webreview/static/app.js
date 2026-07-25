@@ -1409,7 +1409,31 @@ function commentEditor(o, focus) {
   return wrap;
 }
 
-function renderOrderRow(o) {
+// A line's quantity as a NUMBER. The export gives it as a string and the row falls back
+// to '1' when it is missing, so the arithmetic must fall back the same way — a line the
+// tab shows as „1 ks" may never count as 0 in the total.
+function orderQty(o) {
+  const n = parseInt(o && o.qty, 10);
+  return isNaN(n) ? 1 : n;
+}
+
+// #206 — build_to_order_rows emits ONE row per order line and never dedups, so the same
+// product ordered by three customers is three rows and the manager had to add the
+// quantities up in his head before ordering. This is the VISUAL total only: the row model
+// is untouched (each line keeps its own key, flags and order). itemCode → { qty, lines }
+// over one supplier group.
+function groupQtyTotals(items) {
+  const t = Object.create(null);        // keys are itemCodes from the export (free text)
+  for (const o of items || []) {
+    const code = o.itemCode || '';
+    const e = (t[code] = t[code] || { qty: 0, lines: 0 });
+    e.qty += orderQty(o);
+    e.lines += 1;
+  }
+  return t;
+}
+
+function renderOrderRow(o, totals) {
   const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : '') + (WAITING[o.key] ? ' waiting' : '')
     + (INSTOCK[o.key] ? ' instock' : '') + (UNAVAIL[o.key] ? ' unavail' : ''));
   row.dataset.key = o.key; row.dataset.code = o.itemCode;
@@ -1465,6 +1489,15 @@ function renderOrderRow(o) {
   }
   row.appendChild(el('span', 'to-size', escapeHtml(o.size || '')));
   row.appendChild(el('span', 'to-qty', (o.qty || '1') + ' ks'));
+  // #206 — only when this product really is on MORE than one line of this supplier's
+  // group; on a single-line product the chip would just repeat the quantity next to it.
+  const tot = totals && totals[o.itemCode || ''];
+  if (tot && tot.lines > 1) {
+    const sum = el('span', 'to-total', `Σ spolu ${tot.qty} ks`);
+    sum.title = `Ten istý produkt je v ${tot.lines} objednávkach tohto dodávateľa `
+      + `— spolu ${tot.qty} ks`;
+    row.appendChild(sum);
+  }
   row.appendChild(el('span', 'to-name', escapeHtml(o.name || '')));
   // supplier assign — ONLY for order lines that arrived WITHOUT a supplier. Same shape
   // as the URL pairing: doplniť → svieti názov + malá ✏️ na opravu.
@@ -1854,6 +1887,14 @@ function renderToOrder() {
   document.getElementById('empty').hidden = shown.length > 0;
   const groups = Object.create(null);
   for (const o of shown) { const s = supFilterKey(o); (groups[s] = groups[s] || []).push(o); }
+  // #206 — the per-product totals are computed over EVERY line of the supplier, not over
+  // the rendered ones: a sibling hidden by „skryť poriešené" (#205) must still count,
+  // because the manager orders the PRODUCT, not the visible rows.
+  const totalsBySup = Object.create(null);
+  for (const o of ORDERS) {
+    const s = supFilterKey(o);
+    (totalsBySup[s] = totalsBySup[s] || []).push(o);
+  }
   for (const sup of Object.keys(groups).sort(byPriority)) {
     const items = groups[sup];
     items.sort((a, b) => oNum(b) - oNum(a));   // v rámci dodávateľa: najnovšia objednávka prvá
@@ -1868,7 +1909,8 @@ function renderToOrder() {
     bulk.onclick = () => markGroupOrdered(items, !allOrdered);
     head.appendChild(bulk);
     list.appendChild(head);
-    for (const o of items) list.appendChild(renderOrderRow(o));
+    const totals = groupQtyTotals(totalsBySup[sup] || items);
+    for (const o of items) list.appendChild(renderOrderRow(o, totals));
   }
   restoreOpenEditors(editors);   // put the manager's unsaved typing back where it was
   window.scrollTo(0, keepY);   // stay where the manager was working (same as renderCards)
