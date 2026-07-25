@@ -56,17 +56,22 @@ def _chip(alert, label):
     return next(c for c in alert["chips"] if c.startswith(label))
 
 
-# Holds every /api/instock POST open until the test releases it, so two writes for the
-# SAME row are genuinely in flight at once (a stubbed route answers too fast to race).
-# `__realFetch` stays available so the test can still read the server's real state.
+# Holds every /api/instock POST open until the test releases it — with the status IT
+# picks — so two writes for the SAME row are genuinely in flight at once (a stubbed route
+# answers far too fast to race). A held write is released with `window.__held[i](status)`;
+# a 200 is passed straight through to the real server so its state really does change.
+# `__realFetch` stays available so the test can read that state back afterwards.
 _HOLD_INSTOCK = """
 window.__held = [];
 window.__realFetch = window.fetch.bind(window);
 window.fetch = (url, opts) => {
   if (String(url).indexOf('/api/instock') !== -1 && opts && opts.method === 'POST') {
-    return new Promise((resolve) => window.__held.push(() => resolve(
-      new Response('{"ok": false}',
-                   {status: 500, headers: {'Content-Type': 'application/json'}}))));
+    return new Promise((resolve, reject) => window.__held.push((status) => {
+      if (status === 200) { window.__realFetch(url, opts).then(resolve, reject); return; }
+      resolve(new Response('{"ok": false}',
+                           {status: status || 500,
+                            headers: {'Content-Type': 'application/json'}}));
+    }));
   }
   return window.__realFetch(url, opts);
 };
@@ -241,8 +246,8 @@ def test_double_click_never_leaves_a_flag_the_server_refused(page, toorder_serve
     btn.click()                      # write #2: off — fired before #1 resolved
     page.wait_for_function("() => window.__held.length === 2", timeout=3000)
 
-    page.evaluate("() => window.__held[0]()")      # #1 is refused first …
-    page.evaluate("() => window.__held[1]()")      # … then #2
+    page.evaluate("() => window.__held[0](500)")   # #1 is refused first …
+    page.evaluate("() => window.__held[1](500)")   # … then #2
     alerts = _wait_alert(page)
     page.wait_for_timeout(300)                     # let both continuations settle
 
@@ -257,6 +262,35 @@ def test_double_click_never_leaves_a_flag_the_server_refused(page, toorder_serve
     assert "todo" in (chip.get_attribute("class") or "").split(), "chip must stay un-resolved"
     # one refused row, one message — the superseded write is not a second outage
     assert len(alerts) == 1, [a["msg"] for a in alerts]
+
+
+def test_a_refused_second_write_rolls_back_to_what_the_server_ACCEPTED(page, toorder_server):
+    """The other half of the same race, and the trap in the obvious fix: if the rollback
+    target is the state captured before the FIRST in-flight write, then a first write the
+    server ACCEPTED is thrown off the tab when a second one is refused. The manager's
+    successful click would silently disappear until the next reload — the same class of
+    loss, mirrored. The rollback target is therefore the last value the server took."""
+    _open(page, toorder_server)
+    page.evaluate(_HOLD_INSTOCK)
+
+    btn = page.locator(".toorder-row[data-code='N1'] .to-instock")
+    btn.click()                      # write #1: on  — will be ACCEPTED
+    btn.click()                      # write #2: off — will be refused
+    page.wait_for_function("() => window.__held.length === 2", timeout=3000)
+
+    page.evaluate("() => window.__held[0](200)")   # #1 really lands on the server
+    page.wait_for_timeout(200)
+    page.evaluate("() => window.__held[1](500)")
+    _wait_alert(page)
+    page.wait_for_timeout(300)
+
+    server = page.evaluate(
+        "() => window.__realFetch('/api/instock').then(r => r.json())")
+    assert list(server["instock"]) == ["20260001|N1"], server
+    assert page.evaluate("() => Object.keys(INSTOCK)") == ["20260001|N1"], "the accepted write was lost"
+    row = page.locator(".toorder-row[data-code='N1']")
+    assert "instock" in (row.get_attribute("class") or "").split()
+    assert "on" in (row.locator(".to-instock").get_attribute("class") or "").split()
 
 
 # ── PR #233 review: a repaint must not eat unsaved typing ────────────────────
