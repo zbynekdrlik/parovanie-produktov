@@ -90,11 +90,14 @@ def test_the_screen_number_equals_the_copied_number(page, toorder_server):
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
 
-    def _copied_qty(idx):
+    def _copied_qty():
+        # the spy is re-installed on every navigation, so the buffer is emptied per call
+        # instead of being indexed across a reload
+        page.evaluate("() => { window.__copied = []; }")
         page.locator(".toorder-supplier").filter(has_text="ORBIS").locator(
             ".tosup-copy").click()
-        page.wait_for_function(f"() => window.__copied.length === {idx + 1}")
-        copied = page.evaluate(f"() => window.__copied[{idx}]")
+        page.wait_for_function("() => window.__copied.length === 1")
+        copied = page.evaluate("() => window.__copied[0]")
         # the „N ks" column, wherever it sits (empty columns are dropped, so its index
         # depends on whether the line carries a grube code / a link)
         qty = sum(int(re.fullmatch(r"(\d+) ks", part.strip()).group(1))
@@ -105,18 +108,18 @@ def test_the_screen_number_equals_the_copied_number(page, toorder_server):
             assert chips == [f"Σ spolu {qty} ks"] * len(chips), (chips, copied)
         return qty
 
-    assert _copied_qty(0) == 3          # nothing handled: 1 ks + 2 ks
+    assert _copied_qty() == 3          # nothing handled: 1 ks + 2 ks
 
     page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
     page.wait_for_function(
         "() => /6 položiek z 7/.test(document.getElementById('toToolbar').textContent)")
     page.reload()
     page.wait_for_selector(".toorder-row")
-    assert _copied_qty(1) == 2          # the qty-1 line is handled → 2 ks left to order
+    assert _copied_qty() == 2          # the qty-1 line is handled → 2 ks left to order
 
     page.locator("#toToolbar .to-hidehandled").click()      # same again, filter ON
     page.wait_for_function("() => document.querySelectorAll('.toorder-row').length === 6")
-    assert _copied_qty(2) == 2
+    assert _copied_qty() == 2
 
     assert console == [], f"console not clean: {console}"
 
