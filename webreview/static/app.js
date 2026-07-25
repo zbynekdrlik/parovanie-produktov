@@ -28,6 +28,10 @@ let DEV = null;             // /api/dev/issues — {available, issues:[...]} or 
 let DEV_FILTER = 'open';    // 'Vývoj' tab filter: open | closed | all
 let UI_LABELS = {};         // /api/ui-labels — admin-set custom names {key: label} (#173)
 let ORDER_SUPPLIER = 'all';
+// #205 — hide the lines the manager has already dealt with (any flag on them). Purely a
+// VIEW filter: nothing is written, the chips keep counting every line, and it survives a
+// reload (localStorage), because working a long supplier list down is a multi-visit job.
+let HIDE_HANDLED = false;
 let ACTIVE_TAB = localStorage.getItem('tab') || 'toorder';
 const expanded = new Set(); // keys whose resolution panel is open (transient, NOT saved)
 const splitOpen = new Set(); // #174 — keys whose split-into-sizes editor is open (transient)
@@ -1572,6 +1576,49 @@ function isHandled(o) {
   return !!(ORDERED[o.key] || WAITING[o.key] || INSTOCK[o.key] || UNAVAIL[o.key]);
 }
 
+// #208 — the one global tally above the list. The supplier chips count LINES PER
+// SUPPLIER; what the manager had no way to see is how much of today's work is left in
+// total. Read from the LIVE flag maps (the same source as isHandled), so every toggle
+// recomputes it instead of leaving it stale until a reload (#86).
+function toOrderSummary(orders) {
+  const s = { total: 0, remaining: 0, ordered: 0, waiting: 0, instock: 0, unavail: 0 };
+  for (const o of orders || []) {
+    s.total += 1;
+    if (ORDERED[o.key]) s.ordered += 1;
+    if (WAITING[o.key]) s.waiting += 1;
+    if (INSTOCK[o.key]) s.instock += 1;
+    if (UNAVAIL[o.key]) s.unavail += 1;
+    if (!isHandled(o)) s.remaining += 1;
+  }
+  return s;
+}
+
+const _SUM_PARTS = [['ordered', 'objednané'], ['waiting', 'čaká sa'],
+                    ['instock', 'skladom'], ['unavail', 'nedostupné']];
+
+// „📋 Ostáva vybaviť 5 z 7 položiek · objednané 1 · čaká sa 1". Empty buckets are dropped
+// so the line stays readable. One line can carry SEVERAL flags, so the breakdown is not a
+// partition of `total` — it is never rendered as one (no percentages, no "+" arithmetic).
+function toOrderSummaryText(s) {
+  const bits = _SUM_PARTS.filter(([k]) => s[k] > 0).map(([k, lbl]) => `${lbl} ${s[k]}`);
+  return `📋 Ostáva vybaviť ${s.remaining} z ${s.total} položiek`
+    + (bits.length ? ' · ' + bits.join(' · ') : '');
+}
+
+// The toolbar lives in the top bar, NOT in `#list` — a summary inside the list would be
+// wiped by (and would have to be rebuilt through) the editor capture/restore repaint, and
+// the per-line toggles deliberately do NOT repaint the list. Rendered from
+// renderOrderFilters, which is exactly what every toggle already calls.
+function renderOrderToolbar() {
+  const bar = document.getElementById('toToolbar');
+  if (!bar || ACTIVE_TAB !== 'toorder') return;
+  bar.innerHTML = '';
+  const s = toOrderSummary(ORDERS);
+  const sum = el('span', 'to-sum' + (s.total > 0 && s.remaining === 0 ? ' alldone' : ''));
+  sum.textContent = toOrderSummaryText(s);
+  bar.appendChild(sum);
+}
+
 // Build the supplier filter chips for the Na-objednanie tab, coloured by resolved state:
 // RED (done) = every one of the supplier's lines is flagged (nothing left to deal with),
 // GREEN (todo) = at least one line still un-flagged, ORANGE (active) = the selected chip.
@@ -1609,6 +1656,7 @@ function renderOrderFilters(idx) {
   for (const s of Object.keys(cnt).sort(byPriority)) {
     fbar.appendChild(mk(s, `${escapeHtml(lbl(s))} (${cnt[s]})`, !unhandled[s]));
   }
+  renderOrderToolbar();   // #208 — the global tally rides along with every chip repaint
 }
 
 // A whole-tab repaint (a failed flag's rollback, a saved pair URL / supplier / comment)
@@ -3991,6 +4039,7 @@ function render() {
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
   const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || plain) ? 'none' : '';
   const filt = document.getElementById('filters'); if (filt) filt.style.display = plain ? 'none' : '';
+  const tbar = document.getElementById('toToolbar'); if (tbar) tbar.hidden = !toorder;   // #208
   const secNd = document.getElementById('tab-nedostupne'); if (secNd) secNd.hidden = !nedostupne;
   const secVy = document.getElementById('tab-vystavy'); if (secVy) secVy.hidden = !vystavy;
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
