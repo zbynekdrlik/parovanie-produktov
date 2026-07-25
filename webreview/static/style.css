@@ -249,6 +249,14 @@ body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f3
 .toorder-supplier .tosup-bulk{margin-left:auto;flex:0 0 auto;background:var(--accent-hov);color:#fff;
   border:0;border-radius:7px;padding:5px 11px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
 .toorder-supplier .tosup-bulk:hover{filter:brightness(1.08)}
+/* #207 — kopírovanie celej objednávky dodávateľa do schránky (mimo bulk tlačidla,
+   ktoré si drží margin-left:auto → toto sa zaradí hneď zaň) */
+.toorder-supplier .tosup-copy{flex:0 0 auto;background:var(--panel);color:var(--muted);
+  border:1px solid var(--border);border-radius:7px;padding:5px 11px;font-size:12px;
+  font-weight:600;cursor:pointer;white-space:nowrap}
+.toorder-supplier .tosup-copy:hover{border-color:var(--soft);color:var(--text)}
+.toorder-supplier .tosup-copy.ok{background:var(--accent-soft);color:var(--accent);
+  border-color:var(--accent)}
 .toorder-row{display:flex;gap:12px;align-items:center;padding:10px 12px;background:var(--panel);
   border:1px solid var(--border);border-radius:10px;margin-bottom:8px;box-shadow:var(--shadow)}
 .toorder-row.done{opacity:.55;background:var(--row-done)}

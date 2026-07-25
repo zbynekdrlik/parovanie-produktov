@@ -1433,6 +1433,75 @@ function groupQtyTotals(items) {
   return t;
 }
 
+// #207 — GRUBE (and most of the others) has no B2B auto-ordering: the manager writes the
+// order by hand, so he needs the whole supplier list as plain text in one click.
+//
+// The text AGGREGATES by product+size, summing the pieces (the same arithmetic #206 put
+// on screen): an order to a supplier asks for „3 ks of S1", never for the three separate
+// customer lines that produced it. Order of first appearance is kept, so the pasted list
+// reads in the same order as the tab.
+//
+// A GRUBE line carries its per-size itemId — the code GRUBE actually wants — so it is
+// included when present. Only http(s) links are pasted (`safeHttpUrl`), never a stored
+// value the row itself refuses to render as a link.
+const TO_COPY_LABEL = '📋 Kopírovať objednávku';
+
+function orderCopyLines(items) {
+  const seen = Object.create(null), out = [];
+  for (const o of items || []) {
+    const code = o.itemCode || '';
+    const size = (o.size || '').trim();
+    const k = code + ' ' + size;
+    let e = seen[k];
+    if (!e) {
+      e = seen[k] = {
+        code, size, qty: 0,
+        grube: (o.grubeItemId || '').trim(),
+        url: safeHttpUrl(o.supplierUrl) || safeHttpUrl(o.pairUrl)
+             || safeHttpUrl(o.grubeDeUrl) || '',
+      };
+      out.push(e);
+    }
+    e.qty += orderQty(o);
+    if (!e.grube && o.grubeItemId) e.grube = String(o.grubeItemId).trim();
+    if (!e.url) e.url = safeHttpUrl(o.supplierUrl) || safeHttpUrl(o.pairUrl)
+                        || safeHttpUrl(o.grubeDeUrl) || '';
+  }
+  // empty parts are DROPPED, never padded with a placeholder — a '—' column in a pasted
+  // e-mail reads like an instruction to the supplier
+  return out.map(e => [e.code, e.grube ? 'grube ' + e.grube : '', e.size,
+                       e.qty + ' ks', e.url].filter(Boolean).join(' | '));
+}
+
+// The Clipboard API needs a secure context AND a permission; when it is missing or
+// refused, fall back to the legacy selection + execCommand path instead of leaving the
+// manager with a button that only ever says no.
+async function copyPlainText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through to the legacy path */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return !!ok;
+  } catch (_) { return false; }
+}
+
+function orderCopyText(supplierLabel, items) {
+  const lines = orderCopyLines(items);
+  return [`Objednávka — ${supplierLabel} (${lines.length} položiek)`, ...lines].join('\n');
+}
+
 function renderOrderRow(o, totals) {
   const row = el('div', 'toorder-row' + (ORDERED[o.key] ? ' done' : '') + (WAITING[o.key] ? ' waiting' : '')
     + (INSTOCK[o.key] ? ' instock' : '') + (UNAVAIL[o.key] ? ' unavail' : ''));
@@ -1908,6 +1977,20 @@ function renderToOrder() {
                             : 'Označiť VŠETKY položky tohto dodávateľa ako objednané';
     bulk.onclick = () => markGroupOrdered(items, !allOrdered);
     head.appendChild(bulk);
+    // #207 — the whole supplier list as plain text, for the (many) suppliers with no B2B
+    // ordering. It copies exactly the rows the group SHOWS: with „skryť poriešené" (#205)
+    // on that is the outstanding work, with it off it is everything — WYSIWYG either way,
+    // never a hidden set the manager cannot see before pasting it into an e-mail.
+    const copy = el('button', 'tosup-copy', TO_COPY_LABEL);
+    copy.title = 'Skopírovať zoznam tohto dodávateľa (kód, veľkosť, ks, odkaz) do schránky';
+    copy.onclick = async () => {
+      const ok = await copyPlainText(orderCopyText(lbl(sup), items));
+      copy.textContent = ok ? '✓ Skopírované' : '⚠️ Schránka nedostupná';
+      copy.classList.toggle('ok', ok);
+      // the node may be gone by then (a repaint) — harmless, the next paint is correct
+      setTimeout(() => { copy.textContent = TO_COPY_LABEL; copy.classList.remove('ok'); }, 2500);
+    };
+    head.appendChild(copy);
     list.appendChild(head);
     const totals = groupQtyTotals(totalsBySup[sup] || items);
     for (const o of items) list.appendChild(renderOrderRow(o, totals));
