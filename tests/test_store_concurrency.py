@@ -30,7 +30,23 @@ MUST_BE_BACKED_UP = [
     "order_pairings.json", "supplier_assignments.json", "variant_links.json",
     "waiting_items.json", "instock_items.json", "unavailable_items.json",
     "order_comments.json", "nedostupne.json", "vystavy.json", "users.json",
+    "notes.json", "ui_labels.json",
 ]
+
+
+def test_a_long_upload_records_its_keys_onto_the_CURRENT_state(tmp_path, monkeypatch):
+    """The nightly write-backs read their state, then spend MINUTES in a Shoptet
+    import subprocess, then save. Saving the map they read discards anything written
+    meanwhile — a lost review key re-uploads a link the manager already corrected."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_uploaded({"old": "https://x.test/old"})
+    stale = webapp._load_uploaded()                      # what the run read up front
+    assert "concurrent" not in stale
+    fresh = dict(stale, **{"concurrent": "https://x.test/other"})
+    webapp._save_uploaded(fresh)                         # …someone else writes meanwhile
+    webapp._record_uploaded(webapp._load_uploaded, webapp._save_uploaded,
+                            {"mine": "https://x.test/mine"})
+    assert set(webapp._load_uploaded()) == {"old", "concurrent", "mine"}
 
 
 def test_the_backup_script_covers_every_irreplaceable_store():

@@ -94,6 +94,35 @@ def test_the_off_switch_is_opt_in(scheduler_out, monkeypatch):
     assert started == [1]
 
 
+def test_every_e2e_fixture_server_boots_without_a_scheduler():
+    """Each e2e fixture launches a real `python webreview/app.py`, so each one starts
+    a real scheduler over its own data dir. They are inert only because no fixture
+    happens to seed `enabled: true` today — one seeded automation and a CI run would
+    scrape a paid API or mail a customer. Same category as the forgotten preview."""
+    conftest = os.path.join(ROOT, "tests", "e2e", "conftest.py")
+    with open(conftest, encoding="utf-8") as f:
+        text = f.read()
+    assert '"WEBREVIEW_NO_SCHEDULER": "1"' in text, \
+        "the shared fixture-server env must pin the scheduler off"
+    servers = text.count('"WEBREVIEW_OUT": str(out)')
+    pinned = text.count("**_AUTH_ENV")
+    assert pinned >= servers, \
+        f"{servers - pinned} fixture server(s) build an env without the shared pins"
+
+
+def test_run_now_is_refused_on_an_instance_without_a_scheduler(monkeypatch):
+    """„⚡ Spustiť teraz" runs the automation IN THIS PROCESS, so a preview instance
+    could mail customers from its own UI however loudly the boot log says it runs
+    no automation."""
+    from tests.conftest import authed_client
+    monkeypatch.setenv("WEBREVIEW_NO_SCHEDULER", "1")
+    called = []
+    monkeypatch.setattr(webapp.RUNNER, "run_now", lambda key: called.append(key) or True)
+    r = authed_client().post("/api/automations/posta_uncollected/run")
+    assert r.status_code == 503, r.data
+    assert called == []
+
+
 def test_the_playbook_preview_recipe_disables_the_scheduler():
     """The recipe that produced the four-day orphan must boot without a scheduler."""
     skill = os.path.join(ROOT, ".claude", "skills", "webreview", "SKILL.md")

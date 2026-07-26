@@ -180,6 +180,84 @@ def test_a_refused_wipe_leaves_no_half_written_temp_file(monkeypatch, tmp_path):
     assert list(tmp_path.glob("*.tmp")) == []
 
 
+def test_an_unreadable_store_is_never_degraded_to_empty(monkeypatch, tmp_path):
+    """A missing file is a first run and a truncated one is repairable — but an I/O
+    error on a store that IS there (permissions, EIO) is not evidence of „no work".
+    Degrading it to `{}` and letting the next click persist a one-entry file is the
+    silent loss this whole PR exists to prevent; it must stay a loud failure."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "decisions.json").mkdir()          # open() → IsADirectoryError
+    with pytest.raises(OSError):
+        webapp._load_decisions()
+
+
+def test_a_read_that_did_not_yield_the_stored_content_cannot_legitimise_a_wipe(
+        monkeypatch, tmp_path):
+    """Wrong-type store: the loader hands back the default, so the caller never saw
+    the entries on disk — an empty write after that is still a wipe."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "decisions.json").write_text('["a", "b", "c"]', encoding="utf-8")
+    assert webapp._load_decisions() == {}
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+
+
+def test_a_shrink_this_process_never_read_is_refused(monkeypatch, tmp_path):
+    """The incident's fixture was not empty — `_arm_pairings` stubs `_load_decisions`
+    to a small map. Refusing only EMPTY writes would have let a 3-entry fixture land
+    on 2831 entries just as happily."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({"S|9": {"status": "manual", "url": "https://x.test/z"}})
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_a_shrink_the_manager_actually_made_is_allowed(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    d = webapp._load_decisions()
+    d.pop("S|2")
+    webapp._save_decisions(d)
+    assert list(webapp._load_decisions()) == ["S|1"]
+
+
+def test_growing_a_store_never_needs_a_read(monkeypatch, tmp_path):
+    """Only shrinking is suspicious — an incremental upload state that only ever
+    grows must not start failing because it was computed before the read."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._store_reads.pop(os.fspath(webapp.DECISIONS), None)
+    bigger = dict(_two_decisions(), **{"S|3": {"status": "good", "url": "https://x.test/c"}})
+    webapp._save_decisions(bigger)
+    assert len(webapp._load_decisions()) == 3
+
+
+def test_the_dedup_stores_are_protected_too(monkeypatch, tmp_path):
+    """orders_reminder.json / posta_uncollected.json are the ones whose loss means a
+    SECOND mail to every customer — they were the only manager-critical stores left
+    without the write guard."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"1": {"status": "emailed"}}, "red": []}), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_orders_reminder({})
+    st = webapp._load_orders_reminder()
+    st["orders"]["2"] = {"status": "emailed"}
+    webapp._save_orders_reminder(st)          # the normal path still works
+    assert len(webapp._load_orders_reminder()["orders"]) == 2
+
+
+def test_a_refused_write_answers_503_with_something_to_fix(monkeypatch, tmp_path):
+    """A bare 500 reads like a transient glitch and invites another click; the manager
+    must be told what happened (same shape as the corrupt-dedup-store handler)."""
+    for exc in (webapp.StoreWipeRefused("x"), webapp.StoreLockTimeout("y")):
+        handler = webapp.app.error_handler_spec[None][None][type(exc)]
+        body, status = handler(exc)
+        assert status == 503 and body.get_json()["ok"] is False
+        assert body.get_json()["error"]
+
+
 def test_the_startup_prune_never_wipes_when_the_product_list_failed_to_load(
         monkeypatch, tmp_path):
     """review_data.json missing → PRODUCTS == [] → every decision looks orphaned.
