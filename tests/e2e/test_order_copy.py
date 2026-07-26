@@ -58,8 +58,10 @@ document.execCommand = (cmd) => {
 };
 """
 
-# First write lands, every later one is refused (and the legacy path throws) → two clicks
-# in one 2,5 s window end on DIFFERENT labels, which is what pins the reset timer.
+# The first write lands, the SECOND is refused (and the legacy path throws) → two clicks
+# in one 2,5 s window end on DIFFERENT labels, which is what pins the reset timer. Only
+# that one write is refused: the same test then copies two DIFFERENT suppliers, and both
+# of those have to succeed for their „✓ Skopírované" labels to be worth timing.
 _SPY_SECOND_CLICK_FAILS = """
 window.__copied = [];
 window.__n = 0;
@@ -67,7 +69,7 @@ Object.defineProperty(navigator, 'clipboard', {
   configurable: true,
   value: { writeText: (t) => {
     window.__n += 1;
-    if (window.__n > 1) return Promise.reject(new Error('denied'));
+    if (window.__n === 2) return Promise.reject(new Error('denied'));
     window.__copied.push(String(t));
     return Promise.resolve();
   } },
@@ -213,7 +215,14 @@ def test_a_later_copy_outcome_survives_the_earlier_click_timer(page, toorder_ser
     forgotten: the manager copied ORBIS, clicked again ~2,3 s later, that write failed, the
     warning showed for 200 ms and the stale timer wiped it — he read the default label,
     assumed the copy had landed, and pasted the PREVIOUS supplier's order (still in the
-    clipboard) into this supplier's mail. Each click must own its own timer."""
+    clipboard) into this supplier's mail. Each click must own its own timer.
+
+    Second leg: that timer is per BUTTON — `resetT` lives in the per-group closure, so
+    copying a SECOND supplier cancels only ITS OWN pending reset. Hoisted out of the
+    supplier loop it becomes one timer for the whole tab, and the same paste-the-wrong-
+    order harm comes back through the other door: CITRADE's click kills ORBIS's pending
+    reset, ORBIS keeps reading „✓ Skopírované" for good, and the manager trusts that label
+    over a clipboard that now holds CITRADE's order."""
     console = _console_watch(page)
     page.add_init_script(_SPY_SECOND_CLICK_FAILS)
     page.goto(toorder_server + "/?tab=toorder")
@@ -242,6 +251,23 @@ def test_a_later_copy_outcome_survives_the_earlier_click_timer(page, toorder_ser
     page.wait_for_function(
         "(lbl) => document.querySelector('.tosup-copy').textContent === lbl",
         arg=COPY_LABEL, timeout=6000)
+
+    # ONE closure per supplier group: a copy of ANOTHER supplier must not cancel this
+    # button's pending reset either. ORBIS goes first, CITRADE ~1 s later — ORBIS's label
+    # has to come back on its own deadline (a shared timer never lets it) while CITRADE's
+    # outcome, a second younger, is still on screen.
+    _orbis_copy = ("[...document.querySelectorAll('.toorder-supplier')]"
+                   ".find(h => /ORBIS/.test(h.textContent)).querySelector('.tosup-copy')")
+    _group(page, "ORBIS").locator(".tosup-copy").click()
+    page.wait_for_function(f"() => /Skopírované/.test({_orbis_copy}.textContent)")
+    page.wait_for_timeout(1000)          # still well inside ORBIS's 2,5 s window
+    copy.click()
+    page.wait_for_function(
+        "() => /Skopírované/.test(document.querySelector('.tosup-copy').textContent)")
+    page.wait_for_function(f"(lbl) => {_orbis_copy}.textContent === lbl",
+                           arg=COPY_LABEL, timeout=6000)
+    assert "Skopírované" in copy.inner_text(), \
+        "another group's click must not wipe this button's outcome"
 
     assert console == [], f"console not clean: {console}"
 
