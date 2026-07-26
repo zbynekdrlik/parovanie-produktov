@@ -60,7 +60,8 @@ def _admin_session_cookie(base: str) -> str:
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
                     "automations_server", "imgfail_server", "imgflood_server", "dev_server",
-                    "nedostupne_server", "vystavy_server", "toorder_server")
+                    "nedostupne_server", "vystavy_server", "toorder_server",
+                    "toorder_wide_server")
 
 
 @pytest.fixture(autouse=True)
@@ -647,6 +648,75 @@ def toorder_server(tmp_path_factory):
         "20260900;2026-05-16 09:00:00;Vybavuje sa;;Nohavice Orb Test;1;S1;Veľkosť: M;ORBIS\r\n"
         "20260890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
         "20260001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(out / "no_products_here.csv"),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def toorder_wide_server(tmp_path_factory):
+    """Isolated webreview instance for the „Na objednanie" ROW-WIDTH + pairing-edit E2E
+    (#241 row overflows past the viewport under ~1780 px, #242 a reviewed link has no
+    edit affordance at all).
+
+    Deliberately NOT the shared `toorder_server`: that one is all-unpaired with short
+    strings, and a short fixture cannot reproduce a width bug (the #82 lesson — nothing
+    has to shrink, so RED never happens). Here every cell a real row can carry is
+    present AND realistically long: a reviewed pairing link, a long product name, a long
+    shop remark, a supplier-less line (inline assign editor), and two lines sharing one
+    itemCode plus a sibling variant of the same reviewed product.
+
+    Seeded so that:
+      * 61247/L + 61247/XL belong to review product BETALOV|231 with a `good` decision
+        → both rows render the reviewed 🔗 and must both become editable + propagate;
+      * 99999/M is outside the review set → keeps the inline paste box (control);
+      * N1 has no supplier → shows the inline supplier-assign editor (extra width).
+    WEBREVIEW_PRODUCTS points at a nonexistent file so a dev box's real
+    data/products.csv can never influence the run (CI has none)."""
+    out = tmp_path_factory.mktemp("wr_toorder_wide_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "review_data.json").write_text(json.dumps([{
+        "key": "BETALOV|231", "supplier": "BETALOV",
+        "name": "Polokosela FOREST Single Jersey 180g panska dlhy rukav",
+        "pairCode": "231", "variant_codes": ["61247/L", "61247/XL"],
+        "our_url": "https://www.forestshop.sk/polokosela-forest/",
+        "our_images": [], "candidates": [], "current": {},
+        "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+    }]), encoding="utf-8")
+    (out / "decisions.json").write_text(json.dumps({
+        "BETALOV|231": {"status": "good",
+                        "url": "https://www.huntingshop.eu/polokosela-forest-single-jersey-180g/"},
+    }), encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20261217;2026-05-20 09:00:00;Vybavuje sa;"
+        "nemame percussion tricko, zakaznik caka na potvrdenie terminu;"
+        "Polokosela FOREST Single Jersey 180g panska;1;61247/L;Velkost: L;BETALOV\r\n"
+        "20261218;2026-05-21 09:00:00;Vybavuje sa;;"
+        "Polokosela FOREST Single Jersey 180g panska;2;61247/XL;Velkost: XL;BETALOV\r\n"
+        "20261219;2026-05-22 09:00:00;Vybavuje sa;;"
+        "Nohavice ORBIS Trophy zimne zateplene panske;1;99999/M;Velkost: M;ORBIS\r\n"
+        "20261220;2026-05-23 09:00:00;Vybavuje sa;;"
+        "Ciapka bez dodavatela s dlhym nazvom produktu;1;N1;Velkost: uni;\r\n",
         encoding="cp1250")
     env = {
         **os.environ,
