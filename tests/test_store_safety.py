@@ -725,20 +725,25 @@ def test_a_rebuilt_list_of_COPIES_that_only_drops_entries_is_allowed(monkeypatch
     assert [v["id"] for v in webapp._load_vystavy()] == ["a", "c"]
 
 
-def test_naming_a_read_does_not_authorise_gutting_the_NESTED_dedup_map(
+def test_naming_a_read_does_not_authorise_a_FOREIGN_nested_dedup_map(
         monkeypatch, tmp_path):
     """For a `protect=("orders",)` store the derivation check only compared TOP-LEVEL
     keys — and every real writer of those stores keeps the same top-level key set. So a
-    `prev=` write that kept the outer shape and emptied the who-was-already-mailed map
-    passed the narrowing check outright (nobody writes this today; the idiom is what
-    re-opens it — PR #265 third review)."""
+    `prev=` write that kept the outer shape and replaced the who-was-already-mailed map
+    with one that came from NO read passed the narrowing check outright (nobody writes
+    this today; the idiom is what re-opens it — PR #265 third review). This is
+    `test_naming_a_read_does_not_authorise_writing_an_unrelated_map` one level down,
+    where the irreplaceable content of these two stores actually lives.
+
+    Emptying the nested map is deliberately NOT this case: a subset is a legitimate
+    narrowing at either level, exactly as `_save_decisions({}, prev=d0)` is."""
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     (tmp_path / "orders_reminder.json").write_text(
         json.dumps(_reminder_state(50)), encoding="utf-8")
     st = webapp._load_orders_reminder()
-    gutted = dict(st, orders={})
+    foreign = dict(st, orders={"NIKDY-NECITANE": {"status": "emailed"}})
     with pytest.raises(webapp.StoreWipeRefused):
-        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, gutted,
+        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, foreign,
                                   mode=0o600, protect=("orders",), prev=st)
     assert len(webapp._load_orders_reminder()["orders"]) == 50
 
