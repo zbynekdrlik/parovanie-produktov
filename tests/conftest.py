@@ -7,11 +7,34 @@ their exact pre-auth behavior by running as a real logged-in session:
   that user (the gate re-validates the session against the store on EVERY request,
   so the session alone would not be enough — and the real data/out/users.json must
   never be touched by tests).
+
+#261 — HARD ISOLATION OF THE LIVE DATA DIR. The block below runs at conftest IMPORT
+time, i.e. before pytest collects (and therefore before any test module imports the
+app), and points `WEBREVIEW_OUT` + `WEBREVIEW_PRODUCTS` at a throwaway directory for
+the WHOLE backend suite. It is the belt to the app-side braces (paths derived from
+the current OUT): even a test helper that forgets to patch anything at all now writes
+into a temp dir instead of over the manager's live work. On 2026-07-26 a helper that
+patched `OUT` but not the frozen `DECISIONS` wiped all 2831 review decisions; nothing
+in a test run may be able to reach data/out again.
 """
+import atexit
 import json
+import os
+import shutil
 import sys
+import tempfile
 
 import pytest
+
+_TEST_DATA = tempfile.mkdtemp(prefix="webreview-tests-data-")
+_TEST_OUT = os.path.join(_TEST_DATA, "out")
+os.makedirs(_TEST_OUT, exist_ok=True)
+os.environ["WEBREVIEW_OUT"] = _TEST_OUT
+# `run_shoptet_sync` rewrites the export in place — keep the real data/products.csv
+# out of reach too, and make the dev box behave like CI (which has no data/ tree).
+# It sits BESIDE the out dir, exactly as in production (data/products.csv + data/out/).
+os.environ["WEBREVIEW_PRODUCTS"] = os.path.join(_TEST_DATA, "products.csv")
+atexit.register(shutil.rmtree, _TEST_DATA, ignore_errors=True)
 
 TEST_USER = "tester@example.com"
 

@@ -5,7 +5,9 @@ ukladajú do data/out/decisions.json.
 Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:8799)
 """
 from __future__ import annotations
+import collections
 import csv
+import fcntl
 import hmac
 import io
 import json
@@ -39,7 +41,8 @@ from parovanie import (
     __version__, config, image_health, import_builder, nedostupne, orders_reminder,
     posta_uncollected, restock_skladom, riziko_vypadku, stock_skladom,
     supplier_stock, vystavy_imap, writer)
-from parovanie.automation_runner import Automation, AutomationRunner
+from parovanie.automation_runner import (
+    Automation, AutomationRunner, AutomationStateCorrupt)
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of, resync_current
@@ -48,14 +51,180 @@ from parovanie.shoptet_import import parse_import_log
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data dir is env-overridable so tests/E2E can boot the app against a fixture.
 OUT = os.environ.get("WEBREVIEW_OUT") or os.path.join(ROOT, "data", "out")
-DATA = os.path.join(OUT, "review_data.json")
-DECISIONS = os.path.join(OUT, "decisions.json")
-IMGCACHE = os.path.join(OUT, "imgcache")
+
+
+class _StorePath(os.PathLike):
+    """A file inside OUT whose path is resolved on EVERY use — never frozen.
+
+    #261: these used to be plain `os.path.join(OUT, "x.json")` constants, computed
+    once at IMPORT time. Repointing `OUT` (a test helper, a fixture server) therefore
+    redirected NOTHING, and on 2026-07-26 a helper that patched `OUT` but not the
+    frozen `DECISIONS` wrote a fixture over the manager's live decisions.json —
+    all 2831 review decisions gone. Deriving from the CURRENT `OUT` at call time
+    makes `OUT` the single knob it always looked like.
+
+    It stays usable exactly like the string it replaced: `open()`, `os.path.*` and
+    `os.replace()` take the PathLike directly, and `__add__`/`__str__` keep the
+    `path + ".tmp"` / `"%s" % path` idioms working, so no call site (here or in
+    `automation_runner`) has to know the path is lazy. Patching a single store with
+    a plain `str` (what most tests do) keeps working too."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __fspath__(self) -> str:
+        return os.path.join(OUT, self._name)
+
+    def __str__(self) -> str:
+        return self.__fspath__()
+
+    def __repr__(self) -> str:
+        return f"<store {self._name} → {self.__fspath__()}>"
+
+    def __add__(self, other: str) -> str:
+        return self.__fspath__() + other
+
+    def __radd__(self, other: str) -> str:
+        return other + self.__fspath__()
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, (str, os.PathLike)):
+            return self.__fspath__() == os.fspath(other)
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.__fspath__())
+
+
+def _store(name: str) -> _StorePath:
+    """Declare a store file under OUT. ALWAYS use this for a new store — a plain
+    `os.path.join(OUT, ...)` constant re-introduces the #261 freeze (and
+    `test_no_store_path_is_frozen_at_import` will fail on it)."""
+    return _StorePath(name)
+
+
+class StoreWipeRefused(RuntimeError):
+    """A write that would replace a populated store with an empty one — refused.
+
+    The manager's stores only ever lose entries ONE at a time (an undo, a toggle
+    off), so a populated store collapsing to empty in a SINGLE write is never a
+    click — it is a bug (a fixture map, a store loaded as `{}` after a failed read)
+    about to erase months of work. Refuse loudly instead: raising is visible in the
+    log, in the HTTP response and in a test run; a silent `{}` is not. Emptying the
+    LAST remaining entry stays allowed — that one really is a click."""
+
+
+DATA = _store("review_data.json")
+DECISIONS = _store("decisions.json")
+IMGCACHE = _store("imgcache")
 os.makedirs(IMGCACHE, exist_ok=True)
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 app = Flask(__name__, static_folder="static", template_folder="templates")
-_lock = threading.Lock()
+
+
+class StoreLockTimeout(RuntimeError):
+    """Another process held the store lock for far too long — better a loud 500 than
+    a request that hangs forever, and better than writing anyway (a lost update)."""
+
+
+class _StoreLock:
+    """The app's ONE store lock: `threading.RLock` in-process **plus** an
+    `fcntl.flock` on OUT/.store.lock across processes (#264).
+
+    Every read-modify-write in this module already runs inside `with _lock:` — that
+    is the app's deliberate coarse-grained design (one lock for all stores; network
+    and SMTP calls stay OUTSIDE it). It only ever serialised THREADS, though: the
+    atomic tmp+replace keeps a file from being half-written, but it cannot stop two
+    PROCESSES from both reading the same map and the second one's write erasing the
+    first one's entry. A second instance ran over this data dir for four days (#262),
+    so that was live exposure, not theory.
+
+    Re-entrant on purpose: `_atomic_write_json` takes the lock itself (so a write is
+    protected even on a path that forgot to), and almost every save is already inside
+    a `with _lock:` block — a plain Lock would deadlock on the first click.
+
+    The lock file is resolved from the CURRENT OUT, so each data dir (live service,
+    fixture server, test tmp dir) has its own lock and they never contend."""
+
+    def __init__(self, name: str = ".store.lock", timeout: float = None) -> None:
+        self.path = _store(name)
+        # env-tunable so a test (or an operator debugging a stuck instance) does not have
+        # to sit through the full 30 s; the default is unchanged.
+        self.timeout = float(os.environ.get("WEBREVIEW_STORE_LOCK_TIMEOUT") or 30.0) \
+            if timeout is None else timeout
+        self._rlock = threading.RLock()
+        self._depth = 0
+        self._fd = None
+
+    def _flock(self, timeout=None) -> int:
+        p = os.fspath(self.path)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    log.error("store lock %s still held by another process — refusing "
+                              "to write (a second instance? see #262)", p)
+                    raise StoreLockTimeout(
+                        f"Úložisko {os.path.basename(p)} drží iný proces a nepustilo "
+                        "ho — nič sa nezapísalo. Skús to o chvíľu znova; ak to trvá, "
+                        "beží pravdepodobne druhá inštancia aplikácie (#262).") from None
+                time.sleep(0.02)
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        started = time.monotonic()
+        if not self._rlock.acquire(blocking, timeout):
+            return False
+        if self._depth == 0:
+            # the caller's budget governs BOTH halves — a non-blocking acquire that
+            # then waits 30s on the file lock would be a trap
+            budget = None
+            if not blocking:
+                budget = 0.0
+            elif timeout is not None and timeout >= 0:
+                budget = max(0.0, timeout - (time.monotonic() - started))
+            try:
+                self._fd = self._flock(budget)
+            except StoreLockTimeout:
+                # `threading.Lock` semantics for a BOUNDED acquire: answer False, never
+                # raise. `with _lock:` (unbounded) still raises loudly — that one really
+                # is „another process has held the data dir for 30 s", not a poll.
+                self._rlock.release()
+                if budget is not None:
+                    return False
+                raise
+            except BaseException:
+                self._rlock.release()
+                raise
+        self._depth += 1
+        return True
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth == 0 and self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+        self._rlock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.release()
+        return False
+
+
+_lock = _StoreLock()
 _import_lock = threading.Lock()   # one Shoptet import at a time (browser automation)
 CRED_PATH = os.environ.get("SHOPTET_CRED") or os.path.join(ROOT, "data", ".shoptet_admin")
 IMPORT_SCRIPT = os.path.join(ROOT, "scripts", "shoptet_import.py")
@@ -65,9 +234,542 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("webreview")
 log.info("starting webreview v%s", __version__)
 
+
+def _measure_store(d) -> dict:
+    """Entry counts of one store: `""` = the top-level map, plus one entry per
+    top-level key whose value is ITSELF a map/list.
+
+    The nested counts are what makes `protect` real for the two fail-closed dedup
+    stores (PR #265 review): `orders_reminder.json` is
+    `{"orders": {...}, "red": [...], "stats": {...}, …}` and `posta_uncollected.json`
+    is `{"escalation": {...}, "terminal": {...}, …}` — the record of who was already
+    e-mailed is the NESTED map, and every real writer keeps the same top-level key
+    set, so an outer-dict count can never notice its loss."""
+    m = {"": len(d) if isinstance(d, (dict, list)) else 0}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, (dict, list)):
+                m[k] = len(v)
+    return m
+
+
+def _stored_measures(p) -> tuple:
+    """`(measures, corrupt)` for the store as it is on disk RIGHT NOW.
+
+    A MISSING or zero-byte file is a legitimate fresh store: `({}, False)` — nothing
+    to lose. Anything present that we cannot parse (a write cut mid-JSON or
+    mid-UTF-8, an I/O error) is `corrupt=True`, NOT „0 entries": counting it as zero
+    is what let a truncated decisions.json — ~1400 recoverable entries — be replaced
+    by a single click, silently and without a backup copy (PR #265 review)."""
+    try:
+        with open(p, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {}, False
+    except OSError:
+        return {}, True          # present but unreadable — we cannot know what is at stake
+    if not raw.strip():
+        return {}, False
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except ValueError:           # incl. UnicodeDecodeError — a write cut mid-character
+        return {}, True
+    return _measure_store(d), False
+
+
+# path → `(the object a read of that store handed back, its counts AT READ TIME)`.
+#
+# The OBJECT is the receipt (#265 review). The first cut stored only a count, which
+# made this a stale-read detector rather than a provenance check: `_load_decisions()`
+# runs at import and on every /api/products + /api/orders, so „this process last read
+# N and the disk holds N" was permanently true and the guard never fired — the wipe
+# that started all this would have been allowed. Identity cannot be faked by an
+# unrelated read, and the strong reference kept here also stops `id()` from being
+# recycled onto a different object.
+#
+# NOT one slot per store (PR #265 second review): a single slot made the LAST READ win,
+# and every GET re-reads these stores (one /api/orders loads eight of them, the tab
+# polls, `_require_login` reads users on every single request) while Flask serves
+# threaded. A display read landing between the writer's load and its guard check
+# replaced the receipt and the manager's own un-toggle came back as a 503 — 11 of 400
+# clicks with three pollers, 317 of 400 with no sleep between reads. Two structures
+# carry it instead, and a write is legitimate when EITHER remembers the map:
+#
+#   _thread_reads — what THIS thread read, per store. A read-modify-write happens in
+#       one thread (all 24 `protect=` sites load under `_lock` immediately before
+#       saving), and no other thread can evict this one, so the manager's click is
+#       refused-proof no matter how hard the tab polls. Dies with the thread.
+#   _store_reads  — the last few reads by ANY thread, for the cross-thread shape the
+#       single slot used to allow. BEST EFFORT ONLY, and nothing may depend on it
+#       (PR #265 third review): it is one 8-slot ring shared by every thread, and every
+#       GET appends, so a cross-thread receipt is evicted within microseconds — measured
+#       300/300 refusals for a writer relying on it with four pollers running. Nothing in
+#       the tree does: all 24 `protect=` sites load and save inside ONE `with _lock:`
+#       block, i.e. in one thread, which is what `_thread_reads` above covers. Treat a
+#       new cross-thread read-modify-write as UNSUPPORTED — pass `prev=` and read in the
+#       writing thread — not as something this ring will carry.
+#
+# Retention: entries hold the loaded store alive (a review_data read is ~15 MB), so a
+# successful write RESETS both rings to the one object it just wrote — every older
+# receipt is stale the moment the file changes anyway. BETWEEN writes the rings do hold
+# up to 8 loaded copies per path per ring (a decisions.json read is ~1.3 MB, so ~10 MB
+# for that path; review_data's is reset by every `_save_products`) — bounded and
+# accepted, but not the „at most one per store" the first cut of this comment claimed.
+_READ_RING = 8
+_store_reads: dict = {}            # path -> deque[(object, measures)], any thread
+_thread_reads = threading.local()  # path -> deque[(object, measures)], this thread only
+
+# The manager's REAL data dir — never derived from OUT (which tests repoint), so it
+# still names the live files when OUT points at a tmp dir. `realpath`, not `abspath`:
+# abspath does not resolve symlinks, so a helper pointing WEBREVIEW_OUT at a LINK to
+# data/out walked straight past the net (PR #265 second review).
+_LIVE_OUT = os.path.realpath(os.path.join(ROOT, "data", "out"))
+_LIVE_PRODUCTS = os.path.realpath(os.path.join(ROOT, "data", "products.csv"))
+
+
+def _refuse_live_data_under_pytest(p) -> None:
+    """Belt and braces: while pytest runs, nothing may write into the manager's live
+    data dir — whatever OUT resolved to.
+
+    tests/conftest.py pinning WEBREVIEW_OUT is the real defence; this is the net under
+    it, for a helper that repoints paths by hand (or a child process that inherits the
+    env). It costs two string compares per write and would have stopped the 2026-07-26
+    incident on its own."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    # realpath both sides: a symlinked tmp dir must not be a way around this
+    a = os.path.realpath(os.fspath(p))
+    live_out = os.path.realpath(_LIVE_OUT)
+    live_products = os.path.realpath(_LIVE_PRODUCTS)
+    # `data/` ITSELF, not just the export file inside it: the startup sweep walks TWO
+    # directories and the second is `dirname(SRC)`, which is neither `data/out` nor
+    # `products.csv` — so a helper repointing WEBREVIEW_PRODUCTS at the real export let
+    # it unlink live `data/*.tmp` from a test run (PR #265 final review).
+    if (a == live_products or a == live_out or a.startswith(live_out + os.sep)
+            or a == os.path.dirname(live_products)):
+        log.error("REFUSED a write to the live data dir from a pytest run: %s", a)
+        raise StoreWipeRefused(
+            f"Test sa pokúsil zapísať do živých dát ({a}) — zamietnuté. "
+            "Testy musia bežať proti dočasnému WEBREVIEW_OUT.")
+
+
+def _read_json_store(path, default):
+    """The ONE json-store reader (the „SAFE loader" shape: missing / unparseable /
+    wrong-type → `default`, never an exception — one bad file must not 500 a whole
+    tab). Broader than the old per-store copies in one way on purpose: a write cut
+    mid-UTF-8 raises UnicodeDecodeError, which is a ValueError like JSONDecodeError
+    and degrades the same way instead of escaping as a 500.
+
+    An I/O error on a store that IS there (permissions, EIO, a directory in its place)
+    is NOT one of those cases and propagates: „the file is unreadable" is not evidence
+    that the manager did no work, and degrading it to `{}` would let the next click
+    persist a one-entry file over a full one — the silent loss this module exists to
+    prevent (found in review of this change).
+
+    The read is recorded (how many entries this process saw on disk — what the wipe
+    guard checks) ONLY when it really yielded the stored content. A default handed
+    back after a failed or wrong-type read must never legitimise a later shrink.
+
+    NOTE: the two FAIL-CLOSED dedup stores (orders_reminder, posta_uncollected — #225)
+    deliberately do NOT use this reader; losing THEIR contents means mailing a customer
+    twice, so they raise instead of degrading."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except FileNotFoundError:
+        return default
+    except ValueError:
+        # Degrading keeps the tab alive, but it must not be SILENT: a protected write
+        # over this file is about to be refused, and this line is what explains why.
+        log.error("úložisko %s sa nedá prečítať (poškodený/neúplný zápis) — zobrazujem "
+                  "prázdno, ale zápis doň bude zamietnutý, kým sa neopraví", path)
+        return default
+    if not isinstance(d, type(default)):
+        return default
+    _note_store_read(path, d)
+    return d
+
+
+def _thread_ring(p: str) -> collections.deque:
+    """This thread's receipt ring for `p` (created on first use, dies with the thread)."""
+    rings = getattr(_thread_reads, "rings", None)
+    if rings is None:
+        rings = _thread_reads.rings = {}
+    ring = rings.get(p)
+    if ring is None:
+        ring = rings[p] = collections.deque(maxlen=_READ_RING)
+    return ring
+
+
+def _note_store_read(path, data) -> None:
+    """Record the READ ITSELF as the receipt for `path` (#261/#265 wipe guard): the
+    object handed back plus the counts it held at that moment. Kept in BOTH rings —
+    this thread's (which no concurrent reader can evict, and which is the one that
+    actually carries every read-modify-write in the tree) and the shared one, which is
+    best effort: any other thread's read evicts it within microseconds."""
+    p = os.fspath(path)
+    entry = (data, _measure_store(data))
+    _thread_ring(p).append(entry)
+    _store_reads.setdefault(p, collections.deque(maxlen=_READ_RING)).append(entry)
+
+
+def _note_store_write(path, data) -> None:
+    """After a successful write the process HAS the store it just wrote, so that object
+    becomes the receipt — and every OLDER one is stale, because the file on disk is no
+    longer what they were read from. Dropping them here is what bounds retention: at the
+    moment of a write, exactly one loaded store per path survives it. Between writes the
+    rings refill (up to `_READ_RING` per ring per path) — see the retention note beside
+    `_store_reads` (PR #265 third review corrected the „at most one" claim)."""
+    p = os.fspath(path)
+    entry = (data, _measure_store(data))
+    ring = _thread_ring(p)
+    ring.clear()
+    ring.append(entry)
+    shared = collections.deque(maxlen=_READ_RING)
+    shared.append(entry)
+    _store_reads[p] = shared
+
+
+def _store_receipts(p: str):
+    """Every receipt this process may honour for `p` — this thread's first.
+
+    SNAPSHOTS both rings (PR #265 third review): the guard consumes this generator
+    while every GET is appending to the very same deques WITHOUT the store lock, and
+    CPython raises `RuntimeError: deque mutated during iteration` for exactly that.
+    It surfaced as a raw 500 on the manager's click — a RuntimeError is not
+    `StoreWipeRefused`, so not even the 503 with something to fix."""
+    yield from tuple(_thread_ring(p))
+    yield from tuple(_store_reads.get(p, ()))
+
+
+def _canonical(x) -> str:
+    """Order-independent text of one JSON value, for VALUE containment below."""
+    return json.dumps(x, sort_keys=True, ensure_ascii=False, default=repr)
+
+
+def _list_is_narrowing(data: list, prev: list) -> bool:
+    """Is every entry of `data` also in `prev`? Identity first — the common case is a
+    caller filtering the very list it read — then VALUE containment.
+
+    Identity alone refused a rebuild written the natural way
+    (`[dict(x) for x in prev if …]`) with a message saying the write „did not come from
+    a read of that store": wrong, and an invitation for the next author to reach for a
+    bypass instead of a `prev=` (PR #265 third review). The value pass is keyed on a
+    canonical projection so it stays linear rather than O(n·m) over unhashable dicts."""
+    kept = {id(x) for x in prev}
+    if all(id(x) in kept for x in data):
+        return True
+    try:
+        pool = collections.Counter(_canonical(x) for x in prev)
+        for x in data:
+            k = _canonical(x)
+            if not pool[k]:
+                return False
+            pool[k] -= 1
+    except (TypeError, ValueError):   # not projectable → identity is all we can trust
+        return False
+    return True
+
+
+def _is_derived_from(data, prev, keys=()) -> bool:
+    """Is `data` something the caller could have BUILT from the map/list it read?
+
+    `prev=` names the read a rebuilt map came from (the startup decision prune, the
+    výstavy retention sweep). Without this check it was a complete BYPASS rather than a
+    narrowing — the map being written was never compared to anything, so naming a real
+    read authorised writing ANY map over the store (PR #265 second review). A rebuild
+    only ever DROPS entries, so what it writes must be contained in what it read.
+
+    `keys` are the NESTED maps `protect=("orders",)` guards. Checking only the
+    top-level key set made the narrowing inert for exactly those two stores: every real
+    writer of `orders_reminder.json` / `posta_uncollected.json` keeps the same outer
+    keys, so a `prev=` write could keep the shape and empty the who-was-already-mailed
+    map — the loss that re-mails every customer (PR #265 third review)."""
+    if data is prev:
+        return True
+    if isinstance(data, dict) and isinstance(prev, dict):
+        if not set(data) <= set(prev):
+            return False
+        for k in keys:
+            if not k:
+                continue                      # "" is the top-level count, checked above
+            a, b = data.get(k), prev.get(k)
+            # …and only when the value STAYS that container. Both pairs below compare
+            # like with like, so a write REPLACING the guarded map with something else
+            # entirely (`None`, a list, a string, `0`) matched neither branch and passed
+            # as „derived" — all four measured ALLOWED on disk (PR #265 final review).
+            # A guarded key that DISAPPEARS lands here too (`None` against a real map),
+            # which is the same loss written a different way.
+            if type(a) is not type(b):
+                return False
+            if isinstance(a, dict) and isinstance(b, dict) and not set(a) <= set(b):
+                return False
+            if isinstance(a, list) and isinstance(b, list) and not _list_is_narrowing(a, b):
+                return False
+        return True
+    if isinstance(data, list) and isinstance(prev, list):
+        return _list_is_narrowing(data, prev)
+    return False
+
+
+def _guarded_measures(p, protect) -> tuple:
+    """`(keys, disk)` — which maps this write must not silently shrink, and what the
+    store on disk holds. Raises when the file is there but unreadable."""
+    disk, corrupt = _stored_measures(p)
+    if corrupt:
+        backup = _quarantine_corrupt_store(p)
+        log.error("REFUSED to write over %s: the file is there but unparseable, so we "
+                  "cannot know how much work it holds — a copy is preserved as %s and "
+                  "the original is left untouched for repair",
+                  p, backup or "-")
+        raise StoreWipeRefused(
+            f"Zápis do {os.path.basename(p)} zamietnutý: súbor sa nedá prečítať "
+            "(neúplný/poškodený zápis), takže nevieme, koľko práce v ňom je. Nič sa "
+            + (f"neprepísalo, kópia je v {os.path.basename(backup)}. " if backup
+               else "neprepísalo. ")
+            + "Súbor NEMAŽ — obnov ho zo zálohy (data/backups/state).")
+    keys = ("",) if protect is True else ("",) + tuple(protect)
+    return keys, disk
+
+
+def _fsync_dir(d: str) -> None:
+    """Make a rename durable. Best effort: some filesystems refuse a directory fsync,
+    and losing THIS is far less bad than failing a write the manager just made — so it
+    warns instead of raising (ext4, which the box runs, supports it)."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError as e:  # noqa: BLE001 — durability hint only, the data is already written
+        log.warning("adresár %s sa nedá otvoriť na fsync (%r)", d, e)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as e:  # noqa: BLE001 — see above
+        log.warning("fsync adresára %s zlyhal (%r)", d, e)
+    finally:
+        # The close was the ONE error this „best effort" helper still let escape — and
+        # both callers run it AFTER the replace, inside an `except BaseException:
+        # unlink(tmp); raise`. A raise there reported a write that is durably on disk as
+        # a failure (plus a spurious „temp file could not be removed" — the temp file is
+        # gone by then). Durability hint only; the data is already published.
+        try:
+            os.close(fd)
+        except OSError as e:  # noqa: BLE001 — see above
+            log.warning("adresár %s sa nedá zavrieť po fsync (%r)", d, e)
+
+
+def _sweep_stale_tmp(*dirs: str, max_age_h: float = 12.0) -> int:
+    """Remove `*.tmp` leftovers older than `max_age_h` from the data dirs.
+
+    `_atomic_write_bytes` names its temp file with `tempfile.mkstemp`, so a SIGKILL/OOM
+    during the ~55 MB export write leaves one ~55 MB orphan PER EVENT and nothing ever
+    reuses that name (the old pid-derived name was self-limiting at one per process
+    lifetime — PR #265 second review). The age bound is what makes this safe: a live
+    write of any store takes seconds, so nothing another instance is still using can be
+    12 hours old."""
+    cutoff = time.time() - max_age_h * 3600
+    removed = 0
+    for d in dirs:
+        # The one destructive operation here — and the only one in the module that used
+        # to skip the pytest net (PR #265 third review, I4). A test run with an un-pinned
+        # WEBREVIEW_OUT is the incident's own configuration, and this unlinks at IMPORT.
+        _refuse_live_data_under_pytest(d)
+        try:
+            names = os.listdir(d)
+        except OSError as e:  # noqa: BLE001 — housekeeping, never a reason to fail the boot
+            log.warning("nedá sa prehľadať %s na zvyškové .tmp súbory (%r)", d, e)
+            continue
+        for name in names:
+            if not name.endswith(".tmp"):
+                continue
+            f = os.path.join(d, name)
+            try:
+                if os.stat(f).st_mtime >= cutoff:
+                    continue
+                os.unlink(f)
+            except OSError as e:  # noqa: BLE001 — someone else may have won the race
+                log.warning("zvyškový %s sa nepodarilo odstrániť (%r)", f, e)
+                continue
+            removed += 1
+            log.info("odstránený zvyškový dočasný súbor %s (staršī ako %g h)", f, max_age_h)
+    return removed
+
+
+def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False,
+                       prev=None) -> None:
+    """The ONE json-store writer: refuse-wipe check → temp file → atomic os.replace.
+
+    Every `_save_*` in this module goes through here (it used to be 29 copies of the
+    same four lines). `mode` (0600) is applied to the temp file BEFORE any content is
+    written, so a store holding secrets is never briefly world-readable.
+
+    `protect=True` marks a store holding IRREPLACEABLE work — the manager's
+    decisions / flags / pairings; `protect=("orders",)` additionally guards the NESTED
+    map(s) that carry the real content (the dedup stores keep theirs one level down).
+    There the writer refuses any write that SHRINKS the store *unless it is the tail of
+    a read-modify-write THIS caller performed on THAT store*: losing entries
+    is legitimate only as the tail of a read-modify-write the manager just performed
+    (undo the last decision, un-mark a whole supplier group via /api/ordered/bulk),
+    and those all load the live store under `_lock` moments earlier. The 2026-07-26
+    wipe had exactly the opposite shape — `_load_decisions` was stubbed to a fixture,
+    so nothing ever read the 2831 entries that the fixture then erased. It is
+    deliberately not an „empty payload" rule: that fixture was small, not empty, and
+    would have overwritten 2831 entries just as happily. Growth never needs a read (an
+    incremental upload state only ever adds), and a stale count (another process wrote
+    in between) refuses too: that write is a lost update, the #264 half of this story.
+
+    The receipt is the READ, not a count (PR #265 review): `_read_json_store` remembers
+    the OBJECT it handed back, and a shrink is allowed only when the map being written
+    IS that object (or names it via `prev=`, for the few callers that rebuild a new map
+    from the one they read — and a rebuild may only DROP entries, see
+    `_is_derived_from`; without that, naming a read authorised writing anything at all). A count alone made this a stale-read detector: the app
+    reads decisions on every page load, so the count always matched the disk and the
+    guard was disarmed for every caller in the process — including one that had never
+    touched the store.
+
+    Nothing is written when it refuses — not even a stray .tmp — and it raises rather
+    than logging quietly, so the failure is visible in the response and in tests."""
+    p = os.fspath(path)
+    with _lock:
+        _write_json_locked(p, data, indent, mode, protect, prev)
+
+
+def _write_json_locked(p, data, indent, mode, protect, prev=None) -> None:
+    """The body of `_atomic_write_json`, always under the store lock."""
+    _refuse_live_data_under_pytest(p)
+    if protect:
+        keys, disk = _guarded_measures(p, protect)
+        new = _measure_store(data)
+        prev = data if prev is None else prev
+        derived = _is_derived_from(data, prev, keys)
+        for k in keys:
+            was = disk.get(k, 0)
+            if not was or new.get(k, 0) >= was:
+                continue                      # nothing to lose, or the map is growing
+            receipted = any(r[0] is prev and r[1].get(k, 0) == was
+                            for r in _store_receipts(p))
+            if derived and receipted:
+                continue                      # the tail of a read-modify-write on THIS store
+            what = "záznamov" if k == "" else f"položiek v „{k}“"
+            # Name the check that actually failed — the two have different fixes, and a
+            # blanket „did not come from a read" over a rebuild that DID read the store
+            # sends the next author looking for a bypass (PR #265 third review).
+            why = ("obsahuje záznamy, ktoré v načítanom úložisku neboli"
+                   if not derived else
+                   "vychádza z inej (staršej) verzie, než akú má teraz disk")
+            log.error("REFUSED to shrink %s%s from %d to %d entries (#261/#265): "
+                      "derived-from-the-named-read=%s, receipt-matches-disk=%s — the "
+                      "smaller map is not something the manager just did; nothing was "
+                      "written", p, f" [{k}]" if k else "", was, new.get(k, 0),
+                      derived, receipted)
+            raise StoreWipeRefused(
+                f"Zápis do {os.path.basename(p)} zamietnutý: {was} {what} by sa "
+                f"zmenšilo na {new.get(k, 0)}, ale zapisovaný obsah {why} "
+                "(na disku môže byť novšia verzia, alebo ju zapísal iný proces/skript). "
+                "Dáta ostali nedotknuté. V prehliadači načítaj "
+                "stránku znova; ak to hlási automatizácia, spusti ju znova. Súbor NEMAŽ.")
+    tmp = f"{p}.{os.getpid()}.tmp"   # per-process: two instances never share a temp
+    if mode is None:
+        f = open(tmp, "w", encoding="utf-8")
+    else:
+        f = os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode),
+                      "w", encoding="utf-8")
+    try:
+        with f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+            # os.replace is atomic against concurrent READERS, not against a crash: the
+            # rename can be durable while the bytes are not, which is precisely how a
+            # truncated store appears after a power loss (PR #265 review).
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)   # exact perms regardless of the process umask
+        os.replace(tmp, p)
+        # …and the RENAME itself must be durable too: fsyncing the bytes but not the
+        # directory entry lets a power loss bring the OLD file back (PR #265 second
+        # review). One call, in the one place every json store is written.
+        _fsync_dir(os.path.dirname(p) or ".")
+        # what is on disk now IS this object — so the manager's NEXT undo in a row is
+        # still a legitimate read-modify-write and does not 503 on a stale receipt
+        _note_store_write(p, data)
+    except BaseException:
+        # temp files are per-process now, so a failed dump would otherwise leave one
+        # orphan per process lifetime; the store itself is untouched either way
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _record_uploaded(load_fn, save_fn, entries: dict) -> dict:
+    """Merge freshly-uploaded keys into the CURRENT on-disk incremental state.
+
+    The nightly write-backs read their state, then spend MINUTES inside the Shoptet
+    import subprocess, and only then record what landed. Saving the map they read up
+    front would discard everything written meanwhile — and a lost review key means the
+    next run re-uploads a link the manager has since corrected. `_import_lock` is
+    in-process only, so the second-instance scenario this PR is about (#262/#264)
+    reaches straight into that window. Re-read under the store lock and merge.
+
+    Returns the post-run map — the run's summary counts are built from it, so they
+    describe what is really on disk rather than a snapshot from before the import."""
+    if not entries:
+        return load_fn()
+    with _lock:
+        fresh = load_fn()
+        fresh.update(entries)
+        save_fn(fresh)
+    return fresh
+
+
+def _atomic_write_bytes(path, data: bytes, *, mode: int = 0o644) -> None:
+    """Same temp-file + atomic replace for the raw cp1250 CSV caches (export,
+    orders, customers) — a half-written cache would poison every reader.
+
+    The temp name comes from `tempfile.mkstemp`, NOT from the pid: `orders_cache.csv`
+    has TWO writers in one process — `_orders_csv_cached()` on any request thread when
+    the 30-min cache is stale, and `run_shoptet_sync()` on the scheduler thread every
+    hour. A pid-derived name is the SAME string for both, so the one that finishes
+    first renames the inode the other is still writing into place, and the loser then
+    keeps appending into the LIVE cache before its own replace fails (PR #265 review).
+
+    Still no store lock on purpose: with distinct temp files tmp+replace is enough, and
+    the export dump is ~55 MB — holding the cross-process lock across it would queue
+    every other instance's writes behind a multi-second write."""
+    p = os.fspath(path)
+    _refuse_live_data_under_pytest(p)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p) or ".",
+                               prefix=os.path.basename(p) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())          # durable bytes before the rename (see above)
+        # mkstemp creates the temp file 0600. The export is public-ish data and stays
+        # 0644 as it always was; the ORDER and CUSTOMER caches hold customer names,
+        # e-mails and phones and keep mkstemp's 0600 — the same class of data
+        # posta_uncollected.json / orders_reminder.json already keep private, and only
+        # this one systemd --user service ever reads them (PR #265 second review).
+        os.chmod(tmp, mode)               # exact perms regardless of the process umask
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError as e:  # noqa: BLE001 — cleanup only, the real failure re-raises
+            log.warning("temp file %s sa nepodarilo odstrániť (%r)", tmp, e)
+        raise
+    # …and the rename itself must be durable, exactly as in the JSON writer: the
+    # directory fsync was added there only, leaving the 55 MB export and the two
+    # customer caches with durable bytes published by a losable directory entry
+    # (PR #265 third review). OUTSIDE the handler above (final review): past the
+    # replace the write has SUCCEEDED and the temp file no longer exists, so anything
+    # escaping here would be cleaned up as a failure and re-raised at the caller.
+    _fsync_dir(os.path.dirname(p) or ".")
+
 try:
     with open(DATA, encoding="utf-8") as f:
         PRODUCTS = json.load(f)
+    _note_store_read(DATA, PRODUCTS)   # #261 — the receipt a later save is checked against
     log.info("loaded %d products from %s", len(PRODUCTS), DATA)
 except FileNotFoundError:
     PRODUCTS = []
@@ -134,19 +836,14 @@ def _load_decisions() -> dict:
     # hand-corrupted or partially-written decisions.json (written on EVERY review click)
     # must never raise: it feeds /api/orders + /api/products, so one bad file would 500
     # the whole tab. Always a dict (a stray non-dict would break every .get() caller).
-    try:
-        with open(DECISIONS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(DECISIONS, {})
 
 
-def _save_decisions(d: dict) -> None:
-    tmp = DECISIONS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DECISIONS)
+def _save_decisions(d: dict, *, prev: dict = None) -> None:
+    """`prev` = the map this one was BUILT FROM, for a caller that rebuilds a new dict
+    instead of mutating the one it read (the startup prune). It is the read receipt the
+    shrink guard checks; a mutate-in-place caller needs nothing."""
+    _atomic_write_json(DECISIONS, d, protect=True, prev=prev)
 
 
 # --------------------------------------------------------------------------- #
@@ -218,8 +915,8 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
 )
 
-USERS = os.path.join(OUT, "users.json")          # email -> {pw_hash,is_admin,created_at}
-RESET_TOKENS = os.path.join(OUT, "reset_tokens.json")   # sha256(token) -> {email,exp}
+USERS = _store("users.json")          # email -> {pw_hash,is_admin,created_at}
+RESET_TOKENS = _store("reset_tokens.json")   # sha256(token) -> {email,exp}
 RESET_TTL = 2 * 3600                             # reset link validity: 2 hours
 PW_MIN_LEN = 8
 LOGIN_MAX_FAILS = 5                              # failed logins per IP…
@@ -232,24 +929,33 @@ _DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
 
 
 def _load_users() -> dict:
+    # Deliberately NOT the SAFE reader: an unreadable user store must fail closed
+    # (nobody gets in) rather than degrade to „no accounts" and re-bootstrap an admin.
     if os.path.exists(USERS):
         with open(USERS, encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
+        if not isinstance(d, dict):
+            # Parses, but is not an account map — the one corruption shape this loader
+            # missed while every other loader in #265 checks it. `[]` used to reach
+            # `_bootstrap_admin` as a TypeError (import dies) and `_current_user` as an
+            # AttributeError (500 per request); both are outside the except tuples that
+            # turn a bad store into a 503 with repair instructions. A wrong hand-repair
+            # or restore lands here — exactly what that message invites (third review).
+            raise ValueError(f"{USERS} nie je zoznam účtov (je to {type(d).__name__})")
+        _note_store_read(USERS, d)   # #261 — the receipt a later save is checked against
+        return d
     return {}
 
 
-def _save_json_0600(path, d) -> None:
+def _save_json_0600(path, d, *, protect=False) -> None:
     """Atomic write with 0600 perms — users.json holds password hashes and
     reset_tokens.json holds live reset-token hashes."""
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    _atomic_write_json(path, d, mode=0o600, protect=protect)
 
 
 def _save_users(d: dict) -> None:
-    _save_json_0600(USERS, d)
+    # protect: losing the account list locks everyone out of the app (#261).
+    _save_json_0600(USERS, d, protect=True)
 
 
 def _load_reset_tokens() -> dict:
@@ -286,7 +992,22 @@ def _bootstrap_admin() -> None:
     log.info("auth: bootstrapped admin %s from env", email)
 
 
-_bootstrap_admin()
+try:
+    _bootstrap_admin()
+except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError, TypeError) as e:  # noqa: BLE001
+    # This runs at IMPORT. Anything raising here does not degrade a feature — it stops the
+    # service from STARTING at all (systemd restart loop, no web UI, nothing to look at).
+    # All five are real: another instance holding the store lock for 30 s, a refused
+    # write, the OSError `_load_users` deliberately re-raises on a users.json that is
+    # there but unreadable, and — the most likely one of the lot — the ValueError a write
+    # cut mid-JSON or mid-UTF-8 raises, which is exactly the corruption the fsync work
+    # exists to make less likely and was the one shape NOT caught (PR #265 second review,
+    # C2). TypeError is the belt to `_load_users`' isinstance brace: a store that PARSES
+    # but is not a map (`[]` from a wrong hand-repair) used to reach `users[email] = …`
+    # and take the whole import down (PR #265 third review, I2).
+    # Existing accounts are unaffected; only the first-run bootstrap is skipped.
+    log.error("auth: admin bootstrap skipped (%r) — the app keeps serving, existing "
+              "accounts are unaffected; fix data/out/users.json and restart", e)
 
 
 def _current_user():
@@ -311,8 +1032,23 @@ def _require_login():
     unless explicitly public. /api/n8n/* keep their own bearer auth."""
     if request.endpoint in _PUBLIC_ENDPOINTS or request.path.startswith("/api/n8n/"):
         return None
-    if _current_user():
-        return None
+    try:
+        if _current_user():
+            return None
+    except (ValueError, OSError, TypeError) as e:
+        # `_load_users` fails CLOSED on purpose (nobody gets in over a store we cannot
+        # read) — but „fails closed" must still SAY what to fix. A bare 500 reads as a
+        # transient glitch and invites another click (PR #265 second review, C2).
+        log.error("auth: the account store is unreadable (%r) — refusing every request "
+                  "until data/out/users.json is repaired", e)
+        msg = ("Zoznam účtov (data/out/users.json) sa nedá prečítať — neúplný/poškodený "
+               "zápis. Nikoho nepustím dnu, kým sa neopraví: obnov súbor zo zálohy "
+               "(data/backups/state) a reštartuj službu. Súbor NEMAŽ — prázdny zoznam "
+               "účtov znamená, že sa vytvorí nový admin a všetky ostatné účty zmiznú.")
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": msg}), 503
+        # a browser must not get raw JSON on the page it actually opened
+        return Response(msg, status=503, mimetype="text/plain; charset=utf-8")
     log.info("auth: unauthenticated %s %s from %s", request.method, request.path,
              _client_ip())
     if request.path.startswith("/api/"):
@@ -829,25 +1565,17 @@ def api_users_password():
 
 
 # Per-line "objednané" state for the Na-objednanie tab (key = '<orderCode>|<itemCode>').
-ORDERED = os.path.join(OUT, "ordered_items.json")
+ORDERED = _store("ordered_items.json")
 
 
 def _load_ordered() -> dict:
     # Corrupt/wrong-type store degrades to {} (like _load_instock) — one bad file
     # must never 500 the whole /api/orders tab.
-    try:
-        with open(ORDERED, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(ORDERED, {})
 
 
 def _save_ordered(d: dict) -> None:
-    tmp = ORDERED + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ORDERED)
+    _atomic_write_json(ORDERED, d, protect=True)
 
 
 # Inline pairings entered on the Na-objednanie tab: {forestshop_code: supplier_url}.
@@ -855,23 +1583,15 @@ def _save_ordered(d: dict) -> None:
 # covers ANY ordered code, not only the review-dataset subset (decisions.json). Same
 # safe load/save as ordered/decisions; NEVER pruned (an order code may be outside the
 # review set, so a prune would wrongly drop it). Gitignored data/out → survives deploy.
-ORDER_PAIRINGS = os.path.join(OUT, "order_pairings.json")
+ORDER_PAIRINGS = _store("order_pairings.json")
 
 
 def _load_order_pairings() -> dict:
-    try:
-        with open(ORDER_PAIRINGS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(ORDER_PAIRINGS, {})
 
 
 def _save_order_pairings(d: dict) -> None:
-    tmp = ORDER_PAIRINGS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ORDER_PAIRINGS)
+    _atomic_write_json(ORDER_PAIRINGS, d, protect=True)
 
 
 # Per-variant reorder links (#174): {forestshop_variant_code: supplier_url}. A product
@@ -880,46 +1600,30 @@ def _save_order_pairings(d: dict) -> None:
 # variant code (never array position). import_builder.link_rows reads these for a
 # `split`-status decision → per-variant internalNote on the eshop. Same safe atomic
 # gitignored store; NEVER pruned → survives deploy.
-VARIANT_LINKS = os.path.join(OUT, "variant_links.json")
+VARIANT_LINKS = _store("variant_links.json")
 
 
 def _load_variant_links() -> dict:
-    try:
-        with open(VARIANT_LINKS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(VARIANT_LINKS, {})
 
 
 def _save_variant_links(d: dict) -> None:
-    tmp = VARIANT_LINKS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, VARIANT_LINKS)
+    _atomic_write_json(VARIANT_LINKS, d, protect=True)
 
 
 # Per-line "čaká sa" flag (key='<orderCode>|<itemCode>'): an ACTIVE order line that
 # can't be stocked yet — waiting on the supplier, batching more items, or deferred by
 # agreement with the customer. Independent of "objednané". Same safe gitignored store;
 # NEVER pruned → survives deploy.
-WAITING = os.path.join(OUT, "waiting_items.json")
+WAITING = _store("waiting_items.json")
 
 
 def _load_waiting() -> dict:
-    try:
-        with open(WAITING, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(WAITING, {})
 
 
 def _save_waiting(d: dict) -> None:
-    tmp = WAITING + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, WAITING)
+    _atomic_write_json(WAITING, d, protect=True)
 
 
 # Per-line "skladom" / "nedostupné" flags (key='<orderCode>|<itemCode>') — two more
@@ -927,40 +1631,24 @@ def _save_waiting(d: dict) -> None:
 # have it in stock / it's been restocked; "nedostupné" = the supplier can't deliver it.
 # The manager toggles each on its own; a row can carry any combination. Same safe
 # gitignored stores; NEVER pruned → survive deploy.
-INSTOCK = os.path.join(OUT, "instock_items.json")
-UNAVAIL = os.path.join(OUT, "unavailable_items.json")
+INSTOCK = _store("instock_items.json")
+UNAVAIL = _store("unavailable_items.json")
 
 
 def _load_instock() -> dict:
-    try:
-        with open(INSTOCK, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(INSTOCK, {})
 
 
 def _save_instock(d: dict) -> None:
-    tmp = INSTOCK + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, INSTOCK)
+    _atomic_write_json(INSTOCK, d, protect=True)
 
 
 def _load_unavailable() -> dict:
-    try:
-        with open(UNAVAIL, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(UNAVAIL, {})
 
 
 def _save_unavailable(d: dict) -> None:
-    tmp = UNAVAIL + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, UNAVAIL)
+    _atomic_write_json(UNAVAIL, d, protect=True)
 
 
 # Per-ORDER free-text comment for the Na-objednanie tab (key = '<orderCode>'). #101:
@@ -972,47 +1660,31 @@ def _save_unavailable(d: dict) -> None:
 # 2026-07-23) but deferred to a follow-up pending the boss's decision (overwrite vs
 # append, when to sync). Same safe atomic gitignored store, NEVER pruned → survives
 # deploy (an order code lives outside any review set, so a prune would wrongly drop it).
-ORDER_COMMENTS = os.path.join(OUT, "order_comments.json")
+ORDER_COMMENTS = _store("order_comments.json")
 ORDER_COMMENT_MAX = 2000   # generous cap — shopRemark in the admin holds multi-line notes
 
 
 def _load_order_comments() -> dict:
-    try:
-        with open(ORDER_COMMENTS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(ORDER_COMMENTS, {})
 
 
 def _save_order_comments(d: dict) -> None:
-    tmp = ORDER_COMMENTS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ORDER_COMMENTS)
+    _atomic_write_json(ORDER_COMMENTS, d, protect=True)
 
 
 # „Nedostupné tovary" (#100): per-PRODUCT (itemCode) e-mail state — the two checkbox
 # intents (nedostupne/alternativa) + a `sent` dedup map keyed '<orderCode>|<type>' so the
 # same customer/order never gets a duplicate of the same e-mail. Gitignored, NEVER pruned
 # → survives deploy, exactly like the other manager stores.
-NEDOSTUPNE = os.path.join(OUT, "nedostupne.json")
+NEDOSTUPNE = _store("nedostupne.json")
 
 
 def _load_nedostupne() -> dict:
-    try:
-        with open(NEDOSTUPNE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(NEDOSTUPNE, {})
 
 
 def _save_nedostupne(d: dict) -> None:
-    tmp = NEDOSTUPNE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, NEDOSTUPNE)
+    _atomic_write_json(NEDOSTUPNE, d, protect=True)
 
 
 # Admin-set custom display names for nav tabs + automations (#173): {key: label}.
@@ -1023,24 +1695,16 @@ def _save_nedostupne(d: dict) -> None:
 # single map covers both #173 asks (rename automations / rename every tab) with no
 # separate name-override plumbing in automation_runner.py. Same safe gitignored
 # atomic store as ordered/waiting; survives deploy.
-UI_LABELS = os.path.join(OUT, "ui_labels.json")
+UI_LABELS = _store("ui_labels.json")
 UI_LABEL_MAX = 60
 
 
 def _load_ui_labels() -> dict:
-    try:
-        with open(UI_LABELS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(UI_LABELS, {})
 
 
 def _save_ui_labels(d: dict) -> None:
-    tmp = UI_LABELS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, UI_LABELS)
+    _atomic_write_json(UI_LABELS, d, protect=True)
 
 
 # Free-form notes for the "📝 Poznámky" tab — a Discord replacement for ad-hoc
@@ -1048,24 +1712,16 @@ def _save_ui_labels(d: dict) -> None:
 # {id, text, done, ts}, newest-first. Same safe gitignored store, atomic save, tolerant
 # of a missing/corrupt file. NOT written to any CSV/import → no formula-injection guard
 # needed, just a length cap on the free text.
-NOTES = os.path.join(OUT, "notes.json")
+NOTES = _store("notes.json")
 NOTE_MAX_LEN = 5000
 
 
 def _load_notes() -> list:
-    try:
-        with open(NOTES, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-    return d if isinstance(d, list) else []
+    return _read_json_store(NOTES, [])
 
 
 def _save_notes(d: list) -> None:
-    tmp = NOTES + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, NOTES)
+    _atomic_write_json(NOTES, d, protect=True)
 
 
 # Supplier assigned on the Na-objednanie tab for an order line that arrived WITHOUT a
@@ -1073,7 +1729,7 @@ def _save_notes(d: list) -> None:
 # like order_pairings) so it applies across every order line of that product and is the
 # natural key for the eshop write-back. Same safe gitignored store; NEVER pruned →
 # survives deploy. Written back to the eshop `supplier` field by the nightly upload.
-SUPPLIER_ASSIGN = os.path.join(OUT, "supplier_assignments.json")
+SUPPLIER_ASSIGN = _store("supplier_assignments.json")
 
 
 def _load_supplier_assign() -> dict:
@@ -1081,25 +1737,17 @@ def _load_supplier_assign() -> dict:
     # store is written by the app AND by n8n, so it is the most exposed to a partial
     # write. It feeds /api/orders + the nightly write-back; a JSONDecodeError here would
     # 500 the whole to-order tab. Always a dict (a stray non-dict breaks .get() callers).
-    try:
-        with open(SUPPLIER_ASSIGN, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(SUPPLIER_ASSIGN, {})
 
 
 def _save_supplier_assign(d: dict) -> None:
-    tmp = SUPPLIER_ASSIGN + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SUPPLIER_ASSIGN)
+    _atomic_write_json(SUPPLIER_ASSIGN, d, protect=True)
 
 
 # GRUBE per-size externalCode store (durable, built by scripts/build_grube_codes.py):
 # {code: {itemId, size, deUrl, productId}}. Read-only here — feeds the externalCode
 # write-back CSV. Missing/corrupt → {} (the file may not exist until the first gather).
-GRUBE_CODES = os.path.join(OUT, "grube_codes.json")
+GRUBE_CODES = _store("grube_codes.json")
 
 
 def _load_grube_codes() -> dict:
@@ -1131,15 +1779,49 @@ def _attach_grube(r, store=None):
     return r
 
 
-# at startup, prune orphan decisions whose key matches no product (e.g. a stale
-# 'None'/'bad' from before stable keys) so the progress count == the import count
-_VALID_KEYS = {p.get("key") for p in PRODUCTS}
-with _lock:
-    _d0 = _load_decisions()
-    _d1 = {k: v for k, v in _d0.items() if k in _VALID_KEYS}
-    if len(_d1) != len(_d0):
-        log.info("pruned %d orphan decisions at startup", len(_d0) - len(_d1))
-        _save_decisions(_d1)
+def _prune_orphan_decisions(products) -> None:
+    """At startup, drop decisions whose key matches no product (a stale 'None'/'bad'
+    from before stable keys) so the progress count == the import count.
+
+    NEVER prunes against an EMPTY product list: a missing review_data.json leaves
+    PRODUCTS == [] (the app deliberately boots dataless), which
+    would make EVERY decision look orphaned and delete the manager's whole history
+    on the next restart — the same wipe as #261, just via a second door."""
+    if not products:
+        log.warning("skipping the startup decision prune — 0 products loaded "
+                    "(review_data.json missing?); decisions left untouched")
+        return
+    valid = {p.get("key") for p in products}
+    with _lock:
+        d0 = _load_decisions()
+        d1 = {k: v for k, v in d0.items() if k in valid}
+        if len(d1) != len(d0):
+            log.info("pruned %d orphan decisions at startup", len(d0) - len(d1))
+            _save_decisions(d1, prev=d0)   # a REBUILT map — name the read it came from
+
+
+try:
+    _prune_orphan_decisions(PRODUCTS)
+except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
+    # Tidying orphans is housekeeping — never a reason for the service to fail to boot.
+    # Widened past the lock timeout (PR #265 review): a refused write, or the OSError
+    # `_read_json_store` now re-raises on an unreadable decisions.json, would abort the
+    # import just as effectively and leave no UI to diagnose it from. ValueError joins
+    # them for the same reason it joined the admin bootstrap (PR #265 second review).
+    log.error("startup decision prune skipped (%r) — the app keeps serving", e)
+
+def _sweep_stale_tmp_at_startup() -> int:
+    """The startup sweep, reading OUT/SRC at CALL time — never frozen at import
+    (`test_no_store_path_is_frozen_at_import`, which caught this very line)."""
+    return _sweep_stale_tmp(os.fspath(OUT), os.path.dirname(os.fspath(SRC)) or ".")
+
+
+try:
+    _sweep_stale_tmp_at_startup()
+except (OSError, StoreWipeRefused) as e:  # noqa: BLE001 — housekeeping; never a reason for the service not to start
+    # StoreWipeRefused: the pytest net now guards the sweep too, and a test importing the
+    # app with an un-pinned WEBREVIEW_OUT must get a skipped sweep, not a dead import.
+    log.error("startup temp-file sweep skipped (%r) — the app keeps serving", e)
 
 
 _IMG_NOISE = ("logo", "/producer/", ".svg", "/svg/", "placeholder", "no-image",
@@ -1203,8 +1885,8 @@ def _supplier_meta(html: str):
 # --------------------------------------------------------------------------- #
 # Na objednanie: forestshop "Vybavuje sa" orders → supplier reorder links
 # --------------------------------------------------------------------------- #
-ORDERS_CACHE = os.path.join(OUT, "orders_cache.csv")
-CUSTOMERS_CACHE = os.path.join(OUT, "customers_cache.csv")  # hourly Shoptet customer export (cp1250)
+ORDERS_CACHE = _store("orders_cache.csv")
+CUSTOMERS_CACHE = _store("customers_cache.csv")  # hourly Shoptet customer export (cp1250)
 ORDERS_MAXAGE = 1800  # s — refresh the cached orders export at most every 30 min (Marek: raz za pol hodinu stačí)
 # How far back the orders export is fetched. NAMED because the reminder dedup store's retention
 # (orders_reminder.DEDUP_RETENTION_DAYS, 180 d) is justified purely as „twice this window": a
@@ -1327,10 +2009,7 @@ def _orders_csv_cached() -> bytes:
         with open(ORDERS_CACHE, "rb") as f:
             return f.read()
     data = _fetch_orders_csv()
-    tmp = ORDERS_CACHE + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, ORDERS_CACHE)
+    _atomic_write_bytes(ORDERS_CACHE, data, mode=0o600)
     return data
 
 
@@ -1485,8 +2164,14 @@ def api_images():
         log.warning("image fetch failed url=%s: %r", url, e)
         title, imgs, price, avail = "", [], "", ""
     data = {"title": title, "images": imgs, "price": price, "availability": avail}
-    with open(cache, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    # the dir is created at boot, but OUT can be repointed afterwards (#261 lazy
+    # paths) — a missing/unwritable imgcache degrades to "no cache", never a 500
+    try:
+        os.makedirs(IMGCACHE, exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError as e:  # noqa: BLE001 — the scrape result is still returned below
+        log.warning("image cache write failed (%s): %r", cache, e)
     return jsonify(data)
 
 
@@ -1614,10 +2299,7 @@ def api_export():
 def _save_products(products) -> None:
     """Atomic write of review_data.json (tmp + os.replace). Mirrors the other _save_*
     stores; ensure_ascii=False to keep the Slovak names readable, like build_review_data."""
-    tmp = DATA + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(products, f, ensure_ascii=False)
-    os.replace(tmp, DATA)
+    _atomic_write_json(DATA, products, indent=None, protect=True)
 
 
 def _current_for_entry(ce: dict) -> dict:
@@ -2233,7 +2915,7 @@ def api_nedostupne_send():
 # mail templates. The 3 background chains (rozposlať otázky / kontrola odpovedí)
 # live as default-OFF automations further down (run_vystavy_*).
 # --------------------------------------------------------------------------- #
-VYSTAVY = os.path.join(OUT, "vystavy.json")
+VYSTAVY = _store("vystavy.json")
 
 # Canonical state-machine values (kept 1:1 with the original n8n `email_status`).
 VY_NEW = ""                                    # Nová
@@ -2293,19 +2975,12 @@ ForestShop.sk"""
 
 
 def _load_vystavy() -> list:
-    try:
-        with open(VYSTAVY, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-    return d if isinstance(d, list) else []
+    return _read_json_store(VYSTAVY, [])
 
 
-def _save_vystavy(d: list) -> None:
-    tmp = VYSTAVY + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, VYSTAVY)
+def _save_vystavy(d: list, *, prev: list = None) -> None:
+    # `prev` — see _save_decisions: the delete path REBUILDS the list it read.
+    _atomic_write_json(VYSTAVY, d, protect=True, prev=prev)
 
 
 def _now_iso() -> str:
@@ -2411,8 +3086,8 @@ def api_vystava():
         if not v:
             return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
         if body.get("delete"):
-            vystavy = [x for x in vystavy if x.get("id") != vid]
-            _save_vystavy(vystavy)
+            kept = [x for x in vystavy if x.get("id") != vid]
+            _save_vystavy(kept, prev=vystavy)   # a REBUILT list — name the read it came from
             log.info("vystavy: deleted %s user=%s", vid, session.get("user"))
             return jsonify({"ok": True})
         if "status" in body:
@@ -3527,27 +4202,19 @@ def n8n_shoptet_import():
 # --------------------------------------------------------------------------- #
 # n8n → nightly upload of worker pairings (reorder links → eshop internalNote)
 # --------------------------------------------------------------------------- #
-PAIRINGS_STATE = os.path.join(OUT, "uploaded_pairings.json")
+PAIRINGS_STATE = _store("uploaded_pairings.json")
 
 
 def _load_uploaded():
     """{key: url} of pairings already uploaded — so the nightly job only sends new
     or changed ones. Missing/corrupt → empty (treat everything as new)."""
-    try:
-        with open(PAIRINGS_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
     # always a {key: url} map — a stray JSON array could repeat a key and break the
     # "total_uploaded never exceeds total_products" invariant in _pairing_summary
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(PAIRINGS_STATE, {})
 
 
 def _save_uploaded(d):
-    tmp = PAIRINGS_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, PAIRINGS_STATE)
+    _atomic_write_json(PAIRINGS_STATE, d, protect=True)
 
 
 # Public URL of the review web — handed to the n8n notifier so the single summary
@@ -3688,12 +4355,12 @@ def _do_upload_pairings(dry):
             if (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])) <= success]
         uploaded_order_codes = [c for c in new_order_codes
                                 if c in order_written_codes and c in success]
-        if not dry and (uploaded_keys or uploaded_order_codes):
-            for k in uploaded_keys:          # ONLY keys whose codes all imported OK
-                uploaded[k] = (dec[k].get("url") or "").strip()
-            for c in uploaded_order_codes:   # ONLY order codes that imported OK
-                uploaded[f"order:{c}"] = (order_pairings[c] or "").strip()
-            _save_uploaded(uploaded)
+        if not dry:
+            done = {k: (dec[k].get("url") or "").strip()      # keys fully imported OK
+                    for k in uploaded_keys}
+            done.update({f"order:{c}": (order_pairings[c] or "").strip()
+                         for c in uploaded_order_codes})      # order codes imported OK
+            uploaded = _record_uploaded(_load_uploaded, _save_uploaded, done)
     finally:
         _import_lock.release()
 
@@ -3738,26 +4405,18 @@ def n8n_upload_pairings():
 # --------------------------------------------------------------------------- #
 # n8n → nightly upload of assigned supplier names (→ eshop `supplier` field)
 # --------------------------------------------------------------------------- #
-SUPPLIERS_STATE = os.path.join(OUT, "uploaded_suppliers.json")
+SUPPLIERS_STATE = _store("uploaded_suppliers.json")
 
 
 def _load_uploaded_suppliers():
     """{code: supplier} already written back to the eshop — so the nightly job only
     sends new or changed assignments. Missing/corrupt → empty (everything is new).
     Always a dict (a stray array could repeat a code and break the summary invariant)."""
-    try:
-        with open(SUPPLIERS_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(SUPPLIERS_STATE, {})
 
 
 def _save_uploaded_suppliers(d):
-    tmp = SUPPLIERS_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SUPPLIERS_STATE)
+    _atomic_write_json(SUPPLIERS_STATE, d, protect=True)
 
 
 def _supplier_summary(uploaded, assigns):
@@ -3861,10 +4520,10 @@ def _do_upload_suppliers(dry):
         ok = res["ok"]
         success = res["success_codes"]
         uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry and uploaded_codes:       # record only codes that imported OK
-            for c in uploaded_codes:
-                uploaded[c] = (assigns[c] or "").strip()
-            _save_uploaded_suppliers(uploaded)
+        if not dry:                          # record only codes that imported OK
+            uploaded = _record_uploaded(
+                _load_uploaded_suppliers, _save_uploaded_suppliers,
+                {c: (assigns[c] or "").strip() for c in uploaded_codes})
     finally:
         _import_lock.release()
 
@@ -3907,26 +4566,18 @@ def n8n_upload_suppliers():
 # field). #62 — the nightly cron follow-up to the MVP manual zip. Mirrors the
 # supplier write-back exactly (own incremental store, own header, chunked import).
 # --------------------------------------------------------------------------- #
-EXTERNALCODES_STATE = os.path.join(OUT, "uploaded_externalcodes.json")
+EXTERNALCODES_STATE = _store("uploaded_externalcodes.json")
 
 
 def _load_uploaded_externalcodes():
     """{code: itemId} already written back to the eshop — so the nightly job only
     sends new or changed itemIds. Missing/corrupt → empty (everything is new).
     Always a dict (a stray array could repeat a code and break the summary invariant)."""
-    try:
-        with open(EXTERNALCODES_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(EXTERNALCODES_STATE, {})
 
 
 def _save_uploaded_externalcodes(d):
-    tmp = EXTERNALCODES_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, EXTERNALCODES_STATE)
+    _atomic_write_json(EXTERNALCODES_STATE, d, protect=True)
 
 
 def _externalcode_summary(uploaded, grube_codes):
@@ -3993,10 +4644,10 @@ def _do_upload_externalcodes(dry):
         ok = res["ok"]
         success = res["success_codes"]
         uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry and uploaded_codes:       # record only codes that imported OK
-            for c in uploaded_codes:
-                uploaded[c] = str(grube[c].get("itemId", "")).strip()
-            _save_uploaded_externalcodes(uploaded)
+        if not dry:                          # record only codes that imported OK
+            uploaded = _record_uploaded(
+                _load_uploaded_externalcodes, _save_uploaded_externalcodes,
+                {c: str(grube[c].get("itemId", "")).strip() for c in uploaded_codes})
     finally:
         _import_lock.release()
 
@@ -4043,26 +4694,18 @@ def n8n_upload_externalcode():
 # picks it up. Mirrors the supplier/externalcode write-back (own incremental store,
 # reuses import_builder.link_rows for the rows — no duplicated logic).
 # --------------------------------------------------------------------------- #
-VARIANT_LINKS_STATE = os.path.join(OUT, "uploaded_variant_links.json")
+VARIANT_LINKS_STATE = _store("uploaded_variant_links.json")
 
 
 def _load_uploaded_variant_links():
     """{variant_code: url} already written back to the eshop — so the nightly job only
     sends new or changed split links. Missing/corrupt → empty (everything is new).
     Always a dict (a stray array could repeat a code and break the summary invariant)."""
-    try:
-        with open(VARIANT_LINKS_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(VARIANT_LINKS_STATE, {})
 
 
 def _save_uploaded_variant_links(d):
-    tmp = VARIANT_LINKS_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, VARIANT_LINKS_STATE)
+    _atomic_write_json(VARIANT_LINKS_STATE, d, protect=True)
 
 
 def _variant_link_summary(uploaded, vlinks, split_codes):
@@ -4146,10 +4789,10 @@ def _do_upload_variant_links(dry):
         ok = res["ok"]
         success = res["success_codes"]
         uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry and uploaded_codes:       # record only codes that imported OK
-            for c in uploaded_codes:
-                uploaded[c] = (vlinks[c] or "").strip()
-            _save_uploaded_variant_links(uploaded)
+        if not dry:                          # record only codes that imported OK
+            uploaded = _record_uploaded(
+                _load_uploaded_variant_links, _save_uploaded_variant_links,
+                {c: (vlinks[c] or "").strip() for c in uploaded_codes})
     finally:
         _import_lock.release()
 
@@ -4193,11 +4836,11 @@ def n8n_upload_variant_links():
 # automation. New automations (#105-#111) register themselves in AUTOMATIONS_REG
 # below — the runner, endpoints and sidebar section are shared.
 # --------------------------------------------------------------------------- #
-AUTOMATIONS_STATE = os.path.join(OUT, "automations.json")
-POSTA_STATE = os.path.join(OUT, "posta_uncollected.json")
+AUTOMATIONS_STATE = _store("automations.json")
+POSTA_STATE = _store("posta_uncollected.json")
 # How long a cached TERMINAL tracking verdict is trusted before one re-verification (#222).
 POSTA_TERMINAL_RECHECK_DAYS = 7
-ORDERS_REMINDER_STATE = os.path.join(OUT, "orders_reminder.json")   # #105 dedup + display
+ORDERS_REMINDER_STATE = _store("orders_reminder.json")   # #105 dedup + display
 
 
 class DedupStoreCorrupt(RuntimeError):
@@ -4219,7 +4862,7 @@ class DedupStoreCorrupt(RuntimeError):
 # read on every display request too (the tab polls while a run is in flight), and re-scanning +
 # re-reading every existing backup on each of those reads is pure waste. The digest memo also makes
 # the scan-then-create sequence safe under the app's threads — it runs under its OWN small lock,
-# never the global `_lock` (which is NOT reentrant and is frequently already held by the caller).
+# never the global `_lock` (whose holder is frequently the caller of this helper).
 _quarantine_lock = threading.Lock()
 _quarantined: dict = {}                  # path -> (sha256 of the corrupt bytes, backup path)
 
@@ -4235,6 +4878,10 @@ def _quarantine_corrupt_store(path: str) -> str:
     Backups are de-duplicated by CONTENT, so a daily automation hitting the same corrupt file does
     not leave one copy per run; a DIFFERENT corruption later still gets its own copy.
     """
+    # Resolve FIRST: the memo below is keyed by path, and a `_StorePath` hashes from the CURRENT
+    # OUT — keyed by the object, every repointed data dir would leave an entry nobody can look
+    # up again (PR #265 review). Callers pass either form.
+    path = os.fspath(path)
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -4305,6 +4952,7 @@ def _load_dedup_store(path: str, label: str, dedup_keys: tuple = ()) -> dict:
     for key in dedup_keys:
         if key in d and not isinstance(d[key], dict):
             raise DedupStoreCorrupt(_corrupt_msg(path, label))
+    _note_store_read(path, d)   # #261 — these stores are write-guarded like the rest
     return d
 
 
@@ -4319,6 +4967,23 @@ def _corrupt_msg(path: str, label: str) -> str:
             # NEVER suggest deleting it: a missing file is a legitimate first run, so deleting is
             # exactly the wipe this guard prevents — every customer would be mailed again.
             + "POZOR: NEMAŽ ho — prázdna evidencia znamená, že každý zákazník dostane mail znova.")
+
+
+@app.errorhandler(StoreWipeRefused)
+@app.errorhandler(StoreLockTimeout)
+def _handle_store_write_refused(e):
+    """A refused write / a store lock we could not take answers 503 with a Slovak
+    „what to do", never a bare 500 — a 500 reads as a transient glitch and invites the
+    manager to click again, which is exactly the wrong reaction to either of these."""
+    return jsonify({"ok": False, "error": str(e)}), 503
+
+
+@app.errorhandler(AutomationStateCorrupt)
+def _handle_automation_state_corrupt(e: AutomationStateCorrupt):
+    """An unreadable automations.json fails CLOSED (#265 second review, C4) — it must
+    not pretend no automations are set up. The tab therefore answers 503 with what to
+    repair, exactly like a refused store write, instead of a 500 that reads transient."""
+    return jsonify({"ok": False, "error": str(e)}), 503
 
 
 @app.errorhandler(DedupStoreCorrupt)
@@ -4347,11 +5012,9 @@ def _load_posta_state_display() -> tuple:
 
 
 def _save_posta_state(d: dict) -> None:
-    tmp = POSTA_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, POSTA_STATE)
+    # ("escalation",) — the record of who was already e-mailed is that NESTED map; the
+    # outer dict keeps the same key set on every write, so guarding only it is inert.
+    _atomic_write_json(POSTA_STATE, d, mode=0o600, protect=("escalation",))
 
 
 def _fetch_tracking(pkg: str) -> dict:
@@ -4531,13 +5194,24 @@ def run_posta_uncollected() -> dict:
              # instead of a healthy-looking run that quietly mailed nobody (ERROR log only).
              "bcc_missing": _mail_bcc() is None}
     with _lock:
-        _save_posta_state({
+        # Re-read under the lock and update that map, rather than writing a brand-new dict:
+        # `esc`/`term_cache` were read before minutes of Pošta SK round-trips, so this both
+        # keeps whatever another writer added to the untouched keys AND makes the save a
+        # genuine read-modify-write — which is what the shrink guard checks (PR #265 review:
+        # a rebuilt dict carries no read receipt, and `escalation` really does shrink here).
+        st = _load_posta_state()
+        st.update({
+            # `esc` is the start-of-run map MINUS the orders that left the source window
+            # (pruned above) PLUS this run's bumps — so it deliberately CAN shrink. That is
+            # legitimate only because `st` is the map we just read under this lock, which is
+            # exactly what the shrink guard checks.
             "escalation": esc,
             "terminal": term_cache,
             "last_check": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "uncollected": uncollected, "invalid": invalid, "errors": errors,
             "stats": stats,
         })
+        _save_posta_state(st)
     log.info("posta: run done %s", stats)
     return stats
 
@@ -4559,23 +5233,29 @@ def run_shoptet_sync() -> dict:
     try/except (automation_runner._execute) records the error and the app keeps
     serving the previous cache/catalog/review data untouched — degrade, never
     crash, never a half-written file."""
-    global CODE2PAIR, CODE2VARIANT, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
+    global PRODUCTS, CODE2PAIR, CODE2VARIANT, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
 
     orders_bytes = _fetch_orders_csv()
-    tmp = ORDERS_CACHE + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(orders_bytes)
-    os.replace(tmp, ORDERS_CACHE)
+    _atomic_write_bytes(ORDERS_CACHE, orders_bytes, mode=0o600)
 
     export_bytes = _fetch_export_csv()
-    tmp2 = SRC + ".tmp"
-    with open(tmp2, "wb") as f:
-        f.write(export_bytes)
-    os.replace(tmp2, SRC)
+    _atomic_write_bytes(SRC, export_bytes)
 
     # rebuild the in-memory search index from the fresh export — same single
     # cp1250-pass helper the app uses at startup, no restart needed.
     with _lock:
+        # RE-READ review_data.json first (PR #265 review). It changes UNDER a running app:
+        # the documented `scripts/add_supplier_review_data.py` appends a whole new supplier
+        # while the service serves. `PRODUCTS` was read once at BOOT and `resync_current`
+        # only mutates in place, so resyncing and saving that list would discard the new
+        # supplier — and since #261 the writer refuses that shrink, which left this
+        # automation failing every hour with no way back short of a restart. Re-reading
+        # makes the append take effect without one AND makes the save below a legitimate
+        # read-modify-write. A missing/unparsable file yields [] — keep what we are serving
+        # rather than adopt an empty catalogue.
+        fresh = _read_json_store(DATA, [])
+        if fresh:
+            PRODUCTS = fresh
         review_keys = ({p.get("pairCode") for p in PRODUCTS if p.get("pairCode")}
                        | {c for p in PRODUCTS for c in (p.get("variant_codes") or [])})
         CODE2PAIR, CODE2VARIANT, CATALOG = _load_catalog(SRC, review_keys)
@@ -4590,10 +5270,7 @@ def run_shoptet_sync() -> dict:
             rows.append(row)
     with _lock:
         counts = resync_current(rows, PRODUCTS, set(config.SUPPLIERS))
-        tmp3 = DATA + ".tmp"
-        with open(tmp3, "w", encoding="utf-8") as f:
-            json.dump(PRODUCTS, f, ensure_ascii=False)
-        os.replace(tmp3, DATA)
+        _save_products(PRODUCTS)
 
     # Customer export — fetched LAST and NON-FATAL: a customer-export hiccup must
     # never turn the whole sync red, because orders/catalog/review already landed
@@ -4604,10 +5281,7 @@ def run_shoptet_sync() -> dict:
     customers_bytes, customers_error = b"", None
     try:
         customers_bytes = _fetch_customers_csv()
-        tmp4 = CUSTOMERS_CACHE + ".tmp"
-        with open(tmp4, "wb") as f:
-            f.write(customers_bytes)
-        os.replace(tmp4, CUSTOMERS_CACHE)
+        _atomic_write_bytes(CUSTOMERS_CACHE, customers_bytes, mode=0o600)
     except Exception as e:  # noqa: BLE001 — auxiliary source; never fail the whole sync
         customers_error = str(e)   # already secret-sanitized by _fetch_customers_csv
         log.warning("shoptet_sync: customer export refresh failed (non-fatal): %s",
@@ -4794,7 +5468,7 @@ def run_split_links() -> dict:
 # in data/out/supplier_stock.json — the input for #107/#108. Pure logic lives in
 # parovanie.supplier_stock; this wires it to the network, OpenAI and the store.
 # --------------------------------------------------------------------------- #
-SUPPLIER_STOCK_STATE = os.path.join(OUT, "supplier_stock.json")
+SUPPLIER_STOCK_STATE = _store("supplier_stock.json")
 # Refetch only links not checked in the last N hours (skip fresh OK rows) — saves
 # HTTP + paid LLM cost. Chosen < 24h so a daily run still re-checks everything once.
 SUPPLIER_STOCK_MAX_AGE_H = 20.0
@@ -4814,11 +5488,7 @@ def _load_supplier_stock() -> dict:
 
 
 def _save_supplier_stock(d: dict) -> None:
-    tmp = SUPPLIER_STOCK_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SUPPLIER_STOCK_STATE)
+    _atomic_write_json(SUPPLIER_STOCK_STATE, d, mode=0o600)
 
 
 def _read_export_for_links() -> str:
@@ -4970,7 +5640,7 @@ def run_supplier_stock() -> dict:
 # anything itself. Pure logic lives in parovanie.riziko_vypadku; this wires it
 # to the store + the display/CSV endpoints.
 # --------------------------------------------------------------------------- #
-RIZIKO_STATE = os.path.join(OUT, "riziko_vypadku.json")
+RIZIKO_STATE = _store("riziko_vypadku.json")
 
 
 def _load_riziko() -> dict:
@@ -4983,11 +5653,7 @@ def _load_riziko() -> dict:
 
 
 def _save_riziko(d: dict) -> None:
-    tmp = RIZIKO_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, RIZIKO_STATE)
+    _atomic_write_json(RIZIKO_STATE, d, mode=0o600)
 
 
 def run_riziko_vypadku() -> dict:
@@ -5027,7 +5693,7 @@ def run_riziko_vypadku() -> dict:
 # #23-hardened read-back). Detection logic lives in parovanie.restock_skladom; this
 # wires it to the store + the import + the display endpoint.
 # --------------------------------------------------------------------------- #
-RESTOCK_STATE = os.path.join(OUT, "restock_skladom.json")
+RESTOCK_STATE = _store("restock_skladom.json")
 
 
 def _load_restock() -> dict:
@@ -5040,11 +5706,7 @@ def _load_restock() -> dict:
 
 
 def _save_restock(d: dict) -> None:
-    tmp = RESTOCK_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, RESTOCK_STATE)
+    _atomic_write_json(RESTOCK_STATE, d, mode=0o600)
 
 
 def run_restock_skladom() -> dict:
@@ -5136,7 +5798,7 @@ def run_restock_skladom() -> dict:
 # import_builder.skladom_rows (visible + both availability Skladom; the real stock
 # is NEVER overwritten) through the SAME careful chunked import path.
 # --------------------------------------------------------------------------- #
-STOCK_SKLADOM_STATE = os.path.join(OUT, "stock_skladom.json")
+STOCK_SKLADOM_STATE = _store("stock_skladom.json")
 
 
 def _load_stock_skladom() -> dict:
@@ -5149,11 +5811,7 @@ def _load_stock_skladom() -> dict:
 
 
 def _save_stock_skladom(d: dict) -> None:
-    tmp = STOCK_SKLADOM_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, STOCK_SKLADOM_STATE)
+    _atomic_write_json(STOCK_SKLADOM_STATE, d, mode=0o600)
 
 
 def run_stock_skladom() -> dict:
@@ -5249,11 +5907,8 @@ def _load_orders_reminder_display() -> tuple:
 
 
 def _save_orders_reminder(d: dict) -> None:
-    tmp = ORDERS_REMINDER_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, ORDERS_REMINDER_STATE)
+    # ("orders",) — see _save_posta_state: the dedup map is one level down.
+    _atomic_write_json(ORDERS_REMINDER_STATE, d, mode=0o600, protect=("orders",))
 
 
 def _classify_contacted(shop_remark: str) -> bool:
@@ -5767,7 +6422,7 @@ def run_orders_reminder() -> dict:
 # (image_health.clean_products) so a review card never renders a URL
 # confirmed dead. review_data.json itself is never rewritten by this run.
 # --------------------------------------------------------------------------- #
-IMAGE_HEALTH_STATE = os.path.join(OUT, "image_health.json")
+IMAGE_HEALTH_STATE = _store("image_health.json")
 # Short timeout (mirrors /api/images' 8s fast-fail #74) — a hung supplier/CDN
 # must not tie up the whole run; it's simply recorded as a failed check.
 IMAGE_HEALTH_TIMEOUT = 8
@@ -5783,11 +6438,7 @@ def _load_image_health() -> dict:
 
 
 def _save_image_health(d: dict) -> None:
-    tmp = IMAGE_HEALTH_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, IMAGE_HEALTH_STATE)
+    _atomic_write_json(IMAGE_HEALTH_STATE, d, indent=None, mode=0o600)
 
 
 def _check_image_url(url: str) -> bool:
@@ -6115,7 +6766,93 @@ AUTOMATIONS_REG = [
                schedule={"daily_at": "09:30", "tz": "Europe/Bratislava"},
                run_fn=run_vystavy_odpoved_prihlaska),
 ]
-RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
+# lock=_lock: the automation state file is a store like any other — it must be
+# serialised across processes too (#264), not just across threads.
+RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG, lock=_lock)
+
+# #262 — ONE scheduler per data dir. A throwaway instance booted on another port for
+# a screenshot (see the playbook recipe) was never killed and ran four days beside the
+# real service with its scheduler enabled: two runners racing the same nightly jobs
+# over the same data/out, unlogged — the customer-mail automations were one release
+# away from mailing everybody twice. The claim below is an flock held for the whole
+# process lifetime, so a crashed instance releases it automatically (no stale pidfile).
+SCHEDULER_CLAIM = _store(".scheduler.lock")
+_scheduler_claim_fd = None
+
+
+def _scheduler_enabled() -> bool:
+    """False only when WEBREVIEW_NO_SCHEDULER is explicitly set (empty/`0` = on).
+
+    The throwaway preview instance boots with it: with no scheduler the process never
+    fires anything BY ITSELF — no 09:00 customer mails, no 21:00 eshop write, no paid
+    05:00 scrape — however long it is forgotten. (An explicit „⚡ Spustiť teraz" click
+    by someone who opens ITS port still runs; the flag removes the unattended timer,
+    not the logged-in human.)"""
+    return os.environ.get("WEBREVIEW_NO_SCHEDULER", "").strip() in ("", "0")
+
+
+def _claim_scheduler() -> bool:
+    """Take the exclusive cross-process scheduler claim for this data dir."""
+    global _scheduler_claim_fd
+    p = os.fspath(SCHEDULER_CLAIM)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            with open(p, encoding="utf-8") as f:
+                holder = f.read().strip()
+        except OSError:
+            holder = ""
+        os.close(fd)
+        log.error("automation scheduler NOT started: another instance already holds %s "
+                  "(%s). Two schedulers over one data dir race the nightly jobs and can "
+                  "mail a customer twice (#262) — stop the other instance first.",
+                  p, holder or "holder unknown")
+        return False
+    os.ftruncate(fd, 0)
+    os.write(fd, f"pid={os.getpid()} port={os.environ.get('WEBREVIEW_PORT', '8801')} "
+                 f"started={datetime.now().isoformat(timespec='seconds')}\n".encode())
+    _scheduler_claim_fd = fd   # never closed — the claim lasts as long as this process
+    return True
+
+
+# What this instance INTENDED: "running" | "blocked" (another instance holds the claim)
+# | "off" (WEBREVIEW_NO_SCHEDULER). Reported (derived, see `_scheduler_state`) by
+# /api/automations and rendered as a banner: the boot log line used to be the ONLY
+# trace, while the tab kept showing every enabled automation with a healthy future
+# „Ďalší beh" (it comes from the persisted state file) although nothing would ever fire —
+# a silent business failure of exactly the kind the store guard exists to prevent, one
+# level up (PR #265 review). Starts "off": until _start_scheduler() runs, nothing schedules.
+SCHEDULER_INTENT = "off"
+
+
+def _scheduler_state() -> str:
+    """What is REALLY the case, not what boot intended (PR #265 second review).
+
+    An intent assigned once at boot cannot notice the loop thread dying, so a runner
+    that is gone kept reporting „running" forever — the same healthy-looking tab over
+    an idle scheduler that the banner exists to prevent. "dead" is the honest answer
+    and the banner says so."""
+    if SCHEDULER_INTENT != "running":
+        return SCHEDULER_INTENT
+    return "running" if RUNNER.is_alive() else "dead"
+
+
+def _start_scheduler() -> bool:
+    """Start the automation runner iff this instance may and can own it."""
+    global SCHEDULER_INTENT
+    if not _scheduler_enabled():
+        log.warning("automation scheduler DISABLED (WEBREVIEW_NO_SCHEDULER) — nothing "
+                    "will run on a timer in this instance (manual runs still work)")
+        SCHEDULER_INTENT = "off"
+        return False
+    if not _claim_scheduler():
+        SCHEDULER_INTENT = "blocked"
+        return False
+    RUNNER.start()
+    SCHEDULER_INTENT = "running"
+    return True
 
 # Valid /api/ui-label rename keys (#173): every NAV key the frontend actually
 # renders a button for — mirrors app.js's TABS + AUTOMATION_TABS arrays + the
@@ -6145,7 +6882,9 @@ def api_automations():
     for a in RUNNER.status():
         a["description"] = AUTOMATION_DESCRIPTIONS.get(a["key"], "")
         out.append(a)
-    return jsonify({"automations": out})
+    # `scheduler` — see `_scheduler_state`: without it a blocked / switched-off / dead
+    # instance is indistinguishable from a healthy one in the UI.
+    return jsonify({"automations": out, "scheduler": _scheduler_state()})
 
 
 @app.route("/api/ui-labels")
@@ -6199,6 +6938,9 @@ def api_automation_toggle(key):
 
 @app.route("/api/automations/<key>/run", methods=["POST"])
 def api_automation_run(key):
+    # NOTE: „⚡ Spustiť teraz" runs even on a WEBREVIEW_NO_SCHEDULER instance — the flag
+    # removes the SCHEDULER (nothing fires by itself, which is what an orphaned instance
+    # does), not the explicit action of a logged-in human who opened this instance's UI.
     try:
         started = RUNNER.run_now(key)
     except KeyError:
@@ -6572,6 +7314,6 @@ def api_stock_skladom():
 
 
 if __name__ == "__main__":
-    RUNNER.start()
+    _start_scheduler()
     app.run(host="0.0.0.0", port=int(os.environ.get("WEBREVIEW_PORT", "8801")),
             threaded=True)

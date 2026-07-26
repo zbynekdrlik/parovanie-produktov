@@ -1,0 +1,1055 @@
+"""#261 — the manager's live data/out must be unreachable from a test run.
+
+On 2026-07-26 a pytest run wiped all 2831 review decisions: `DECISIONS` (and every
+other store path) was computed from `OUT` at IMPORT time, so a test helper that
+repointed `webapp.OUT` at a tmp dir left `DECISIONS` aimed at the live store — and
+the first `_save_decisions` of a fixture wrote straight over the manager's work.
+
+Three layers are pinned here, each on its own:
+  1. every store path is derived from the CURRENT `OUT` (patching OUT redirects all);
+  2. the whole backend suite runs against a tmp `WEBREVIEW_OUT` (conftest), so even a
+     helper that forgets to patch anything cannot reach data/out;
+  3. a write that would drop a populated store to empty is refused, loudly.
+"""
+import ast
+import json
+import os
+import stat
+import sys
+import threading
+import time
+import types
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
+import app as webapp  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIVE_OUT = os.path.abspath(os.path.join(ROOT, "data", "out"))
+
+# Every module-level path that lives inside OUT. A new store MUST be added here —
+# and `test_no_store_path_is_frozen_at_import` catches it even if someone forgets.
+STORE_ATTRS = [
+    "DATA", "DECISIONS", "IMGCACHE", "USERS", "RESET_TOKENS", "ORDERED",
+    "ORDER_PAIRINGS", "VARIANT_LINKS", "WAITING", "INSTOCK", "UNAVAIL",
+    "ORDER_COMMENTS", "NEDOSTUPNE", "UI_LABELS", "NOTES", "SUPPLIER_ASSIGN",
+    "GRUBE_CODES", "ORDERS_CACHE", "CUSTOMERS_CACHE", "VYSTAVY", "PAIRINGS_STATE",
+    "SUPPLIERS_STATE", "EXTERNALCODES_STATE", "VARIANT_LINKS_STATE",
+    "AUTOMATIONS_STATE", "POSTA_STATE", "ORDERS_REMINDER_STATE",
+    "SUPPLIER_STOCK_STATE", "RIZIKO_STATE", "RESTOCK_STATE", "STOCK_SKLADOM_STATE",
+    "IMAGE_HEALTH_STATE",
+]
+
+
+# --------------------------------------------------------------------------- #
+# Layer 1 — paths follow the CURRENT OUT, never the import-time one
+# --------------------------------------------------------------------------- #
+def test_patching_out_redirects_every_store_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    frozen = [n for n in STORE_ATTRS
+              if os.path.dirname(os.fspath(getattr(webapp, n))) != str(tmp_path)]
+    assert frozen == [], f"still frozen at import time: {frozen}"
+
+
+def _names_the_data_dir(node) -> bool:
+    """Does this expression name the data dir? Three shapes, not one (PR #265 second
+    review): the module global `OUT`, an ATTRIBUTE `something.OUT` (how a helper reads
+    it — `webapp.OUT`), and the raw environment key a path could be built from without
+    mentioning `OUT` at all. Matching only a bare `ast.Name` made the guard blind to
+    the last two, so a path frozen from either was invisible to it."""
+    if isinstance(node, ast.Name) and node.id == "OUT" and isinstance(node.ctx, ast.Load):
+        return True
+    if isinstance(node, ast.Attribute) and node.attr == "OUT" and isinstance(node.ctx, ast.Load):
+        return True
+    return isinstance(node, ast.Constant) and node.value == "WEBREVIEW_OUT"
+
+
+def _import_time_out_uses(src=None):
+    """Every place the module names the data dir in an expression that is EVALUATED AT
+    IMPORT (i.e. not inside a function body). Those are the frozen ones — the shape that
+    caused the wipe. Inside a function it is read per call, which is the point.
+
+    The one module-level use that is NOT frozen-by-mistake is the definition of `OUT`
+    itself, so its right-hand side is excluded."""
+    if src is None:
+        with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+            src = f.read()
+    tree = ast.parse(src)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    definition = set()
+    for node in tree.body:                       # module level only
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "OUT" for t in node.targets)):
+            definition.update(ast.walk(node.value))
+    frozen = []
+    for node in ast.walk(tree):
+        if not _names_the_data_dir(node) or node in definition:
+            continue
+        cur, lazy = node, False
+        while cur in parents:
+            cur = parents[cur]
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                lazy = True
+                break
+        if not lazy:
+            frozen.append(node.lineno)
+    return frozen
+
+
+def test_the_drift_guard_sees_every_shape_a_path_can_be_frozen_from():
+    """The guard itself, tested — it used to match a bare `OUT` only, so the two other
+    ways to freeze the very same path walked straight past it."""
+    for src in ('import os\nDECISIONS = os.path.join(OUT, "decisions.json")\n',
+                'import webapp\nDECISIONS = webapp.OUT + "/decisions.json"\n',
+                'import os\nDECISIONS = os.environ["WEBREVIEW_OUT"] + "/decisions.json"\n',
+                'import os\nDECISIONS = os.environ.get("WEBREVIEW_OUT")\n'):
+        assert _import_time_out_uses(src) == [2], f"drift guard blind to:\n{src}"
+    # …and the definition of OUT itself is not a frozen path
+    assert _import_time_out_uses(
+        'import os\nOUT = os.environ.get("WEBREVIEW_OUT") or "/data/out"\n'
+        'def _store(n):\n    return os.path.join(OUT, n)\n') == []
+
+
+def test_no_store_path_is_frozen_at_import():
+    """Drift guard, structural. The string-shaped version it replaces only saw
+    module-level `str` globals, so a `pathlib.Path(OUT) / "x.json"`, an f-string, or a
+    path frozen into a dict / class attribute / default argument was invisible to it —
+    and every one of those re-introduces the #261 freeze. Reading the AST catches the
+    CAUSE (OUT evaluated once, at import) instead of one of its shapes."""
+    frozen = _import_time_out_uses()
+    assert frozen == [], (
+        f"app.py:{frozen} builds a path from OUT at import time — use `_store(name)`, "
+        "which resolves against the CURRENT OUT on every use")
+
+
+def test_no_module_level_value_hides_a_path_under_out():
+    """The runtime half of the same guard: a path frozen INSIDE a container, a class
+    attribute or a function default is still a frozen path, and none of those are a
+    module-level `str`."""
+    out = os.fspath(webapp.OUT)
+
+    def _under_out(v):
+        return isinstance(v, str) and os.path.isabs(v) and v.startswith(out + os.sep)
+
+    # Runtime registries KEYED by a resolved path, by design — they hold whatever OUT
+    # was when the app last touched a store, which is the opposite of frozen.
+    runtime_caches = {"_store_reads", "_quarantined"}
+
+    frozen = []
+    for name, value in list(vars(webapp).items()):
+        if name.startswith("__") or name in runtime_caches:
+            continue
+        # `type(...) is` on purpose: app.py holds Flask/werkzeug proxies whose attributes
+        # explode outside a request context, so nothing here may probe an unknown object.
+        if type(value) in (list, tuple, set, frozenset):
+            seen = list(value)
+        elif type(value) is dict:
+            seen = list(value.keys()) + list(value.values())
+        elif type(value) is type:
+            seen = list(vars(value).values())
+        elif type(value) is types.FunctionType:
+            seen = (list(value.__defaults__ or ())
+                    + list((value.__kwdefaults__ or {}).values()))
+        else:
+            seen = [value]
+        frozen += [name for v in seen if _under_out(v)]
+    assert sorted(set(frozen)) == [], f"frozen paths under OUT: {sorted(set(frozen))}"
+
+
+# --------------------------------------------------------------------------- #
+# Layer 2 — the suite itself can never reach data/out
+# --------------------------------------------------------------------------- #
+def test_the_backend_suite_runs_against_a_throwaway_out():
+    assert os.path.abspath(os.fspath(webapp.OUT)) != LIVE_OUT
+
+
+def test_no_store_of_this_run_points_into_the_live_data_dir():
+    """The proof the issue asks for: a write aimed at data/out must be impossible."""
+    live = [n for n in STORE_ATTRS
+            if os.path.abspath(os.fspath(getattr(webapp, n))).startswith(LIVE_OUT + os.sep)]
+    assert live == [], f"these stores still point at the manager's live data: {live}"
+
+
+def test_the_shoptet_export_is_isolated_too():
+    """`run_shoptet_sync` overwrites SRC in place — a test must not rewrite the
+    real data/products.csv either."""
+    assert os.path.abspath(os.fspath(webapp.SRC)) != os.path.abspath(
+        os.path.join(ROOT, "data", "products.csv"))
+
+
+def test_the_exact_helper_that_wiped_the_store_now_lands_in_the_tmp_dir(monkeypatch, tmp_path):
+    """Reproduces `_arm_pairings`: patch OUT only, then save. Before the fix this
+    wrote decisions.json into data/out."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+    assert json.loads((tmp_path / "decisions.json").read_text(encoding="utf-8"))
+    assert webapp._load_decisions() == {"S|1": {"status": "manual", "url": "https://x.test/a"}}
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3 — an empty map never overwrites a populated store
+# --------------------------------------------------------------------------- #
+def _two_decisions():
+    return {"S|1": {"status": "manual", "url": "https://x.test/a"},
+            "S|2": {"status": "good", "url": "https://x.test/b"}}
+
+
+def test_an_empty_map_never_overwrites_a_populated_decisions_store(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+    assert webapp._load_decisions() == _two_decisions()   # untouched
+
+
+def test_undoing_the_very_last_decision_is_still_allowed(monkeypatch, tmp_path):
+    """The manager CAN legitimately undo his only remaining decision (1 → 0). The
+    real flow reads the store, drops the key and saves — that read is what tells the
+    guard the empty map really is the manager's work and not a fixture."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+    d = webapp._load_decisions()
+    d.pop("S|1")
+    webapp._save_decisions(d)
+    assert webapp._load_decisions() == {}
+
+
+def test_clearing_a_whole_group_in_one_write_is_still_allowed(monkeypatch, tmp_path):
+    """`/api/ordered/bulk` un-marks a whole supplier group at once, so a populated
+    store legitimately empties in ONE write — a plain „empty over non-empty" rule
+    would break the manager's bulk button (it did, in the first cut of this fix)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_ordered({"O1|A": True, "O1|B": True, "O1|C": True})
+    d = webapp._load_ordered()
+    for k in list(d):
+        d.pop(k)
+    webapp._save_ordered(d)
+    assert webapp._load_ordered() == {}
+
+
+def test_a_wipe_is_refused_even_when_the_store_holds_a_single_entry(monkeypatch, tmp_path):
+    """No count threshold: what makes an empty write legitimate is having READ the
+    store, not how big it is."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+
+
+def test_a_wipe_is_refused_when_someone_else_wrote_after_our_read(monkeypatch, tmp_path):
+    """Read 2, another process appends a third, then we save empty: our empty map is
+    not what the manager just did to THAT store — it would silently lose the third
+    entry (the #264 lost-update shape)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._load_decisions()
+    grown = dict(_two_decisions(), **{"S|3": {"status": "good", "url": "https://x.test/c"}})
+    (tmp_path / "decisions.json").write_text(json.dumps(grown), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+    assert len(webapp._load_decisions()) == 3
+
+
+@pytest.mark.parametrize("save_fn,load_fn", [
+    ("_save_decisions", "_load_decisions"),
+    ("_save_ordered", "_load_ordered"),
+    ("_save_order_pairings", "_load_order_pairings"),
+    ("_save_variant_links", "_load_variant_links"),
+    ("_save_waiting", "_load_waiting"),
+    ("_save_instock", "_load_instock"),
+    ("_save_unavailable", "_load_unavailable"),
+    ("_save_order_comments", "_load_order_comments"),
+    ("_save_supplier_assign", "_load_supplier_assign"),
+    ("_save_nedostupne", "_load_nedostupne"),
+])
+def test_every_manager_work_store_refuses_a_wipe(monkeypatch, tmp_path, save_fn, load_fn):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    populated = {"a": {"x": 1}, "b": {"x": 2}}
+    getattr(webapp, save_fn)(populated)
+    with pytest.raises(webapp.StoreWipeRefused):
+        getattr(webapp, save_fn)({})
+    assert getattr(webapp, load_fn)() == populated
+
+
+def test_a_refused_wipe_leaves_no_half_written_temp_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_an_unreadable_store_is_never_degraded_to_empty(monkeypatch, tmp_path):
+    """A missing file is a first run and a truncated one is repairable — but an I/O
+    error on a store that IS there (permissions, EIO) is not evidence of „no work".
+    Degrading it to `{}` and letting the next click persist a one-entry file is the
+    silent loss this whole PR exists to prevent; it must stay a loud failure."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "decisions.json").mkdir()          # open() → IsADirectoryError
+    with pytest.raises(OSError):
+        webapp._load_decisions()
+
+
+def test_a_read_that_did_not_yield_the_stored_content_cannot_legitimise_a_wipe(
+        monkeypatch, tmp_path):
+    """Wrong-type store: the loader hands back the default, so the caller never saw
+    the entries on disk — an empty write after that is still a wipe."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "decisions.json").write_text('["a", "b", "c"]', encoding="utf-8")
+    assert webapp._load_decisions() == {}
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+
+
+def test_a_shrink_this_process_never_read_is_refused(monkeypatch, tmp_path):
+    """The incident's fixture was not empty — `_arm_pairings` stubs `_load_decisions`
+    to a small map. Refusing only EMPTY writes would have let a 3-entry fixture land
+    on 2831 entries just as happily."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({"S|9": {"status": "manual", "url": "https://x.test/z"}})
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_a_shrink_the_manager_actually_made_is_allowed(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    d = webapp._load_decisions()
+    d.pop("S|2")
+    webapp._save_decisions(d)
+    assert list(webapp._load_decisions()) == ["S|1"]
+
+
+def test_growing_a_store_never_needs_a_read(monkeypatch, tmp_path):
+    """Only shrinking is suspicious — an incremental upload state that only ever
+    grows must not start failing because it was computed before the read."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._store_reads.pop(os.fspath(webapp.DECISIONS), None)
+    webapp._thread_ring(os.fspath(webapp.DECISIONS)).clear()   # both receipt rings
+    bigger = dict(_two_decisions(), **{"S|3": {"status": "good", "url": "https://x.test/c"}})
+    webapp._save_decisions(bigger)
+    assert len(webapp._load_decisions()) == 3
+
+
+def test_the_dedup_stores_are_protected_too(monkeypatch, tmp_path):
+    """orders_reminder.json / posta_uncollected.json are the ones whose loss means a
+    SECOND mail to every customer — they were the only manager-critical stores left
+    without the write guard."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps({"orders": {"1": {"status": "emailed"}}, "red": []}), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_orders_reminder({})
+    st = webapp._load_orders_reminder()
+    st["orders"]["2"] = {"status": "emailed"}
+    webapp._save_orders_reminder(st)          # the normal path still works
+    assert len(webapp._load_orders_reminder()["orders"]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened (PR #265 review) — the receipt is PROVENANCE-bound
+#
+# The first cut recorded „how many entries THIS PROCESS last read from that store"
+# in a process-GLOBAL map. That is a stale-read detector, not a provenance check:
+# `_load_decisions()` runs at import and on every /api/products + /api/orders, so
+# the recorded count always equalled the disk count and the guard was permanently
+# disarmed — the incident's own write would have been ALLOWED. The receipt is now
+# the READ ITSELF (the object the loader handed back), so a caller that never
+# loaded the store cannot produce one.
+# --------------------------------------------------------------------------- #
+def test_a_normal_read_elsewhere_never_legitimises_a_wipe_from_a_path_that_read_nothing(
+        monkeypatch, tmp_path):
+    """THE incident's shape, reproduced: the live app reads decisions on every page
+    load, and then something that never loaded the store writes over it."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._load_decisions()                     # a normal read, as /api/products does
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})               # …from a path that never loaded it
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_a_read_of_a_DIFFERENT_store_cannot_legitimise_a_wipe(monkeypatch, tmp_path):
+    """The receipt is per-store: loading ordered_items must say nothing about what
+    may be written over decisions."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._save_ordered({"O1|A": True, "O1|B": True})
+    webapp._load_ordered()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+
+
+def test_two_undos_in_a_row_are_both_allowed(monkeypatch, tmp_path):
+    """After a successful write the process HAS the store it just wrote — the receipt
+    must follow it, or the manager's second undo in a row 503s (the guard's own
+    bookkeeping going stale)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(dict(_two_decisions(),
+                                **{"S|3": {"status": "good", "url": "https://x.test/c"}}))
+    d = webapp._load_decisions()
+    d.pop("S|1")
+    webapp._save_decisions(d)
+    d.pop("S|2")
+    webapp._save_decisions(d)                    # used to raise: the receipt was stale
+    assert list(webapp._load_decisions()) == ["S|3"]
+
+
+def test_a_rebuilt_map_may_shrink_when_it_names_the_read_it_was_built_from(
+        monkeypatch, tmp_path):
+    """Not every read-modify-write mutates in place — the startup prune builds a NEW
+    dict from the one it read. Such a caller passes `prev=` (the map it loaded)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    d0 = webapp._load_decisions()
+    d1 = {k: v for k, v in d0.items() if k == "S|1"}
+    webapp._save_decisions(d1, prev=d0)
+    assert list(webapp._load_decisions()) == ["S|1"]
+
+
+def test_a_rebuilt_map_that_names_nothing_is_still_refused(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._load_decisions()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened — „unreadable" must never be read as „empty"
+# --------------------------------------------------------------------------- #
+def test_a_truncated_store_is_never_treated_as_zero_entries(monkeypatch, tmp_path):
+    """A half-written decisions.json parses as NOTHING, so the entry count used to come
+    back 0 and the guard skipped itself entirely — one manager click then replaced ~1400
+    recoverable entries with one. There is no fsync-free way to rule this out, so it is
+    the MOST likely real corruption, not the least."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    p = tmp_path / "decisions.json"
+    raw = p.read_text(encoding="utf-8")
+    p.write_text(raw[:len(raw) // 2], encoding="utf-8")     # cut mid-write
+    assert webapp._load_decisions() == {}                   # display still degrades…
+    with pytest.raises(webapp.StoreWipeRefused):            # …but a write is refused
+        webapp._save_decisions({"S|9": {"status": "manual", "url": "https://x.test/z"}})
+    assert list(tmp_path.glob("decisions.json.corrupt-*")), \
+        "the unreadable bytes must be preserved before anything refuses"
+    assert p.read_text(encoding="utf-8") == raw[:len(raw) // 2]   # original untouched
+
+
+def test_a_truncated_store_is_refused_even_when_the_write_would_GROW_it(
+        monkeypatch, tmp_path):
+    """Growth normally needs no read — but over a file we cannot parse we do not know
+    what we are growing FROM, so there is nothing to compare and everything to lose."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "ordered_items.json").write_text('{"a": true, "b"', encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_ordered({"a": True, "b": True, "c": True})
+
+
+def test_an_empty_file_is_not_corruption(monkeypatch, tmp_path):
+    """A zero-byte store is a fresh/never-written one — nothing to lose, so a write
+    must go straight through (a `touch`ed file must not brick the tab)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "decisions.json").write_text("", encoding="utf-8")
+    webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+    assert list(webapp._load_decisions()) == ["S|1"]
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened — the two dedup stores keep their map NESTED
+# --------------------------------------------------------------------------- #
+def _reminder_state(n: int) -> dict:
+    return {"orders": {str(i): {"status": "emailed"} for i in range(n)},
+            "red": [], "orange": [], "skipped": [], "no_email": [],
+            "stats": {}, "last_check": "", "fingerprints": {}}
+
+
+def test_the_nested_dedup_map_cannot_be_wiped_by_a_path_that_never_read_it(
+        monkeypatch, tmp_path):
+    """`orders_reminder.json` is `{"orders": {...}, "red": [...], …}` — the record of
+    who was already mailed is the NESTED map, and every real writer keeps the same
+    top-level keys. Counting only the outer dict made `protect` inert for exactly the
+    two stores whose loss re-mails every customer."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_orders_reminder(_reminder_state(0))
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
+def test_the_nested_escalation_map_is_guarded_the_same_way(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    state = {"escalation": {str(i): "1|2026-01-01" for i in range(20)},
+             "terminal": {}, "uncollected": [], "invalid": [], "errors": [],
+             "stats": {}, "last_check": ""}
+    (tmp_path / "posta_uncollected.json").write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_posta_state(dict(state, escalation={}))
+    assert len(webapp._load_posta_state()["escalation"]) == 20
+
+
+def test_pruning_the_dedup_map_after_a_real_read_still_works(monkeypatch, tmp_path):
+    """#220 retention really does shrink `orders` — a blanket „never shrink the nested
+    map" rule would break the run that bounds it. The receipt is what tells them apart."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    st["orders"] = {k: v for k, v in list(st["orders"].items())[:10]}
+    webapp._save_orders_reminder(st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 10
+
+
+# --------------------------------------------------------------------------- #
+# Belt and braces — a test process may never write into the manager's data dir
+# --------------------------------------------------------------------------- #
+def test_a_write_into_the_live_data_dir_is_refused_while_pytest_runs(tmp_path):
+    """The conftest pin is the real defence; this is the net under it — a helper (or a
+    subprocess that inherits the env) that resolves OUT to the live dir must still be
+    unable to write there."""
+    target = os.path.join(LIVE_OUT, "pytest-must-never-write.json")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(target, {"x": 1})
+    assert not os.path.exists(target)
+
+
+def test_the_quarantine_memo_is_keyed_by_the_resolved_path(monkeypatch, tmp_path):
+    """`_quarantined` used to be keyed by the store object, whose hash follows the
+    CURRENT OUT — every repointed data dir left an entry nobody can ever look up again."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text("{ truncated", encoding="utf-8")
+    webapp._quarantine_corrupt_store(webapp.ORDERS_REMINDER_STATE)
+    assert webapp._quarantined, "nothing was memoised"
+    assert all(isinstance(k, str) for k in webapp._quarantined), \
+        f"memo keys must be plain paths: {list(webapp._quarantined)}"
+
+
+def test_a_refused_write_answers_503_with_something_to_fix(monkeypatch, tmp_path):
+    """A bare 500 reads like a transient glitch and invites another click; the manager
+    must be told what happened (same shape as the corrupt-dedup-store handler)."""
+    for exc in (webapp.StoreWipeRefused("x"), webapp.StoreLockTimeout("y")):
+        handler = webapp.app.error_handler_spec[None][None][type(exc)]
+        with webapp.app.test_request_context():
+            body, status = handler(exc)
+        assert status == 503 and body.get_json()["ok"] is False
+        assert body.get_json()["error"]
+
+
+def test_the_startup_prune_never_wipes_when_the_product_list_failed_to_load(
+        monkeypatch, tmp_path):
+    """review_data.json missing → PRODUCTS == [] → every decision looks orphaned.
+    Pruning then would delete the manager's whole history at the next restart."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._prune_orphan_decisions([])
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_the_startup_prune_still_drops_a_genuine_orphan(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._prune_orphan_decisions([{"key": "S|1"}])
+    assert list(webapp._load_decisions()) == ["S|1"]
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened again — the receipt must survive a CONCURRENT READ
+#
+# The first cut of the receipt kept ONE slot per store and overwrote it on every
+# read. Flask runs threaded, every GET re-reads these stores (/api/orders alone
+# loads eight of them, and the tab polls), so a display read landing between the
+# writer's load and its guard check replaced the receipt — and the manager's own
+# un-toggle was refused with a 503. Measured before this section existed: 11 of
+# 400 un-toggles refused with three pollers, 317 of 400 with no sleep between
+# reads. The receipt must be provenance, not „the last read wins" (PR #265
+# second review, C1).
+# --------------------------------------------------------------------------- #
+def test_a_display_read_between_the_load_and_the_write_never_refuses_it(
+        monkeypatch, tmp_path):
+    """Deterministic form: the read lands INSIDE the writer's guarded window (the
+    re-read of the store that `_write_json_locked` does while holding the lock)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_ordered({"O1|A": True, "O1|B": True})
+    d = webapp._load_ordered()
+    d.pop("O1|A")
+
+    orig = webapp._stored_measures
+
+    def _read_from_another_request(p):
+        webapp._load_ordered()          # what /api/orders does, on another thread
+        return orig(p)
+
+    monkeypatch.setattr(webapp, "_stored_measures", _read_from_another_request)
+    webapp._save_ordered(d)             # the manager's un-toggle — must NOT 503
+    assert webapp._load_ordered() == {"O1|B": True}
+
+
+def test_the_managers_undos_are_never_refused_while_the_tab_polls(monkeypatch, tmp_path):
+    """The reviewer's shape, with real threads: a writer doing legitimate shrinking
+    writes while another thread reads the same store in a loop. Zero refusals."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    n = 200
+    webapp._save_ordered({f"O|{i}": True for i in range(n + 1)})
+
+    stop = threading.Event()
+    reads = []
+
+    def _poller():
+        while not stop.is_set():
+            reads.append(len(webapp._load_ordered()))
+
+    t = threading.Thread(target=_poller, daemon=True, name="tab-poller")
+    t.start()
+    refused = []
+    try:
+        for i in range(n):
+            d = webapp._load_ordered()
+            d.pop(f"O|{i}")
+            try:
+                webapp._save_ordered(d)
+            except webapp.StoreWipeRefused as e:
+                refused.append(f"{i}: {e}")
+    finally:
+        stop.set()
+        t.join(timeout=10)
+
+    assert reads, "the poller never ran — the test proves nothing"
+    assert refused == [], f"{len(refused)}/{n} legitimate un-toggles refused"
+    assert len(webapp._load_ordered()) == 1
+
+
+def test_a_read_arriving_mid_guard_does_not_crash_the_write(monkeypatch, tmp_path):
+    """The guard walks the receipts with `any(...)` while every GET appends to the
+    same rings WITHOUT the store lock — and `_store_receipts` used to `yield from`
+    the live deques, so CPython raised `RuntimeError: deque mutated during
+    iteration` INSIDE the guarded window. That is not the 503 with something to fix:
+    a bare RuntimeError is not `StoreWipeRefused`, so the manager's click came back
+    as a raw 500 (measured 93/4000 at a 1 µs switch interval). Snapshot both rings.
+
+    `skip` walks the generator into EACH ring in turn: 0-2 are this thread's, 3+ the
+    shared one — both are appended to by the same concurrent read."""
+    p = str(tmp_path / "decisions.json")
+    for i in range(3):
+        webapp._note_store_read(p, {"a": i})
+    for skip in (1, 4):
+        gen = webapp._store_receipts(p)
+        for _ in range(skip):
+            next(gen)
+        webapp._note_store_read(p, {"mid": skip})   # a GET on another thread
+        rest = list(gen)                            # must not RuntimeError
+        assert isinstance(rest, list)
+
+
+def test_a_concurrent_read_still_does_not_legitimise_a_foreign_wipe(
+        monkeypatch, tmp_path):
+    """The B1 exploit, re-run against the widened receipt: however many reads are in
+    flight, a map that came from NO read of this store is still refused."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    for _ in range(50):                      # fill whatever the receipt remembers
+        webapp._load_decisions()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_the_receipt_of_one_thread_is_not_a_receipt_for_another(monkeypatch, tmp_path):
+    """Widening the receipt must not turn „some thread read it once" into a licence
+    for a thread that never did — that is the incident's own shape, threaded.
+
+    The foreign thread writes a map genuinely DERIVED from the OTHER thread's read and
+    names it with `prev=`, so nothing here is refused by object identity: this is the
+    strongest write a thread that never read the store can attempt (its earlier form —
+    writing `{}` — was refused identically before and after the per-thread ring, so it
+    proved nothing about it, PR #265 third review).
+
+    It also pins what the SHARED ring is really worth: the pollers' reads turn it over
+    within microseconds (`_READ_RING` = 8), which is why the cross-thread fallback is
+    BEST EFFORT and nothing in the tree may depend on it — every `protect=` write in
+    app.py loads and saves inside one `with _lock:` block, i.e. in one thread."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    read = webapp._load_decisions()                     # this thread reads…
+    kept = {k: v for k, v in list(read.items())[:1]}    # …and narrows what it read
+
+    def _poller():                                       # the tab, on its own thread
+        for _ in range(webapp._READ_RING):
+            webapp._load_decisions()
+
+    t = threading.Thread(target=_poller, name="tab-poller")
+    t.start()
+    t.join(timeout=10)
+
+    boom = []
+
+    def _foreign_writer():
+        try:
+            webapp._save_decisions(kept, prev=read)      # a read THIS thread never made
+        except webapp.StoreWipeRefused:
+            boom.append("refused")
+
+    t = threading.Thread(target=_foreign_writer, name="foreign")
+    t.start()
+    t.join(timeout=10)
+    assert boom == ["refused"], "a foreign thread shrank the store on another's read"
+    assert webapp._load_decisions() == _two_decisions()
+
+    # …and the thread that DID the read is not collateral damage: its own receipt
+    # survived every one of those polls. That is the per-thread ring's whole purpose —
+    # with the single slot this wave replaced, the polls above overwrote the receipt and
+    # the reader's own write came back as a 503.
+    webapp._save_decisions(kept, prev=read)
+    assert list(webapp._load_decisions()) == list(kept)
+
+
+# --------------------------------------------------------------------------- #
+# `prev=` narrows the receipt — it must never be a way AROUND it
+#
+# `prev = data if prev is None else prev` followed by `rec[0] is prev` never compared
+# `data` to anything at all, so naming a real read authorised writing ANY map over the
+# store: `_save_decisions({}, prev=_load_decisions())` wiped 2831 entries without a
+# complaint. Both callers in the tree are honest rebuilds; the idiom is what re-opens
+# the incident for the next one (PR #265 second review).
+# --------------------------------------------------------------------------- #
+def test_naming_a_read_does_not_authorise_writing_an_unrelated_map(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    d0 = webapp._load_decisions()
+    foreign = {"NOT|FROM|d0": {"status": "manual", "url": "https://x.test/zz"}}
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions(foreign, prev=d0)      # a real read, an unrelated map
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_a_rebuilt_list_that_only_drops_entries_is_still_allowed(monkeypatch, tmp_path):
+    """The výstavy retention sweep keeps a SUBSET of the list it read (#220) — the
+    narrowing must not break it."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
+    v0 = webapp._load_vystavy()
+    kept = [v for v in v0 if v["id"] != "b"]
+    webapp._save_vystavy(kept, prev=v0)
+    assert [v["id"] for v in webapp._load_vystavy()] == ["a", "c"]
+
+
+def test_a_rebuilt_list_of_COPIES_that_only_drops_entries_is_allowed(monkeypatch, tmp_path):
+    """The list branch required element IDENTITY, so the natural way to write a
+    retention sweep — `[dict(x) for x in prev if …]` — was refused, and refused with a
+    message saying the write „did not come from a read of that store". That is both
+    wrong and an invitation for the next author to reach for a bypass instead
+    (PR #265 third review). A rebuild of COPIES still only DROPS, which is the rule."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
+    v0 = webapp._load_vystavy()
+    kept = [dict(v) for v in v0 if v["id"] != "b"]
+    webapp._save_vystavy(kept, prev=v0)
+    assert [v["id"] for v in webapp._load_vystavy()] == ["a", "c"]
+
+
+def test_naming_a_read_does_not_authorise_a_FOREIGN_nested_dedup_map(
+        monkeypatch, tmp_path):
+    """For a `protect=("orders",)` store the derivation check only compared TOP-LEVEL
+    keys — and every real writer of those stores keeps the same top-level key set. So a
+    `prev=` write that kept the outer shape and replaced the who-was-already-mailed map
+    with one that came from NO read passed the narrowing check outright (nobody writes
+    this today; the idiom is what re-opens it — PR #265 third review). This is
+    `test_naming_a_read_does_not_authorise_writing_an_unrelated_map` one level down,
+    where the irreplaceable content of these two stores actually lives.
+
+    Emptying the nested map is deliberately NOT this case: a subset is a legitimate
+    narrowing at either level, exactly as `_save_decisions({}, prev=d0)` is."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    foreign = dict(st, orders={"NIKDY-NECITANE": {"status": "emailed"}})
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, foreign,
+                                  mode=0o600, protect=("orders",), prev=st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
+@pytest.mark.parametrize("gone", [None, ["x"], "gone", 0])
+def test_replacing_the_nested_dedup_map_with_a_NON_map_is_refused(
+        monkeypatch, tmp_path, gone):
+    """The narrowing check compared the guarded nested value only with ITSELF-shaped
+    values: `isinstance(a, dict) and isinstance(b, dict)` / the same for lists. A
+    `prev=` write that swaps the who-was-already-mailed map for something that is
+    NEITHER — `None`, a list, a string, `0` — matched no branch, so `derived` stayed
+    True, the receipt matched, and the 50-entry map was written away (all four shapes
+    measured ALLOWED on HEAD; PR #265 final review).
+
+    Nothing writes this today — the loader refuses `{"orders": null}` on the next read,
+    so it fails closed rather than silently — but the guard is supposed to cover the
+    nested level unconditionally, and it did not."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, dict(st, orders=gone),
+                                  mode=0o600, protect=("orders",), prev=st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
+def test_dropping_the_guarded_key_entirely_is_refused_too(monkeypatch, tmp_path):
+    """The degenerate case of the same hole: the outer key set stays a SUBSET, so the
+    top-level check passes, and `data.get("orders")` is then `None` against a real map."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    without = {k: v for k, v in st.items() if k != "orders"}
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, without,
+                                  mode=0o600, protect=("orders",), prev=st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
+def test_a_rebuilt_list_that_smuggles_in_a_foreign_entry_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
+    v0 = webapp._load_vystavy()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_vystavy([{"id": "smuggled"}], prev=v0)
+    assert len(webapp._load_vystavy()) == 3
+
+
+# --------------------------------------------------------------------------- #
+# The write path itself — durability, perms, and the tmp files it leaves behind
+# (PR #265 second review, the MINOR set)
+# --------------------------------------------------------------------------- #
+def _write_spy(monkeypatch):
+    """Records fsync/replace order, and whether each fsync was of a DIRECTORY."""
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def _fsync(fd):
+        calls.append(("fsync", stat.S_ISDIR(os.fstat(fd).st_mode)))
+        return real_fsync(fd)
+
+    def _replace(a, b):
+        calls.append(("replace", False))
+        return real_replace(a, b)
+
+    monkeypatch.setattr(os, "fsync", _fsync)
+    monkeypatch.setattr(os, "replace", _replace)
+    return calls
+
+
+def test_a_store_is_fsynced_before_the_rename_that_publishes_it(monkeypatch, tmp_path):
+    """Deleting both fsync lines left the whole suite green — the one claimed fix of
+    the previous wave with no regression test. os.replace is atomic against concurrent
+    READERS, not against a crash: the rename can be durable while the bytes are not,
+    which is exactly how a truncated store appears after a power loss."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._save_decisions(_two_decisions())
+    assert ("fsync", False) in calls, "the store was renamed into place without an fsync"
+    assert calls.index(("fsync", False)) < calls.index(("replace", False)), calls
+
+
+def test_the_directory_is_fsynced_after_the_rename(monkeypatch, tmp_path):
+    """Without it the RENAME itself can be lost on power loss and the old bytes
+    reappear — durable content published by a non-durable directory entry."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._save_decisions(_two_decisions())
+    after = calls[calls.index(("replace", False)):]
+    assert ("fsync", True) in after, f"no directory fsync after the rename: {calls}"
+
+
+def test_the_raw_cache_writer_fsyncs_too(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._atomic_write_bytes(str(tmp_path / "orders_cache.csv"), b"kod;nazov\r\n")
+    assert calls.index(("fsync", False)) < calls.index(("replace", False)), calls
+
+
+def test_the_customer_caches_are_written_private(monkeypatch, tmp_path):
+    """`orders_cache.csv` and `customers_cache.csv` hold customer names, e-mails and
+    phones — the same data `posta_uncollected.json` / `orders_reminder.json` keep at
+    0600. mkstemp creates the temp file 0600; the writer used to widen it to 0644 for
+    every cache. Only the app (one systemd --user service, one owner) reads them."""
+    p = tmp_path / "orders_cache.csv"
+    webapp._atomic_write_bytes(str(p), b"x", mode=0o600)
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    q = tmp_path / "products.csv"                      # the export is not PII
+    webapp._atomic_write_bytes(str(q), b"x")
+    assert stat.S_IMODE(os.stat(q).st_mode) == 0o644
+
+
+def test_every_customer_cache_write_asks_for_private_permissions():
+    """Structural, so a NEW writer of these two files cannot quietly go back to 0644."""
+    with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    loose = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_atomic_write_bytes" and node.args):
+            continue
+        target = node.args[0]
+        if not (isinstance(target, ast.Name)
+                and target.id in {"ORDERS_CACHE", "CUSTOMERS_CACHE"}):
+            continue
+        mode = next((k.value for k in node.keywords if k.arg == "mode"), None)
+        if not (isinstance(mode, ast.Constant) and mode.value == 0o600):
+            loose.append(f"{target.id} at line {node.lineno}")
+    assert loose == [], f"customer PII written world-readable: {loose}"
+
+
+def test_an_orphaned_temp_file_is_swept_at_startup(monkeypatch, tmp_path):
+    """`mkstemp` names are random, so a SIGKILL/OOM during the ~55 MB export write
+    leaves one orphan per event and nothing ever removes them (the old pid-derived
+    name was self-limiting at one per process lifetime)."""
+    old = tmp_path / "products.csv.abc123.tmp"
+    old.write_bytes(b"x" * 10)
+    os.utime(old, (time.time() - 36 * 3600, time.time() - 36 * 3600))
+    fresh = tmp_path / "orders_cache.csv.def456.tmp"       # another instance, right now
+    fresh.write_bytes(b"y")
+    keep = tmp_path / "decisions.json"
+    keep.write_text("{}", encoding="utf-8")
+
+    webapp._sweep_stale_tmp(str(tmp_path))
+
+    assert not old.exists(), "the orphaned temp file was never swept"
+    assert fresh.exists(), "a temp file a live write may still be using was deleted"
+    assert keep.exists(), "the sweep deleted a real store"
+
+
+def test_the_startup_sweep_never_unlinks_inside_the_live_data_dir_under_pytest(
+        monkeypatch, tmp_path):
+    """`_sweep_stale_tmp` is the ONLY destructive operation in this codebase that did
+    not consult `_refuse_live_data_under_pytest` — it `os.unlink`s at IMPORT, over OUT
+    and `dirname(SRC)`. Under a pytest run with an un-pinned WEBREVIEW_OUT (the exact
+    configuration that wiped 2831 decisions, and the one this PR exists to make
+    impossible) it deleted live `data/out/*.tmp` and `data/*.tmp`. The blast radius is
+    small today, but the SHAPE is the incident's and it was exempt from the PR's own
+    brace (third review, I4). `_LIVE_OUT` is repointed at a throwaway dir so a
+    REGRESSION here cannot reach the manager's data."""
+    real = tmp_path / "pretend-live-out"
+    real.mkdir()
+    monkeypatch.setattr(webapp, "_LIVE_OUT", str(real))
+    old = real / "products.csv.abc123.tmp"
+    old.write_bytes(b"x" * 10)
+    os.utime(old, (time.time() - 36 * 3600, time.time() - 36 * 3600))
+
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._sweep_stale_tmp(str(real))
+    assert old.exists(), "the sweep deleted inside the live data dir from a test run"
+
+
+def test_the_boot_survives_a_sweep_the_pytest_net_refuses():
+    """…and refusing must not become a NEW way to stop the service from starting: the
+    startup call site catches only OSError, and StoreWipeRefused is not one."""
+    with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    guarded = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        called = {n.func.id for n in ast.walk(node)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if "_sweep_stale_tmp_at_startup" not in called:
+            continue
+        for h in node.handlers:
+            names = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
+            guarded = [n.id for n in names if isinstance(n, ast.Name)]
+    assert guarded, "the startup sweep is not wrapped at all"
+    assert "StoreWipeRefused" in guarded, \
+        f"a refused sweep would abort the import: {guarded}"
+
+
+def test_the_pytest_live_dir_net_resolves_symlinks(monkeypatch, tmp_path):
+    """`os.path.abspath` does not resolve symlinks, so a helper pointing WEBREVIEW_OUT
+    at a link to data/out walked straight past the net. `_LIVE_OUT` is repointed at a
+    throwaway dir here so that a REGRESSION cannot write into the manager's data."""
+    real = tmp_path / "pretend-live-out"
+    real.mkdir()
+    monkeypatch.setattr(webapp, "_LIVE_OUT", str(real))
+    link = tmp_path / "link-to-live"
+    link.symlink_to(real)
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(str(link / "decisions.json"), {"S|1": {"status": "x"}})
+    assert not (real / "decisions.json").exists()
+
+
+def test_the_sweep_never_unlinks_in_the_live_data_dir_ITSELF_under_pytest(
+        monkeypatch, tmp_path):
+    """The pytest net covered `data/out` (and everything under it) and the products.csv
+    FILE — but the startup sweep walks TWO directories, and the second is
+    `dirname(SRC)` = `data/`, which is neither. A helper repointing
+    `WEBREVIEW_PRODUCTS` at the real export therefore let the import-time sweep unlink
+    live `data/*.tmp` — the blast radius the delta's own docstring already named
+    (PR #265 final review). `_LIVE_PRODUCTS` is repointed at a throwaway path so a
+    REGRESSION here cannot reach the manager's data."""
+    real = tmp_path / "pretend-live-data"
+    real.mkdir()
+    monkeypatch.setattr(webapp, "_LIVE_PRODUCTS", str(real / "products.csv"))
+    old = real / "products.csv.abc123.tmp"
+    old.write_bytes(b"x" * 10)
+    os.utime(old, (time.time() - 36 * 3600, time.time() - 36 * 3600))
+
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._sweep_stale_tmp(str(real))
+    assert old.exists(), "the sweep deleted inside the live data dir from a test run"
+
+
+def test_a_failing_directory_close_never_reports_a_finished_write_as_failed(
+        monkeypatch, tmp_path):
+    """`_fsync_dir` is documented BEST EFFORT and swallows `os.open`/`os.fsync` errors —
+    but not the `os.close` in its `finally`. It ran INSIDE `_atomic_write_bytes`'s
+    `except BaseException: unlink(tmp); raise`, where the temp file is already gone
+    after the replace: an error there logged a spurious „temp file could not be removed"
+    and re-raised, so the caller believed a 55 MB export that is durably on disk had
+    failed (PR #265 final review)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    real_close = os.close
+
+    def _close(fd):
+        isdir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        real_close(fd)                     # never leak the fd we are pretending broke
+        if isdir:
+            raise OSError(5, "EIO on close")
+
+    monkeypatch.setattr(os, "close", _close)
+    p = tmp_path / "orders_cache.csv"
+    webapp._atomic_write_bytes(str(p), b"kod;nazov\r\n")
+    assert p.read_bytes() == b"kod;nazov\r\n"
+
+
+def test_a_failing_directory_close_does_not_fail_a_store_write_either(
+        monkeypatch, tmp_path):
+    """Same `_fsync_dir`, same `except BaseException` shape, one writer further: a store
+    the manager just saved must not answer 503 because a directory handle refused to
+    close."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    real_close = os.close
+
+    def _close(fd):
+        isdir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        real_close(fd)
+        if isdir:
+            raise OSError(5, "EIO on close")
+
+    monkeypatch.setattr(os, "close", _close)
+    webapp._save_decisions(_two_decisions())
+    assert len(webapp._load_decisions()) == 2
+
+
+def test_the_raw_cache_writer_fsyncs_the_directory_too(monkeypatch, tmp_path):
+    """The directory fsync landed in the JSON writer only — the 55 MB export and the
+    two customer caches got the durable BYTES and a rename that a power loss can still
+    lose (PR #265 third review)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._atomic_write_bytes(str(tmp_path / "orders_cache.csv"), b"kod;nazov\r\n")
+    after = calls[calls.index(("replace", False)):]
+    assert ("fsync", True) in after, f"no directory fsync after the rename: {calls}"

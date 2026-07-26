@@ -725,3 +725,11 @@ body[data-theme=dark] .vy-pdf{color:#fcd34d;background:#3a2e12}
 .vy-feed-ts{color:var(--soft);font-size:12px;white-space:nowrap;flex:0 0 auto}
 .vy-feed-tx{color:var(--text)}
 @media(max-width:820px){#tab-vystavy{padding-left:16px;padding-right:16px}.vy-form{grid-template-columns:1fr}}
+
+/* Plánovač nebeží (review PR #265) — banner nad obsahom automatizačných tabov. */
+.schedwarn {
+  margin: 10px 16px 0; padding: 10px 14px; border-radius: 8px;
+  border: 1px solid #e0a800; background: #fff8e1; color: #6b4e00;
+  font-size: 13px; line-height: 1.45;
+}
+[data-theme="dark"] .schedwarn { background: #3a2f10; border-color: #8a6d1a; color: #f2dfa8; }

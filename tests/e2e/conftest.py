@@ -33,8 +33,14 @@ E2E_ADMIN_PW = "e2e-tajne-heslo-123"
 # Secure session cookie would never round-trip → the login POST loses its CSRF session
 # → 400 (only bites a dev box that HAS a real data/.auth_env with AUTH_COOKIE_SECURE=1;
 # CI has no data/ so it was already off there). Pinning it keeps local E2E deterministic.
+# WEBREVIEW_NO_SCHEDULER pinned on: every fixture below launches a REAL
+# `python webreview/app.py`, which would otherwise start a real automation scheduler
+# over its fixture data dir. They are inert today only because no fixture happens to
+# seed `enabled: true` — one seeded automation and a CI run would scrape a paid API or
+# mail a customer. Same category as the forgotten preview instance (#262).
 _AUTH_ENV = {"ADMIN_EMAIL": E2E_ADMIN, "ADMIN_PW": E2E_ADMIN_PW,
-             "SECRET_KEY": "e2e-secret-key", "AUTH_COOKIE_SECURE": "0"}
+             "SECRET_KEY": "e2e-secret-key", "AUTH_COOKIE_SECURE": "0",
+             "WEBREVIEW_NO_SCHEDULER": "1"}
 
 _COOKIE_CACHE = {}
 

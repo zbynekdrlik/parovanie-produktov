@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from parovanie.automation_runner import (
-    Automation, AutomationRunner, next_run_at, schedule_label)
+    Automation, AutomationRunner, AutomationStateCorrupt, next_run_at, schedule_label)
 
 TZ = ZoneInfo("Europe/Bratislava")
 SCHED = {"daily_at": "09:00", "tz": "Europe/Bratislava"}
@@ -193,14 +193,24 @@ def test_run_now_unknown_key_raises(tmp_path):
         _runner(tmp_path).run_now("neexistuje")
 
 
-# ── corrupt state tolerance ───────────────────────────────────────────────────
-def test_corrupt_state_file_tolerated(tmp_path):
+# ── corrupt state fails CLOSED ────────────────────────────────────────────────
+def test_corrupt_state_file_fails_closed_instead_of_being_rewritten(tmp_path):
+    """REPLACES `test_corrupt_state_file_tolerated`, which asserted the defect itself:
+    „a corrupt state reads as no automations, and the next click rewrites it". That is
+    „unreadable means empty" on the file that decides which automations are ENABLED —
+    a truncated state silently switched off every reminder mail, pošta escalation and
+    hourly sync, and the recovery it praised OVERWROTE the only evidence of what had
+    been enabled. Fail closed instead: raise, keep the file, keep a copy (PR #265
+    second review, C4)."""
     p = tmp_path / "automations.json"
     p.write_text("{not json", encoding="utf-8")
     r = _runner(tmp_path)
-    assert r.status()[0]["enabled"] is False
-    r.set_enabled("demo", True)          # recovers by rewriting the store
-    assert r.status()[0]["enabled"] is True
+    with pytest.raises(AutomationStateCorrupt):
+        r.status()
+    with pytest.raises(AutomationStateCorrupt):
+        r.set_enabled("demo", True)
+    assert p.read_text(encoding="utf-8") == "{not json", "the corrupt state was rewritten"
+    assert list(tmp_path.glob("automations.json.corrupt-*")), "no copy kept for repair"
 
 
 def test_enabled_without_next_run_gets_rescheduled_not_run(tmp_path):
@@ -210,3 +220,63 @@ def test_enabled_without_next_run_gets_rescheduled_not_run(tmp_path):
     r.tick_once()
     assert ran == []                          # no surprise run
     assert r.status()[0]["next_run"] != ""    # scheduled forward instead
+
+
+# ── durability: the state file decides what is ENABLED, so it must survive a crash ──
+def _write_spy(monkeypatch):
+    """Records fsync/replace order, and whether each fsync was of a DIRECTORY."""
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def _fsync(fd):
+        calls.append(("fsync", stat.S_ISDIR(os.fstat(fd).st_mode)))
+        return real_fsync(fd)
+
+    def _replace(a, b):
+        calls.append(("replace", False))
+        return real_replace(a, b)
+
+    monkeypatch.setattr(os, "fsync", _fsync)
+    monkeypatch.setattr(os, "replace", _replace)
+    return calls
+
+
+def test_the_state_write_fsyncs_the_directory_after_the_rename(tmp_path, monkeypatch):
+    """The directory fsync landed in app.py's JSON writer only — and `automations.json`
+    is written by THIS module, which the app deliberately does not import from. Without
+    it a power loss can lose the RENAME while the bytes are durable, bringing the old
+    state back; and a truncated `automations.json` is precisely the corruption the
+    fail-closed loader now refuses to read (PR #265 third review)."""
+    calls = _write_spy(monkeypatch)
+    _runner(tmp_path)._save({"demo": {"enabled": True}})
+    assert ("fsync", False) in calls, "the state was renamed into place without an fsync"
+    assert calls.index(("fsync", False)) < calls.index(("replace", False)), calls
+    after = calls[calls.index(("replace", False)):]
+    assert ("fsync", True) in after, f"no directory fsync after the rename: {calls}"
+
+
+def test_two_different_corruptions_in_the_same_second_both_survive(tmp_path, monkeypatch):
+    """The quarantine name had SECOND resolution, so a second corruption inside the
+    same second overwrote the first copy — losing the very bytes the fail-closed loader
+    preserved for repair. The dedup memo does not save it: different contents are
+    different digests, so both genuinely want their own file (PR #265 third review)."""
+    import parovanie.automation_runner as ar
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 7, 26, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(ar, "datetime", _Frozen)
+    monkeypatch.setattr(ar, "_quarantined", {})
+    p = tmp_path / "automations.json"
+    r = AutomationRunner(str(p), [])
+    for raw in (b'{"a": ', b'{"b": '):
+        p.write_bytes(raw)
+        with pytest.raises(AutomationStateCorrupt):
+            r._load()
+
+    backups = [n for n in os.listdir(tmp_path) if ".corrupt-" in n]
+    assert len(backups) == 2, f"a second corruption overwrote the first copy: {backups}"
+    kept = {(tmp_path / n).read_bytes() for n in backups}
+    assert kept == {b'{"a": ', b'{"b": '}, kept
