@@ -6191,7 +6191,9 @@ AUTOMATIONS_REG = [
                schedule={"daily_at": "09:30", "tz": "Europe/Bratislava"},
                run_fn=run_vystavy_odpoved_prihlaska),
 ]
-RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
+# lock=_lock: the automation state file is a store like any other — it must be
+# serialised across processes too (#264), not just across threads.
+RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG, lock=_lock)
 
 # #262 — ONE scheduler per data dir. A throwaway instance booted on another port for
 # a screenshot (see the playbook recipe) was never killed and ran four days beside the

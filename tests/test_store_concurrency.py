@@ -83,6 +83,12 @@ def test_the_store_lock_is_reentrant_for_one_thread(tmp_path, monkeypatch):
             webapp._lock.release()
 
 
+def test_the_automation_state_shares_the_cross_process_store_lock():
+    """automations.json is written by the scheduler thread AND by a Štart/Stop click
+    in any instance sharing the data dir — its own threading.Lock protected neither."""
+    assert webapp.RUNNER._lock is webapp._lock
+
+
 _WORKER = textwrap.dedent("""
     import os, sys, time
     sys.path.insert(0, os.path.join(sys.argv[1], "webreview"))

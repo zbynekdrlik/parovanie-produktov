@@ -77,11 +77,18 @@ class AutomationRunner:
     last_result, next_run}}. enabled persists across restarts; next_run is
     recomputed forward on enable and after every run."""
 
-    def __init__(self, state_path: str, automations: list[Automation], tick: float = 30.0):
+    def __init__(self, state_path: str, automations: list[Automation], tick: float = 30.0,
+                 lock=None):
         self.state_path = state_path
         self.automations = {a.key: a for a in automations}
         self.tick = tick
-        self._lock = threading.Lock()      # guards state-file read-modify-write
+        # Guards the state-file read-modify-write. The app injects ITS store lock so
+        # automations.json is serialised across PROCESSES too (#264) — a plain
+        # threading.Lock only ever protected threads, and the state file is written
+        # by the scheduler thread AND by a Štart/Stop click in any instance sharing
+        # the data dir. Never held around a run (`a.run_fn()` is outside it), so the
+        # shared lock can never freeze the web UI for the length of an automation.
+        self._lock = lock if lock is not None else threading.Lock()
         self._running: dict[str, bool] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._stop = threading.Event()
@@ -97,7 +104,7 @@ class AutomationRunner:
             return {}
 
     def _save(self, st: dict) -> None:
-        tmp = self.state_path + ".tmp"
+        tmp = "%s.%d.tmp" % (os.fspath(self.state_path), os.getpid())
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False, indent=2)
         os.chmod(tmp, 0o600)
