@@ -36,6 +36,23 @@ class AutomationStateCorrupt(RuntimeError):
     the unreadable bytes kept for repair."""
 
 
+def _fsync_dir(d: str) -> None:
+    """Make a rename durable. Best effort — some filesystems refuse a directory fsync,
+    and losing THIS is far less bad than failing a state write (mirrors app.py's
+    `_fsync_dir`; kept local because this module stays Flask-free by design)."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError as e:  # noqa: BLE001 — durability hint only, the data is already written
+        log.warning("automations: adresár %s sa nedá otvoriť na fsync (%r)", d, e)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as e:  # noqa: BLE001 — see above
+        log.warning("automations: fsync adresára %s zlyhal (%r)", d, e)
+    finally:
+        os.close(fd)
+
+
 _quarantine_lock = threading.Lock()
 _quarantined: dict = {}                  # path -> (sha256 of the corrupt bytes, backup path)
 
@@ -183,6 +200,12 @@ class AutomationRunner:
             os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.state_path)
+        # …and the RENAME must be durable too, or a power loss brings the old state
+        # back — durable bytes published by a losable directory entry. app.py's JSON
+        # writer got this; this module is deliberately not importing from it, so it got
+        # nothing for free — the same blind spot as the fail-closed loader (PR #265
+        # third review).
+        _fsync_dir(os.path.dirname(os.fspath(self.state_path)) or ".")
 
     # -- controls ----------------------------------------------------------- #
     def set_enabled(self, key: str, enabled: bool) -> None:

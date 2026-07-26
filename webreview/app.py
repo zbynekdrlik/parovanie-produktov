@@ -717,6 +717,11 @@ def _atomic_write_bytes(path, data: bytes, *, mode: int = 0o644) -> None:
         # this one systemd --user service ever reads them (PR #265 second review).
         os.chmod(tmp, mode)               # exact perms regardless of the process umask
         os.replace(tmp, p)
+        # …and the rename itself must be durable, exactly as in the JSON writer: the
+        # directory fsync was added there only, leaving the 55 MB export and the two
+        # customer caches with durable bytes published by a losable directory entry
+        # (PR #265 third review).
+        _fsync_dir(os.path.dirname(p) or ".")
     except BaseException:
         try:
             os.unlink(tmp)
