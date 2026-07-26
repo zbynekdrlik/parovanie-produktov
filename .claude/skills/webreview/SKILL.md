@@ -186,7 +186,14 @@ Manažér si priamo na webe značí stav. Tieto súbory držia jeho ŽIVÚ prác
 
 Vstupy endpointov, čo píšu do CSV (kód/dodávateľ), MUSIA odmietnuť formula-injection: kód aj meno dodávateľa začínajúce `= + - @ \t \r` → 400; URL `^https?://`. **CSV sink prefixuje `'` cez `_csv_safe` — aj manuálny `/api/import` zip AJ nočný `upload-*` sink** (nočný píše naživo do eshopu, takže NESMIE byť slabšie chránený než zip).
 
-**Každý endpoint, čo ukladá URL, potrebuje EŠTE TRI veci (revízia PR #255):** (1) **dĺžkový strop `URL_MAX` (2000)** — 300 000-znaková URL sa prijala a nafúkla `decisions.json` na 300 kB, pričom ten store sa re-číta pri KAŽDOM `/api/orders` a hodnota končí v Shoptet `internalNote` bunke; zdieľajú ho `/api/decision`, `/api/order-pair` aj `/api/order-decision-url`. (2) **`_log_safe()` pred zápisom do logu** — `^https?://` regex prepustí `https://x.test/a\r\nSet-Cookie: x`, takže surové `log.info(... url=%s)` vyrobí vlastný falošný log riadok (log-line forging). (3) **hlášky po SLOVENSKY** — `postToOrder` vypisuje `j.error` doslova do manažérovho alertu, takže „unknown review key" (dosiahnuteľné: zastaraný tab po resynci, ktorý produkt vypustil) mu prišlo v angličtine.
+**Každý endpoint, čo ukladá URL, potrebuje EŠTE TRI veci (revízia PR #255):** (1) **dĺžkový strop `URL_MAX` (2000)** — 300 000-znaková URL sa prijala a nafúkla `decisions.json` na 300 kB, pričom ten store sa re-číta pri KAŽDOM `/api/orders` a hodnota končí v Shoptet `internalNote` bunke; majú ho **VŠETKY** endpointy, čo URL ukladajú — `/api/decision`, `/api/order-pair`, `/api/order-decision-url`, `/api/variant-link` a `/api/search-pair`. (2) **`_log_safe()` pred zápisom do logu** — `^https?://` regex prepustí `https://x.test/a\r\nSet-Cookie: x`, takže surové `log.info(... url=%s)` vyrobí vlastný falošný log riadok (log-line forging); sanitizuj AJ **kľúč/kód** (`/api/decision` loguje manažérov `key` rovnako surovo). (3) **hlášky po SLOVENSKY** — `postToOrder` vypisuje `j.error` doslova do manažérovho alertu, takže „unknown review key" (dosiahnuteľné: zastaraný tab po resynci, ktorý produkt vypustil) mu prišlo v angličtine.
+**A pri dopisovaní takej ochrany si VYGREPUJ VŠETKY endpointy toho tvaru naraz** (revízia
+PR #255, druhá vlna): prvá vlna strop aj sanitizér doplnila na tri endpointy a `/api/
+variant-link` + `/api/search-pair` nechala tak — pritom `variant_links` práve TOTO PR
+zohrialo (`build_to_order_rows(..., _load_variant_links())` ho re-číta pri každom
+`/api/orders`), takže 300 000-znaková URL nafúkla `variant_links.json` na 300 029 bajtov.
+Pravidlo je „každý endpoint, čo URL ukladá", nie „ten, ktorý sme práve opravovali" —
+a test drž ako SLUČKU cez zoznam endpointov, aby ďalší pribudol jedným riadkom.
 
 **XSS — escapuj voľný text v KAŽDOM render-sinku, nie len v jednom.** `el(tag,cls,html)` používa `innerHTML`. Meno dodávateľa (voľný text manažéra) ide do 3 miest: 🏷️ menovka, **filter-button label** AJ **hlavička skupiny** — všetky 3 cez `escapeHtml(...)`. Escapnúť len menovku a zabudnúť na label/hlavičku = stored-XSS (našla to adversariálna revízia).
 
@@ -951,6 +958,16 @@ viď classic-Project gotcha nižšie; `requests.patch`, nie post).
   kľúč), takže každý ĎALŠÍ endpoint, čo podľa čísla ZAPISUJE (`/edit`, a rovnako každý
   budúci), ich musí odmietnuť tiež — inak si ktorýkoľvek prihlásený užívateľ prepíše
   názov a telo PR-ka len tým, že napíše jeho číslo. Odpoveď „toto číslo nepatrí úlohe".
+  **Ochranu daj do ZDIEĽANÉHO `_gh_issue_or_refuse(token, repo, number)`, nie do jedného
+  endpointu (revízia PR #255, druhá vlna).** Prvá vlna ju dala LEN do `/edit`, takže
+  `/note` (komentár) a `/priority` (labely) ďalej písali do ľubovoľného PR-ka a
+  `_do_issue_detail` jeho telo aj komentáre VRACAL — pravidlo bolo v playbooku napísané
+  pre „každý endpoint", ale v kóde platilo pre jeden. Helper vracia `(issue, refusal)`,
+  volajúci si necháva vlastný `try/except` (sieťová chyba je jeho degradácia), takže
+  ďalší by-number endpoint ochranu ZDEDÍ namiesto toho, aby ju znova vymýšľal.
+  **Test-pasca:** stub, ktorý `raise`-ne, tu prejde AJ s dierou — endpointy chytajú
+  všetko do `except` a vrátia „GitHub nedostupný", čo je tiež ne-ASCII; použi
+  ZAZNAMENÁVAJÚCI stub a asertuj `calls == []` + presné znenie odmietnutia.
 - **Potvrdenie ukáž PRED refreshom zoznamu a tlačidlo NEODOMYKAJ (revízia PR #255).**
   `_ideaSubmit` odomkol `#ideaSubmit` a AŽ POTOM `await loadDevIssues()` — v tom okne
   (namerané 6 s pri pomalom `/api/dev/issues`) druhý klik poslal DRUHÝ POST a vytvoril
@@ -958,6 +975,17 @@ viď classic-Project gotcha nižšie; `requests.patch`, nie post).
   flaky (2 z 3 plných behov padli). Poradie je `_ideaDone(number)` → `await
   loadDevIssues()`; tlačidlo sa odomyká JEDINE v `_ideaOpen`. Pravidlo pre každý ďalší
   „odošli a obnov zoznam" dialóg: potvrď hneď, obnovuj potom, odomkni pri otvorení.
+- **Zámok drž na PRÍZNAKU VNÚTRI funkcie, NIKDY na `btn.disabled` (revízia PR #255,
+  druhá vlna).** `_ideaSubmit` `disabled` iba NASTAVOVAL, nikdy nečítal — a keydown-Enter
+  na poli s názvom volá `_ideaSubmit()` PRIAMO, takže `disabled` zastavil druhý KLIK a nič
+  viac: Enter, Enter → dva POSTy → **dve GitHub úlohy**. Enter na jednoriadkovom názve je
+  šéfova hlavná cesta odoslania, takže to bola tá živá. Vzor: `let _ideaBusy = false;` +
+  `if (_ideaBusy) return;` ako PRVÝ riadok funkcie, cez ktorú idú VŠETKY vstupné body;
+  nuluje sa len na chybovej ceste (retry je v poriadku) a v `_ideaOpen`. Pri KAŽDOM
+  ďalšom „nesmie sa odoslať dvakrát" si vymenuj vstupné body (klik, Enter, Ctrl+Enter,
+  submit formulára) a over, že zámok vidia VŠETKY — DOM vlastnosť tlačidla vidí jeden.
+  **A test pomenuj podľa toho, čo naozaj pinuje**: `..._one_click_...` hnal len
+  `ideaSubmit.click()`, takže ostal zelený celý čas, čo bol Enter rozbitý.
 - **E2E na dvojité odoslanie drž PODRŽANÍM route** (`page.route(..., lambda r:
   held.append(r))` a `r.continue_()` až na konci) — stub odpovie príliš rýchlo na to,
   aby sa to okno vôbec otvorilo. Druhý klik posielaj cez `page.evaluate(... .click())`,
@@ -1089,7 +1117,17 @@ endpoint: kľúč zo snapshotu je len ADRESA, stav sa vždy re-číta pod zámko
 **`import_builder.link_row_specs` je JEDNA slučka za `link_rows` aj za mapu vlastníkov.**
 Pravidlo „každý kód raz, prvé párovanie vyhráva" rozhoduje AJ o tom, ktorý kód komu patrí,
 takže druhá kópia tej dedup logiky by sa časom rozišla s tým, čo sa naozaj zapisuje. Nový
-konzument „ktoré rozhodnutie vlastní tento kód" konzumuje `link_row_specs` PRIAMO
+**A filter, ktorý z toho vyplýva, patrí DO tej slučky — nie do jedného čitateľa (revízia
+PR #255, druhá vlna).** Špecifikácia musí POMENOVAŤ vlastníka, takže produkt bez
+použiteľného kľúča nesmie vydať nič — lenže prvá vlna filtrovala `if s[3]` len v mape
+vlastníkov (`code2owner`), nie v `code2url` ani v `link_rows`. Riadok tak ďalej ukazoval
+odkaz rozhodnutia AJ ✏️, ale s prázdnym `reviewKey` → `savePairUrl` poslal opravu do
+`order_pairings`, ktoré `_do_upload_pairings` vylúči (`owned_codes` ide z `link_rows` a
+na kľúč nefiltruje). Prijaté a nikdy neodoslané — presne ten tichý no-op, kvôli ktorému
+#242 vzniklo. Guard preto sedí v `link_row_specs` (`if not key: continue`), kde ho
+vyzdvihnú VŠETCI TRAJA čitatelia naraz. Test to pinuje aj cez `link_rows(...) == []`,
+takže „downstream-only" oprava (filter iba v `code2url`) ho neprejde — over MUTANTOM.
+Konzument „ktoré rozhodnutie vlastní tento kód" konzumuje `link_row_specs` PRIAMO
 (`build_to_order_rows` to tak robí — jeden prechod dá aj URL aj vlastníka). Obálka
 `link_owners` existovala, ale ju **nevolal žiadny produkčný kód** — len anti-drift test,
 takže test strážil mŕtvy kód; zmazaná, test prepísaný na `link_row_specs`. Keď píšeš
@@ -1107,6 +1145,20 @@ prekreslení by sa produktovo-široké pole vrátilo zadnými dvierkami) a to ot
 panel v revízii (`openSplitSizes`: `splitOpen.add`, `FILTER='good'`, `switchTab('review')`,
 scroll na `.card[data-key]`). Produktovo-široký save tam nemá zmysel: endpoint ho odmietne
 409, inline cesta ho skazí.
+
+**Tlačidlo V RIADKU, ktoré ODNAVIGUJE, je tichá strata práce — a nesmie prepísať uloženú
+predvoľbu (revízia PR #255, druhá vlna).** ✂️ sedí hneď vedľa ✏️, ktoré edituje NA MIESTE,
+takže sa ako navigácia vôbec nečíta — a odchod z tabu postaví `#list` nanovo, čiže zahodí
+KAŽDÝ otvorený inline editor aj s rozpísaným textom na VŠETKÝCH ostatných riadkoch, bez
+hlášky (trieda strát, ktorú #205/#233 odstraňujú). Pred odchodom preto spočítaj prácu TÝM
+ISTÝM predikátom, aký používa prekresľovacia mašinéria — `captureOpenEditors().filter(s =>
+editorSnapHasWork(s, ORDERS.find(x => x.key === s.key)))` — a pri nenulovom počte sa spýtaj
+`confirm()`-om („zrušiť" = ostávame, nič sa nezmení). Bez toho filtra varuje aj tam, kde
+nie je čo stratiť (prázdne default paste-boxy sa počítajú) — over MUTANTOM v oboch smeroch.
+A `FILTER = 'good'` nastav LEN v pamäti: `localStorage.setItem('filter', …)` z toho robí
+trvalú zmenu manažérovej revíznej predvoľby ako vedľajší účinok jedného kliku (číta sa iba
+v `init()`, takže na zobrazenie karty stačí premenná). Platí pre každé ďalšie tlačidlo,
+ktoré z riadku odvedie inam.
 
 `order_pairings` kód pokrytý reviewed decisiou v TOM ISTOM behu sa **vynechá** (Shoptet
 padá na duplicitný `code` v jednom importe — decision vyhráva). Dedup nočného stavu pre
