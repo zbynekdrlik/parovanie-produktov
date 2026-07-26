@@ -274,6 +274,14 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   cez `**_AUTH_ENV` — tam žije aj `WEBREVIEW_NO_SCHEDULER=1` (bez neho každý z 13 fixture
   serverov štartoval OSTRÝ plánovač; neškodilo to len preto, že žiadna fixtúra neseeduje
   `enabled: true`).
+  - **To isté platí aj pre BACKEND test: nikdy neštartuj produkčný `RUNNER`.** Má
+    zaregistrované reálne mailujúce automatizácie a v pytest procese bol bezpečný len
+    náhodou (`tick=30.0` prežil test, fixture dir nemal `automations.json`). Použi stub
+    `AutomationRunner` s neškodným `run_fn` (tretia revízia PR #265).
+  - **Každý nový test si over, či je ZÁVISLÝ NA OPRAVE** — spusti ho proti kódu PRED
+    opravou (`git stash push <súbor>`). Test „cudzie vlákno zapíše `{}`" prechádzal
+    rovnako pred aj po zavedení per-thread potvrdenky, takže o nej nedokazoval nič;
+    až zápis mapy ODVODENEJ z čítania druhého vlákna (`prev=`) sa o ňu naozaj oprie.
 - **Nový `protect=True` store pridaj aj do `scripts/backup_data.sh`** — zoznam stráži
   `test_the_backup_script_covers_every_irreplaceable_store`.
 - **Story MIMO `app.py` nedostanú tieto pravidlá zadarmo — `automations.json` ich nemal
