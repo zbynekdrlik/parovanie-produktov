@@ -143,6 +143,21 @@ body.edit-labels .navedit{display:block}
 body.toorder-wide .filters button.todo{background:#6CAB68;border-color:#6CAB68;color:#173617}
 body.toorder-wide .filters button.done{background:#D14D3B;border-color:#D14D3B;color:#fff}
 body.toorder-wide .filters button.active{background:#DDA43C;border-color:#DDA43C;color:#3b1d00;font-weight:700}
+/* „Na objednanie" toolbar (#208 súhrn, #205 prepínač) — vlastný riadok pod čipmi,
+   mimo #list, takže ho neprekresľuje repaint zoznamu. */
+.to-toolbar{grid-column:1 / -1;display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:6px}
+.to-toolbar .to-sum{font-size:13px;font-weight:600;color:var(--muted)}
+/* „všetko vybavené“ = odvodená tmavšia zelená (var(--accent)); #6CAB68 mal na svetlom
+   topbare kontrast 2.56:1, AA žiada 4.5:1 — a je to riadok, ktorý šéf číta najradšej.
+   V dark theme sa prepne sám. Paleta čipov (#143) sa NEMENÍ — meria ju
+   tests/e2e/test_order_chips.py. */
+.to-toolbar .to-sum.alldone{color:var(--accent)}
+.to-toolbar .to-hidehandled{margin-left:auto;background:var(--panel);color:var(--muted);
+  border:1px solid var(--border);border-radius:20px;padding:5px 12px;font-size:12.5px;
+  font-weight:600;cursor:pointer;white-space:nowrap}
+.to-toolbar .to-hidehandled:hover{border-color:var(--soft)}
+.to-toolbar .to-hidehandled.on{background:var(--accent-soft);color:var(--accent);
+  border-color:var(--accent)}
 .downloads{display:flex;gap:8px}
 .downloads a{background:var(--accent-hov);color:#fff;text-decoration:none;font-size:13.5px;
   font-weight:600;padding:9px 15px;border-radius:9px}
@@ -238,6 +253,14 @@ body[data-theme=dark] .reason{color:#fcd34d;background:#241c07;border-color:#3f3
 .toorder-supplier .tosup-bulk{margin-left:auto;flex:0 0 auto;background:var(--accent-hov);color:#fff;
   border:0;border-radius:7px;padding:5px 11px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
 .toorder-supplier .tosup-bulk:hover{filter:brightness(1.08)}
+/* #207 — kopírovanie celej objednávky dodávateľa do schránky (mimo bulk tlačidla,
+   ktoré si drží margin-left:auto → toto sa zaradí hneď zaň) */
+.toorder-supplier .tosup-copy{flex:0 0 auto;background:var(--panel);color:var(--muted);
+  border:1px solid var(--border);border-radius:7px;padding:5px 11px;font-size:12px;
+  font-weight:600;cursor:pointer;white-space:nowrap}
+.toorder-supplier .tosup-copy:hover{border-color:var(--soft);color:var(--text)}
+.toorder-supplier .tosup-copy.ok{background:var(--accent-soft);color:var(--accent);
+  border-color:var(--accent)}
 .toorder-row{display:flex;gap:12px;align-items:center;padding:10px 12px;background:var(--panel);
   border:1px solid var(--border);border-radius:10px;margin-bottom:8px;box-shadow:var(--shadow)}
 .toorder-row.done{opacity:.55;background:var(--row-done)}
@@ -279,6 +302,10 @@ body[data-theme=dark] .toorder-row .to-link{color:#60a5fa}
 .toorder-row .to-size{font-weight:600;font-size:13px;min-width:90px}
 .toorder-row .to-qty{font-weight:700;color:#065f46;font-size:13px;min-width:52px}
 body[data-theme=dark] .toorder-row .to-qty{color:#4ade80}
+/* #206 — súčet ks za rovnaký produkt naprieč objednávkami toho istého dodávateľa */
+.toorder-row .to-total{background:#ede9fe;color:#4c1d95;font-size:12px;font-weight:700;
+  border-radius:6px;padding:3px 8px;flex:0 0 auto;white-space:nowrap;cursor:help}
+body[data-theme=dark] .toorder-row .to-total{background:#3b2a63;color:#ddd6fe}
 .toorder-row .to-name{color:var(--muted);font-size:13px;flex:1;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .toorder-row .to-date{color:var(--soft);font-size:12px;flex:0 0 auto;white-space:nowrap}
