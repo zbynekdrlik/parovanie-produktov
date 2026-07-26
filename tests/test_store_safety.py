@@ -103,13 +103,52 @@ def test_an_empty_map_never_overwrites_a_populated_decisions_store(monkeypatch, 
     assert webapp._load_decisions() == _two_decisions()   # untouched
 
 
-def test_deleting_the_very_last_entry_is_still_allowed(monkeypatch, tmp_path):
-    """The manager CAN legitimately undo his only remaining decision (1 → 0). Only a
-    populated store (≥2) collapsing to empty in one write is a bug, never a click."""
+def test_undoing_the_very_last_decision_is_still_allowed(monkeypatch, tmp_path):
+    """The manager CAN legitimately undo his only remaining decision (1 → 0). The
+    real flow reads the store, drops the key and saves — that read is what tells the
+    guard the empty map really is the manager's work and not a fixture."""
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
-    webapp._save_decisions({})
+    d = webapp._load_decisions()
+    d.pop("S|1")
+    webapp._save_decisions(d)
     assert webapp._load_decisions() == {}
+
+
+def test_clearing_a_whole_group_in_one_write_is_still_allowed(monkeypatch, tmp_path):
+    """`/api/ordered/bulk` un-marks a whole supplier group at once, so a populated
+    store legitimately empties in ONE write — a plain „empty over non-empty" rule
+    would break the manager's bulk button (it did, in the first cut of this fix)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_ordered({"O1|A": True, "O1|B": True, "O1|C": True})
+    d = webapp._load_ordered()
+    for k in list(d):
+        d.pop(k)
+    webapp._save_ordered(d)
+    assert webapp._load_ordered() == {}
+
+
+def test_a_wipe_is_refused_even_when_the_store_holds_a_single_entry(monkeypatch, tmp_path):
+    """No count threshold: what makes an empty write legitimate is having READ the
+    store, not how big it is."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+
+
+def test_a_wipe_is_refused_when_someone_else_wrote_after_our_read(monkeypatch, tmp_path):
+    """Read 2, another process appends a third, then we save empty: our empty map is
+    not what the manager just did to THAT store — it would silently lose the third
+    entry (the #264 lost-update shape)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._load_decisions()
+    grown = dict(_two_decisions(), **{"S|3": {"status": "good", "url": "https://x.test/c"}})
+    (tmp_path / "decisions.json").write_text(json.dumps(grown), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+    assert len(webapp._load_decisions()) == 3
 
 
 @pytest.mark.parametrize("save_fn,load_fn", [

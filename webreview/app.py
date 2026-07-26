@@ -48,9 +48,74 @@ from parovanie.shoptet_import import parse_import_log
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data dir is env-overridable so tests/E2E can boot the app against a fixture.
 OUT = os.environ.get("WEBREVIEW_OUT") or os.path.join(ROOT, "data", "out")
-DATA = os.path.join(OUT, "review_data.json")
-DECISIONS = os.path.join(OUT, "decisions.json")
-IMGCACHE = os.path.join(OUT, "imgcache")
+
+
+class _StorePath(os.PathLike):
+    """A file inside OUT whose path is resolved on EVERY use — never frozen.
+
+    #261: these used to be plain `os.path.join(OUT, "x.json")` constants, computed
+    once at IMPORT time. Repointing `OUT` (a test helper, a fixture server) therefore
+    redirected NOTHING, and on 2026-07-26 a helper that patched `OUT` but not the
+    frozen `DECISIONS` wrote a fixture over the manager's live decisions.json —
+    all 2831 review decisions gone. Deriving from the CURRENT `OUT` at call time
+    makes `OUT` the single knob it always looked like.
+
+    It stays usable exactly like the string it replaced: `open()`, `os.path.*` and
+    `os.replace()` take the PathLike directly, and `__add__`/`__str__` keep the
+    `path + ".tmp"` / `"%s" % path` idioms working, so no call site (here or in
+    `automation_runner`) has to know the path is lazy. Patching a single store with
+    a plain `str` (what most tests do) keeps working too."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __fspath__(self) -> str:
+        return os.path.join(OUT, self._name)
+
+    def __str__(self) -> str:
+        return self.__fspath__()
+
+    def __repr__(self) -> str:
+        return f"<store {self._name} → {self.__fspath__()}>"
+
+    def __add__(self, other: str) -> str:
+        return self.__fspath__() + other
+
+    def __radd__(self, other: str) -> str:
+        return other + self.__fspath__()
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, (str, os.PathLike)):
+            return self.__fspath__() == os.fspath(other)
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.__fspath__())
+
+
+def _store(name: str) -> _StorePath:
+    """Declare a store file under OUT. ALWAYS use this for a new store — a plain
+    `os.path.join(OUT, ...)` constant re-introduces the #261 freeze (and
+    `test_no_store_path_is_frozen_at_import` will fail on it)."""
+    return _StorePath(name)
+
+
+class StoreWipeRefused(RuntimeError):
+    """A write that would replace a populated store with an empty one — refused.
+
+    The manager's stores only ever lose entries ONE at a time (an undo, a toggle
+    off), so a populated store collapsing to empty in a SINGLE write is never a
+    click — it is a bug (a fixture map, a store loaded as `{}` after a failed read)
+    about to erase months of work. Refuse loudly instead: raising is visible in the
+    log, in the HTTP response and in a test run; a silent `{}` is not. Emptying the
+    LAST remaining entry stays allowed — that one really is a click."""
+
+
+DATA = _store("review_data.json")
+DECISIONS = _store("decisions.json")
+IMGCACHE = _store("imgcache")
 os.makedirs(IMGCACHE, exist_ok=True)
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
@@ -65,9 +130,100 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger("webreview")
 log.info("starting webreview v%s", __version__)
 
+
+def _stored_entry_count(path) -> int:
+    """How many entries the store on disk currently holds (0 for missing/corrupt —
+    an unreadable file is not evidence of work, and must not block the self-heal)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return 0
+    return len(d) if isinstance(d, (dict, list)) else 0
+
+
+# path → how many entries THIS process last read from that store. It is what makes
+# the #261 wipe guard exact instead of a guess (see _atomic_write_json).
+_store_reads: dict = {}
+
+
+def _read_json_store(path, default):
+    """The ONE json-store reader (the „SAFE loader" shape: missing / unparseable /
+    wrong-type → `default`, never an exception — one bad file must not 500 a whole
+    tab). Broader than the old per-store copies in one way on purpose: a write cut
+    mid-UTF-8 raises UnicodeDecodeError, which is a ValueError like JSONDecodeError
+    and degrades the same way instead of escaping as a 500.
+
+    It also records how many entries this process just saw on disk, which is what the
+    wipe guard checks. NOTE: the two FAIL-CLOSED dedup stores (orders_reminder,
+    posta_uncollected — #225) deliberately do NOT use this reader; losing THEIR
+    contents means mailing a customer twice, so they raise instead of degrading."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = default
+    if not isinstance(d, type(default)):
+        d = default
+    _store_reads[os.fspath(path)] = len(d)
+    return d
+
+
+def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> None:
+    """The ONE json-store writer: refuse-wipe check → temp file → atomic os.replace.
+
+    Every `_save_*` in this module goes through here (it used to be 29 copies of the
+    same four lines). `mode` (0600) is applied to the temp file BEFORE any content is
+    written, so a store holding secrets is never briefly world-readable.
+
+    `protect=True` marks a store holding IRREPLACEABLE work — the manager's
+    decisions / flags / pairings. There the writer refuses to replace a populated
+    store with an EMPTY one *unless this process actually read that exact store
+    first*: emptying it is legitimate only as the tail of a read-modify-write the
+    manager just performed (undo the last decision, un-mark a whole supplier group
+    via /api/ordered/bulk), and those all load the live store under `_lock` moments
+    earlier. The 2026-07-26 wipe had exactly the opposite shape — `_load_decisions`
+    was stubbed to a fixture, so nothing ever read the 2831 entries that the empty
+    map then erased. A stale count (another process wrote in between) refuses too:
+    that write is a lost update, which is the #264 half of the same story.
+
+    Nothing is written when it refuses — not even a stray .tmp — and it raises rather
+    than logging quietly, so the failure is visible in the response and in tests."""
+    p = os.fspath(path)
+    if protect and not data:
+        n = _stored_entry_count(p)
+        if n and _store_reads.get(p) != n:
+            log.error("REFUSED to overwrite %s (%d entries on disk, this process last "
+                      "read %s) with an EMPTY store (#261) — nothing was written",
+                      p, n, _store_reads.get(p))
+            raise StoreWipeRefused(
+                f"{p}: refusing to replace {n} entries with an empty store")
+    tmp = p + ".tmp"
+    if mode is None:
+        f = open(tmp, "w", encoding="utf-8")
+    else:
+        f = os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode),
+                      "w", encoding="utf-8")
+    with f:
+        json.dump(data, f, ensure_ascii=False, indent=indent)
+    if mode is not None:
+        os.chmod(tmp, mode)   # exact perms regardless of the process umask
+    os.replace(tmp, p)
+
+
+def _atomic_write_bytes(path, data: bytes) -> None:
+    """Same temp-file + atomic replace for the raw cp1250 CSV caches (export,
+    orders, customers) — a half-written cache would poison every reader."""
+    p = os.fspath(path)
+    tmp = p + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, p)
+
 try:
     with open(DATA, encoding="utf-8") as f:
         PRODUCTS = json.load(f)
+    _store_reads[os.fspath(DATA)] = len(PRODUCTS)   # #261 — what a later save replaces
     log.info("loaded %d products from %s", len(PRODUCTS), DATA)
 except FileNotFoundError:
     PRODUCTS = []
@@ -134,19 +290,11 @@ def _load_decisions() -> dict:
     # hand-corrupted or partially-written decisions.json (written on EVERY review click)
     # must never raise: it feeds /api/orders + /api/products, so one bad file would 500
     # the whole tab. Always a dict (a stray non-dict would break every .get() caller).
-    try:
-        with open(DECISIONS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(DECISIONS, {})
 
 
 def _save_decisions(d: dict) -> None:
-    tmp = DECISIONS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DECISIONS)
+    _atomic_write_json(DECISIONS, d, protect=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -218,8 +366,8 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=30),
 )
 
-USERS = os.path.join(OUT, "users.json")          # email -> {pw_hash,is_admin,created_at}
-RESET_TOKENS = os.path.join(OUT, "reset_tokens.json")   # sha256(token) -> {email,exp}
+USERS = _store("users.json")          # email -> {pw_hash,is_admin,created_at}
+RESET_TOKENS = _store("reset_tokens.json")   # sha256(token) -> {email,exp}
 RESET_TTL = 2 * 3600                             # reset link validity: 2 hours
 PW_MIN_LEN = 8
 LOGIN_MAX_FAILS = 5                              # failed logins per IP…
@@ -232,24 +380,25 @@ _DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
 
 
 def _load_users() -> dict:
+    # Deliberately NOT the SAFE reader: an unreadable user store must fail closed
+    # (nobody gets in) rather than degrade to „no accounts" and re-bootstrap an admin.
     if os.path.exists(USERS):
         with open(USERS, encoding="utf-8") as f:
-            return json.load(f)
+            d = json.load(f)
+        _store_reads[os.fspath(USERS)] = len(d)   # #261 — what a later save replaces
+        return d
     return {}
 
 
-def _save_json_0600(path, d) -> None:
+def _save_json_0600(path, d, *, protect=False) -> None:
     """Atomic write with 0600 perms — users.json holds password hashes and
     reset_tokens.json holds live reset-token hashes."""
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    _atomic_write_json(path, d, mode=0o600, protect=protect)
 
 
 def _save_users(d: dict) -> None:
-    _save_json_0600(USERS, d)
+    # protect: losing the account list locks everyone out of the app (#261).
+    _save_json_0600(USERS, d, protect=True)
 
 
 def _load_reset_tokens() -> dict:
@@ -829,25 +978,17 @@ def api_users_password():
 
 
 # Per-line "objednané" state for the Na-objednanie tab (key = '<orderCode>|<itemCode>').
-ORDERED = os.path.join(OUT, "ordered_items.json")
+ORDERED = _store("ordered_items.json")
 
 
 def _load_ordered() -> dict:
     # Corrupt/wrong-type store degrades to {} (like _load_instock) — one bad file
     # must never 500 the whole /api/orders tab.
-    try:
-        with open(ORDERED, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(ORDERED, {})
 
 
 def _save_ordered(d: dict) -> None:
-    tmp = ORDERED + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ORDERED)
+    _atomic_write_json(ORDERED, d, protect=True)
 
 
 # Inline pairings entered on the Na-objednanie tab: {forestshop_code: supplier_url}.
@@ -855,23 +996,15 @@ def _save_ordered(d: dict) -> None:
 # covers ANY ordered code, not only the review-dataset subset (decisions.json). Same
 # safe load/save as ordered/decisions; NEVER pruned (an order code may be outside the
 # review set, so a prune would wrongly drop it). Gitignored data/out → survives deploy.
-ORDER_PAIRINGS = os.path.join(OUT, "order_pairings.json")
+ORDER_PAIRINGS = _store("order_pairings.json")
 
 
 def _load_order_pairings() -> dict:
-    try:
-        with open(ORDER_PAIRINGS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(ORDER_PAIRINGS, {})
 
 
 def _save_order_pairings(d: dict) -> None:
-    tmp = ORDER_PAIRINGS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ORDER_PAIRINGS)
+    _atomic_write_json(ORDER_PAIRINGS, d, protect=True)
 
 
 # Per-variant reorder links (#174): {forestshop_variant_code: supplier_url}. A product
@@ -880,46 +1013,30 @@ def _save_order_pairings(d: dict) -> None:
 # variant code (never array position). import_builder.link_rows reads these for a
 # `split`-status decision → per-variant internalNote on the eshop. Same safe atomic
 # gitignored store; NEVER pruned → survives deploy.
-VARIANT_LINKS = os.path.join(OUT, "variant_links.json")
+VARIANT_LINKS = _store("variant_links.json")
 
 
 def _load_variant_links() -> dict:
-    try:
-        with open(VARIANT_LINKS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(VARIANT_LINKS, {})
 
 
 def _save_variant_links(d: dict) -> None:
-    tmp = VARIANT_LINKS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, VARIANT_LINKS)
+    _atomic_write_json(VARIANT_LINKS, d, protect=True)
 
 
 # Per-line "čaká sa" flag (key='<orderCode>|<itemCode>'): an ACTIVE order line that
 # can't be stocked yet — waiting on the supplier, batching more items, or deferred by
 # agreement with the customer. Independent of "objednané". Same safe gitignored store;
 # NEVER pruned → survives deploy.
-WAITING = os.path.join(OUT, "waiting_items.json")
+WAITING = _store("waiting_items.json")
 
 
 def _load_waiting() -> dict:
-    try:
-        with open(WAITING, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(WAITING, {})
 
 
 def _save_waiting(d: dict) -> None:
-    tmp = WAITING + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, WAITING)
+    _atomic_write_json(WAITING, d, protect=True)
 
 
 # Per-line "skladom" / "nedostupné" flags (key='<orderCode>|<itemCode>') — two more
@@ -927,40 +1044,24 @@ def _save_waiting(d: dict) -> None:
 # have it in stock / it's been restocked; "nedostupné" = the supplier can't deliver it.
 # The manager toggles each on its own; a row can carry any combination. Same safe
 # gitignored stores; NEVER pruned → survive deploy.
-INSTOCK = os.path.join(OUT, "instock_items.json")
-UNAVAIL = os.path.join(OUT, "unavailable_items.json")
+INSTOCK = _store("instock_items.json")
+UNAVAIL = _store("unavailable_items.json")
 
 
 def _load_instock() -> dict:
-    try:
-        with open(INSTOCK, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(INSTOCK, {})
 
 
 def _save_instock(d: dict) -> None:
-    tmp = INSTOCK + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, INSTOCK)
+    _atomic_write_json(INSTOCK, d, protect=True)
 
 
 def _load_unavailable() -> dict:
-    try:
-        with open(UNAVAIL, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(UNAVAIL, {})
 
 
 def _save_unavailable(d: dict) -> None:
-    tmp = UNAVAIL + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, UNAVAIL)
+    _atomic_write_json(UNAVAIL, d, protect=True)
 
 
 # Per-ORDER free-text comment for the Na-objednanie tab (key = '<orderCode>'). #101:
@@ -972,47 +1073,31 @@ def _save_unavailable(d: dict) -> None:
 # 2026-07-23) but deferred to a follow-up pending the boss's decision (overwrite vs
 # append, when to sync). Same safe atomic gitignored store, NEVER pruned → survives
 # deploy (an order code lives outside any review set, so a prune would wrongly drop it).
-ORDER_COMMENTS = os.path.join(OUT, "order_comments.json")
+ORDER_COMMENTS = _store("order_comments.json")
 ORDER_COMMENT_MAX = 2000   # generous cap — shopRemark in the admin holds multi-line notes
 
 
 def _load_order_comments() -> dict:
-    try:
-        with open(ORDER_COMMENTS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(ORDER_COMMENTS, {})
 
 
 def _save_order_comments(d: dict) -> None:
-    tmp = ORDER_COMMENTS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, ORDER_COMMENTS)
+    _atomic_write_json(ORDER_COMMENTS, d, protect=True)
 
 
 # „Nedostupné tovary" (#100): per-PRODUCT (itemCode) e-mail state — the two checkbox
 # intents (nedostupne/alternativa) + a `sent` dedup map keyed '<orderCode>|<type>' so the
 # same customer/order never gets a duplicate of the same e-mail. Gitignored, NEVER pruned
 # → survives deploy, exactly like the other manager stores.
-NEDOSTUPNE = os.path.join(OUT, "nedostupne.json")
+NEDOSTUPNE = _store("nedostupne.json")
 
 
 def _load_nedostupne() -> dict:
-    try:
-        with open(NEDOSTUPNE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(NEDOSTUPNE, {})
 
 
 def _save_nedostupne(d: dict) -> None:
-    tmp = NEDOSTUPNE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, NEDOSTUPNE)
+    _atomic_write_json(NEDOSTUPNE, d, protect=True)
 
 
 # Admin-set custom display names for nav tabs + automations (#173): {key: label}.
@@ -1023,24 +1108,16 @@ def _save_nedostupne(d: dict) -> None:
 # single map covers both #173 asks (rename automations / rename every tab) with no
 # separate name-override plumbing in automation_runner.py. Same safe gitignored
 # atomic store as ordered/waiting; survives deploy.
-UI_LABELS = os.path.join(OUT, "ui_labels.json")
+UI_LABELS = _store("ui_labels.json")
 UI_LABEL_MAX = 60
 
 
 def _load_ui_labels() -> dict:
-    try:
-        with open(UI_LABELS, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(UI_LABELS, {})
 
 
 def _save_ui_labels(d: dict) -> None:
-    tmp = UI_LABELS + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, UI_LABELS)
+    _atomic_write_json(UI_LABELS, d, protect=True)
 
 
 # Free-form notes for the "📝 Poznámky" tab — a Discord replacement for ad-hoc
@@ -1048,24 +1125,16 @@ def _save_ui_labels(d: dict) -> None:
 # {id, text, done, ts}, newest-first. Same safe gitignored store, atomic save, tolerant
 # of a missing/corrupt file. NOT written to any CSV/import → no formula-injection guard
 # needed, just a length cap on the free text.
-NOTES = os.path.join(OUT, "notes.json")
+NOTES = _store("notes.json")
 NOTE_MAX_LEN = 5000
 
 
 def _load_notes() -> list:
-    try:
-        with open(NOTES, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-    return d if isinstance(d, list) else []
+    return _read_json_store(NOTES, [])
 
 
 def _save_notes(d: list) -> None:
-    tmp = NOTES + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, NOTES)
+    _atomic_write_json(NOTES, d, protect=True)
 
 
 # Supplier assigned on the Na-objednanie tab for an order line that arrived WITHOUT a
@@ -1073,7 +1142,7 @@ def _save_notes(d: list) -> None:
 # like order_pairings) so it applies across every order line of that product and is the
 # natural key for the eshop write-back. Same safe gitignored store; NEVER pruned →
 # survives deploy. Written back to the eshop `supplier` field by the nightly upload.
-SUPPLIER_ASSIGN = os.path.join(OUT, "supplier_assignments.json")
+SUPPLIER_ASSIGN = _store("supplier_assignments.json")
 
 
 def _load_supplier_assign() -> dict:
@@ -1081,25 +1150,17 @@ def _load_supplier_assign() -> dict:
     # store is written by the app AND by n8n, so it is the most exposed to a partial
     # write. It feeds /api/orders + the nightly write-back; a JSONDecodeError here would
     # 500 the whole to-order tab. Always a dict (a stray non-dict breaks .get() callers).
-    try:
-        with open(SUPPLIER_ASSIGN, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(SUPPLIER_ASSIGN, {})
 
 
 def _save_supplier_assign(d: dict) -> None:
-    tmp = SUPPLIER_ASSIGN + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SUPPLIER_ASSIGN)
+    _atomic_write_json(SUPPLIER_ASSIGN, d, protect=True)
 
 
 # GRUBE per-size externalCode store (durable, built by scripts/build_grube_codes.py):
 # {code: {itemId, size, deUrl, productId}}. Read-only here — feeds the externalCode
 # write-back CSV. Missing/corrupt → {} (the file may not exist until the first gather).
-GRUBE_CODES = os.path.join(OUT, "grube_codes.json")
+GRUBE_CODES = _store("grube_codes.json")
 
 
 def _load_grube_codes() -> dict:
@@ -1131,15 +1192,28 @@ def _attach_grube(r, store=None):
     return r
 
 
-# at startup, prune orphan decisions whose key matches no product (e.g. a stale
-# 'None'/'bad' from before stable keys) so the progress count == the import count
-_VALID_KEYS = {p.get("key") for p in PRODUCTS}
-with _lock:
-    _d0 = _load_decisions()
-    _d1 = {k: v for k, v in _d0.items() if k in _VALID_KEYS}
-    if len(_d1) != len(_d0):
-        log.info("pruned %d orphan decisions at startup", len(_d0) - len(_d1))
-        _save_decisions(_d1)
+def _prune_orphan_decisions(products) -> None:
+    """At startup, drop decisions whose key matches no product (a stale 'None'/'bad'
+    from before stable keys) so the progress count == the import count.
+
+    NEVER prunes against an EMPTY product list: review_data.json missing or
+    unreadable leaves PRODUCTS == [] (the app deliberately boots dataless), which
+    would make EVERY decision look orphaned and delete the manager's whole history
+    on the next restart — the same wipe as #261, just via a second door."""
+    if not products:
+        log.warning("skipping the startup decision prune — 0 products loaded "
+                    "(review_data.json missing?); decisions left untouched")
+        return
+    valid = {p.get("key") for p in products}
+    with _lock:
+        d0 = _load_decisions()
+        d1 = {k: v for k, v in d0.items() if k in valid}
+        if len(d1) != len(d0):
+            log.info("pruned %d orphan decisions at startup", len(d0) - len(d1))
+            _save_decisions(d1)
+
+
+_prune_orphan_decisions(PRODUCTS)
 
 
 _IMG_NOISE = ("logo", "/producer/", ".svg", "/svg/", "placeholder", "no-image",
@@ -1203,8 +1277,8 @@ def _supplier_meta(html: str):
 # --------------------------------------------------------------------------- #
 # Na objednanie: forestshop "Vybavuje sa" orders → supplier reorder links
 # --------------------------------------------------------------------------- #
-ORDERS_CACHE = os.path.join(OUT, "orders_cache.csv")
-CUSTOMERS_CACHE = os.path.join(OUT, "customers_cache.csv")  # hourly Shoptet customer export (cp1250)
+ORDERS_CACHE = _store("orders_cache.csv")
+CUSTOMERS_CACHE = _store("customers_cache.csv")  # hourly Shoptet customer export (cp1250)
 ORDERS_MAXAGE = 1800  # s — refresh the cached orders export at most every 30 min (Marek: raz za pol hodinu stačí)
 # How far back the orders export is fetched. NAMED because the reminder dedup store's retention
 # (orders_reminder.DEDUP_RETENTION_DAYS, 180 d) is justified purely as „twice this window": a
@@ -1327,10 +1401,7 @@ def _orders_csv_cached() -> bytes:
         with open(ORDERS_CACHE, "rb") as f:
             return f.read()
     data = _fetch_orders_csv()
-    tmp = ORDERS_CACHE + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, ORDERS_CACHE)
+    _atomic_write_bytes(ORDERS_CACHE, data)
     return data
 
 
@@ -1614,10 +1685,7 @@ def api_export():
 def _save_products(products) -> None:
     """Atomic write of review_data.json (tmp + os.replace). Mirrors the other _save_*
     stores; ensure_ascii=False to keep the Slovak names readable, like build_review_data."""
-    tmp = DATA + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(products, f, ensure_ascii=False)
-    os.replace(tmp, DATA)
+    _atomic_write_json(DATA, products, indent=None, protect=True)
 
 
 def _current_for_entry(ce: dict) -> dict:
@@ -2233,7 +2301,7 @@ def api_nedostupne_send():
 # mail templates. The 3 background chains (rozposlať otázky / kontrola odpovedí)
 # live as default-OFF automations further down (run_vystavy_*).
 # --------------------------------------------------------------------------- #
-VYSTAVY = os.path.join(OUT, "vystavy.json")
+VYSTAVY = _store("vystavy.json")
 
 # Canonical state-machine values (kept 1:1 with the original n8n `email_status`).
 VY_NEW = ""                                    # Nová
@@ -2293,19 +2361,11 @@ ForestShop.sk"""
 
 
 def _load_vystavy() -> list:
-    try:
-        with open(VYSTAVY, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
-    return d if isinstance(d, list) else []
+    return _read_json_store(VYSTAVY, [])
 
 
 def _save_vystavy(d: list) -> None:
-    tmp = VYSTAVY + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, VYSTAVY)
+    _atomic_write_json(VYSTAVY, d, protect=True)
 
 
 def _now_iso() -> str:
@@ -3527,27 +3587,19 @@ def n8n_shoptet_import():
 # --------------------------------------------------------------------------- #
 # n8n → nightly upload of worker pairings (reorder links → eshop internalNote)
 # --------------------------------------------------------------------------- #
-PAIRINGS_STATE = os.path.join(OUT, "uploaded_pairings.json")
+PAIRINGS_STATE = _store("uploaded_pairings.json")
 
 
 def _load_uploaded():
     """{key: url} of pairings already uploaded — so the nightly job only sends new
     or changed ones. Missing/corrupt → empty (treat everything as new)."""
-    try:
-        with open(PAIRINGS_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
     # always a {key: url} map — a stray JSON array could repeat a key and break the
     # "total_uploaded never exceeds total_products" invariant in _pairing_summary
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(PAIRINGS_STATE, {})
 
 
 def _save_uploaded(d):
-    tmp = PAIRINGS_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, PAIRINGS_STATE)
+    _atomic_write_json(PAIRINGS_STATE, d, protect=True)
 
 
 # Public URL of the review web — handed to the n8n notifier so the single summary
@@ -3738,26 +3790,18 @@ def n8n_upload_pairings():
 # --------------------------------------------------------------------------- #
 # n8n → nightly upload of assigned supplier names (→ eshop `supplier` field)
 # --------------------------------------------------------------------------- #
-SUPPLIERS_STATE = os.path.join(OUT, "uploaded_suppliers.json")
+SUPPLIERS_STATE = _store("uploaded_suppliers.json")
 
 
 def _load_uploaded_suppliers():
     """{code: supplier} already written back to the eshop — so the nightly job only
     sends new or changed assignments. Missing/corrupt → empty (everything is new).
     Always a dict (a stray array could repeat a code and break the summary invariant)."""
-    try:
-        with open(SUPPLIERS_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(SUPPLIERS_STATE, {})
 
 
 def _save_uploaded_suppliers(d):
-    tmp = SUPPLIERS_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, SUPPLIERS_STATE)
+    _atomic_write_json(SUPPLIERS_STATE, d, protect=True)
 
 
 def _supplier_summary(uploaded, assigns):
@@ -3907,26 +3951,18 @@ def n8n_upload_suppliers():
 # field). #62 — the nightly cron follow-up to the MVP manual zip. Mirrors the
 # supplier write-back exactly (own incremental store, own header, chunked import).
 # --------------------------------------------------------------------------- #
-EXTERNALCODES_STATE = os.path.join(OUT, "uploaded_externalcodes.json")
+EXTERNALCODES_STATE = _store("uploaded_externalcodes.json")
 
 
 def _load_uploaded_externalcodes():
     """{code: itemId} already written back to the eshop — so the nightly job only
     sends new or changed itemIds. Missing/corrupt → empty (everything is new).
     Always a dict (a stray array could repeat a code and break the summary invariant)."""
-    try:
-        with open(EXTERNALCODES_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(EXTERNALCODES_STATE, {})
 
 
 def _save_uploaded_externalcodes(d):
-    tmp = EXTERNALCODES_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, EXTERNALCODES_STATE)
+    _atomic_write_json(EXTERNALCODES_STATE, d, protect=True)
 
 
 def _externalcode_summary(uploaded, grube_codes):
@@ -4043,26 +4079,18 @@ def n8n_upload_externalcode():
 # picks it up. Mirrors the supplier/externalcode write-back (own incremental store,
 # reuses import_builder.link_rows for the rows — no duplicated logic).
 # --------------------------------------------------------------------------- #
-VARIANT_LINKS_STATE = os.path.join(OUT, "uploaded_variant_links.json")
+VARIANT_LINKS_STATE = _store("uploaded_variant_links.json")
 
 
 def _load_uploaded_variant_links():
     """{variant_code: url} already written back to the eshop — so the nightly job only
     sends new or changed split links. Missing/corrupt → empty (everything is new).
     Always a dict (a stray array could repeat a code and break the summary invariant)."""
-    try:
-        with open(VARIANT_LINKS_STATE, encoding="utf-8") as f:
-            d = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-    return d if isinstance(d, dict) else {}
+    return _read_json_store(VARIANT_LINKS_STATE, {})
 
 
 def _save_uploaded_variant_links(d):
-    tmp = VARIANT_LINKS_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, VARIANT_LINKS_STATE)
+    _atomic_write_json(VARIANT_LINKS_STATE, d, protect=True)
 
 
 def _variant_link_summary(uploaded, vlinks, split_codes):
@@ -4193,11 +4221,11 @@ def n8n_upload_variant_links():
 # automation. New automations (#105-#111) register themselves in AUTOMATIONS_REG
 # below — the runner, endpoints and sidebar section are shared.
 # --------------------------------------------------------------------------- #
-AUTOMATIONS_STATE = os.path.join(OUT, "automations.json")
-POSTA_STATE = os.path.join(OUT, "posta_uncollected.json")
+AUTOMATIONS_STATE = _store("automations.json")
+POSTA_STATE = _store("posta_uncollected.json")
 # How long a cached TERMINAL tracking verdict is trusted before one re-verification (#222).
 POSTA_TERMINAL_RECHECK_DAYS = 7
-ORDERS_REMINDER_STATE = os.path.join(OUT, "orders_reminder.json")   # #105 dedup + display
+ORDERS_REMINDER_STATE = _store("orders_reminder.json")   # #105 dedup + display
 
 
 class DedupStoreCorrupt(RuntimeError):
@@ -4347,11 +4375,7 @@ def _load_posta_state_display() -> tuple:
 
 
 def _save_posta_state(d: dict) -> None:
-    tmp = POSTA_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, POSTA_STATE)
+    _atomic_write_json(POSTA_STATE, d, mode=0o600)
 
 
 def _fetch_tracking(pkg: str) -> dict:
@@ -4562,16 +4586,10 @@ def run_shoptet_sync() -> dict:
     global CODE2PAIR, CODE2VARIANT, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
 
     orders_bytes = _fetch_orders_csv()
-    tmp = ORDERS_CACHE + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(orders_bytes)
-    os.replace(tmp, ORDERS_CACHE)
+    _atomic_write_bytes(ORDERS_CACHE, orders_bytes)
 
     export_bytes = _fetch_export_csv()
-    tmp2 = SRC + ".tmp"
-    with open(tmp2, "wb") as f:
-        f.write(export_bytes)
-    os.replace(tmp2, SRC)
+    _atomic_write_bytes(SRC, export_bytes)
 
     # rebuild the in-memory search index from the fresh export — same single
     # cp1250-pass helper the app uses at startup, no restart needed.
@@ -4590,10 +4608,7 @@ def run_shoptet_sync() -> dict:
             rows.append(row)
     with _lock:
         counts = resync_current(rows, PRODUCTS, set(config.SUPPLIERS))
-        tmp3 = DATA + ".tmp"
-        with open(tmp3, "w", encoding="utf-8") as f:
-            json.dump(PRODUCTS, f, ensure_ascii=False)
-        os.replace(tmp3, DATA)
+        _save_products(PRODUCTS)
 
     # Customer export — fetched LAST and NON-FATAL: a customer-export hiccup must
     # never turn the whole sync red, because orders/catalog/review already landed
@@ -4604,10 +4619,7 @@ def run_shoptet_sync() -> dict:
     customers_bytes, customers_error = b"", None
     try:
         customers_bytes = _fetch_customers_csv()
-        tmp4 = CUSTOMERS_CACHE + ".tmp"
-        with open(tmp4, "wb") as f:
-            f.write(customers_bytes)
-        os.replace(tmp4, CUSTOMERS_CACHE)
+        _atomic_write_bytes(CUSTOMERS_CACHE, customers_bytes)
     except Exception as e:  # noqa: BLE001 — auxiliary source; never fail the whole sync
         customers_error = str(e)   # already secret-sanitized by _fetch_customers_csv
         log.warning("shoptet_sync: customer export refresh failed (non-fatal): %s",
@@ -4794,7 +4806,7 @@ def run_split_links() -> dict:
 # in data/out/supplier_stock.json — the input for #107/#108. Pure logic lives in
 # parovanie.supplier_stock; this wires it to the network, OpenAI and the store.
 # --------------------------------------------------------------------------- #
-SUPPLIER_STOCK_STATE = os.path.join(OUT, "supplier_stock.json")
+SUPPLIER_STOCK_STATE = _store("supplier_stock.json")
 # Refetch only links not checked in the last N hours (skip fresh OK rows) — saves
 # HTTP + paid LLM cost. Chosen < 24h so a daily run still re-checks everything once.
 SUPPLIER_STOCK_MAX_AGE_H = 20.0
@@ -4814,11 +4826,7 @@ def _load_supplier_stock() -> dict:
 
 
 def _save_supplier_stock(d: dict) -> None:
-    tmp = SUPPLIER_STOCK_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, SUPPLIER_STOCK_STATE)
+    _atomic_write_json(SUPPLIER_STOCK_STATE, d, mode=0o600)
 
 
 def _read_export_for_links() -> str:
@@ -4970,7 +4978,7 @@ def run_supplier_stock() -> dict:
 # anything itself. Pure logic lives in parovanie.riziko_vypadku; this wires it
 # to the store + the display/CSV endpoints.
 # --------------------------------------------------------------------------- #
-RIZIKO_STATE = os.path.join(OUT, "riziko_vypadku.json")
+RIZIKO_STATE = _store("riziko_vypadku.json")
 
 
 def _load_riziko() -> dict:
@@ -4983,11 +4991,7 @@ def _load_riziko() -> dict:
 
 
 def _save_riziko(d: dict) -> None:
-    tmp = RIZIKO_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, RIZIKO_STATE)
+    _atomic_write_json(RIZIKO_STATE, d, mode=0o600)
 
 
 def run_riziko_vypadku() -> dict:
@@ -5027,7 +5031,7 @@ def run_riziko_vypadku() -> dict:
 # #23-hardened read-back). Detection logic lives in parovanie.restock_skladom; this
 # wires it to the store + the import + the display endpoint.
 # --------------------------------------------------------------------------- #
-RESTOCK_STATE = os.path.join(OUT, "restock_skladom.json")
+RESTOCK_STATE = _store("restock_skladom.json")
 
 
 def _load_restock() -> dict:
@@ -5040,11 +5044,7 @@ def _load_restock() -> dict:
 
 
 def _save_restock(d: dict) -> None:
-    tmp = RESTOCK_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, RESTOCK_STATE)
+    _atomic_write_json(RESTOCK_STATE, d, mode=0o600)
 
 
 def run_restock_skladom() -> dict:
@@ -5136,7 +5136,7 @@ def run_restock_skladom() -> dict:
 # import_builder.skladom_rows (visible + both availability Skladom; the real stock
 # is NEVER overwritten) through the SAME careful chunked import path.
 # --------------------------------------------------------------------------- #
-STOCK_SKLADOM_STATE = os.path.join(OUT, "stock_skladom.json")
+STOCK_SKLADOM_STATE = _store("stock_skladom.json")
 
 
 def _load_stock_skladom() -> dict:
@@ -5149,11 +5149,7 @@ def _load_stock_skladom() -> dict:
 
 
 def _save_stock_skladom(d: dict) -> None:
-    tmp = STOCK_SKLADOM_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, STOCK_SKLADOM_STATE)
+    _atomic_write_json(STOCK_SKLADOM_STATE, d, mode=0o600)
 
 
 def run_stock_skladom() -> dict:
@@ -5249,11 +5245,7 @@ def _load_orders_reminder_display() -> tuple:
 
 
 def _save_orders_reminder(d: dict) -> None:
-    tmp = ORDERS_REMINDER_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, ORDERS_REMINDER_STATE)
+    _atomic_write_json(ORDERS_REMINDER_STATE, d, mode=0o600)
 
 
 def _classify_contacted(shop_remark: str) -> bool:
@@ -5767,7 +5759,7 @@ def run_orders_reminder() -> dict:
 # (image_health.clean_products) so a review card never renders a URL
 # confirmed dead. review_data.json itself is never rewritten by this run.
 # --------------------------------------------------------------------------- #
-IMAGE_HEALTH_STATE = os.path.join(OUT, "image_health.json")
+IMAGE_HEALTH_STATE = _store("image_health.json")
 # Short timeout (mirrors /api/images' 8s fast-fail #74) — a hung supplier/CDN
 # must not tie up the whole run; it's simply recorded as a failed check.
 IMAGE_HEALTH_TIMEOUT = 8
@@ -5783,11 +5775,7 @@ def _load_image_health() -> dict:
 
 
 def _save_image_health(d: dict) -> None:
-    tmp = IMAGE_HEALTH_STATE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, IMAGE_HEALTH_STATE)
+    _atomic_write_json(IMAGE_HEALTH_STATE, d, indent=None, mode=0o600)
 
 
 def _check_image_url(url: str) -> bool:

@@ -26,12 +26,15 @@ import tempfile
 
 import pytest
 
-_TEST_OUT = tempfile.mkdtemp(prefix="webreview-tests-out-")
+_TEST_DATA = tempfile.mkdtemp(prefix="webreview-tests-data-")
+_TEST_OUT = os.path.join(_TEST_DATA, "out")
+os.makedirs(_TEST_OUT, exist_ok=True)
 os.environ["WEBREVIEW_OUT"] = _TEST_OUT
 # `run_shoptet_sync` rewrites the export in place — keep the real data/products.csv
 # out of reach too, and make the dev box behave like CI (which has no data/ tree).
-os.environ["WEBREVIEW_PRODUCTS"] = os.path.join(_TEST_OUT, "products.csv")
-atexit.register(shutil.rmtree, _TEST_OUT, ignore_errors=True)
+# It sits BESIDE the out dir, exactly as in production (data/products.csv + data/out/).
+os.environ["WEBREVIEW_PRODUCTS"] = os.path.join(_TEST_DATA, "products.csv")
+atexit.register(shutil.rmtree, _TEST_DATA, ignore_errors=True)
 
 TEST_USER = "tester@example.com"
 
