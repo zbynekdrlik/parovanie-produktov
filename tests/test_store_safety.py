@@ -711,6 +711,38 @@ def test_a_rebuilt_list_that_only_drops_entries_is_still_allowed(monkeypatch, tm
     assert [v["id"] for v in webapp._load_vystavy()] == ["a", "c"]
 
 
+def test_a_rebuilt_list_of_COPIES_that_only_drops_entries_is_allowed(monkeypatch, tmp_path):
+    """The list branch required element IDENTITY, so the natural way to write a
+    retention sweep — `[dict(x) for x in prev if …]` — was refused, and refused with a
+    message saying the write „did not come from a read of that store". That is both
+    wrong and an invitation for the next author to reach for a bypass instead
+    (PR #265 third review). A rebuild of COPIES still only DROPS, which is the rule."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
+    v0 = webapp._load_vystavy()
+    kept = [dict(v) for v in v0 if v["id"] != "b"]
+    webapp._save_vystavy(kept, prev=v0)
+    assert [v["id"] for v in webapp._load_vystavy()] == ["a", "c"]
+
+
+def test_naming_a_read_does_not_authorise_gutting_the_NESTED_dedup_map(
+        monkeypatch, tmp_path):
+    """For a `protect=("orders",)` store the derivation check only compared TOP-LEVEL
+    keys — and every real writer of those stores keeps the same top-level key set. So a
+    `prev=` write that kept the outer shape and emptied the who-was-already-mailed map
+    passed the narrowing check outright (nobody writes this today; the idiom is what
+    re-opens it — PR #265 third review)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    gutted = dict(st, orders={})
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, gutted,
+                                  mode=0o600, protect=("orders",), prev=st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
 def test_a_rebuilt_list_that_smuggles_in_a_foreign_entry_is_refused(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
