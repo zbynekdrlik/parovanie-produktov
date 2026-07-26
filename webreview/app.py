@@ -121,7 +121,87 @@ os.makedirs(IMGCACHE, exist_ok=True)
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
 app = Flask(__name__, static_folder="static", template_folder="templates")
-_lock = threading.Lock()
+
+
+class StoreLockTimeout(RuntimeError):
+    """Another process held the store lock for far too long — better a loud 500 than
+    a request that hangs forever, and better than writing anyway (a lost update)."""
+
+
+class _StoreLock:
+    """The app's ONE store lock: `threading.RLock` in-process **plus** an
+    `fcntl.flock` on OUT/.store.lock across processes (#264).
+
+    Every read-modify-write in this module already runs inside `with _lock:` — that
+    is the app's deliberate coarse-grained design (one lock for all stores; network
+    and SMTP calls stay OUTSIDE it). It only ever serialised THREADS, though: the
+    atomic tmp+replace keeps a file from being half-written, but it cannot stop two
+    PROCESSES from both reading the same map and the second one's write erasing the
+    first one's entry. A second instance ran over this data dir for four days (#262),
+    so that was live exposure, not theory.
+
+    Re-entrant on purpose: `_atomic_write_json` takes the lock itself (so a write is
+    protected even on a path that forgot to), and almost every save is already inside
+    a `with _lock:` block — a plain Lock would deadlock on the first click.
+
+    The lock file is resolved from the CURRENT OUT, so each data dir (live service,
+    fixture server, test tmp dir) has its own lock and they never contend."""
+
+    def __init__(self, name: str = ".store.lock", timeout: float = 30.0) -> None:
+        self.path = _store(name)
+        self.timeout = timeout
+        self._rlock = threading.RLock()
+        self._depth = 0
+        self._fd = None
+
+    def _flock(self) -> int:
+        p = os.fspath(self.path)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    log.error("store lock %s still held by another process after %.0fs "
+                              "— refusing to write (a second instance? see #262)",
+                              p, self.timeout)
+                    raise StoreLockTimeout(p) from None
+                time.sleep(0.02)
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        if not self._rlock.acquire(blocking, timeout):
+            return False
+        if self._depth == 0:
+            try:
+                self._fd = self._flock()
+            except BaseException:
+                self._rlock.release()
+                raise
+        self._depth += 1
+        return True
+
+    def release(self) -> None:
+        self._depth -= 1
+        if self._depth == 0 and self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+        self._rlock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self.release()
+        return False
+
+
+_lock = _StoreLock()
 _import_lock = threading.Lock()   # one Shoptet import at a time (browser automation)
 CRED_PATH = os.environ.get("SHOPTET_CRED") or os.path.join(ROOT, "data", ".shoptet_admin")
 IMPORT_SCRIPT = os.path.join(ROOT, "scripts", "shoptet_import.py")
@@ -191,6 +271,12 @@ def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> Non
     Nothing is written when it refuses — not even a stray .tmp — and it raises rather
     than logging quietly, so the failure is visible in the response and in tests."""
     p = os.fspath(path)
+    with _lock:
+        _write_json_locked(p, data, indent, mode, protect)
+
+
+def _write_json_locked(p, data, indent, mode, protect) -> None:
+    """The body of `_atomic_write_json`, always under the store lock."""
     if protect and not data:
         n = _stored_entry_count(p)
         if n and _store_reads.get(p) != n:
@@ -199,7 +285,7 @@ def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> Non
                       p, n, _store_reads.get(p))
             raise StoreWipeRefused(
                 f"{p}: refusing to replace {n} entries with an empty store")
-    tmp = p + ".tmp"
+    tmp = f"{p}.{os.getpid()}.tmp"   # per-process: two instances never share a temp
     if mode is None:
         f = open(tmp, "w", encoding="utf-8")
     else:
@@ -216,10 +302,11 @@ def _atomic_write_bytes(path, data: bytes) -> None:
     """Same temp-file + atomic replace for the raw cp1250 CSV caches (export,
     orders, customers) — a half-written cache would poison every reader."""
     p = os.fspath(path)
-    tmp = p + ".tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, p)
+    tmp = f"{p}.{os.getpid()}.tmp"
+    with _lock:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, p)
 
 try:
     with open(DATA, encoding="utf-8") as f:
