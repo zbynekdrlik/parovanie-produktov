@@ -440,3 +440,99 @@ def test_run_reads_but_never_writes_manager_decision_stores(iso, monkeypatch):
     # the manager's live stores are untouched (the automation only READS them)
     assert (iso["tmp"] / "decisions.json").read_text() == dec_before
     assert (iso["tmp"] / "supplier_assignments.json").read_text() == sa_before
+
+
+# ── #257 cause 2: a partially-failed chunk is not a batch that imported nothing ──
+#
+# The real 2026-07-26 21:00 run: 35 rows sent, Shoptet answered
+#   '#12689 … Spracované: 35. Upravené: 31. Zlyhanie variantov: 2.'
+# i.e. it took every row we sent and rejected 2 variants. The whole chunk was booked
+# as 0 imported rows, uploaded_pairings.json froze on 2026-07-22 and the same rows
+# were rebuilt + re-sent every night.
+PARTIAL_STDOUT = "VÝSLEDOK: spracované={n} upravené={u} zlyhania=2"
+
+
+def _partial_import(partial_on_call=1):
+    """run_import stub whose Nth chunk answers like the real partial night: Shoptet
+    processed EVERY row we sent, but rejected 2 variants (script exit code 2)."""
+    calls = []
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rd = list(_csv.reader(f, delimiter=";"))
+        rows = rd[1:]
+        calls.append({"header": rd[0], "rows": rows})
+        if len(calls) == partial_on_call:
+            return 2, PARTIAL_STDOUT.format(n=len(rows), u=len(rows) - 4), ""
+        return 0, f"VÝSLEDOK: spracované={len(rows)} upravené={len(rows)} zlyhania=0", ""
+    return fake_run, calls
+
+
+def _export(pairs):
+    """A minimal catalog export (the eshop's own truth) carrying code→internalNote."""
+    head = "code;pairCode;internalNote;supplier\r\n"
+    return head + "".join(f"{c};P1;{note};\r\n" for c, note in pairs.items())
+
+
+def test_partial_chunk_keeps_importing_the_rest_of_the_batch(iso, monkeypatch):
+    n = 650                                     # 3 chunks of <=300
+    products = [{"key": f"K{i}", "idx": i, "supplier": "BETALOV", "name": f"P{i}",
+                 "pairCode": "P", "variant_codes": [f"{i}/M"], "our_url": "u",
+                 "ai_status": "matched", "ai_chosen_url": "", "ai_reason": "",
+                 "candidates": [], "current": {}} for i in range(n)]
+    monkeypatch.setattr(webapp, "PRODUCTS", products)
+    monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
+    webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"}
+                            for i in range(n)})
+    fake_run, calls = _partial_import(partial_on_call=1)
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    # the batch is NOT aborted by a partial chunk — chunks 2 and 3 still go up
+    assert len(calls) == 3
+    p = result["pairings"]
+    # the later, fully clean chunks ARE credited (they used to be lost entirely)
+    uploaded = json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())
+    chunk1_keys = {"K" + r[0].split("/")[0] for r in calls[0]["rows"]}
+    assert len(uploaded) == n - len(chunk1_keys) > 0
+    assert not (set(uploaded) & chunk1_keys)    # the partial chunk stays unconfirmed
+    # …and the rejection is SURFACED, not hidden behind a bare 'ok'
+    assert p["ok"] is False
+    assert p["partial"] is True
+    assert "odmietol" in p["error"] and "2" in p["error"]
+
+
+def test_rows_already_correct_in_the_eshop_are_credited_from_the_export(iso, monkeypatch):
+    """THE unfreeze (#257): the import log reports aggregate counts only, so a
+    partially-failed chunk cannot say WHICH rows landed. The eshop's own export can —
+    a code whose internalNote already equals the URL we would send is proven to be on
+    the eshop, so it is recorded uploaded and never re-sent."""
+    _seed_pairing()                                   # BETALOV|P1 → https://supplier/x
+    monkeypatch.setattr(webapp, "_read_export_for_links",
+                        lambda: _export({"1/M": "https://supplier/x"}))
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("nothing left to import"))
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["pairings"]["ok"] is True
+    assert result["pairings"]["count"] == 1
+    assert result["pairings"]["confirmed_in_export"] == 1
+    assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) \
+        == {"BETALOV|P1": "https://supplier/x"}
+
+
+def test_export_confirmation_needs_an_exact_url_match(iso, monkeypatch):
+    # a stale / different note on the eshop proves nothing — the row is still sent
+    _seed_pairing()
+    monkeypatch.setattr(webapp, "_read_export_for_links",
+                        lambda: _export({"1/M": "https://supplier/OLD"}))
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["pairings"]["confirmed_in_export"] == 0
+    links = [c for c in calls if c["header"][2] == "internalNote"]
+    assert links and ["1/M", "P1", "https://supplier/x"] in links[0]["rows"]
