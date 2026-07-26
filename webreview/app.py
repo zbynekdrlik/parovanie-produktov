@@ -4937,7 +4937,7 @@ def run_shoptet_sync() -> dict:
     try/except (automation_runner._execute) records the error and the app keeps
     serving the previous cache/catalog/review data untouched — degrade, never
     crash, never a half-written file."""
-    global CODE2PAIR, CODE2VARIANT, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
+    global PRODUCTS, CODE2PAIR, CODE2VARIANT, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
 
     orders_bytes = _fetch_orders_csv()
     _atomic_write_bytes(ORDERS_CACHE, orders_bytes)
@@ -4948,6 +4948,18 @@ def run_shoptet_sync() -> dict:
     # rebuild the in-memory search index from the fresh export — same single
     # cp1250-pass helper the app uses at startup, no restart needed.
     with _lock:
+        # RE-READ review_data.json first (PR #265 review). It changes UNDER a running app:
+        # the documented `scripts/add_supplier_review_data.py` appends a whole new supplier
+        # while the service serves. `PRODUCTS` was read once at BOOT and `resync_current`
+        # only mutates in place, so resyncing and saving that list would discard the new
+        # supplier — and since #261 the writer refuses that shrink, which left this
+        # automation failing every hour with no way back short of a restart. Re-reading
+        # makes the append take effect without one AND makes the save below a legitimate
+        # read-modify-write. A missing/unparsable file yields [] — keep what we are serving
+        # rather than adopt an empty catalogue.
+        fresh = _read_json_store(DATA, [])
+        if fresh:
+            PRODUCTS = fresh
         review_keys = ({p.get("pairCode") for p in PRODUCTS if p.get("pairCode")}
                        | {c for p in PRODUCTS for c in (p.get("variant_codes") or [])})
         CODE2PAIR, CODE2VARIANT, CATALOG = _load_catalog(SRC, review_keys)
