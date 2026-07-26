@@ -340,8 +340,13 @@ def _refuse_live_data_under_pytest(p) -> None:
     # realpath both sides: a symlinked tmp dir must not be a way around this
     a = os.path.realpath(os.fspath(p))
     live_out = os.path.realpath(_LIVE_OUT)
-    if (a == os.path.realpath(_LIVE_PRODUCTS) or a == live_out
-            or a.startswith(live_out + os.sep)):
+    live_products = os.path.realpath(_LIVE_PRODUCTS)
+    # `data/` ITSELF, not just the export file inside it: the startup sweep walks TWO
+    # directories and the second is `dirname(SRC)`, which is neither `data/out` nor
+    # `products.csv` — so a helper repointing WEBREVIEW_PRODUCTS at the real export let
+    # it unlink live `data/*.tmp` from a test run (PR #265 final review).
+    if (a == live_products or a == live_out or a.startswith(live_out + os.sep)
+            or a == os.path.dirname(live_products)):
         log.error("REFUSED a write to the live data dir from a pytest run: %s", a)
         raise StoreWipeRefused(
             f"Test sa pokúsil zapísať do živých dát ({a}) — zamietnuté. "
@@ -489,6 +494,14 @@ def _is_derived_from(data, prev, keys=()) -> bool:
             if not k:
                 continue                      # "" is the top-level count, checked above
             a, b = data.get(k), prev.get(k)
+            # …and only when the value STAYS that container. Both pairs below compare
+            # like with like, so a write REPLACING the guarded map with something else
+            # entirely (`None`, a list, a string, `0`) matched neither branch and passed
+            # as „derived" — all four measured ALLOWED on disk (PR #265 final review).
+            # A guarded key that DISAPPEARS lands here too (`None` against a real map),
+            # which is the same loss written a different way.
+            if type(a) is not type(b):
+                return False
             if isinstance(a, dict) and isinstance(b, dict) and not set(a) <= set(b):
                 return False
             if isinstance(a, list) and isinstance(b, list) and not _list_is_narrowing(a, b):
@@ -533,7 +546,15 @@ def _fsync_dir(d: str) -> None:
     except OSError as e:  # noqa: BLE001 — see above
         log.warning("fsync adresára %s zlyhal (%r)", d, e)
     finally:
-        os.close(fd)
+        # The close was the ONE error this „best effort" helper still let escape — and
+        # both callers run it AFTER the replace, inside an `except BaseException:
+        # unlink(tmp); raise`. A raise there reported a write that is durably on disk as
+        # a failure (plus a spurious „temp file could not be removed" — the temp file is
+        # gone by then). Durability hint only; the data is already published.
+        try:
+            os.close(fd)
+        except OSError as e:  # noqa: BLE001 — see above
+            log.warning("adresár %s sa nedá zavrieť po fsync (%r)", d, e)
 
 
 def _sweep_stale_tmp(*dirs: str, max_age_h: float = 12.0) -> int:
@@ -731,17 +752,19 @@ def _atomic_write_bytes(path, data: bytes, *, mode: int = 0o644) -> None:
         # this one systemd --user service ever reads them (PR #265 second review).
         os.chmod(tmp, mode)               # exact perms regardless of the process umask
         os.replace(tmp, p)
-        # …and the rename itself must be durable, exactly as in the JSON writer: the
-        # directory fsync was added there only, leaving the 55 MB export and the two
-        # customer caches with durable bytes published by a losable directory entry
-        # (PR #265 third review).
-        _fsync_dir(os.path.dirname(p) or ".")
     except BaseException:
         try:
             os.unlink(tmp)
         except OSError as e:  # noqa: BLE001 — cleanup only, the real failure re-raises
             log.warning("temp file %s sa nepodarilo odstrániť (%r)", tmp, e)
         raise
+    # …and the rename itself must be durable, exactly as in the JSON writer: the
+    # directory fsync was added there only, leaving the 55 MB export and the two
+    # customer caches with durable bytes published by a losable directory entry
+    # (PR #265 third review). OUTSIDE the handler above (final review): past the
+    # replace the write has SUCCEEDED and the temp file no longer exists, so anything
+    # escaping here would be cleaned up as a failure and re-raised at the caller.
+    _fsync_dir(os.path.dirname(p) or ".")
 
 try:
     with open(DATA, encoding="utf-8") as f:
