@@ -25,6 +25,16 @@ log = logging.getLogger("automations")
 DEFAULT_TZ = "Europe/Bratislava"
 
 
+class AutomationStateCorrupt(RuntimeError):
+    """`automations.json` is there but unparseable (or is not a map).
+
+    Raised instead of degrading to „no automations": that file decides which
+    automations are ENABLED, so reading it as empty silently switches off every
+    reminder mail, pošta escalation and hourly sync while the tab renders a clean
+    first-run state (PR #265 second review, C4). Fails closed, loudly, with a copy of
+    the unreadable bytes kept for repair."""
+
+
 @dataclass
 class Automation:
     """One registered automation: key (id + state key), human name (SK, shown in

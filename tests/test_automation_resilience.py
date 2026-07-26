@@ -25,7 +25,8 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
-from parovanie.automation_runner import Automation, AutomationRunner  # noqa: E402
+from parovanie.automation_runner import (  # noqa: E402
+    Automation, AutomationRunner, AutomationStateCorrupt)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -286,3 +287,76 @@ def test_the_claim_still_clears_when_the_outcome_write_raises(tmp_path):
     r = AutomationRunner(str(tmp_path / "automations.json"), [a], tick=999.0, lock=lock)
     assert r._execute("demo") is True
     assert r._running["demo"] is False, "the automation stayed claimed forever"
+
+
+# --------------------------------------------------------------------------- #
+# automations.json got neither of this PR's own two principles
+#
+# `_load` answered `{}` on a parse error — „unreadable means empty", the exact defect
+# the rest of this work exists to kill, on the file that decides which automations are
+# ENABLED. A truncated state file silently reverts every automation to
+# disabled/unscheduled (no reminder mails, no pošta escalations, no hourly sync) while
+# the tab renders a clean first-run state. And `_save` had no fsync before its
+# `os.replace`, so that truncation is reachable on power loss — while the same PR added
+# fsync to both app.py writers and put automations.json in the backup rotation
+# (PR #265 second review, C4).
+# --------------------------------------------------------------------------- #
+def _state_runner(tmp_path, **kw):
+    a = Automation(key="demo", name="Demo", schedule={"interval_minutes": 60},
+                   run_fn=lambda: {"n": 1})
+    return AutomationRunner(str(tmp_path / "automations.json"), [a], tick=999.0, **kw)
+
+
+def test_a_truncated_automation_state_is_never_read_as_no_automations(tmp_path):
+    r = _state_runner(tmp_path)
+    r.set_enabled("demo", True)
+    p = tmp_path / "automations.json"
+    raw = p.read_text(encoding="utf-8")
+    p.write_text(raw[:len(raw) // 2], encoding="utf-8")          # cut mid-write
+    with pytest.raises(AutomationStateCorrupt):
+        r._load()
+    assert p.read_text(encoding="utf-8") == raw[:len(raw) // 2], "the original was touched"
+    assert list(tmp_path.glob("automations.json.corrupt-*")), "no copy kept for repair"
+
+
+def test_a_state_file_that_is_not_a_map_fails_closed_too(tmp_path):
+    r = _state_runner(tmp_path)
+    (tmp_path / "automations.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(AutomationStateCorrupt):
+        r.status()
+
+
+def test_a_corrupt_state_file_never_silently_reschedules_or_disables(tmp_path):
+    """The dangerous consequence, not just the exception: a tick over a corrupt state
+    must not decide „nothing is enabled" — and must not overwrite it either."""
+    r = _state_runner(tmp_path)
+    r.set_enabled("demo", True)
+    p = tmp_path / "automations.json"
+    p.write_text('{"demo": {"enab', encoding="utf-8")
+    with pytest.raises(AutomationStateCorrupt):
+        r.tick_once()
+    assert p.read_text(encoding="utf-8") == '{"demo": {"enab'
+
+
+def test_the_state_file_is_fsynced_before_it_replaces_the_old_one(tmp_path, monkeypatch):
+    """Without this the rename can be durable while the bytes are not — which is
+    exactly how the truncated file above appears after a power loss."""
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (calls.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace",
+                        lambda a, b: (calls.append("replace"), real_replace(a, b))[1])
+    _state_runner(tmp_path).set_enabled("demo", True)
+    assert "fsync" in calls, "the state file was replaced without ever being fsynced"
+    assert calls.index("fsync") < calls.index("replace"), calls
+
+
+def test_a_corrupt_state_file_answers_503_and_does_not_stop_the_boot(tmp_path, monkeypatch):
+    """Failing closed must not brick the service: the module still imports, and the
+    automations tab says what to fix instead of 500-ing."""
+    monkeypatch.setattr(webapp.RUNNER, "state_path", str(tmp_path / "automations.json"))
+    (tmp_path / "automations.json").write_text('{"demo": {"enab', encoding="utf-8")
+    from tests.conftest import authed_client
+    r = authed_client().get("/api/automations")
+    assert r.status_code == 503, r.status_code
+    assert r.get_json()["ok"] is False and "automations.json" in r.get_json()["error"]
