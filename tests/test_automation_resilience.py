@@ -171,6 +171,56 @@ def test_the_service_still_boots_with_a_TRUNCATED_store(tmp_path, broken):
     assert (out / broken).read_text(encoding="utf-8") == '{"admin@test.local": {"pw_ha'
 
 
+@pytest.mark.parametrize("broken", ["decisions.json", "users.json"])
+def test_the_service_still_boots_with_a_store_that_parses_to_the_WRONG_SHAPE(
+        tmp_path, broken):
+    """A store that parses fine but is not a MAP is the one shape C2 left open:
+    `_load_users` was the single loader in this PR with no `isinstance` check, so a
+    `users.json` holding `[]` reached `_bootstrap_admin`, which then did
+    `users[email] = {...}` → `TypeError: list indices must be integers`. TypeError is
+    not in the boot except tuple, so the import died: systemd restart loop, no web UI.
+    Reachable from a wrong hand-repair or a wrong restore — precisely what the 503
+    repair message invites an operator to attempt (PR #265 third review, I2)."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / broken).write_text("[]", encoding="utf-8")
+    code = ("import os, sys; sys.path.insert(0, os.path.join(sys.argv[1], 'webreview')); "
+            "import app; print('BOOTED', app.__version__)")
+    env = dict(os.environ,
+               WEBREVIEW_OUT=str(out),
+               WEBREVIEW_PRODUCTS=str(tmp_path / "nonexistent.csv"),
+               WEBREVIEW_NO_SCHEDULER="1",
+               ADMIN_EMAIL="admin@test.local", ADMIN_PW="dost-dlhe-heslo",
+               PYTHONPATH=os.path.join(ROOT, "src"))
+    p = subprocess.run([sys.executable, "-c", code, ROOT], env=env,
+                       capture_output=True, timeout=120)
+    assert p.returncode == 0, p.stderr.decode()[-3000:]
+    assert b"BOOTED" in p.stdout, p.stderr.decode()[-3000:]
+    assert (out / broken).read_text(encoding="utf-8") == "[]", "the store was rewritten"
+
+
+def test_a_user_store_of_the_wrong_shape_answers_503_not_500(tmp_path, monkeypatch):
+    """With ADMIN_EMAIL unset the boot survives, but `_current_user` then did
+    `[].get(email)` → `AttributeError`, which is outside `_require_login`'s
+    `except (ValueError, OSError)` — so EVERY request 500'd. That is the „reads as a
+    transient glitch, invites another click" outcome C2 replaced with a 503."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(ROOT, "webreview"))
+    import app as webapp
+
+    broken = tmp_path / "users.json"
+    broken.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(webapp, "USERS", str(broken))
+    with pytest.raises(ValueError):
+        webapp._load_users()
+    c = webapp.app.test_client()
+    with c.session_transaction() as s:
+        s["user"] = "someone@test.local"
+    r = c.get("/api/orders")
+    assert r.status_code == 503, r.status_code
+    assert r.get_json()["ok"] is False and "NEMAŽ" in r.get_json()["error"]
+
+
 def test_a_corrupt_user_store_answers_503_with_something_to_fix(tmp_path, monkeypatch):
     """A per-request 500 reads as a transient glitch and invites another click; an
     unreadable account list is neither transient nor clickable-away (PR #265, C2)."""
