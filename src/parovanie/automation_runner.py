@@ -63,17 +63,32 @@ def _quarantine_state(path: str, raw: bytes) -> str:
     Deliberately a small local copy of app.py's store quarantine rather than an import
     of it: this module is pure-python by design (no Flask, unit-testable on its own).
     De-duplicated by CONTENT for the lifetime of the process — the tab polls
-    /api/automations every few seconds, and one copy per poll would bury the real one."""
+    /api/automations every few seconds, and one copy per poll would bury the real one.
+
+    The name carries MICROSECONDS and the file is created O_EXCL (PR #265 third
+    review): with second resolution a second, DIFFERENT corruption inside the same
+    second silently overwrote the first copy — losing the very bytes this exists to
+    preserve. Different content is a different digest, so the memo never covers it."""
     digest = hashlib.sha256(raw).hexdigest()
     with _quarantine_lock:
         memo = _quarantined.get(path)
         if memo and memo[0] == digest:
             return memo[1]
-        backup = "%s.corrupt-%s" % (path, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
         try:
-            with open(backup, "wb") as f:
-                f.write(raw)
-            os.chmod(backup, 0o600)
+            for n in range(100):            # …and a counter for a frozen/coarse clock
+                backup = "%s.corrupt-%s%s" % (path, stamp, f"-{n}" if n else "")
+                try:
+                    fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    continue
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+                break
+            else:
+                log.warning("automations: 100 záloh s rovnakou časovou značkou — "
+                            "kópiu poškodeného stavu nezapisujem")
+                return ""
         except OSError as e:  # noqa: BLE001 — the caller is already failing closed; best effort
             log.warning("automations: kópiu poškodeného stavu sa nepodarilo uložiť (%r)", e)
             return ""
