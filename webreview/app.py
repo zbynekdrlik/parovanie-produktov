@@ -411,6 +411,25 @@ def _store_receipts(p: str):
     yield from _store_reads.get(p, ())
 
 
+def _is_derived_from(data, prev) -> bool:
+    """Is `data` something the caller could have BUILT from the map/list it read?
+
+    `prev=` names the read a rebuilt map came from (the startup decision prune, the
+    výstavy retention sweep). Without this check it was a complete BYPASS rather than a
+    narrowing — the map being written was never compared to anything, so naming a real
+    read authorised writing ANY map over the store (PR #265 second review). A rebuild
+    only ever DROPS entries, so what it writes must be contained in what it read: keys
+    for a map, entry identity for a list."""
+    if data is prev:
+        return True
+    if isinstance(data, dict) and isinstance(prev, dict):
+        return set(data) <= set(prev)
+    if isinstance(data, list) and isinstance(prev, list):
+        kept = {id(x) for x in prev}
+        return all(id(x) in kept for x in data)
+    return False
+
+
 def _guarded_measures(p, protect) -> tuple:
     """`(keys, disk)` — which maps this write must not silently shrink, and what the
     store on disk holds. Raises when the file is there but unreadable."""
@@ -457,7 +476,8 @@ def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False,
     The receipt is the READ, not a count (PR #265 review): `_read_json_store` remembers
     the OBJECT it handed back, and a shrink is allowed only when the map being written
     IS that object (or names it via `prev=`, for the few callers that rebuild a new map
-    from the one they read). A count alone made this a stale-read detector: the app
+    from the one they read — and a rebuild may only DROP entries, see
+    `_is_derived_from`; without that, naming a read authorised writing anything at all). A count alone made this a stale-read detector: the app
     reads decisions on every page load, so the count always matched the disk and the
     guard was disarmed for every caller in the process — including one that had never
     touched the store.
@@ -476,18 +496,20 @@ def _write_json_locked(p, data, indent, mode, protect, prev=None) -> None:
         keys, disk = _guarded_measures(p, protect)
         new = _measure_store(data)
         prev = data if prev is None else prev
+        derived = _is_derived_from(data, prev)
         for k in keys:
             was = disk.get(k, 0)
             if not was or new.get(k, 0) >= was:
                 continue                      # nothing to lose, or the map is growing
-            if any(r[0] is prev and r[1].get(k, 0) == was
-                   for r in _store_receipts(p)):
+            if derived and any(r[0] is prev and r[1].get(k, 0) == was
+                               for r in _store_receipts(p)):
                 continue                      # the tail of a read-modify-write on THIS store
             what = "záznamov" if k == "" else f"položiek v „{k}“"
             log.error("REFUSED to shrink %s%s from %d to %d entries (#261/#265): this "
-                      "write did not come from a read of that store, so the smaller "
-                      "map is not something the manager just did — nothing was "
-                      "written", p, f" [{k}]" if k else "", was, new.get(k, 0))
+                      "write did not come from a read of that store (built from the "
+                      "map it names: %s), so the smaller map is not something the "
+                      "manager just did — nothing was written", p,
+                      f" [{k}]" if k else "", was, new.get(k, 0), derived)
             raise StoreWipeRefused(
                 f"Zápis do {os.path.basename(p)} zamietnutý: {was} {what} by sa "
                 f"zmenšilo na {new.get(k, 0)}, ale zapisovaný obsah nepochádza z "
