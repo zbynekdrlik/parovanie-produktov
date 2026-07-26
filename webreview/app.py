@@ -46,12 +46,7 @@ from parovanie.automation_runner import (
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of, resync_current
-from parovanie.shoptet_import import (
-    chunk_outcome,
-    hard_error_detail,
-    parse_import_log,
-    result_stdout_slice,
-)
+from parovanie.shoptet_import import chunk_outcome, parse_result_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data dir is env-overridable so tests/E2E can boot the app against a fixture.
@@ -4014,7 +4009,12 @@ def run_import(csv_path, dry_run=False, timeout=300):
     if dry_run:
         cmd.append("--dry-run")
     env = {**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")}
+    # decode the child's output as UTF-8 EXPLICITLY — never the box's locale. The
+    # result is read by slicing on the non-ASCII marker 'VÝSLEDOK:' (parse_result_stdout);
+    # under a non-UTF-8 locale that marker would mojibake, every slice would come back
+    # empty and #257 would silently regress (a partially accepted chunk → 'failed').
     p = subprocess.Popen(cmd, cwd=ROOT, env=env, text=True,
+                         encoding="utf-8", errors="replace",
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                          start_new_session=True)
     try:
@@ -4096,6 +4096,7 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
     seen = {"processed": False, "updated": False, "failed": False}
     rc, error_detail, stdout_tail, err_tail = 0, None, "", ""
     chunks_ok = chunks_partial = rows_ok = rows_partial = partial_failed = 0
+    unreadable = False
     for i, chunk in enumerate(chunks, 1):
         chunk_path = _write_import_csv(header, chunk, prefix, csv_safe=csv_safe)
         try:
@@ -4111,12 +4112,14 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
         # ONLY the script's own result slice — the raw stdout starts with an echo of
         # the baseline Log entry, whose 'Spracované: N' parse_import_log would find
         # FIRST and report as this run's result (#196/#257).
-        out_slice = result_stdout_slice(out)
-        parsed = parse_import_log(out_slice)
+        parsed = parse_result_stdout(out)
         stdout_tail, err_tail = (out or "")[-800:], (err or "")[-400:]
         outcome = chunk_outcome(crc, parsed, len(chunk))
         if outcome == "failed":
-            rc, error_detail = crc, hard_error_detail(out_slice, parsed)
+            rc, error_detail = crc, parsed.get("error_detail")
+            # an UNREADABLE result says nothing about what landed — the rows very
+            # likely DID reach the eshop and only the read-back failed
+            unreadable = parsed.get("processed") is None and not error_detail
             log.error("import %schunk %d/%d FAILED rc=%s", prefix, i, len(chunks), crc)
             break
         for k in agg:
@@ -4151,7 +4154,7 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
         "processed": agg["processed"] if seen["processed"] else None,
         "updated": agg["updated"] if seen["updated"] else None,
         "failed": agg["failed"] if seen["failed"] else None,
-        "error_detail": error_detail, "rc": rc,
+        "error_detail": error_detail, "rc": rc, "unreadable": unreadable,
         "stdout_tail": stdout_tail, "err": err_tail,
     }
 
@@ -4175,13 +4178,20 @@ def _chunk_error_msg(res, total_rows, confirms_from_export=False):
     """
     done = res["chunks_ok"] + res.get("chunks_partial", 0)
     if done < res["chunks_total"]:
-        landed = f"naimportované {res['rows_ok']}"
+        where = f"časti {done + 1}/{res['chunks_total']}"
+        count = f"{res['rows_ok']}"
         if res.get("rows_partial"):
             # rows_ok counts only fully clean chunks; a preceding partial chunk did
             # write most of its rows, so report it instead of understating the push
-            landed += f" (+{res['rows_partial']} čiastočne prijatých)"
-        return (f"import zlyhal na časti {done + 1}/{res['chunks_total']} "
-                f"({landed} z {total_rows} riadkov)")
+            count += f" (+{res['rows_partial'] - res.get('partial_failed', 0)} čiastočne prijatých)"
+        if res.get("unreadable"):
+            # NOT the same as "nothing was imported": the rows WERE submitted and very
+            # likely landed, we just could not read/attribute Shoptet's own answer
+            return (f"výsledok {where} sa nepodarilo prečítať — riadky mohli prejsť, "
+                    f"over Log v Shoptete (potvrdených {count} z {total_rows} riadkov)")
+        detail = f": {res['error_detail']}" if res.get("error_detail") else ""
+        return (f"import zlyhal na {where} "
+                f"(naimportované {count} z {total_rows} riadkov){detail}")
     tail = (" (zvyšok sa naimportoval; potvrdí sa z exportu eshopu)"
             if confirms_from_export else " (zvyšok sa naimportoval)")
     return (f"Shoptet odmietol {res.get('partial_failed', 0)} z {total_rows} riadkov"
@@ -5908,8 +5918,10 @@ def run_restock_skladom() -> dict:
                 status = "ok"
             else:
                 status = "error"
-                detail = res["error_detail"] or (res["err"] or "")[-300:]
-                error_detail = f"{_chunk_error_msg(res, len(rows))}: {detail}"
+                # _chunk_error_msg already carries res["error_detail"]; add the
+                # stderr tail only when there is no Shoptet reason to show
+                tail = "" if res["error_detail"] else (res["err"] or "")[-300:]
+                error_detail = _chunk_error_msg(res, len(rows)) + (f": {tail}" if tail else "")
                 log.error("restock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
                           res["rc"], res["chunks_ok"], res["chunks_total"],
                           (res["err"] or "")[-400:])
@@ -6000,8 +6012,10 @@ def run_stock_skladom() -> dict:
                 status = "ok"
             else:
                 status = "error"
-                detail = res["error_detail"] or (res["err"] or "")[-300:]
-                error_detail = f"{_chunk_error_msg(res, len(rows))}: {detail}"
+                # _chunk_error_msg already carries res["error_detail"]; add the
+                # stderr tail only when there is no Shoptet reason to show
+                tail = "" if res["error_detail"] else (res["err"] or "")[-300:]
+                error_detail = _chunk_error_msg(res, len(rows)) + (f": {tail}" if tail else "")
                 log.error("stock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
                           res["rc"], res["chunks_ok"], res["chunks_total"],
                           (res["err"] or "")[-400:])

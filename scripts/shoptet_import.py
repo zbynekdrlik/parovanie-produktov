@@ -218,8 +218,9 @@ def _capture_baseline(page, creds):
     # for the import result, and an echoed 'Spracované: N' from the PREVIOUS entry
     # sits AHEAD of our own result line — parse_import_log takes the first match, so
     # the app read the baseline's counts as this run's result (#196/#257).
+    bid = log_entry_id(baseline) if baseline else None
     print(f"[import] baseline (posledný záznam Logu pred behom): "
-          f"#{log_entry_id(baseline) if baseline else '(žiadny)'}")
+          f"{f'#{bid}' if bid else '(bez čísla)' if baseline else '(žiadny)'}")
     return baseline
 
 
@@ -268,6 +269,19 @@ def _row_texts(page):
     )
 
 
+def _same_entry(a, b):
+    """Do two reads of the Log point at the SAME entry? Compare Shoptet's entry number
+    when both carry one — the rendered row text is not stable (a late-rendered link, a
+    relative time), and settling on the text would make a perfectly good import never
+    agree with itself and end up unattributable."""
+    if b is None:
+        return False
+    ia, ib = log_entry_id(a), log_entry_id(b)
+    if ia is not None and ib is not None:
+        return ia == ib
+    return a == b
+
+
 def _read_result(page, baseline=None, expected_rows=None, retries=6, wait_s=2.0):
     """Read back THIS run's result row from /admin/import-produktov/log/ (#23).
 
@@ -299,7 +313,7 @@ def _read_result(page, baseline=None, expected_rows=None, retries=6, wait_s=2.0)
     for attempt in range(retries):
         row = pick_result_row(_row_texts(page), baseline=baseline,
                               expected_rows=expected_rows)
-        if row is not None and row == picked:
+        if row is not None and _same_entry(row, picked):
             return row
         picked = row
         if attempt < retries - 1:

@@ -162,13 +162,31 @@ HARD_ERROR_MARKER = "CHYBA LOGU:"
 
 def hard_error_detail(slice_text, parsed=None):
     """The Shoptet error line ALONE (no surrounding chatter) when the import aborted
-    hard, else the parsed `error_detail`. Keeps what reaches n8n / the automation card
-    readable: 'Chyba | Číslo riadku: 42 - Data in column code are not unique', not the
-    whole result block it was printed in."""
+    hard, else the parsed `error_detail`. Keeps the reason that reaches n8n and the
+    automation card readable: 'Chyba | Číslo riadku: 42 - Data in column code are not
+    unique', not the whole result block it was printed in."""
     text = slice_text or ""
     if HARD_ERROR_MARKER in text:
         return text.split(HARD_ERROR_MARKER, 1)[1].strip() or None
     return (parsed or {}).get("error_detail")
+
+
+def parse_result_stdout(text):
+    """THE entry point for reading scripts/shoptet_import.py's stdout — use this, never
+    a bare parse_import_log(stdout).
+
+    Two traps it closes, both of which silently corrupted the reported result:
+      * the stdout opens with progress chatter (the baseline entry id, the plan), and
+        parse_import_log returns the FIRST count it finds → slice to this run's result
+        (result_stdout_slice);
+      * 'Zlyhanie …: N' reaches up to 40 characters ahead, so on a hard-error block it
+        happily returns the Shoptet ROW NUMBER or ENTRY ID as the failure count →
+        read the counts from the part BEFORE the error line, and keep the error line
+        itself as `error_detail`."""
+    sl = result_stdout_slice(text)
+    parsed = parse_import_log(sl.split(HARD_ERROR_MARKER, 1)[0])
+    parsed["error_detail"] = hard_error_detail(sl, parsed)
+    return parsed
 
 
 def result_stdout_slice(text):
