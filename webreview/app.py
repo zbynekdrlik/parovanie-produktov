@@ -1507,7 +1507,11 @@ def api_decision():
         else:
             d[key] = {"status": status, "url": body.get("url", "").strip()}
         _save_decisions(d)
-    log.info("decision key=%s status=%s url=%s", key, status, body.get("url", ""))
+    # both values are manager-supplied and reach the log verbatim — a CR/LF in either
+    # forges a log record of its own (this endpoint does not even validate the scheme,
+    # so the forged value is not filtered on the way in)
+    log.info("decision key=%s status=%s url=%s",
+             _log_safe(key), status, _log_safe(body.get("url", "")))
     return jsonify({"ok": True})
 
 
@@ -1893,6 +1897,11 @@ def api_search_pair():
     # malformed values from reaching the import's internalNote / a CSV cell.
     if not re.match(r"^https?://", url):
         return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+    # same cap as every other URL-storing endpoint: this writes a decision, which is
+    # re-read on every /api/orders and whose value reaches a Shoptet internalNote cell
+    if len(url) > URL_MAX:
+        return jsonify({"ok": False,
+                        "error": f"adresa je príliš dlhá (max {URL_MAX} znakov)"}), 400
     ce = CATALOG.get(key)
     if not ce:
         return jsonify({"ok": False, "error": "unknown key"}), 404
@@ -1942,15 +1951,17 @@ def api_search_pair():
             target_key = entry["key"]  # promoted entry's key == pairCode-or-code
             promoted = True
             log.info("search-pair promoted key=%s supplier=%s codes=%d our_url=%s",
-                     target_key, entry["supplier"], len(entry["variant_codes"]),
-                     entry["our_url"])
+                     _log_safe(target_key), _log_safe(entry["supplier"]),
+                     len(entry["variant_codes"]), _log_safe(entry["our_url"]))
         else:
             target_key = existing["key"]   # write under the REAL key (e.g. GRUBE|425)
             promoted = False
         dec = _load_decisions()
         dec[target_key] = {"status": "manual", "url": url}
         _save_decisions(dec)
-    log.info("search-pair decision key=%s url=%s promoted=%s", target_key, url, promoted)
+    # `^https?://` happily passes a URL carrying CR/LF — sanitise before it reaches a log
+    log.info("search-pair decision key=%s url=%s promoted=%s",
+             _log_safe(target_key), _log_safe(url), promoted)
     return jsonify({"ok": True, "promoted": promoted, "key": target_key})
 
 
@@ -2681,11 +2692,36 @@ def _do_create_idea(title: str, description: str, author: str = ""):
         return {"ok": False, "error": "GitHub nedostupný"}, 200
 
 
+def _gh_issue_or_refuse(token, repo, number: int):
+    """(issue, refusal) — read one issue by number and refuse anything that is not one.
+
+    GitHub serves PULL REQUESTS from /repos/{repo}/issues/{n} under the same numbering,
+    so a number is only an ADDRESS — never proof that it belongs to a task. The list
+    endpoint has always filtered PRs out (`pull_request` key), and #243 added the same
+    check to /edit; every other by-number path went without it, so any logged-in shop
+    user could comment on, label, or read back any PR of the repo just by typing its
+    number. One helper, so a future by-number endpoint inherits the guard instead of
+    re-deciding it. `refusal` is a ready (payload, status) pair; callers keep their own
+    try/except — a network error is theirs to degrade."""
+    r = requests.get(f"{GITHUB_API}/repos/{repo}/issues/{number}",
+                     headers=_gh_headers(token), timeout=GH_TIMEOUT)
+    if r.status_code != 200:
+        log.warning("gh read issue: HTTP %s for %s#%s", r.status_code, repo, number)
+        return None, ({"ok": False, "error": f"GitHub API vrátil {r.status_code}"}, 200)
+    parsed = r.json()                                   # parse ONCE
+    cur = parsed if isinstance(parsed, dict) else {}
+    if cur.get("pull_request"):
+        log.warning("gh %s#%s is a pull request — refused", repo, number)
+        return None, ({"ok": False, "error": "toto číslo nepatrí úlohe"}, 200)
+    return cur, None
+
+
 def _do_add_note(number: int, text: str, author: str = ""):
     """(payload, status) — append the boss's detail as a GitHub issue COMMENT
     (non-destructive; the issue body is never overwritten). The boss never sees
     GitHub — the token is used server-side only. No token → graceful „unavailable";
-    upstream/network errors are caught (never 500)."""
+    upstream/network errors are caught (never 500). A PULL REQUEST is refused: the
+    number is read back first, because /issues/{n} serves PRs too."""
     token, repo = _gh_config()
     if not token:
         return {"ok": False, "available": False,
@@ -2694,6 +2730,9 @@ def _do_add_note(number: int, text: str, author: str = ""):
     if author:
         body = body + f"\n\n_Doplnené cez appku (Vývoj) — {author}_"
     try:
+        _cur, refusal = _gh_issue_or_refuse(token, repo, number)
+        if refusal:
+            return refusal
         r = requests.post(
             f"{GITHUB_API}/repos/{repo}/issues/{number}/comments",
             json={"body": body},
@@ -2758,17 +2797,9 @@ def _do_edit_issue(number: int, title: str, text: str, author: str = ""):
         return {"ok": False, "available": False,
                 "error": "GitHub nedostupný — token nie je nastavený"}, 200
     try:
-        rg = requests.get(f"{GITHUB_API}/repos/{repo}/issues/{number}",
-                          headers=_gh_headers(token), timeout=GH_TIMEOUT)
-        if rg.status_code != 200:
-            log.warning("gh edit issue (read): HTTP %s for %s#%s",
-                        rg.status_code, repo, number)
-            return {"ok": False, "error": f"GitHub API vrátil {rg.status_code}"}, 200
-        body_json = rg.json()                       # parse ONCE
-        cur = body_json if isinstance(body_json, dict) else {}
-        if cur.get("pull_request"):
-            log.warning("gh edit issue: %s#%s is a pull request — refused", repo, number)
-            return {"ok": False, "error": "toto číslo nepatrí úlohe"}, 200
+        cur, refusal = _gh_issue_or_refuse(token, repo, number)
+        if refusal:
+            return refusal
         if (cur.get("state") or "open") != "open":
             return {"ok": False,
                     "error": "úloha je už uzavretá — doplň ju radšej detailom"}, 200
@@ -2790,18 +2821,17 @@ def _do_edit_issue(number: int, title: str, text: str, author: str = ""):
 def _do_issue_detail(number: int):
     """(payload, status) — one issue's full text (body) + ALL its comments, so the
     boss reads everything IN the app (GitHub stays hidden). No token → graceful
-    „unavailable"; upstream/network errors are caught (never 500)."""
+    „unavailable"; upstream/network errors are caught (never 500). A PULL REQUEST is
+    refused here too — his task list never shows one, so serving a PR's body and
+    comments on a hand-typed number only shows him something this tab is not about."""
     token, repo = _gh_config()
     if not token:
         return {"ok": False, "available": False,
                 "error": "GitHub nedostupný — token nie je nastavený"}, 200
     try:
-        ri = requests.get(f"{GITHUB_API}/repos/{repo}/issues/{number}",
-                          headers=_gh_headers(token), timeout=GH_TIMEOUT)
-        if ri.status_code != 200:
-            log.warning("gh issue detail: HTTP %s for %s#%s", ri.status_code, repo, number)
-            return {"ok": False, "error": f"GitHub API vrátil {ri.status_code}"}, 200
-        it = ri.json() if isinstance(ri.json(), dict) else {}
+        it, refusal = _gh_issue_or_refuse(token, repo, number)
+        if refusal:
+            return refusal
         comments = []
         rc = requests.get(f"{GITHUB_API}/repos/{repo}/issues/{number}/comments",
                           params={"per_page": GH_LIST_PER_PAGE},
@@ -2836,7 +2866,9 @@ def _ensure_label(token, repo, name, color):
 def _do_set_priority(number: int, priority: str):
     """(payload, status) — set the boss's in-app priority by managing the hidden
     prio labels: add the chosen one, remove the other. `priority` is 'soon',
-    'later' or 'none' (clear). Graceful on no-token / upstream / network error."""
+    'later' or 'none' (clear). Graceful on no-token / upstream / network error.
+    A PULL REQUEST is refused — /issues/{n} serves PRs, so without the read-back a
+    number alone was enough to label any PR of the repo."""
     token, repo = _gh_config()
     if not token:
         return {"ok": False, "available": False,
@@ -2844,6 +2876,9 @@ def _do_set_priority(number: int, priority: str):
     keep = PRIO_LABELS.get(priority)                       # None for 'none' (clear)
     remove = [n for k, n in PRIO_LABELS.items() if n != keep]
     try:
+        _cur, refusal = _gh_issue_or_refuse(token, repo, number)
+        if refusal:
+            return refusal
         for name in remove:                               # drop the opposite label(s)
             dr = requests.delete(
                 f"{GITHUB_API}/repos/{repo}/issues/{number}/labels/{quote(name, safe='')}",
@@ -3133,6 +3168,12 @@ def api_variant_link():
     # the import's internalNote; blocks javascript:/data: and malformed 'httpfoo'.
     if url and not re.match(r"^https?://", url):
         return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+    # same cap as every other URL-storing endpoint — and this store is now HOT:
+    # build_to_order_rows() re-reads it on every /api/orders, and the value lands in a
+    # Shoptet internalNote cell per variant
+    if len(url) > URL_MAX:
+        return jsonify({"ok": False,
+                        "error": f"adresa je príliš dlhá (max {URL_MAX} znakov)"}), 400
     with _lock:
         d = _load_variant_links()
         if url:
@@ -3140,7 +3181,7 @@ def api_variant_link():
         else:
             d.pop(code, None)
         _save_variant_links(d)
-    log.info("variant-link code=%s url=%s", code, url)
+    log.info("variant-link code=%s url=%s", _log_safe(code), _log_safe(url))
     return jsonify({"ok": True})
 
 

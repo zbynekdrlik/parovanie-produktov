@@ -1218,9 +1218,20 @@ async function openSplitSizes(o) {
           + 'otvor tab „Kontrola párovania" a oprav odkaz pri konkrétnej veľkosti.');
     return;
   }
+  // Leaving the tab rebuilds `#list` from scratch, so every open inline editor on every
+  // OTHER row — and the half-typed pair / supplier / comment text in it — goes with it.
+  // The button sits IN the row, right beside the ✏️ that edits in place, so it does not
+  // read as navigation: warn first rather than lose the work silently (#205/#233). Same
+  // predicate the repaint machinery uses, so „would be lost" cannot drift from „is lost".
+  const busy = captureOpenEditors().filter(
+    s => editorSnapHasWork(s, ORDERS.find(x => x.key === s.key))).length;
+  if (busy && !confirm('⚠️ Máš rozpísaný neuložený text (' + busy + '×) v objednávkach. '
+                       + 'Prechodom na veľkosti sa zahodí. Pokračovať?')) return;
   splitOpen.add(p.key);
-  FILTER = 'good';                       // 'split' sits under the „Dobré / Vybrané" filter
-  localStorage.setItem('filter', FILTER);
+  // in memory ONLY — 'split' sits under the „Dobré / Vybrané" filter, so the review tab
+  // has to be on it to show the card. Persisting it replaced whichever filter the
+  // manager had chosen, permanently, as a side effect of one ✂️ click.
+  FILTER = 'good';
   await switchTab('review');
   const card = [...document.querySelectorAll('#list .card')]
     .find(c => c.dataset.key === p.key);
@@ -3182,8 +3193,18 @@ function _ideaMsg(text, cls) {
   if (!text) { msg.hidden = true; msg.textContent = ''; return; }
   msg.hidden = false; msg.className = 'idea-msg' + (cls ? ' ' + cls : ''); msg.textContent = text;
 }
+// One submission at a time, guarded on a FLAG rather than on `btn.disabled`. The button
+// property only stops a second CLICK dispatch, and the title input's keydown-Enter calls
+// _ideaSubmit() DIRECTLY — so with the click-only guard, Enter+Enter sent two POSTs and
+// created two GitHub issues. Enter on a one-line title is the boss's primary submit
+// affordance, so that was the live path. The flag sits inside the function every entry
+// point goes through, and is cleared only on the error path (retry is fine) and in
+// _ideaOpen — the success path stays locked exactly like the button.
+let _ideaBusy = false;
+
 function _ideaOpen() {
   const m = document.getElementById('ideaModal'); if (!m) return;
+  _ideaBusy = false;
   document.getElementById('ideaTitleInput').value = '';
   document.getElementById('ideaDescInput').value = '';
   // back to the form — the previous open may have ended on the confirmation panel
@@ -3201,11 +3222,13 @@ function _ideaClose() {
   const m = document.getElementById('ideaModal'); if (m) m.hidden = true;
 }
 async function _ideaSubmit() {
+  if (_ideaBusy) return;                 // click OR Enter — both come through here
   const ti = document.getElementById('ideaTitleInput');
   const de = document.getElementById('ideaDescInput');
   const btn = document.getElementById('ideaSubmit');
   const title = ti.value.trim();
   if (!title) { _ideaMsg('Napíš aspoň názov nápadu.', 'err'); ti.focus(); return; }
+  _ideaBusy = true;
   btn.disabled = true;
   let ok = false, err = '', number = 0;
   try {
@@ -3218,7 +3241,7 @@ async function _ideaSubmit() {
     number = (j.issue && j.issue.number) || 0;
     if (!ok) err = j.error || ('chyba ' + r.status);
   } catch (_) { err = 'sieťová chyba'; }
-  if (!ok) { btn.disabled = false; _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
+  if (!ok) { _ideaBusy = false; btn.disabled = false; _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
   // #243 — the dialog used to just vanish. The lightbulb is on EVERY tab, so unless he
   // happened to be standing in „Vývoj" he got no number, no confirmation and no way
   // back to what he had just sent. Say it landed, and offer to open it right away.

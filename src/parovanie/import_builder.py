@@ -277,7 +277,18 @@ def link_row_specs(products, decisions, code2pair, variant_links=None):
     variant_links = variant_links or {}
     seen = set()
     for p in products:
-        d = decisions.get(p.get("key"))
+        key = p.get("key")
+        # A spec has to NAME its owner, so a product without a usable key yields
+        # nothing at all — here, rather than in one consumer. Filtering it downstream
+        # (the to-order owner map did) makes the readers disagree about the same code:
+        # the row still showed the decision's link plus a ✏️, but with an empty
+        # `reviewKey`, so the correction went to order_pairings — which the write-back
+        # then excludes, because `owned_codes` comes from link_rows() and never
+        # filtered on the key. Accepted, and never shipped: the silent no-op #242
+        # exists to remove. One loop, one rule, all three readers.
+        if not key:
+            continue
+        d = decisions.get(key)
         if not d:
             continue
         st = d.get("status")
@@ -292,7 +303,7 @@ def link_row_specs(products, decisions, code2pair, variant_links=None):
                 seen.add(c)
                 if is_grube:
                     vurl = to_grube_de(vurl) or vurl
-                yield [c, code2pair.get(c, ""), vurl, p.get("key"), st]
+                yield [c, code2pair.get(c, ""), vurl, key, st]
         elif st in ("good", "manual") and (d.get("url") or "").strip():
             url = d["url"].strip()
             if is_grube:
@@ -301,7 +312,7 @@ def link_row_specs(products, decisions, code2pair, variant_links=None):
                 if c in seen:
                     continue
                 seen.add(c)
-                yield [c, code2pair.get(c, ""), url, p.get("key"), st]
+                yield [c, code2pair.get(c, ""), url, key, st]
 
 
 def order_pairing_rows(order_pairings, code2pair, exclude_codes=None):
