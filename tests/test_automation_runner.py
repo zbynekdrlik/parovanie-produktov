@@ -253,3 +253,30 @@ def test_the_state_write_fsyncs_the_directory_after_the_rename(tmp_path, monkeyp
     assert calls.index(("fsync", False)) < calls.index(("replace", False)), calls
     after = calls[calls.index(("replace", False)):]
     assert ("fsync", True) in after, f"no directory fsync after the rename: {calls}"
+
+
+def test_two_different_corruptions_in_the_same_second_both_survive(tmp_path, monkeypatch):
+    """The quarantine name had SECOND resolution, so a second corruption inside the
+    same second overwrote the first copy — losing the very bytes the fail-closed loader
+    preserved for repair. The dedup memo does not save it: different contents are
+    different digests, so both genuinely want their own file (PR #265 third review)."""
+    import parovanie.automation_runner as ar
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 7, 26, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(ar, "datetime", _Frozen)
+    monkeypatch.setattr(ar, "_quarantined", {})
+    p = tmp_path / "automations.json"
+    r = AutomationRunner(str(p), [])
+    for raw in (b'{"a": ', b'{"b": '):
+        p.write_bytes(raw)
+        with pytest.raises(AutomationStateCorrupt):
+            r._load()
+
+    backups = [n for n in os.listdir(tmp_path) if ".corrupt-" in n]
+    assert len(backups) == 2, f"a second corruption overwrote the first copy: {backups}"
+    kept = {(tmp_path / n).read_bytes() for n in backups}
+    assert kept == {b'{"a": ', b'{"b": '}, kept
