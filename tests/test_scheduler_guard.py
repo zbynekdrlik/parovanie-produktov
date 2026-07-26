@@ -20,6 +20,8 @@ import sys
 
 import pytest
 
+from parovanie.automation_runner import Automation, AutomationRunner
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
@@ -192,16 +194,30 @@ def _automations_json():
 
 
 def test_a_running_scheduler_reports_itself_as_running(scheduler_out, monkeypatch):
-    """Starts the REAL loop thread (it used to stub `RUNNER.start` away, which is
-    precisely the state the API could not tell apart from a healthy one — see the
-    dead-thread test below). The module global is pinned through monkeypatch so the
-    test cannot leave the process reporting a scheduler it did not start."""
+    """Starts a REAL loop thread (stubbing `RUNNER.start` away is precisely the state
+    the API could not tell apart from a healthy one — see the dead-thread test below),
+    but over a STUB runner, never the production `RUNNER` (PR #265 third review).
+
+    The production one carries the real mail-sending automations, and starting it
+    inside the pytest process was safe only by accident: `tick=30.0` outran the test
+    and the fixture dir happened to seed no `automations.json` with `enabled: true`.
+    One seeded fixture and a CI run mails a customer — the same category as the
+    forgotten preview instance this whole file exists for. The module global is pinned
+    through monkeypatch so the test cannot leave the process reporting a scheduler it
+    did not start."""
     monkeypatch.setattr(webapp, "SCHEDULER_INTENT", webapp.SCHEDULER_INTENT)
+    stub = AutomationRunner(
+        str(scheduler_out / "automations.json"),
+        [Automation(key="stub", name="Stub", schedule={"daily_at": "09:00",
+                                                       "tz": "Europe/Bratislava"},
+                    run_fn=lambda: {"ok": True})],   # touches nothing outside the test
+        tick=30.0)
+    monkeypatch.setattr(webapp, "RUNNER", stub)
     try:
         assert webapp._start_scheduler() is True
         assert _automations_json()["scheduler"] == "running"
     finally:
-        webapp.RUNNER.stop()
+        stub.stop()
 
 
 def test_a_scheduler_whose_thread_is_gone_stops_claiming_to_run(scheduler_out, monkeypatch):

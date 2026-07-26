@@ -662,23 +662,51 @@ def test_a_concurrent_read_still_does_not_legitimise_a_foreign_wipe(
 
 def test_the_receipt_of_one_thread_is_not_a_receipt_for_another(monkeypatch, tmp_path):
     """Widening the receipt must not turn „some thread read it once" into a licence
-    for a thread that never did — that is the incident's own shape, threaded."""
+    for a thread that never did — that is the incident's own shape, threaded.
+
+    The foreign thread writes a map genuinely DERIVED from the OTHER thread's read and
+    names it with `prev=`, so nothing here is refused by object identity: this is the
+    strongest write a thread that never read the store can attempt (its earlier form —
+    writing `{}` — was refused identically before and after the per-thread ring, so it
+    proved nothing about it, PR #265 third review).
+
+    It also pins what the SHARED ring is really worth: the pollers' reads turn it over
+    within microseconds (`_READ_RING` = 8), which is why the cross-thread fallback is
+    BEST EFFORT and nothing in the tree may depend on it — every `protect=` write in
+    app.py loads and saves inside one `with _lock:` block, i.e. in one thread."""
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     webapp._save_decisions(_two_decisions())
-    read = webapp._load_decisions()          # this thread reads…
+    read = webapp._load_decisions()                     # this thread reads…
+    kept = {k: v for k, v in list(read.items())[:1]}    # …and narrows what it read
+
+    def _poller():                                       # the tab, on its own thread
+        for _ in range(webapp._READ_RING):
+            webapp._load_decisions()
+
+    t = threading.Thread(target=_poller, name="tab-poller")
+    t.start()
+    t.join(timeout=10)
+
     boom = []
 
     def _foreign_writer():
         try:
-            webapp._save_decisions({})       # …a DIFFERENT thread wipes, having read nothing
+            webapp._save_decisions(kept, prev=read)      # a read THIS thread never made
         except webapp.StoreWipeRefused:
             boom.append("refused")
 
     t = threading.Thread(target=_foreign_writer, name="foreign")
     t.start()
     t.join(timeout=10)
-    assert boom == ["refused"], "a foreign thread wiped the store"
-    assert webapp._load_decisions() == _two_decisions() and read
+    assert boom == ["refused"], "a foreign thread shrank the store on another's read"
+    assert webapp._load_decisions() == _two_decisions()
+
+    # …and the thread that DID the read is not collateral damage: its own receipt
+    # survived every one of those polls. That is the per-thread ring's whole purpose —
+    # with the single slot this wave replaced, the polls above overwrote the receipt and
+    # the reader's own write came back as a 503.
+    webapp._save_decisions(kept, prev=read)
+    assert list(webapp._load_decisions()) == list(kept)
 
 
 # --------------------------------------------------------------------------- #
