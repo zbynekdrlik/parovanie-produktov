@@ -128,19 +128,26 @@ def test_a_split_variant_with_no_link_of_its_own_keeps_the_inline_paste_box():
     assert r["supplierUrl"] == "" and r["reviewKey"] == "" and r["reviewStatus"] == ""
 
 
-def test_an_owner_without_a_usable_key_is_reported_as_no_owner_at_all():
-    """`"reviewKey": owner_key or ""` conflated 'no owner' with 'falsy key': the row
-    then advertised `reviewStatus:'good'` with an EMPTY `reviewKey`, so `savePairUrl`
-    routed the correction to order_pairings — which the write-back discards for a code
-    link_rows already covers. That is the very silent no-op #242 exists to remove, so
-    a spec with no usable key must report no owner at all (→ plain inline path)."""
+def test_a_spec_without_a_usable_key_owns_nothing_anywhere():
+    """A decision nothing can OWN must not reach any of the three places that read
+    `link_row_specs`, or they disagree about the same code.
+
+    The first pass filtered only the owner map: the row still rendered the decision's
+    link plus a ✏️, but with an empty `reviewKey`, so `savePairUrl` routed the
+    correction to order_pairings — which `_do_upload_pairings` then excludes, because
+    `owned_codes` comes from `link_rows` and does NOT filter on the key. An accepted
+    correction that never ships: the exact silent no-op #242 exists to remove. So the
+    guard belongs at the SOURCE (the one loop), where the row map, the owner map and
+    the eshop write-back all pick it up together."""
     products = [dict(PRODUCTS[0], key="")]
-    rows = webapp.build_to_order_rows(ORDERS_CSV, products,
-                                      {"": {"status": "good", "url": "https://a.test/x"}},
-                                      CODE2PAIR)
+    decisions = {"": {"status": "good", "url": "https://a.test/x"}}
+    rows = webapp.build_to_order_rows(ORDERS_CSV, products, decisions, CODE2PAIR)
     r = _by_code(rows, "61247/L")
-    assert r["supplierUrl"] == "https://a.test/x"        # the link is still shown
+    assert r["supplierUrl"] == ""                        # no owner-backed URL, no ✏️
     assert r["reviewKey"] == "" and r["reviewStatus"] == ""
+    # and the write-back does not claim the code either, so the inline paste box the
+    # row now shows is a path that actually reaches the eshop
+    assert import_builder.link_rows(products, decisions, CODE2PAIR, {}) == []
 
 
 # --- the endpoint that rewrites the reviewed link --------------------------- #
@@ -266,12 +273,21 @@ def test_correcting_a_reviewed_link_drops_the_superseded_inline_pairing(monkeypa
     assert left == {"99999/M": "https://other.test/keep"}
 
 
+def _arm_url_stores(monkeypatch, tmp_path):
+    """Every store an URL-saving endpoint writes, pointed at tmp."""
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "variant_links.json"))
+
+
 def test_an_absurdly_long_url_is_refused(monkeypatch, tmp_path):
     """A 300 000-char URL was accepted and grew decisions.json to 300 kB — a store
     re-read on every /api/orders, whose value also lands in a Shoptet internalNote
-    cell. The same cap guards /api/order-pair and /api/decision."""
-    _arm(monkeypatch, tmp_path)
-    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
+    cell. EVERY endpoint that stores an URL needs the cap, not just the three the
+    first pass reached: /api/variant-link had neither cap nor sanitiser, and THIS PR
+    is what made its store hot (`build_to_order_rows(..., _load_variant_links())` now
+    re-reads it on every /api/orders) — a 300 000-char URL grew it to 300 029 bytes."""
+    _arm_url_stores(monkeypatch, tmp_path)
     long_url = "https://x.test/" + "a" * 300000
     assert _client().post("/api/order-decision-url",
                           json={"key": "BETALOV|231", "url": long_url}).status_code == 400
@@ -283,18 +299,34 @@ def test_an_absurdly_long_url_is_refused(monkeypatch, tmp_path):
                           json={"key": "BETALOV|231", "status": "manual",
                                 "url": long_url}).status_code == 400
     assert webapp._load_decisions()["BETALOV|231"]["url"] == "https://www.huntingshop.eu/stara"
+    assert _client().post("/api/variant-link",
+                          json={"code": "61247/L", "url": long_url}).status_code == 400
+    assert webapp._load_variant_links() == {}
 
 
 def test_a_crlf_in_the_url_cannot_forge_a_log_line(monkeypatch, tmp_path, caplog):
     """`log.info("order-decision-url key=%s url=%s", …)` echoed the raw value, so
     posting `https://x.test/a\\r\\nSet-Cookie: x` produced a bare `Set-Cookie: x` log
-    line of its own."""
-    _arm(monkeypatch, tmp_path)
-    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
+    line of its own.
+
+    Every endpoint that logs a manager-supplied value belongs in this loop — the
+    first pass sanitised two of them and left /api/decision (the one URL endpoint
+    with NO scheme validation at all, so the forged value is not even filtered on the
+    way in) and /api/variant-link raw. The KEY is manager-supplied too, so it is
+    forged here as well."""
+    _arm_url_stores(monkeypatch, tmp_path)
     forged = "https://x.test/a\r\nSet-Cookie: x"
+    posts = [
+        ("/api/order-decision-url", {"key": "BETALOV|231", "url": forged}),
+        ("/api/order-pair", {"code": "99999/M", "url": forged}),
+        ("/api/decision", {"key": "BETALOV|231", "status": "manual", "url": forged}),
+        ("/api/decision", {"key": "K\r\nSet-Cookie: k", "status": "manual",
+                           "url": "https://x.test/ok"}),
+        ("/api/variant-link", {"code": "61247/L", "url": forged}),
+    ]
     with caplog.at_level("INFO"):
-        _client().post("/api/order-decision-url", json={"key": "BETALOV|231", "url": forged})
-        _client().post("/api/order-pair", json={"code": "99999/M", "url": forged})
+        for path, payload in posts:
+            _client().post(path, json=payload)
     for rec in caplog.records:
         assert "\r" not in rec.getMessage() and "\n" not in rec.getMessage(), rec.getMessage()
 

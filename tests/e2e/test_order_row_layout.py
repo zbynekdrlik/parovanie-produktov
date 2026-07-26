@@ -278,6 +278,55 @@ def test_a_split_row_sends_the_edit_to_the_per_size_panel(page, toorder_wide_ser
     assert console == [], f"console not clean: {console}"
 
 
+def test_the_split_button_warns_before_discarding_unsaved_typing(page, toorder_wide_server):
+    """✂️ leaves the tab, and leaving repaints `#list` from scratch — so every open
+    inline editor on EVERY other row, and the half-typed text in it, is gone with no
+    message at all. That is the silent-loss class #205/#233 exist to remove, and this
+    button hides it especially well: it sits IN the row, right where ✏️ edits in
+    place, so it does not read as navigation.
+
+    Dismissing the warning must leave everything exactly as it was — same tab, same
+    text, and no per-size panel opened behind his back."""
+    console = _console(page)
+    dialogs = []
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    row = page.locator(_BAD)
+    row.locator(".to-pairedit").click()
+    row.locator(".to-pairurl").fill("https://www.citrade.sk/rukavice-ROZPISANE")
+
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.dismiss()))
+    page.locator(_SPLIT + " .to-splitedit").click()
+    page.wait_for_timeout(300)
+
+    assert len(dialogs) == 1, f"no warning before discarding typed text: {dialogs}"
+    assert page.locator("#pageTitle").inner_text() == "Na objednanie", "navigated anyway"
+    assert row.locator(".to-pairurl").input_value() == \
+        "https://www.citrade.sk/rukavice-ROZPISANE"
+    assert console == [], f"console not clean: {console}"
+
+
+def test_the_split_button_keeps_the_saved_filter_preference(page, toorder_wide_server):
+    """Getting to the per-size panel needs the review tab on a filter that shows a
+    `split` card, but that is a NAVIGATION detail — it was also WRITTEN to
+    localStorage, so one ✂️ silently replaced whichever review filter the manager had
+    chosen, for good. The in-memory switch is enough; his stored preference is his."""
+    console = _console(page)
+    dialogs = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+    page.add_init_script("localStorage.setItem('filter', 'bad');")
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    page.locator(_SPLIT + " .to-splitedit").click()
+    page.wait_for_selector('#list .card[data-key="ORBIS|555"] .splitrow')
+
+    assert dialogs == [], "warned with nothing unsaved to lose"
+    assert page.evaluate("() => localStorage.getItem('filter')") == "bad"
+    assert console == [], f"console not clean: {console}"
+
+
 def test_a_row_outside_the_review_set_keeps_its_inline_paste_box(page, toorder_wide_server):
     """The existing inline-pairing path must be untouched — it writes to order_pairings,
     which is still the right store for a code that has no reviewed decision."""

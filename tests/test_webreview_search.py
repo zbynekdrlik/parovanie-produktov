@@ -144,6 +144,29 @@ def test_search_pair_unknown_paircode_404(client):
                        json={"pairCode": "999", "url": "https://x.sk/"}).status_code == 404
 
 
+def test_search_pair_refuses_an_absurdly_long_url(client):
+    """Same cap as every other URL-storing endpoint (URL_MAX): this one writes a
+    decision, which is re-read on every /api/orders and whose value ends up in a
+    Shoptet internalNote cell — it had no cap at all."""
+    long_url = "https://www.grube.de/" + "a" * 300000
+    assert client.post("/api/search-pair",
+                       json={"pairCode": "425", "url": long_url}).status_code == 400
+    assert webapp.PRODUCTS == []                       # nothing promoted either
+    assert (not os.path.exists(webapp.DECISIONS)
+            or "425" not in json.load(open(webapp.DECISIONS)))
+
+
+def test_search_pair_cannot_forge_a_log_line(client, caplog):
+    """`log.info("search-pair decision key=%s url=%s", …)` echoed the raw value, and
+    the `^https?://` guard happily passes `https://x/a\\r\\nSet-Cookie: x` — so the
+    endpoint wrote a log record of its own choosing."""
+    forged = "https://www.grube.de/a\r\nSet-Cookie: x"
+    with caplog.at_level("INFO"):
+        client.post("/api/search-pair", json={"pairCode": "425", "url": forged})
+    for rec in caplog.records:
+        assert "\r" not in rec.getMessage() and "\n" not in rec.getMessage(), rec.getMessage()
+
+
 # --------------------------------------------------------------------------- #
 # BUG 1 end-to-end: a single-variant product with an EMPTY pairCode (čiapky/nože…) is
 # indexed by its CODE, returned by /api/search with key==code, and promoted by /api/

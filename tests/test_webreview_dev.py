@@ -49,6 +49,23 @@ def _configure(monkeypatch):
     monkeypatch.setenv("GITHUB_REPO", "owner/repo")
 
 
+# GitHub serves PULL REQUESTS from /issues/{n} too, so every path that acts on a
+# number the user typed has to READ the issue first and refuse a PR. That read is why
+# note/priority/detail all need `requests.get` armed now.
+_PLAIN_ISSUE = {"number": 5, "title": "Úloha", "state": "open", "body": "",
+                "labels": [], "html_url": "https://example.test/issues/5"}
+_PULL_REQUEST = dict(_PLAIN_ISSUE, number=7, title="Nejaké PR",
+                     pull_request={"url": "https://api.test/pulls/7"})
+
+
+def _arm_read(monkeypatch, issue=None):
+    """Arm the pre-write read every by-number endpoint performs (the PR guard)."""
+    payload = dict(issue if issue is not None else _PLAIN_ISSUE)
+    monkeypatch.setattr(webapp.requests, "get",
+                        lambda url, **k: _Resp(200, [])
+                        if "/comments" in url else _Resp(200, dict(payload)))
+
+
 # --------------------------------------------------------------------------- #
 # /api/dev/issues — list open + closed, PRs filtered out
 # --------------------------------------------------------------------------- #
@@ -258,6 +275,7 @@ def test_dev_note_requires_login():
 
 def test_dev_note_posts_comment(monkeypatch):
     _configure(monkeypatch)
+    _arm_read(monkeypatch)
     sent = {}
 
     def fake_post(url, json=None, headers=None, timeout=None):
@@ -291,6 +309,54 @@ def test_dev_note_too_long_rejected(monkeypatch):
     assert r.status_code == 400
 
 
+def test_dev_note_on_a_pull_request_is_refused(monkeypatch):
+    """The refusal was added to /edit only, so any logged-in shop user could comment
+    on ANY pull request of the repo just by typing its number — GitHub's /issues/{n}
+    serves PRs under the same numbering. The rule is „every endpoint that WRITES by
+    number", not „the one we happened to be fixing"."""
+    _configure(monkeypatch)
+    _arm_read(monkeypatch, _PULL_REQUEST)
+    # a RECORDING stub, not a raising one: the endpoints swallow every exception into
+    # a generic „GitHub nedostupný", which is also non-ASCII — a raising stub would
+    # make this test pass while the write still went through in production
+    calls = []
+    monkeypatch.setattr(webapp.requests, "post",
+                        lambda *a, **k: (calls.append(a), _Resp(201, {"id": 1}))[1])
+    r = _client().post("/api/dev/issue/7/note", json={"text": "detail"})
+    assert calls == [], "commented on a pull request"
+    assert r.status_code == 200 and r.get_json()["ok"] is False
+    assert r.get_json()["error"] == "toto číslo nepatrí úlohe"
+
+
+def test_dev_priority_on_a_pull_request_is_refused(monkeypatch):
+    """Same hole in the labelling path: prio labels could be added to and removed
+    from any PR of the repo by number alone."""
+    _configure(monkeypatch)
+    _arm_read(monkeypatch, _PULL_REQUEST)
+    calls = []                                    # recording, not raising — see above
+    monkeypatch.setattr(webapp.requests, "post",
+                        lambda *a, **k: (calls.append(("POST",) + a), _Resp(200, []))[1])
+    monkeypatch.setattr(webapp.requests, "delete",
+                        lambda *a, **k: (calls.append(("DELETE",) + a), _Resp(200, []))[1])
+    r = _client().post("/api/dev/issue/7/priority", json={"priority": "soon"})
+    assert calls == [], "touched a pull request's labels"
+    assert r.status_code == 200 and r.get_json()["ok"] is False
+    assert r.get_json()["error"] == "toto číslo nepatrí úlohe"
+
+
+def test_dev_issue_detail_of_a_pull_request_is_refused(monkeypatch):
+    """Lower harm than the writes, but the same confusion: the boss's task list never
+    shows PRs, so serving one's body and comments on a hand-typed number is a leak of
+    something he is not meant to see through this tab at all."""
+    _configure(monkeypatch)
+    _arm_read(monkeypatch, dict(_PULL_REQUEST, body="interné PR telo"))
+    r = _client().get("/api/dev/issue/7")
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["ok"] is False and "interné PR telo" not in str(j)
+    assert not j["error"].isascii()
+
+
 def test_dev_note_token_missing_degrades_gracefully(monkeypatch):
     # no token; requests.post is the raising guard → must NOT be called
     r = _client().post("/api/dev/issue/5/note", json={"text": "detail bez tokenu"})
@@ -310,6 +376,7 @@ def test_dev_priority_requires_login():
 
 def test_dev_priority_soon_adds_label_and_removes_opposite(monkeypatch):
     _configure(monkeypatch)
+    _arm_read(monkeypatch)
     calls = []
 
     def fake_delete(url, headers=None, timeout=None):
@@ -335,6 +402,7 @@ def test_dev_priority_soon_adds_label_and_removes_opposite(monkeypatch):
 
 def test_dev_priority_none_clears_both_and_adds_nothing(monkeypatch):
     _configure(monkeypatch)
+    _arm_read(monkeypatch)
     calls = []
 
     def fake_delete(url, headers=None, timeout=None):
@@ -362,6 +430,7 @@ def test_dev_priority_delete_failure_reported_not_silent(monkeypatch):
     surfaced as ok:False — never reported as success with the label still on the
     issue. And the add-label POST must NOT run after a failed delete."""
     _configure(monkeypatch)
+    _arm_read(monkeypatch)
 
     def fake_delete(url, headers=None, timeout=None):
         return _Resp(403, {"message": "secondary rate limit"})
@@ -382,6 +451,7 @@ def test_dev_priority_delete_404_is_ok(monkeypatch):
     """DELETE 404 means the opposite label simply wasn't set — that is success,
     not a failure; the chosen label still gets added."""
     _configure(monkeypatch)
+    _arm_read(monkeypatch)
 
     def fake_delete(url, headers=None, timeout=None):
         return _Resp(404, {"message": "Label does not exist"})
@@ -399,6 +469,7 @@ def test_dev_priority_none_delete_failure_reported(monkeypatch):
     """Clearing to 'none' with a failing DELETE must NOT report ok unconditionally
     — the pre-fix bug returned ok:True even when the labels weren't removed."""
     _configure(monkeypatch)
+    _arm_read(monkeypatch)
 
     def fake_delete(url, headers=None, timeout=None):
         return _Resp(500, {"message": "server error"})

@@ -405,3 +405,50 @@ def test_one_click_on_the_lightbulb_creates_exactly_one_request(page, dev_server
     page.unroute("**/api/dev/issues")
     page.wait_for_timeout(200)
     assert console == [], f"console not clean: {console}"
+
+
+def test_pressing_enter_twice_creates_exactly_one_request(page, dev_server):
+    """The click guard was `btn.disabled = true` — and `_ideaSubmit` only SETS that
+    property, it never reads it. The title input's keydown-Enter calls `_ideaSubmit()`
+    DIRECTLY, so the disabled button stopped a second CLICK dispatch and nothing else:
+    Enter, Enter → two POSTs → TWO GitHub issues. Enter on a one-line title is the
+    boss's primary submit affordance, so this is the live path, and the click-only
+    test above stayed green the whole time its name claimed otherwise.
+
+    The POST itself is HELD (never answered until the end) so the second Enter really
+    lands mid-flight — a stub answers too fast for the window to exist."""
+    console = _console(page)
+    posts = []
+    page.goto(dev_server + "/?tab=toorder")
+    page.wait_for_selector(".sidebar #tabs button")
+    page.on("request", lambda r: posts.append(r.url)
+            if r.method == "POST" and r.url.endswith("/api/dev/idea") else None)
+
+    held = []
+    page.route("**/api/dev/idea", lambda route: held.append(route))
+
+    page.locator("#ideaBtn").click()
+    title = page.locator("#ideaTitleInput")
+    title.fill("Enter dvakrat, uloha raz")
+    title.press("Enter")
+    for _ in range(60):                               # the first POST is now in flight
+        if held:
+            break
+        page.wait_for_timeout(50)
+    assert held, "the first Enter never submitted"
+    # the impatient second Enter, while that request is still unanswered
+    title.press("Enter")
+    page.wait_for_timeout(300)
+    assert len(posts) == 1, f"created {len(posts)} requests: {posts}"
+
+    for route in held:                                # answer the held POST
+        route.continue_()
+    page.unroute("**/api/dev/idea")
+    page.wait_for_selector("#ideaDone:not([hidden])", timeout=5000)
+    # and a THIRD Enter after it landed must not start another one either
+    page.evaluate("() => { const t = document.getElementById('ideaTitleInput');"
+                  " t.dispatchEvent(new KeyboardEvent('keydown',"
+                  " {key: 'Enter', bubbles: true, cancelable: true})); }")
+    page.wait_for_timeout(200)
+    assert len(posts) == 1, f"created {len(posts)} requests: {posts}"
+    assert console == [], f"console not clean: {console}"
