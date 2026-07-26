@@ -776,6 +776,43 @@ def test_naming_a_read_does_not_authorise_a_FOREIGN_nested_dedup_map(
     assert len(webapp._load_orders_reminder()["orders"]) == 50
 
 
+@pytest.mark.parametrize("gone", [None, ["x"], "gone", 0])
+def test_replacing_the_nested_dedup_map_with_a_NON_map_is_refused(
+        monkeypatch, tmp_path, gone):
+    """The narrowing check compared the guarded nested value only with ITSELF-shaped
+    values: `isinstance(a, dict) and isinstance(b, dict)` / the same for lists. A
+    `prev=` write that swaps the who-was-already-mailed map for something that is
+    NEITHER — `None`, a list, a string, `0` — matched no branch, so `derived` stayed
+    True, the receipt matched, and the 50-entry map was written away (all four shapes
+    measured ALLOWED on HEAD; PR #265 final review).
+
+    Nothing writes this today — the loader refuses `{"orders": null}` on the next read,
+    so it fails closed rather than silently — but the guard is supposed to cover the
+    nested level unconditionally, and it did not."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, dict(st, orders=gone),
+                                  mode=0o600, protect=("orders",), prev=st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
+def test_dropping_the_guarded_key_entirely_is_refused_too(monkeypatch, tmp_path):
+    """The degenerate case of the same hole: the outer key set stays a SUBSET, so the
+    top-level check passes, and `data.get("orders")` is then `None` against a real map."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    without = {k: v for k, v in st.items() if k != "orders"}
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(webapp.ORDERS_REMINDER_STATE, without,
+                                  mode=0o600, protect=("orders",), prev=st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
 def test_a_rebuilt_list_that_smuggles_in_a_foreign_entry_is_refused(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
@@ -942,6 +979,69 @@ def test_the_pytest_live_dir_net_resolves_symlinks(monkeypatch, tmp_path):
     with pytest.raises(webapp.StoreWipeRefused):
         webapp._atomic_write_json(str(link / "decisions.json"), {"S|1": {"status": "x"}})
     assert not (real / "decisions.json").exists()
+
+
+def test_the_sweep_never_unlinks_in_the_live_data_dir_ITSELF_under_pytest(
+        monkeypatch, tmp_path):
+    """The pytest net covered `data/out` (and everything under it) and the products.csv
+    FILE — but the startup sweep walks TWO directories, and the second is
+    `dirname(SRC)` = `data/`, which is neither. A helper repointing
+    `WEBREVIEW_PRODUCTS` at the real export therefore let the import-time sweep unlink
+    live `data/*.tmp` — the blast radius the delta's own docstring already named
+    (PR #265 final review). `_LIVE_PRODUCTS` is repointed at a throwaway path so a
+    REGRESSION here cannot reach the manager's data."""
+    real = tmp_path / "pretend-live-data"
+    real.mkdir()
+    monkeypatch.setattr(webapp, "_LIVE_PRODUCTS", str(real / "products.csv"))
+    old = real / "products.csv.abc123.tmp"
+    old.write_bytes(b"x" * 10)
+    os.utime(old, (time.time() - 36 * 3600, time.time() - 36 * 3600))
+
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._sweep_stale_tmp(str(real))
+    assert old.exists(), "the sweep deleted inside the live data dir from a test run"
+
+
+def test_a_failing_directory_close_never_reports_a_finished_write_as_failed(
+        monkeypatch, tmp_path):
+    """`_fsync_dir` is documented BEST EFFORT and swallows `os.open`/`os.fsync` errors —
+    but not the `os.close` in its `finally`. It ran INSIDE `_atomic_write_bytes`'s
+    `except BaseException: unlink(tmp); raise`, where the temp file is already gone
+    after the replace: an error there logged a spurious „temp file could not be removed"
+    and re-raised, so the caller believed a 55 MB export that is durably on disk had
+    failed (PR #265 final review)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    real_close = os.close
+
+    def _close(fd):
+        isdir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        real_close(fd)                     # never leak the fd we are pretending broke
+        if isdir:
+            raise OSError(5, "EIO on close")
+
+    monkeypatch.setattr(os, "close", _close)
+    p = tmp_path / "orders_cache.csv"
+    webapp._atomic_write_bytes(str(p), b"kod;nazov\r\n")
+    assert p.read_bytes() == b"kod;nazov\r\n"
+
+
+def test_a_failing_directory_close_does_not_fail_a_store_write_either(
+        monkeypatch, tmp_path):
+    """Same `_fsync_dir`, same `except BaseException` shape, one writer further: a store
+    the manager just saved must not answer 503 because a directory handle refused to
+    close."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    real_close = os.close
+
+    def _close(fd):
+        isdir = stat.S_ISDIR(os.fstat(fd).st_mode)
+        real_close(fd)
+        if isdir:
+            raise OSError(5, "EIO on close")
+
+    monkeypatch.setattr(os, "close", _close)
+    webapp._save_decisions(_two_decisions())
+    assert len(webapp._load_decisions()) == 2
 
 
 def test_the_raw_cache_writer_fsyncs_the_directory_too(monkeypatch, tmp_path):
