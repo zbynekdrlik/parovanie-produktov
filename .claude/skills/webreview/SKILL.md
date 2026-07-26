@@ -140,17 +140,34 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   UnicodeDecodeError); **každá iná `OSError` musí prebublať** — „súbor sa nedá prečítať"
   nie je dôkaz, že manažér nič neurobil, a tiché `{}` je presne tá strata (nález revízie).
 - **`protect=True` = neopakovateľná práca; POTVRDENKOU je samotné ČÍTANIE, nie počet.**
-  `_store_reads[cesta] = (objekt, ktorý reader vrátil, počty v čase čítania)`. Writer
-  povolí ZMENŠENIE len vtedy, keď zapisovaná mapa JE ten objekt (alebo ho volajúci pomenuje
-  cez `prev=`). **Prvá verzia si pamätala len POČET a bola tým trvalo odzbrojená** — appka
-  číta `decisions.json` pri každom načítaní stránky, takže „naposledy sme čítali N a na disku
-  je N" platilo vždy a incidentný zápis by prešiel (nález revízie PR #265). Rast nikdy
-  nevyžaduje potvrdenku. Po úspešnom zápise sa potvrdenka prepíše na zapísaný objekt, inak
-  druhé undo za sebou spadne na 503.
+  Writer povolí ZMENŠENIE len vtedy, keď zapisovaná mapa JE objekt, ktorý reader vrátil
+  (alebo ho volajúci pomenuje cez `prev=`). **Prvá verzia si pamätala len POČET a bola tým
+  trvalo odzbrojená** — appka číta `decisions.json` pri každom načítaní stránky, takže
+  „naposledy sme čítali N a na disku je N" platilo vždy a incidentný zápis by prešiel.
+  Rast nikdy nevyžaduje potvrdenku.
+  - **Potvrdenka NESMIE byť JEDEN slot na store — musí byť PER-THREAD** (druhá revízia
+    PR #265). Flask beží `threaded=True` a KAŽDÝ GET číta chránené story (`/api/orders` ich
+    načíta osem, `_require_login` číta `users.json` pri každom requeste, tab pollne
+    dokola). Pri jednom slote vyhrávalo POSLEDNÉ ČÍTANIE: displejové čítanie z iného
+    vlákna trafilo okno medzi `_load_x()` writeru a jeho kontrolou, prepísalo potvrdenku a
+    **manažérov vlastný klik dostal 503** (namerané: 11 zo 400 odznačení pri troch
+    polleroch, 317 zo 400 bez pauzy). Preto `_thread_reads` (this-thread ring, iné vlákno
+    ho nevie vytesniť — read-modify-write je vždy v jednom vlákne) + malý zdieľaný ring.
+    **Neriešiť to zamknutím GET-ov** — to serializuje každé čítanie za každý zápis zadarmo.
+  - **Retenciu drž pri zemi:** potvrdenka drží načítaný store nažive (jedno čítanie
+    `review_data.json` ≈ 15 MB), takže po ÚSPEŠNOM zápise sa oba ringy resetujú na ten
+    jeden zapísaný objekt (staršie potvrdenky sú aj tak neplatné — súbor sa zmenil). To
+    zároveň drží „druhé undo za sebou" funkčné, inak spadne na 503.
   - **Kto prestavia mapu NANOVO, musí poslať `prev=`** (`_save_decisions(d1, prev=d0)`,
     `_save_vystavy(kept, prev=vystavy)`). Kto mutuje načítaný objekt (drvivá väčšina ciest)
     nepotrebuje nič. Pri novom store-zápise sa vždy spýtaj: *je toto ten istý objekt, ktorý
     som čítal?*
+  - **`prev=` je ZÚŽENIE, nie zadné dvierka.** Prvá verzia porovnávala len `rec[0] is prev`
+    a zapisovanú mapu neporovnávala s ničím — pomenovanie reálneho čítania teda povoľovalo
+    zapísať ČOKOĽVEK (`_save_decisions({}, prev=_load_decisions())` zmazalo 2831 záznamov
+    bez sťažnosti). Prestavba smie len UBERAŤ, takže `_is_derived_from` žiada podmnožinu
+    (kľúče pri mape, identita prvkov pri liste). Pri každom novom „escape hatch" parametri
+    sa pýtaj: *porovnáva sa vôbec to, čo zapisujem?*
   - **NEČITATEĽNÝ súbor ≠ 0 záznamov.** Useknutý/nerozparsovateľný store sa zazálohuje
     (`<store>.corrupt-<ts>`) a zápis sa ODMIETNE — aj rast (nad neparsovateľným súborom
     nevieme, z čoho rastieme). Predtým sa počítal ako 0 a jeden klik prepísal ~1400
@@ -180,7 +197,20 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   už odišli; a `_bootstrap_admin()` beží pri IMPORTE, takže výnimka tam neznamená degradáciu
   ale to, že sa služba VÔBEC nenaštartuje. Pravidlo: príznaky čisti v `finally` MIMO zámku,
   zápis výsledku obaľ, a všetko, čo beží pri importe, obaľ
-  `(StoreLockTimeout, StoreWipeRefused, OSError)`.
+  `(StoreLockTimeout, StoreWipeRefused, OSError, ValueError)`.
+  - **`ValueError` v tej trojici CHÝBAL a to je práve tá najpravdepodobnejšia korupcia**
+    (druhá revízia PR #265): useknutý zápis JSONu / mid-UTF-8 hodí `JSONDecodeError` resp.
+    `UnicodeDecodeError` — oboje `ValueError`, ani jedno `OSError`. Useknutý `users.json`
+    tak zhodil celý import (systemd restart loop, žiadne UI). Boot-time try/except píš vždy
+    proti tomu, ako súbor reálne zomiera, nie proti tomu, ako sa nedá otvoriť. Za behu to
+    isté: `_require_login` mení nečitateľný `users.json` na **503 so slovenským návodom**
+    (ne 500 — na 500 sa klikne znova).
+  - **POZOR na opačnú chybu: `finally` s vyčistením príznaku NESMIE bežať PRED zápisom
+    výsledku.** Presne to zaviedla prvá oprava a otvorila okno na DUPLICITNÝ BEH: príznak
+    „už bežím" bol zhodený, kým `automations.json` ešte držal starý, dávno prešlý
+    `next_run` — plánovač tiká každých 30 s, nevidí ani jedno, a spustí automatizáciu
+    DRUHÝKRÁT (duplicitné maily zákazníkom). Správny tvar: **JEDEN `try`, ktorého telom je
+    beh AJ zápis výsledku, a `finally` s príznakom až za ním.**
 - **`PRODUCTS` (review_data.json) sa mení POD bežiacou appkou** —
   `scripts/add_supplier_review_data.py` pridá dodávateľa za behu. `run_shoptet_sync` preto
   súbor pred resyncom ZNOVA načíta pod `_lock`: bez toho by zapisoval boot-time zoznam,
@@ -192,12 +222,27 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   odkaz, ktorý manažér už opravil.
 - **`fsync` PRED `os.replace`** v oboch writeroch. `os.replace` je atomický voči ČITATEĽOM,
   nie voči pádu prúdu: premenovanie môže byť trvanlivé skôr než dáta — presne tak vznikne
-  useknutý store z predošlého bodu.
+  useknutý store z predošlého bodu. **Plus `fsync` ADRESÁRA PO `os.replace`** (jeden call
+  v jedinom centrálnom JSON writeri): bez neho môže pád prúdu stratiť samotné premenovanie
+  a vrátia sa staré bajty — trvanlivý obsah zverejnený netrvanlivým adresárovým záznamom.
+  **A oba fsync-y otestuj** (spy na poradie `os.fsync`/`os.replace`) — pôvodná oprava
+  fsyncu bola jediná v celej vlne BEZ testu: zmazanie oboch riadkov nechalo suite zelenú.
 - **Tmp meno: JSON writer per-proces (`<store>.<pid>.tmp`, beží pod `_lock`), ale
   `_atomic_write_bytes` MUSÍ `tempfile.mkstemp`** — `orders_cache.csv` má DVOCH pisateľov v
   jednom procese (request thread pri starej 30-min cache + hodinový sync), takže pid-ové meno
   bolo pre oboch to isté: jeden premenoval inode, do ktorého druhý ešte písal, a ten potom
   dopisoval rovno do ŽIVEJ cache. Per-proces meno nestačí, keď sú pisatelia dva THREADY.
+  - **Náhodné meno ale prestalo byť samo-obmedzujúce → treba METLU pri štarte.** Pid-ové
+    meno nechalo max. jeden sirotinec na život procesu; `mkstemp` nechá jeden ~55 MB
+    `products.csv.XXXX.tmp` po KAŽDOM SIGKILL/OOM počas exportu a nič ich nemaže.
+    `_sweep_stale_tmp(OUT, dirname(SRC))` pri importe zmaže `*.tmp` staršie ako 12 h (vekový
+    limit = bezpečnosť: živý zápis trvá sekundy, takže cudzí rozpísaný tmp nikdy nie je
+    12 h starý). Metla musí čítať `OUT` LENIVO (vnútri funkcie), inak ju zrazí drift guard.
+  - **`mode` sa dedí z `mkstemp` (0600) — nešir ho naslepo na 0644.** `orders_cache.csv` a
+    `customers_cache.csv` držia mená, e-maily a telefóny zákazníkov (tá istá trieda dát ako
+    `posta_uncollected.json` / `orders_reminder.json`, ktoré 0600 majú); číta ich len táto
+    jedna `systemd --user` služba. Export (`products.csv`) ostáva 0644 ako predtým.
+    AST test stráži, že každý zápis týchto dvoch pýta `mode=0o600`.
 - **Testy: `tests/conftest.py` prepne `WEBREVIEW_OUT` + `WEBREVIEW_PRODUCTS` do tmp** pri
   IMPORTE conftestu (pred kolekciou), takže sa žiadny test nedostane na `data/out` ani keď
   nič nepatchne. Dev box sa tým správa ako CI. **Nový e2e fixture server** dedí pinned env
@@ -206,6 +251,31 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   `enabled: true`).
 - **Nový `protect=True` store pridaj aj do `scripts/backup_data.sh`** — zoznam stráži
   `test_the_backup_script_covers_every_irreplaceable_store`.
+- **Story MIMO `app.py` nedostanú tieto pravidlá zadarmo — `automations.json` ich nemal
+  ani jedno.** `AutomationRunner` má vlastný `_load`/`_save` (modul je zámerne bez Flasku),
+  takže vracal `{}` pri parse erroru a nefsyncoval — na súbore, ktorý ROZHODUJE, ktoré
+  automatizácie sú zapnuté. Useknutý stav teda ticho vypol pripomienky, poštu aj hodinovú
+  synchronizáciu a tab vykreslil čistý „prvý beh". Teraz padá naprázdno (`AutomationStateCorrupt`
+  → 503 s návodom, kópia `<state>.corrupt-<ts>`, originál nedotknutý) a `_save` fsyncuje.
+  **Keď pridávaš stav do iného modulu, prejdi ten istý checklist: nečitateľné ≠ prázdne,
+  fsync pred replace, kópia pri korupcii, v `backup_data.sh`.**
+  - Starý test `test_corrupt_state_file_tolerated` tvrdil presný OPAK („poškodený stav = 0
+    automatizácií a ďalší klik ho prepíše") — teda tú chybu chválil a jeho „recovery"
+    prepísalo jediný dôkaz, čo bolo zapnuté. Keď test kodifikuje defekt, **nahraď ho vo
+    vlastnom commite s odôvodnením**, nikdy ho neoslabuj potichu.
+- **Stav hlás ODVODENÝ zo skutočnosti, nie zapamätaný z bootu.** `SCHEDULER_STATE` sa
+  nastavil raz pri štarte, takže keď vlákno plánovača umrelo, `/api/automations` hlásil
+  „running" naveky — presne ten zdravo vyzerajúci tab s budúcimi „Ďalší beh", proti ktorému
+  banner vznikol. Teraz `SCHEDULER_INTENT` (čo inštancia zamýšľala) + `_scheduler_state()`,
+  ktorý „running" degraduje na `dead` podľa `RUNNER.is_alive()`; banner to povie a pomenuje
+  službu na reštart. Test na „running" preto MUSÍ spustiť skutočné vlákno — stubnutý
+  `RUNNER.start` je práve ten stav, ktorý má rozlišovať. A testy, čo hýbu modulovým
+  globálom, ho pinuj cez `monkeypatch.setattr(webapp, "X", webapp.X)`, nech ho nenechajú
+  špinavý pre ďalšie testy.
+- **Drift guard nad AST musí poznať VŠETKY tvary toho istého zápisu.** Ten náš videl len
+  holý `ast.Name` `"OUT"`, takže cesta zamrazená z `webapp.OUT` (`ast.Attribute`) alebo
+  rovno z `os.environ["WEBREVIEW_OUT"]` mu bola neviditeľná. Vždy si guard otestuj tým, že
+  mu podhodíš každý tvar (a vylúč definíciu samotného `OUT`, nech neflaguje sám seba).
 
 ## Per-riadkové stavy = 5 gitignored stores v `data/out/` (DÁTA MANAŽÉRA, ŽIVÉ)
 
