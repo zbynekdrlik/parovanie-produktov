@@ -46,7 +46,7 @@ from parovanie.automation_runner import (
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of, resync_current
-from parovanie.shoptet_import import parse_import_log
+from parovanie.shoptet_import import chunk_outcome, parse_import_log
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data dir is env-overridable so tests/E2E can boot the app against a fixture.
@@ -4061,22 +4061,36 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
     ``TimeoutExpired`` — a chunk timeout is caught and treated as a failed chunk, so the
     lock is always released and no stuck import-lock is left behind (the 21:03 cascade).
 
+    A chunk Shoptet PARTIALLY accepted ('Spracované: 35. Upravené: 31. Zlyhanie
+    variantov: 2.' — every submitted row processed, a few variants rejected) is NOT a
+    failed chunk: those rows really did land in the eshop. It no longer stops the batch
+    and is no longer booked as "0 rows imported" (#257 — that all-or-nothing accounting
+    discarded 31 genuinely written rows a night and froze uploaded_pairings.json since
+    2026-07-22). Its codes go to ``partial_codes``, NOT to ``success_codes``: the Shoptet
+    log reports aggregate counts only and never says WHICH rows failed, so no individual
+    row of that chunk may be claimed uploaded on the strength of the log alone (the
+    caller proves them from the eshop's own export instead — _export_internal_notes).
+
     Returns a dict:
-      ok             True iff EVERY chunk succeeded (dry-run all-ok counts as ok)
-      success_codes  set of r[0] for every row in a SUCCESSFUL chunk (partial progress)
-      chunks_total / chunks_ok / rows_ok
-      processed / updated / failed   summed over successful chunks (None-safe)
-      error_detail   first failing chunk's hard Shoptet error line, if any
-      rc             0 iff ok, else the first failing chunk's rc (1 for a timeout)
+      ok             True iff EVERY chunk was fully clean (dry-run all-ok counts as ok)
+      success_codes  set of r[0] for every row in a fully SUCCESSFUL chunk
+      partial_codes  set of r[0] for every row in a PARTIALLY accepted chunk (some of
+                     them landed — which ones is unknowable from the log)
+      partial        True iff any chunk was partially accepted
+      partial_failed how many rows Shoptet rejected across the partial chunks
+      chunks_total / chunks_ok / chunks_partial / rows_ok
+      processed / updated / failed   summed over completed chunks (None-safe)
+      error_detail   first hard-failing chunk's Shoptet error line, if any
+      rc             0 iff every chunk was clean, else the first non-clean chunk's rc
       stdout_tail / err   from the LAST attempted chunk (surfaced upstream)
     """
     chunks = [all_rows[i:i + IMPORT_CHUNK_ROWS]
               for i in range(0, len(all_rows), IMPORT_CHUNK_ROWS)]
-    success_codes = set()
+    success_codes, partial_codes = set(), set()
     agg = {"processed": 0, "updated": 0, "failed": 0}
     seen = {"processed": False, "updated": False, "failed": False}
     rc, error_detail, stdout_tail, err_tail = 0, None, "", ""
-    chunks_ok = rows_ok = 0
+    chunks_ok = chunks_partial = rows_ok = partial_failed = 0
     for i, chunk in enumerate(chunks, 1):
         chunk_path = _write_import_csv(header, chunk, prefix, csv_safe=csv_safe)
         try:
@@ -4091,22 +4105,37 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
             _safe_unlink(chunk_path)
         parsed = parse_import_log(out)
         stdout_tail, err_tail = (out or "")[-800:], (err or "")[-400:]
-        if crc != 0:
+        outcome = chunk_outcome(crc, parsed, len(chunk))
+        if outcome == "failed":
             rc, error_detail = crc, parsed.get("error_detail")
             log.error("import %schunk %d/%d FAILED rc=%s", prefix, i, len(chunks), crc)
             break
-        chunks_ok += 1
-        rows_ok += len(chunk)
-        success_codes.update(r[0] for r in chunk)
         for k in agg:
             v = parsed.get(k)
             if v is not None:
                 agg[k] += v
                 seen[k] = True
+        if outcome == "partial":
+            # rc is kept non-zero so the run is reported as not-fully-ok, but the
+            # batch CONTINUES — the remaining chunks are independent uploads.
+            rc = rc or crc
+            chunks_partial += 1
+            partial_failed += parsed.get("failed") or 0
+            partial_codes.update(r[0] for r in chunk)
+            log.warning("import %schunk %d/%d PARTIAL processed=%s failed=%s — "
+                        "riadky sa potvrdia z exportu, nie z logu",
+                        prefix, i, len(chunks), parsed.get("processed"),
+                        parsed.get("failed"))
+            continue
+        chunks_ok += 1
+        rows_ok += len(chunk)
+        success_codes.update(r[0] for r in chunk)
         log.info("import %schunk %d/%d OK processed=%s",
                  prefix, i, len(chunks), parsed.get("processed"))
     return {
         "ok": rc == 0, "success_codes": success_codes,
+        "partial_codes": partial_codes, "partial": chunks_partial > 0,
+        "partial_failed": partial_failed, "chunks_partial": chunks_partial,
         "chunks_total": len(chunks), "chunks_ok": chunks_ok, "rows_ok": rows_ok,
         "processed": agg["processed"] if seen["processed"] else None,
         "updated": agg["updated"] if seen["updated"] else None,
@@ -4114,6 +4143,62 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
         "error_detail": error_detail, "rc": rc,
         "stdout_tail": stdout_tail, "err": err_tail,
     }
+
+
+def _chunk_error_msg(res, total_rows):
+    """ONE message for a chunked import that did not finish fully clean (the same
+    text every caller used to build inline — NEkopíruj logiku). Two distinct cases,
+    because they mean opposite things to the manager:
+
+      * a chunk HARD-failed and stopped the batch → which chunk + how many rows
+        still made it (the rest are retried next run);
+      * every chunk ran but Shoptet REJECTED some rows (#257 'Zlyhanie variantov')
+        → the rest genuinely landed; which ones is only provable from the eshop's
+        own export, so those rows are re-sent until the export confirms them.
+    """
+    done = res["chunks_ok"] + res.get("chunks_partial", 0)
+    if done < res["chunks_total"]:
+        return (f"import zlyhal na časti {done + 1}/{res['chunks_total']} "
+                f"(naimportované {res['rows_ok']} z {total_rows} riadkov)")
+    return (f"Shoptet odmietol {res.get('partial_failed', 0)} z {total_rows} riadkov "
+            f"(zvyšok sa naimportoval; potvrdí sa z exportu eshopu)")
+
+
+def _export_internal_notes(text: str | None = None) -> dict:
+    """{variant code: internalNote} as the LIVE eshop currently has it, from the
+    on-disk catalog export (data/products.csv, refreshed hourly by „Sync zo
+    Shoptetu"). This is the ONLY per-row proof that a reorder link really reached
+    the eshop: the Shoptet import log reports aggregate counts only ('Spracované:
+    35. Upravené: 31. Zlyhanie variantov: 2.') and never says WHICH rows failed.
+    A missing/empty export yields {} — nothing is then confirmed and every row is
+    (re-)sent, which is the safe direction for this write (unlike the supplier
+    write-back, which must fail CLOSED — there an empty export could CLOBBER a real
+    eshop value, here it only means a harmless idempotent re-upload)."""
+    if text is None:
+        text = _read_export_for_links()
+    if not text:
+        return {}
+    csv.field_size_limit(10**9)
+    notes = {}
+    for r in csv.DictReader(io.StringIO(text), delimiter=";"):
+        code = (r.get("code") or "").strip()
+        if code:
+            notes[code] = (r.get("internalNote") or "").strip()
+    return notes
+
+
+def _codes_confirmed_in_export(rows, note_col=2, notes=None) -> set:
+    """The subset of `rows` (code;pairCode;internalNote) the eshop ALREADY carries
+    exactly as we would write them — proven uploaded, so they need neither a
+    re-upload nor a guess. This is what un-freezes the nightly push (#257): rows
+    Shoptet accepted inside a partially-rejected batch are credited on the next run
+    from the eshop's own export instead of being re-sent forever."""
+    if notes is None:
+        notes = _export_internal_notes()
+    if not notes:
+        return set()
+    return {r[0] for r in rows
+            if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
 
 
 @app.route("/api/n8n/shoptet-import", methods=["POST"])
@@ -4183,8 +4268,7 @@ def n8n_shoptet_import():
 
     err_msg = ""
     if not res["ok"]:
-        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
-                   f"(naimportované {res['rows_ok']} z {row_count} riadkov)")
+        err_msg = _chunk_error_msg(res, row_count)
     result = {"ok": res["ok"], "exit_code": res["rc"], "rows": row_count, "dry_run": dry,
               "processed": res["processed"], "updated": res["updated"],
               "failed": res["failed"], "error_detail": res["error_detail"], "error": err_msg,
@@ -4331,19 +4415,34 @@ def _do_upload_pairings(dry):
         log.warning("n8n pairings: %d order_pairings codes already covered by a reviewed decision: %s",
                     len(blocked_order_codes), blocked_order_codes[:10])
 
+    # #257: the eshop's own export is the ONLY per-row proof that a link landed. A
+    # row whose internalNote already IS what we would send is confirmed uploaded —
+    # it is recorded and NOT sent again. That is what un-freezes the nightly push:
+    # rows Shoptet accepted inside a partially-rejected batch (whose identity the
+    # import log never reveals) get credited on the next run instead of being
+    # rebuilt and re-sent every night forever.
+    confirmed = _codes_confirmed_in_export(all_rows)
+    send_rows = [r for r in all_rows if r[0] not in confirmed]
+    if confirmed:
+        log.info("n8n pairings: %d z %d riadkov už eshop má presne tak, ako by sme "
+                 "ich poslali — potvrdené z exportu, neposielam znova",
+                 len(confirmed), len(all_rows))
+
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n pairings: another import already running")
         return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n pairings: %d products, %d order codes, %d rows (chunks of %d), dry_run=%s",
-             len(new_keys), len(new_order_codes), len(all_rows), IMPORT_CHUNK_ROWS, dry)
+    log.info("n8n pairings: %d products, %d order codes, %d rows to send of %d "
+             "(chunks of %d), dry_run=%s", len(new_keys), len(new_order_codes),
+             len(send_rows), len(all_rows), IMPORT_CHUNK_ROWS, dry)
     try:
         # #156: import in chunks so no single large import overruns the browser
-        # redirect timeout. The FIRST failing chunk stops the batch; success_codes
-        # holds every row imported by a successful chunk (partial progress).
-        res = _import_rows_chunked(all_rows, import_builder.LINK_HEADER, dry,
+        # redirect timeout. A HARD-failing chunk stops the batch; a partially
+        # accepted one does not (#257) — its rows are simply not credited from the
+        # log, they wait for the export to confirm them.
+        res = _import_rows_chunked(send_rows, import_builder.LINK_HEADER, dry,
                                    prefix="import_links_", timeout=900)
-        ok = res["ok"]
-        success = res["success_codes"]
+        ok = res["ok"] and not res["partial"]
+        success = res["success_codes"] | confirmed
         # A decision key is recorded uploaded only when EVERY one of its written codes
         # landed in a SUCCESSFUL chunk — a key straddling the failed boundary stays
         # "new" (re-uploading its done codes next run is idempotent, same URL; marking
@@ -4366,10 +4465,12 @@ def _do_upload_pairings(dry):
 
     err_msg = ""
     if not ok:                               # clear, tab-surfaced message: which chunk + progress
-        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
-                   f"(naimportované {res['rows_ok']} z {len(all_rows)} riadkov)")
+        err_msg = _chunk_error_msg(res, len(send_rows))
     result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_keys),
-              "rows": len(all_rows), "dry_run": dry, "processed": res["processed"],
+              "rows": len(all_rows), "rows_sent": len(send_rows),
+              "confirmed_in_export": len(confirmed),
+              "partial": res["partial"], "rejected": res["partial_failed"],
+              "dry_run": dry, "processed": res["processed"],
               "updated": res["updated"], "failed": res["failed"],
               "error_detail": res["error_detail"], "error": err_msg,
               "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
@@ -4378,9 +4479,11 @@ def _do_upload_pairings(dry):
               "order_count": len(uploaded_order_codes),
               "order_blocked": len(blocked_order_codes),
               **_pairing_summary(uploaded)}
-    log.info("n8n pairings: rc=%s chunks=%d/%d processed=%s products=%d order_codes=%d",
+    log.info("n8n pairings: rc=%s chunks=%d/%d processed=%s products=%d order_codes=%d "
+             "confirmed_from_export=%d rejected=%d",
              res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"],
-             len(uploaded_keys), len(uploaded_order_codes))
+             len(uploaded_keys), len(uploaded_order_codes), len(confirmed),
+             res["partial_failed"])
     if not ok:
         log.error("n8n pairings FAILED rc=%s chunks_ok=%d/%d stderr=%s",
                   res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
@@ -4529,8 +4632,7 @@ def _do_upload_suppliers(dry):
 
     err_msg = ""
     if not ok:
-        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
-                   f"(naimportované {res['rows_ok']} z {len(rows)} riadkov)")
+        err_msg = _chunk_error_msg(res, len(rows))
     result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
               "rows": len(rows), "dry_run": dry, "processed": res["processed"],
               "updated": res["updated"], "failed": res["failed"],
@@ -4653,8 +4755,7 @@ def _do_upload_externalcodes(dry):
 
     err_msg = ""
     if not ok:
-        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
-                   f"(naimportované {res['rows_ok']} z {len(rows)} riadkov)")
+        err_msg = _chunk_error_msg(res, len(rows))
     result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
               "rows": len(rows), "dry_run": dry, "processed": res["processed"],
               "updated": res["updated"], "failed": res["failed"],
@@ -4798,8 +4899,7 @@ def _do_upload_variant_links(dry):
 
     err_msg = ""
     if not ok:
-        err_msg = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
-                   f"(naimportované {res['rows_ok']} z {len(rows)} riadkov)")
+        err_msg = _chunk_error_msg(res, len(rows))
     result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
               "rows": len(rows), "dry_run": dry, "processed": res["processed"],
               "updated": res["updated"], "failed": res["failed"],
@@ -5348,6 +5448,13 @@ def run_parovania_eshop() -> dict:
             # own counters — see _do_upload_pairings)
             "order_count": int(pairings.get("order_count") or 0),
             "order_blocked": int(pairings.get("order_blocked") or 0),
+            # #257: how many rows the eshop already had exactly as we would write
+            # them (proven from its export → credited, not re-sent), and how many
+            # Shoptet REJECTED out of the ones we did send. Both were invisible
+            # while a partially-accepted batch was booked as a plain failure.
+            "confirmed_in_export": int(pairings.get("confirmed_in_export") or 0),
+            "rejected": int(pairings.get("rejected") or 0),
+            "partial": bool(pairings.get("partial")),
             "ok": p_ok,
             "error": pairings.get("error", ""),
         },
@@ -5763,8 +5870,7 @@ def run_restock_skladom() -> dict:
             else:
                 status = "error"
                 detail = res["error_detail"] or (res["err"] or "")[-300:]
-                error_detail = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
-                                f"(naimportované {res['rows_ok']} z {len(rows)} riadkov): {detail}")
+                error_detail = f"{_chunk_error_msg(res, len(rows))}: {detail}"
                 log.error("restock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
                           res["rc"], res["chunks_ok"], res["chunks_total"],
                           (res["err"] or "")[-400:])
@@ -5856,8 +5962,7 @@ def run_stock_skladom() -> dict:
             else:
                 status = "error"
                 detail = res["error_detail"] or (res["err"] or "")[-300:]
-                error_detail = (f"import zlyhal na časti {res['chunks_ok'] + 1}/{res['chunks_total']} "
-                                f"(naimportované {res['rows_ok']} z {len(rows)} riadkov): {detail}")
+                error_detail = f"{_chunk_error_msg(res, len(rows))}: {detail}"
                 log.error("stock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
                           res["rc"], res["chunks_ok"], res["chunks_total"],
                           (res["err"] or "")[-400:])
