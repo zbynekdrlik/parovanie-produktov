@@ -5,6 +5,7 @@ ukladajú do data/out/decisions.json.
 Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:8799)
 """
 from __future__ import annotations
+import collections
 import csv
 import fcntl
 import hmac
@@ -283,8 +284,29 @@ def _stored_measures(p) -> tuple:
 # N and the disk holds N" was permanently true and the guard never fired — the wipe
 # that started all this would have been allowed. Identity cannot be faked by an
 # unrelated read, and the strong reference kept here also stops `id()` from being
-# recycled onto a different object. One entry per store, so the cost is bounded.
-_store_reads: dict = {}
+# recycled onto a different object.
+#
+# NOT one slot per store (PR #265 second review): a single slot made the LAST READ win,
+# and every GET re-reads these stores (one /api/orders loads eight of them, the tab
+# polls, `_require_login` reads users on every single request) while Flask serves
+# threaded. A display read landing between the writer's load and its guard check
+# replaced the receipt and the manager's own un-toggle came back as a 503 — 11 of 400
+# clicks with three pollers, 317 of 400 with no sleep between reads. Two structures
+# carry it instead, and a write is legitimate when EITHER remembers the map:
+#
+#   _thread_reads — what THIS thread read, per store. A read-modify-write happens in
+#       one thread (all 24 `protect=` sites load under `_lock` immediately before
+#       saving), and no other thread can evict this one, so the manager's click is
+#       refused-proof no matter how hard the tab polls. Dies with the thread.
+#   _store_reads  — the last few reads by ANY thread, for the cross-thread shape the
+#       single slot used to allow. Bounded ring; never a licence for a map nobody read.
+#
+# Retention is what keeps this honest: entries hold the loaded store alive (a
+# review_data read is ~15 MB), so a successful write RESETS both to the one object it
+# just wrote — every older receipt is stale the moment the file changes anyway.
+_READ_RING = 8
+_store_reads: dict = {}            # path -> deque[(object, measures)], any thread
+_thread_reads = threading.local()  # path -> deque[(object, measures)], this thread only
 
 # The manager's REAL data dir — never derived from OUT (which tests repoint), so it
 # still names the live files when OUT points at a tmp dir.
@@ -347,10 +369,46 @@ def _read_json_store(path, default):
     return d
 
 
+def _thread_ring(p: str) -> collections.deque:
+    """This thread's receipt ring for `p` (created on first use, dies with the thread)."""
+    rings = getattr(_thread_reads, "rings", None)
+    if rings is None:
+        rings = _thread_reads.rings = {}
+    ring = rings.get(p)
+    if ring is None:
+        ring = rings[p] = collections.deque(maxlen=_READ_RING)
+    return ring
+
+
 def _note_store_read(path, data) -> None:
     """Record the READ ITSELF as the receipt for `path` (#261/#265 wipe guard): the
-    object handed back plus the counts it held at that moment."""
-    _store_reads[os.fspath(path)] = (data, _measure_store(data))
+    object handed back plus the counts it held at that moment. Kept in BOTH rings —
+    this thread's (which no concurrent reader can evict) and the shared one."""
+    p = os.fspath(path)
+    entry = (data, _measure_store(data))
+    _thread_ring(p).append(entry)
+    _store_reads.setdefault(p, collections.deque(maxlen=_READ_RING)).append(entry)
+
+
+def _note_store_write(path, data) -> None:
+    """After a successful write the process HAS the store it just wrote, so that object
+    becomes the receipt — and every OLDER one is stale, because the file on disk is no
+    longer what they were read from. Dropping them here is what bounds retention: at
+    most one loaded store per path survives a write (PR #265 second review)."""
+    p = os.fspath(path)
+    entry = (data, _measure_store(data))
+    ring = _thread_ring(p)
+    ring.clear()
+    ring.append(entry)
+    shared = collections.deque(maxlen=_READ_RING)
+    shared.append(entry)
+    _store_reads[p] = shared
+
+
+def _store_receipts(p: str):
+    """Every receipt this process may honour for `p` — this thread's first."""
+    yield from _thread_ring(p)
+    yield from _store_reads.get(p, ())
 
 
 def _guarded_measures(p, protect) -> tuple:
@@ -417,20 +475,19 @@ def _write_json_locked(p, data, indent, mode, protect, prev=None) -> None:
     if protect:
         keys, disk = _guarded_measures(p, protect)
         new = _measure_store(data)
-        rec = _store_reads.get(p)
         prev = data if prev is None else prev
         for k in keys:
             was = disk.get(k, 0)
             if not was or new.get(k, 0) >= was:
                 continue                      # nothing to lose, or the map is growing
-            if rec is not None and rec[0] is prev and rec[1].get(k, 0) == was:
+            if any(r[0] is prev and r[1].get(k, 0) == was
+                   for r in _store_receipts(p)):
                 continue                      # the tail of a read-modify-write on THIS store
             what = "záznamov" if k == "" else f"položiek v „{k}“"
             log.error("REFUSED to shrink %s%s from %d to %d entries (#261/#265): this "
-                      "write did not come from a read of that store (read receipt: %s), "
-                      "so the smaller map is not something the manager just did — "
-                      "nothing was written", p, f" [{k}]" if k else "",
-                      was, new.get(k, 0), "none" if rec is None else "a different map")
+                      "write did not come from a read of that store, so the smaller "
+                      "map is not something the manager just did — nothing was "
+                      "written", p, f" [{k}]" if k else "", was, new.get(k, 0))
             raise StoreWipeRefused(
                 f"Zápis do {os.path.basename(p)} zamietnutý: {was} {what} by sa "
                 f"zmenšilo na {new.get(k, 0)}, ale zapisovaný obsah nepochádza z "
@@ -456,7 +513,7 @@ def _write_json_locked(p, data, indent, mode, protect, prev=None) -> None:
         os.replace(tmp, p)
         # what is on disk now IS this object — so the manager's NEXT undo in a row is
         # still a legitimate read-modify-write and does not 503 on a stale receipt
-        _note_store_read(p, data)
+        _note_store_write(p, data)
     except BaseException:
         # temp files are per-process now, so a failed dump would otherwise leave one
         # orphan per process lifetime; the store itself is untouched either way
