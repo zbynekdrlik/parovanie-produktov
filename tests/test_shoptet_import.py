@@ -12,6 +12,7 @@ from parovanie.shoptet_import import (
     load_credentials,
     log_entry_id,
     parse_import_log,
+    parse_result_stdout,
     pick_result_row,
     preflight_csv,
     result_exit_code,
@@ -391,6 +392,25 @@ def test_hard_error_detail_is_the_shoptet_line_alone():
     plain = "Chyba | Číslo riadku: 7 - duplicitný kód"
     assert hard_error_detail(plain, parse_import_log(plain)) == plain
     assert hard_error_detail("", {}) is None
+
+
+def test_counts_are_never_read_from_the_hard_error_line():
+    # 'Zlyhanie …: N' may not reach across into the Shoptet error line that follows —
+    # there it would return the ROW NUMBER ('Číslo riadku: 42') or the entry id as the
+    # failure count, and a hard abort would be mis-accounted as a partial one.
+    out = ("[import] baseline (posledný záznam Logu pred behom): #12688\n"
+           "VÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+           "CHYBA LOGU: #12689 Chyba | Číslo riadku: 42 - Data in column code are not unique\n")
+    # naive parsing of the whole result block reaches INTO the error line and returns
+    # the Shoptet entry id as the failure count
+    naive = parse_import_log(result_stdout_slice(out))
+    assert naive["failed"] == 12689
+    # the one entry point the app uses keeps counts and reason apart
+    r = parse_result_stdout(out)
+    assert r["processed"] is None and r["failed"] is None and r["updated"] is None
+    assert r["error_detail"] == ("#12689 Chyba | Číslo riadku: 42 - "
+                                 "Data in column code are not unique")
+    assert chunk_outcome(2, r, rows_sent=35) == "failed"
 
 
 def test_result_slice_keeps_a_hard_shoptet_error_and_survives_junk():

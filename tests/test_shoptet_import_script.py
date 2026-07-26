@@ -83,6 +83,38 @@ def test_read_result_does_not_credit_a_lone_foreign_row_that_matches_the_count()
                                retries=4, wait_s=0) is None
 
 
+def test_read_result_settles_on_the_entry_id_not_on_volatile_row_text():
+    # The settle check must compare WHICH entry it is, not the rendered text: a Log
+    # row whose innerText changes cosmetically between two reads (a late-rendered
+    # link, a relative time) would never "agree with itself", so a perfectly good
+    # import would end unattributable and its chunk would be booked as failed.
+    a = ("#12689 26.07.2026 21:00 Upozornenie Import skončil s chybou. "
+         "Spracované: 35. Upravené: 31. Zlyhanie variantov: 2.")
+    # the SAME entry, re-rendered with a different volatile tail on every read
+    page = FakePage([[a + " pred 1 s", BASELINE], [a + " pred 3 s", BASELINE],
+                     [a + " pred 5 s", BASELINE], [a + " pred 7 s", BASELINE]])
+    row = script._read_result(page, baseline=BASELINE, expected_rows=35,
+                              retries=4, wait_s=0)
+    assert row is not None and row.startswith("#12689")
+
+
+def test_capture_baseline_prints_a_readable_marker_when_the_row_has_no_id(capsys):
+    class P:
+        def goto(self, *a, **kw):
+            pass
+
+        def wait_for_load_state(self, *a, **kw):
+            pass
+
+        def evaluate(self, _js):
+            return ["26.07.2026 21:00 Import dobehol úspešne. Spracované: 4."]
+
+    script._capture_baseline(P(), {"SHOPTET_ADMIN_URL": "https://x/admin"})
+    printed = capsys.readouterr().out
+    assert "#None" not in printed
+    assert "Spracované" not in printed
+
+
 def test_capture_baseline_never_echoes_the_previous_runs_counts(capsys):
     """The stdout of this script is parsed by webreview/app.py to learn what the
     import did. Echoing the baseline ROW there put a foreign 'Spracované: N' AHEAD of

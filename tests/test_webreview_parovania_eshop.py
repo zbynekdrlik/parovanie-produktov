@@ -598,6 +598,71 @@ def test_rows_already_correct_in_the_eshop_are_credited_from_the_export(iso, mon
         == {"BETALOV|P1": "https://supplier/x"}
 
 
+def test_unreadable_result_is_not_reported_as_zero_imported_rows(iso, monkeypatch):
+    # An unattributable read-back (our Log entry never appeared / two same-sized
+    # imports) says NOTHING about what landed — the rows very likely DID reach the
+    # eshop. Claiming "naimportované 0" as a fact misleads the manager into thinking
+    # nothing was written; say the result could not be read and point at the Log.
+    _seed_pairing()
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300:
+                        (2, "\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n", ""))
+
+    p, _st = webapp._do_upload_pairings(dry=False)
+
+    assert p["ok"] is False
+    assert "nepodarilo" in p["error"] and "Log" in p["error"]
+    assert "naimportované 0" not in p["error"]
+
+
+def test_hard_shoptet_error_reaches_the_automation_card(iso, monkeypatch):
+    # the reason Shoptet aborted must be visible where the manager looks (the card's
+    # error line), not only in the JSON the n8n call gets back
+    _seed_pairing()
+    err = "Chyba | Číslo riadku: 7 - Data in column code are not unique"
+    out = ("\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+           f"CHYBA LOGU: {err}\n")
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (2, out, "boom"))
+
+    result = webapp.run_parovania_eshop()
+
+    assert err in result["pairings"]["error"]
+
+
+def test_partial_chunk_then_hard_failure_reports_what_really_landed(iso, monkeypatch):
+    # chunk 1 partially accepted (Shoptet took its 300 rows, rejected 2), chunk 2
+    # hard-fails → the message must not understate the push as "naimportované 0",
+    # and the partially accepted rows must be counted WITHOUT the rejected ones.
+    n = 650
+    products = [{"key": f"K{i}", "idx": i, "supplier": "BETALOV", "name": f"P{i}",
+                 "pairCode": "P", "variant_codes": [f"{i}/M"], "our_url": "u",
+                 "ai_status": "matched", "ai_chosen_url": "", "ai_reason": "",
+                 "candidates": [], "current": {}} for i in range(n)]
+    monkeypatch.setattr(webapp, "PRODUCTS", products)
+    monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
+    webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"}
+                            for i in range(n)})
+    calls = []
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rows = list(_csv.reader(f, delimiter=";"))[1:]
+        calls.append(rows)
+        if len(calls) == 1:
+            return 2, f"VÝSLEDOK: spracované={len(rows)} upravené=10 zlyhania=2", ""
+        return 2, ("\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+                   "CHYBA LOGU: Chyba | Číslo riadku: 3 - Data in column code are not unique"), ""
+
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    p, _st = webapp._do_upload_pairings(dry=False)
+
+    assert len(calls) == 2                      # the partial chunk did not stop the batch
+    assert "časti 2/3" in p["error"]
+    assert "298 čiastočne prijatých" in p["error"]   # 300 sent, 2 rejected by Shoptet
+
+
 def test_export_confirmation_needs_an_exact_url_match(iso, monkeypatch):
     # a stale / different note on the eshop proves nothing — the row is still sent
     _seed_pairing()
