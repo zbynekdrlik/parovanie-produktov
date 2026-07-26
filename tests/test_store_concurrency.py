@@ -83,6 +83,24 @@ def test_the_store_lock_is_released_again(tmp_path, monkeypatch):
         os.close(fd)
 
 
+def test_a_non_blocking_acquire_answers_False_instead_of_raising(tmp_path, monkeypatch):
+    """`_StoreLock` stands in for a `threading.Lock` (the automation runner takes it as
+    an injected lock), so it must keep that contract: `acquire(blocking=False)` on a held
+    lock RETURNS False. Raising there is a trap for the next caller — and it must not
+    leave the in-process half of the lock taken either."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    lockfile = os.fspath(webapp._lock.path)
+    fd = os.open(lockfile, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert webapp._lock.acquire(blocking=False) is False
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    assert webapp._lock.acquire(timeout=5), "the refused acquire kept the in-process lock"
+    webapp._lock.release()
+
+
 def test_the_store_lock_is_reentrant_for_one_thread(tmp_path, monkeypatch):
     """Every `_save_*` takes the lock itself now, and almost all of them are called
     from inside a `with _lock:` read-modify-write — a non-reentrant lock would

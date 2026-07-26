@@ -248,6 +248,185 @@ def test_the_dedup_stores_are_protected_too(monkeypatch, tmp_path):
     assert len(webapp._load_orders_reminder()["orders"]) == 2
 
 
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened (PR #265 review) — the receipt is PROVENANCE-bound
+#
+# The first cut recorded „how many entries THIS PROCESS last read from that store"
+# in a process-GLOBAL map. That is a stale-read detector, not a provenance check:
+# `_load_decisions()` runs at import and on every /api/products + /api/orders, so
+# the recorded count always equalled the disk count and the guard was permanently
+# disarmed — the incident's own write would have been ALLOWED. The receipt is now
+# the READ ITSELF (the object the loader handed back), so a caller that never
+# loaded the store cannot produce one.
+# --------------------------------------------------------------------------- #
+def test_a_normal_read_elsewhere_never_legitimises_a_wipe_from_a_path_that_read_nothing(
+        monkeypatch, tmp_path):
+    """THE incident's shape, reproduced: the live app reads decisions on every page
+    load, and then something that never loaded the store writes over it."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._load_decisions()                     # a normal read, as /api/products does
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})               # …from a path that never loaded it
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_a_read_of_a_DIFFERENT_store_cannot_legitimise_a_wipe(monkeypatch, tmp_path):
+    """The receipt is per-store: loading ordered_items must say nothing about what
+    may be written over decisions."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._save_ordered({"O1|A": True, "O1|B": True})
+    webapp._load_ordered()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+
+
+def test_two_undos_in_a_row_are_both_allowed(monkeypatch, tmp_path):
+    """After a successful write the process HAS the store it just wrote — the receipt
+    must follow it, or the manager's second undo in a row 503s (the guard's own
+    bookkeeping going stale)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(dict(_two_decisions(),
+                                **{"S|3": {"status": "good", "url": "https://x.test/c"}}))
+    d = webapp._load_decisions()
+    d.pop("S|1")
+    webapp._save_decisions(d)
+    d.pop("S|2")
+    webapp._save_decisions(d)                    # used to raise: the receipt was stale
+    assert list(webapp._load_decisions()) == ["S|3"]
+
+
+def test_a_rebuilt_map_may_shrink_when_it_names_the_read_it_was_built_from(
+        monkeypatch, tmp_path):
+    """Not every read-modify-write mutates in place — the startup prune builds a NEW
+    dict from the one it read. Such a caller passes `prev=` (the map it loaded)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    d0 = webapp._load_decisions()
+    d1 = {k: v for k, v in d0.items() if k == "S|1"}
+    webapp._save_decisions(d1, prev=d0)
+    assert list(webapp._load_decisions()) == ["S|1"]
+
+
+def test_a_rebuilt_map_that_names_nothing_is_still_refused(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    webapp._load_decisions()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened — „unreadable" must never be read as „empty"
+# --------------------------------------------------------------------------- #
+def test_a_truncated_store_is_never_treated_as_zero_entries(monkeypatch, tmp_path):
+    """A half-written decisions.json parses as NOTHING, so the entry count used to come
+    back 0 and the guard skipped itself entirely — one manager click then replaced ~1400
+    recoverable entries with one. There is no fsync-free way to rule this out, so it is
+    the MOST likely real corruption, not the least."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    p = tmp_path / "decisions.json"
+    raw = p.read_text(encoding="utf-8")
+    p.write_text(raw[:len(raw) // 2], encoding="utf-8")     # cut mid-write
+    assert webapp._load_decisions() == {}                   # display still degrades…
+    with pytest.raises(webapp.StoreWipeRefused):            # …but a write is refused
+        webapp._save_decisions({"S|9": {"status": "manual", "url": "https://x.test/z"}})
+    assert list(tmp_path.glob("decisions.json.corrupt-*")), \
+        "the unreadable bytes must be preserved before anything refuses"
+    assert p.read_text(encoding="utf-8") == raw[:len(raw) // 2]   # original untouched
+
+
+def test_a_truncated_store_is_refused_even_when_the_write_would_GROW_it(
+        monkeypatch, tmp_path):
+    """Growth normally needs no read — but over a file we cannot parse we do not know
+    what we are growing FROM, so there is nothing to compare and everything to lose."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "ordered_items.json").write_text('{"a": true, "b"', encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_ordered({"a": True, "b": True, "c": True})
+
+
+def test_an_empty_file_is_not_corruption(monkeypatch, tmp_path):
+    """A zero-byte store is a fresh/never-written one — nothing to lose, so a write
+    must go straight through (a `touch`ed file must not brick the tab)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "decisions.json").write_text("", encoding="utf-8")
+    webapp._save_decisions({"S|1": {"status": "manual", "url": "https://x.test/a"}})
+    assert list(webapp._load_decisions()) == ["S|1"]
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened — the two dedup stores keep their map NESTED
+# --------------------------------------------------------------------------- #
+def _reminder_state(n: int) -> dict:
+    return {"orders": {str(i): {"status": "emailed"} for i in range(n)},
+            "red": [], "orange": [], "skipped": [], "no_email": [],
+            "stats": {}, "last_check": "", "fingerprints": {}}
+
+
+def test_the_nested_dedup_map_cannot_be_wiped_by_a_path_that_never_read_it(
+        monkeypatch, tmp_path):
+    """`orders_reminder.json` is `{"orders": {...}, "red": [...], …}` — the record of
+    who was already mailed is the NESTED map, and every real writer keeps the same
+    top-level keys. Counting only the outer dict made `protect` inert for exactly the
+    two stores whose loss re-mails every customer."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_orders_reminder(_reminder_state(0))
+    assert len(webapp._load_orders_reminder()["orders"]) == 50
+
+
+def test_the_nested_escalation_map_is_guarded_the_same_way(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    state = {"escalation": {str(i): "1|2026-01-01" for i in range(20)},
+             "terminal": {}, "uncollected": [], "invalid": [], "errors": [],
+             "stats": {}, "last_check": ""}
+    (tmp_path / "posta_uncollected.json").write_text(json.dumps(state), encoding="utf-8")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_posta_state(dict(state, escalation={}))
+    assert len(webapp._load_posta_state()["escalation"]) == 20
+
+
+def test_pruning_the_dedup_map_after_a_real_read_still_works(monkeypatch, tmp_path):
+    """#220 retention really does shrink `orders` — a blanket „never shrink the nested
+    map" rule would break the run that bounds it. The receipt is what tells them apart."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text(
+        json.dumps(_reminder_state(50)), encoding="utf-8")
+    st = webapp._load_orders_reminder()
+    st["orders"] = {k: v for k, v in list(st["orders"].items())[:10]}
+    webapp._save_orders_reminder(st)
+    assert len(webapp._load_orders_reminder()["orders"]) == 10
+
+
+# --------------------------------------------------------------------------- #
+# Belt and braces — a test process may never write into the manager's data dir
+# --------------------------------------------------------------------------- #
+def test_a_write_into_the_live_data_dir_is_refused_while_pytest_runs(tmp_path):
+    """The conftest pin is the real defence; this is the net under it — a helper (or a
+    subprocess that inherits the env) that resolves OUT to the live dir must still be
+    unable to write there."""
+    target = os.path.join(LIVE_OUT, "pytest-must-never-write.json")
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(target, {"x": 1})
+    assert not os.path.exists(target)
+
+
+def test_the_quarantine_memo_is_keyed_by_the_resolved_path(monkeypatch, tmp_path):
+    """`_quarantined` used to be keyed by the store object, whose hash follows the
+    CURRENT OUT — every repointed data dir left an entry nobody can ever look up again."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    (tmp_path / "orders_reminder.json").write_text("{ truncated", encoding="utf-8")
+    webapp._quarantine_corrupt_store(webapp.ORDERS_REMINDER_STATE)
+    assert webapp._quarantined, "nothing was memoised"
+    assert all(isinstance(k, str) for k in webapp._quarantined), \
+        f"memo keys must be plain paths: {list(webapp._quarantined)}"
+
+
 def test_a_refused_write_answers_503_with_something_to_fix(monkeypatch, tmp_path):
     """A bare 500 reads like a transient glitch and invites another click; the manager
     must be told what happened (same shape as the corrupt-dedup-store handler)."""
