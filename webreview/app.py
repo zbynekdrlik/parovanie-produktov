@@ -300,11 +300,21 @@ def _stored_measures(p) -> tuple:
 #       saving), and no other thread can evict this one, so the manager's click is
 #       refused-proof no matter how hard the tab polls. Dies with the thread.
 #   _store_reads  — the last few reads by ANY thread, for the cross-thread shape the
-#       single slot used to allow. Bounded ring; never a licence for a map nobody read.
+#       single slot used to allow. BEST EFFORT ONLY, and nothing may depend on it
+#       (PR #265 third review): it is one 8-slot ring shared by every thread, and every
+#       GET appends, so a cross-thread receipt is evicted within microseconds — measured
+#       300/300 refusals for a writer relying on it with four pollers running. Nothing in
+#       the tree does: all 24 `protect=` sites load and save inside ONE `with _lock:`
+#       block, i.e. in one thread, which is what `_thread_reads` above covers. Treat a
+#       new cross-thread read-modify-write as UNSUPPORTED — pass `prev=` and read in the
+#       writing thread — not as something this ring will carry.
 #
-# Retention is what keeps this honest: entries hold the loaded store alive (a
-# review_data read is ~15 MB), so a successful write RESETS both to the one object it
-# just wrote — every older receipt is stale the moment the file changes anyway.
+# Retention: entries hold the loaded store alive (a review_data read is ~15 MB), so a
+# successful write RESETS both rings to the one object it just wrote — every older
+# receipt is stale the moment the file changes anyway. BETWEEN writes the rings do hold
+# up to 8 loaded copies per path per ring (a decisions.json read is ~1.3 MB, so ~10 MB
+# for that path; review_data's is reset by every `_save_products`) — bounded and
+# accepted, but not the „at most one per store" the first cut of this comment claimed.
 _READ_RING = 8
 _store_reads: dict = {}            # path -> deque[(object, measures)], any thread
 _thread_reads = threading.local()  # path -> deque[(object, measures)], this thread only
@@ -389,7 +399,9 @@ def _thread_ring(p: str) -> collections.deque:
 def _note_store_read(path, data) -> None:
     """Record the READ ITSELF as the receipt for `path` (#261/#265 wipe guard): the
     object handed back plus the counts it held at that moment. Kept in BOTH rings —
-    this thread's (which no concurrent reader can evict) and the shared one."""
+    this thread's (which no concurrent reader can evict, and which is the one that
+    actually carries every read-modify-write in the tree) and the shared one, which is
+    best effort: any other thread's read evicts it within microseconds."""
     p = os.fspath(path)
     entry = (data, _measure_store(data))
     _thread_ring(p).append(entry)
@@ -399,8 +411,10 @@ def _note_store_read(path, data) -> None:
 def _note_store_write(path, data) -> None:
     """After a successful write the process HAS the store it just wrote, so that object
     becomes the receipt — and every OLDER one is stale, because the file on disk is no
-    longer what they were read from. Dropping them here is what bounds retention: at
-    most one loaded store per path survives a write (PR #265 second review)."""
+    longer what they were read from. Dropping them here is what bounds retention: at the
+    moment of a write, exactly one loaded store per path survives it. Between writes the
+    rings refill (up to `_READ_RING` per ring per path) — see the retention note beside
+    `_store_reads` (PR #265 third review corrected the „at most one" claim)."""
     p = os.fspath(path)
     entry = (data, _measure_store(data))
     ring = _thread_ring(p)

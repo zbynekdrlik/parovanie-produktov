@@ -154,10 +154,20 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
     polleroch, 317 zo 400 bez pauzy). Preto `_thread_reads` (this-thread ring, iné vlákno
     ho nevie vytesniť — read-modify-write je vždy v jednom vlákne) + malý zdieľaný ring.
     **Neriešiť to zamknutím GET-ov** — to serializuje každé čítanie za každý zápis zadarmo.
+  - **Zdieľaný ring je LEN „best effort" — NESPOLIEHAJ sa naň** (tretia revízia PR #265).
+    Je to jeden 8-slotový ring pre všetky vlákna a pridáva doň KAŽDÝ GET, takže potvrdenku
+    z iného vlákna vytesní v priebehu mikrosekúnd: namerané 300/300 zamietnutých zápisov
+    pre writer, ktorý sa naň spoliehal, pri štyroch polleroch. V strome na ňom nezávisí
+    nič — všetkých 24 `protect=` zápisov číta aj zapisuje v JEDNOM `with _lock:` bloku,
+    teda v jednom vlákne. **Nový read-modify-write cez dve vlákna ber ako NEPODPOROVANÝ**
+    (čítaj v tom vlákne, ktoré zapisuje, a pošli `prev=`), nie ako niečo, čo ring unesie.
   - **Retenciu drž pri zemi:** potvrdenka drží načítaný store nažive (jedno čítanie
     `review_data.json` ≈ 15 MB), takže po ÚSPEŠNOM zápise sa oba ringy resetujú na ten
     jeden zapísaný objekt (staršie potvrdenky sú aj tak neplatné — súbor sa zmenil). To
-    zároveň drží „druhé undo za sebou" funkčné, inak spadne na 503.
+    zároveň drží „druhé undo za sebou" funkčné, inak spadne na 503. **MEDZI zápismi sa
+    ringy zase naplnia** (až `_READ_RING` kópií na ring a cestu — pri `decisions.json`
+    ≈ 1,3 MB na kópiu, teda ~10 MB) — je to ohraničené a v poriadku, ale NIE je pravda
+    „na store prežije nanajvýš jedna načítaná kópia", ako tvrdila predošlá verzia.
   - **Kto prestavia mapu NANOVO, musí poslať `prev=`** (`_save_decisions(d1, prev=d0)`,
     `_save_vystavy(kept, prev=vystavy)`). Kto mutuje načítaný objekt (drvivá väčšina ciest)
     nepotrebuje nič. Pri novom store-zápise sa vždy spýtaj: *je toto ten istý objekt, ktorý
@@ -165,9 +175,15 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   - **`prev=` je ZÚŽENIE, nie zadné dvierka.** Prvá verzia porovnávala len `rec[0] is prev`
     a zapisovanú mapu neporovnávala s ničím — pomenovanie reálneho čítania teda povoľovalo
     zapísať ČOKOĽVEK (`_save_decisions({}, prev=_load_decisions())` zmazalo 2831 záznamov
-    bez sťažnosti). Prestavba smie len UBERAŤ, takže `_is_derived_from` žiada podmnožinu
-    (kľúče pri mape, identita prvkov pri liste). Pri každom novom „escape hatch" parametri
-    sa pýtaj: *porovnáva sa vôbec to, čo zapisujem?*
+    bez sťažnosti). Prestavba smie len UBERAŤ, takže `_is_derived_from` žiada podmnožinu:
+    kľúče pri mape — **vrátane VNORENÝCH máp, ktoré `protect=("orders",)` stráži**, lebo
+    vonkajšiu sadu kľúčov nechá rovnakú každý reálny writer, takže kontrola len na
+    najvyššej úrovni dovolila `prev=` zápisu podstrčiť cudziu mapu „komu sme už písali";
+    a pri liste identita prvkov **alebo hodnotová zhoda** — samotná identita zamietala
+    poctivú prestavbu `[dict(x) for x in prev if …]`, a to hláškou „nepochádza z načítania
+    tohto úložiska", čo je nepravda a pozvánka nájsť si obchádzku (tretia revízia).
+    Pri každom novom „escape hatch" parametri sa pýtaj: *porovnáva sa vôbec to, čo
+    zapisujem — a na správnej úrovni?*
   - **NEČITATEĽNÝ súbor ≠ 0 záznamov.** Useknutý/nerozparsovateľný store sa zazálohuje
     (`<store>.corrupt-<ts>`) a zápis sa ODMIETNE — aj rast (nad neparsovateľným súborom
     nevieme, z čoho rastieme). Predtým sa počítal ako 0 a jeden klik prepísal ~1400
@@ -222,9 +238,12 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   odkaz, ktorý manažér už opravil.
 - **`fsync` PRED `os.replace`** v oboch writeroch. `os.replace` je atomický voči ČITATEĽOM,
   nie voči pádu prúdu: premenovanie môže byť trvanlivé skôr než dáta — presne tak vznikne
-  useknutý store z predošlého bodu. **Plus `fsync` ADRESÁRA PO `os.replace`** (jeden call
-  v jedinom centrálnom JSON writeri): bez neho môže pád prúdu stratiť samotné premenovanie
+  useknutý store z predošlého bodu. **Plus `fsync` ADRESÁRA PO `os.replace` — v KAŽDOM
+  writeri, nielen v tom JSON-ovom**: bez neho môže pád prúdu stratiť samotné premenovanie
   a vrátia sa staré bajty — trvanlivý obsah zverejnený netrvanlivým adresárovým záznamom.
+  Prvá oprava ho dala len do `_write_json_locked` a nechala diery v `_atomic_write_bytes`
+  (55 MB export + zákaznícke cache) a v `AutomationRunner._save` — teda práve na súbore,
+  ktorého useknutie fail-closed loader hlási ako korupciu (tretia revízia PR #265).
   **A oba fsync-y otestuj** (spy na poradie `os.fsync`/`os.replace`) — pôvodná oprava
   fsyncu bola jediná v celej vlne BEZ testu: zmazanie oboch riadkov nechalo suite zelenú.
 - **Tmp meno: JSON writer per-proces (`<store>.<pid>.tmp`, beží pod `_lock`), ale
@@ -238,6 +257,12 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
     `_sweep_stale_tmp(OUT, dirname(SRC))` pri importe zmaže `*.tmp` staršie ako 12 h (vekový
     limit = bezpečnosť: živý zápis trvá sekundy, takže cudzí rozpísaný tmp nikdy nie je
     12 h starý). Metla musí čítať `OUT` LENIVO (vnútri funkcie), inak ju zrazí drift guard.
+    **A musí ísť cez `_refuse_live_data_under_pytest` — pytest sieť patrí ku KAŽDEJ
+    deštruktívnej operácii, nielen k zápisom.** Metla bola jediné `os.unlink` v strome
+    mimo tej siete, a beží pri IMPORTE nad `OUT` + `dirname(SRC)`: pri nepripnutom
+    `WEBREVIEW_OUT` (presne konfigurácia incidentu) mazala živé `data/out/*.tmp`
+    (tretia revízia PR #265). Volajúci pri štarte musí zamietnutie prežiť
+    (`except (OSError, StoreWipeRefused)`), inak z ochrany spravíš mŕtvy import.
   - **`mode` sa dedí z `mkstemp` (0600) — nešir ho naslepo na 0644.** `orders_cache.csv` a
     `customers_cache.csv` držia mená, e-maily a telefóny zákazníkov (tá istá trieda dát ako
     `posta_uncollected.json` / `orders_reminder.json`, ktoré 0600 majú); číta ich len táto
@@ -258,7 +283,21 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   synchronizáciu a tab vykreslil čistý „prvý beh". Teraz padá naprázdno (`AutomationStateCorrupt`
   → 503 s návodom, kópia `<state>.corrupt-<ts>`, originál nedotknutý) a `_save` fsyncuje.
   **Keď pridávaš stav do iného modulu, prejdi ten istý checklist: nečitateľné ≠ prázdne,
-  fsync pred replace, kópia pri korupcii, v `backup_data.sh`.**
+  fsync pred replace (aj adresára), kópia pri korupcii, v `backup_data.sh`.**
+  - **Fail-closed na serveri je len POLOVICA — frontend musí čítať HTTP STATUS.**
+    `loadAutomations` robil `(await fetch(...)).json()` a `j.scheduler || 'running'`, takže
+    503 s návodom na opravu vykreslil ako čistý prvý beh a banner SKRYL: manažér videl
+    „nič nie je nastavené, plánovač je zdravý", kým boli vypnuté všetky pripomienky
+    (tretia revízia PR #265). Globálny `fetch` wrapper rieši LEN 401 — nič iné nechytí.
+    Pravidlo: **ku každému fail-closed endpointu patrí vetva `if (!r.ok)`, ktorá zobrazí
+    `j.error` zo servera**, a e2e test, ktorý ten stav naozaj pošle po drôte
+    (`page.route(...).fulfill(status: 503)`).
+  - **Loader, ktorý parsuje JSON, MUSÍ overiť aj TYP.** `_load_users` bol jediný bez
+    `isinstance` — `users.json` s `[]` prešiel parsovaním a spadol až na
+    `users[email] = …` (TypeError pri IMPORTE = systemd restart loop) resp. `[].get(...)`
+    (AttributeError = 500 na každom requeste). Do boot/`before_request` `except` tuple
+    preto patrí aj `TypeError`. Zlá ručná oprava alebo zlý restore vyrobí presne toto —
+    a je to to, na čo naša vlastná 503 hláška operátora navádza.
   - Starý test `test_corrupt_state_file_tolerated` tvrdil presný OPAK („poškodený stav = 0
     automatizácií a ďalší klik ho prepíše") — teda tú chybu chválil a jeho „recovery"
     prepísalo jediný dôkaz, čo bolo zapnuté. Keď test kodifikuje defekt, **nahraď ho vo
@@ -861,7 +900,9 @@ DRUHÝ mail. Vzor, ktorý drž pri každom novom dedup store:
 - **Záloha je KÓPIA, nie presun.** Presunutý originál = ďalší load vidí „súbor neexistuje" =
   prvý beh = presne ten wipe. Originál necháš na mieste, nech padá nahlas, kým to človek
   neopraví. Kópie dedupuj podľa OBSAHU (`<path>.corrupt-<ts>`), inak denná automatizácia
-  nechá jednu zálohu za každý beh.
+  nechá jednu zálohu za každý beh. **Časová značka musí byť sub-sekundová (`%f`) a súbor
+  zakladaj `O_EXCL`** — pri sekundovej presnosti druhá, INÁ korupcia v tej istej sekunde
+  prepísala prvú kópiu, teda práve tie bajty, kvôli ktorým záloha existuje (tretia revízia).
 - **Fail-closed je DEFAULT loader**, tolerantná je explicitná `_load_*_display()` varianta
   (len read-only taby). Nový call site tak zdedí bezpečné správanie, nie nebezpečné. Display
   varianta vracia **`(state, corrupt)`** a endpoint pošle `store_corrupt` → tab vykreslí
