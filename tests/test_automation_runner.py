@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from parovanie.automation_runner import (
-    Automation, AutomationRunner, next_run_at, schedule_label)
+    Automation, AutomationRunner, AutomationStateCorrupt, next_run_at, schedule_label)
 
 TZ = ZoneInfo("Europe/Bratislava")
 SCHED = {"daily_at": "09:00", "tz": "Europe/Bratislava"}
@@ -193,14 +193,24 @@ def test_run_now_unknown_key_raises(tmp_path):
         _runner(tmp_path).run_now("neexistuje")
 
 
-# ── corrupt state tolerance ───────────────────────────────────────────────────
-def test_corrupt_state_file_tolerated(tmp_path):
+# ── corrupt state fails CLOSED ────────────────────────────────────────────────
+def test_corrupt_state_file_fails_closed_instead_of_being_rewritten(tmp_path):
+    """REPLACES `test_corrupt_state_file_tolerated`, which asserted the defect itself:
+    „a corrupt state reads as no automations, and the next click rewrites it". That is
+    „unreadable means empty" on the file that decides which automations are ENABLED —
+    a truncated state silently switched off every reminder mail, pošta escalation and
+    hourly sync, and the recovery it praised OVERWROTE the only evidence of what had
+    been enabled. Fail closed instead: raise, keep the file, keep a copy (PR #265
+    second review, C4)."""
     p = tmp_path / "automations.json"
     p.write_text("{not json", encoding="utf-8")
     r = _runner(tmp_path)
-    assert r.status()[0]["enabled"] is False
-    r.set_enabled("demo", True)          # recovers by rewriting the store
-    assert r.status()[0]["enabled"] is True
+    with pytest.raises(AutomationStateCorrupt):
+        r.status()
+    with pytest.raises(AutomationStateCorrupt):
+        r.set_enabled("demo", True)
+    assert p.read_text(encoding="utf-8") == "{not json", "the corrupt state was rewritten"
+    assert list(tmp_path.glob("automations.json.corrupt-*")), "no copy kept for repair"
 
 
 def test_enabled_without_next_run_gets_rescheduled_not_run(tmp_path):
