@@ -1060,6 +1060,66 @@ def test_order_pairings_code_covered_by_decision_is_excluded_and_blocked(monkeyp
     assert "order:A/1" not in uploaded
 
 
+def test_a_decision_already_uploaded_still_outranks_a_stale_inline_pairing(monkeypatch, tmp_path):
+    """The exclusion must hold on EVERY later night, not just the one that ships the
+    decision.
+
+    `exclude_codes` used to be built from THIS run's NEW decision keys only. Once a
+    decision is recorded uploaded it stops being "new", the exclusion set goes empty,
+    and the stale `order_pairings[code]` — 8 codes on live data carry both values, at
+    least one of them different — is emitted and written to the live `internalNote`.
+    The correction therefore survived exactly ONE night and the eshop then held the
+    WRONG supplier page permanently (the code is recorded and never retried), while
+    the tab, /api/orders and /api/import all kept showing the corrected one. That URL
+    feeds automatic reordering, so a wrong link orders the wrong product.
+    """
+    dec = {"k1": {"status": "manual", "url": "https://CORRECT.test/x"}}
+    tok = _arm_pairings(monkeypatch, tmp_path, dec,
+                        order_pairings={"A/1": "https://STALE-INLINE.test/x"})
+    runs = []
+
+    def fake_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rd = list(_csv.reader(f, delimiter=";"))
+        runs.append(rd[1:])
+        return 0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""
+
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    # night 1 — the correction ships, the stale inline pairing is blocked
+    j1 = _client().post("/api/n8n/upload-pairings",
+                        headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j1["count"] == 1 and j1["order_count"] == 0 and j1["order_blocked"] == 1
+    assert runs[0] == [["A/1", "100", "https://CORRECT.test/x"],
+                       ["A/2", "100", "https://CORRECT.test/x"]]
+
+    # night 2 — the decision is no longer "new", but it still OWNS A/1
+    j2 = _client().post("/api/n8n/upload-pairings",
+                        headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert len(runs) == 1, f"night 2 reverted the eshop: {runs[1:]}"
+    assert j2["order_count"] == 0 and j2["order_blocked"] == 1
+    uploaded = json.loads((tmp_path / "uploaded.json").read_text())
+    assert "order:A/1" not in uploaded          # never recorded → never silently final
+    assert uploaded["k1"] == "https://CORRECT.test/x"
+
+
+def test_a_split_decision_blocks_a_stale_inline_pairing_too(monkeypatch, tmp_path):
+    """A `split` product's codes are owned per size (#174) and shipped by the
+    `split_links` automation — an inline pairing for the same code must not race it
+    into the same internalNote cell. The exclusion therefore has to see variant_links,
+    exactly like the manual zip does."""
+    dec = {"k1": {"status": "split", "url": ""}}
+    tok = _arm_pairings(monkeypatch, tmp_path, dec,
+                        order_pairings={"A/1": "https://STALE-INLINE.test/x"})
+    monkeypatch.setattr(webapp, "VARIANT_LINKS", str(tmp_path / "variant_links.json"))
+    webapp._save_variant_links({"A/1": "https://per-size.test/l"})
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j["order_count"] == 0 and j["order_blocked"] == 1
+    assert not (tmp_path / "uploaded.json").exists()
+
+
 def test_order_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
     tok = _arm_pairings(monkeypatch, tmp_path, {},
                         order_pairings={"B/1": "https://supplier/z"})

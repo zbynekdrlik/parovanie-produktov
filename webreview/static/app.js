@@ -346,6 +346,7 @@ function renderCard(p) {
   const s = statusOf(p);
   const exp = expanded.has(p.key);
   const card = el('div', 'card' + (s ? ' ' + s : '') + (p.current && p.current.off ? ' curoff' : ''));
+  card.dataset.key = p.key;      // so another tab can scroll straight to this product
 
   // LEFT — our product
   const left = el('div', 'side left');
@@ -1194,13 +1195,82 @@ function initNdModal() {
   if (send) send.onclick = ndSendNow;
 }
 
+// The pairing URL this row is actually SHOWING. A reviewed decision outranks an inline
+// pairing BOTH on the row and in the eshop write-back (`order_pairing_rows` skips codes
+// already covered by `link_rows`), so the editor must prefill, compare and save against
+// the very same value — otherwise a correction is accepted and silently discarded (#242).
+const rowPairUrl = (o) => (o.reviewKey ? o.supplierUrl : o.pairUrl) || '';
+
 // Inline pairing: paste the supplier reorder URL straight onto an order line.
-// Persists per forestshop code (covers items outside the review dataset too).
+// Persists per forestshop code (covers items outside the review dataset too), or — when
+// the link came from a reviewed decision — rewrites THAT decision (#242).
+// #174/#242 — a `split` product's reorder link belongs to ONE SIZE, so there is nothing
+// product-wide to save on this row: /api/order-decision-url refuses it (409, it would
+// discard every per-size link), and the inline path is worse — order_pairings would win
+// the write-back for that code and PERMANENTLY clobber an already-uploaded per-size link
+// (`split_links` keeps its own uploaded_variant_links.json idempotency, so it never
+// re-pushes). The ✂️ therefore takes him to the per-size panel instead of offering a save
+// that can only fail or corrupt.
+async function openSplitSizes(o) {
+  const p = (PRODUCTS || []).find(x => x.key === o.reviewKey);
+  if (!p) {
+    alert('⚠️ Tento produkt je rozdelený na veľkosti, ale nenašiel sa v revízii — '
+          + 'otvor tab „Kontrola párovania" a oprav odkaz pri konkrétnej veľkosti.');
+    return;
+  }
+  // Leaving the tab rebuilds `#list` from scratch, so every open inline editor on every
+  // OTHER row — and the half-typed pair / supplier / comment text in it — goes with it.
+  // The button sits IN the row, right beside the ✏️ that edits in place, so it does not
+  // read as navigation: warn first rather than lose the work silently (#205/#233). Same
+  // predicate the repaint machinery uses, so „would be lost" cannot drift from „is lost".
+  const busy = captureOpenEditors().filter(
+    s => editorSnapHasWork(s, ORDERS.find(x => x.key === s.key))).length;
+  if (busy && !confirm('⚠️ Máš rozpísaný neuložený text (' + busy + '×) v objednávkach. '
+                       + 'Prechodom na veľkosti sa zahodí. Pokračovať?')) return;
+  splitOpen.add(p.key);
+  // in memory ONLY — 'split' sits under the „Dobré / Vybrané" filter, so the review tab
+  // has to be on it to show the card. Persisting it replaced whichever filter the
+  // manager had chosen, permanently, as a side effect of one ✂️ click.
+  FILTER = 'good';
+  await switchTab('review');
+  const card = [...document.querySelectorAll('#list .card')]
+    .find(c => c.dataset.key === p.key);
+  if (card) card.scrollIntoView({ block: 'center' });
+}
+
 async function savePairUrl(o, url) {
+  if (o.reviewStatus === 'split') {
+    // unreachable from the row (a split row shows ✂️, not ✏️) — but a stale captured
+    // editor must never turn into a product-wide write on a per-size product
+    await openSplitSizes(o);
+    return false;
+  }
   if (url && !/^https?:\/\//.test(url)) {
     // #214 — the guard used to drop a typo'd URL on the floor with no explanation
     alert('⚠️ Zadaj platnú adresu začínajúcu http:// alebo https:// — takto sa uložiť nedá.');
     return false;
+  }
+  if (o.reviewKey) {
+    if (!url) {
+      // clearing a reviewed pairing is a review-tab decision ('↩ Vrátiť'); an empty save
+      // here would look like it un-paired the product while nothing actually changed
+      alert('⚠️ Tento produkt je napárovaný v revízii — prázdnou hodnotou sa párovanie '
+            + 'nezruší. Zadaj opravenú adresu, alebo zruš párovanie v tabe „Kontrola párovania".');
+      return false;
+    }
+    const derr = await postToOrder('/api/order-decision-url', { key: o.reviewKey, url });
+    if (derr) {
+      toOrderSaveFailed('Párovacia URL', derr, toOrderPartLabel('kód', o.itemCode), url);
+      return false;
+    }
+    // ONE decision covers EVERY variant code of the product, so every row it feeds must
+    // follow — same reason as the per-product mirror below (#204): without it a sibling
+    // size keeps showing the old link until the next reload.
+    for (const x of ORDERS) {
+      if (x.reviewKey === o.reviewKey) { x.supplierUrl = url; x.reviewStatus = 'manual'; }
+    }
+    renderToOrder();
+    return true;
   }
   const err = await postToOrder('/api/order-pair', { code: o.itemCode, url });
   if (err) { toOrderSaveFailed('Párovacia URL', err, toOrderPartLabel('kód', o.itemCode), url); return false; }
@@ -1219,8 +1289,9 @@ function pairEditor(o, focus) {
   pair.dataset.editor = 'pair';        // so a repaint can carry unsaved typing over
   pair.appendChild(el('span', 'to-pcode', escapeHtml(o.itemCode || '')));
   const inp = el('input', 'to-pairurl'); inp.type = 'url';
-  inp.placeholder = o.pairUrl ? 'upraviť párovaciu URL…' : 'vlož párovaciu URL dodávateľa…';
-  inp.value = o.pairUrl || '';
+  const cur = rowPairUrl(o);
+  inp.placeholder = cur ? 'upraviť párovaciu URL…' : 'vlož párovaciu URL dodávateľa…';
+  inp.value = cur;
   const save = el('button', 'to-pairsave', '💾 Spárovať');
   save.title = 'Uložiť párovaciu URL — objaví sa ako odkaz a pôjde do importu';
   const doSave = () => commitEditor(pair, () => savePairUrl(o, inp.value.trim()));
@@ -1596,26 +1667,46 @@ function renderOrderRow(o, totals) {
   // editor — and the half-typed work in it — with it. The value is never echoed back
   // into a tooltip either.
   const supHref = safeHttpUrl(o.supplierUrl), pairHref = safeHttpUrl(o.pairUrl);
+  // #242 — EVERY pairing this row can show gets the same ✏️. A reviewed link used to
+  // be read-only here, so a wrong link ('mám to tam zle') meant hunting the product
+  // down in the review tab and pairing it from scratch; the save routes itself to
+  // whichever store owns the value (savePairUrl), so the fix cannot be a no-op.
+  // …unless the product is split per size (#174): then the value belongs to ONE size and
+  // the only honest affordance is the per-size panel. A DIFFERENT class matters — the
+  // `.to-pairedit` selector is what `_EDITORS.pair.open` reopens after a repaint, and a
+  // split row must never get a product-wide paste box back that way either.
+  const pairPencil = (node) => {
+    if (o.reviewStatus === 'split') {
+      const sp = el('button', 'to-splitedit', '✂️');
+      sp.title = 'Tento produkt má vlastný odkaz pre každú veľkosť — otvoriť veľkosti';
+      sp.onclick = () => openSplitSizes(o);
+      return sp;
+    }
+    const edit = el('button', 'to-pairedit', '✏️');
+    edit.title = 'Zmeniť / opraviť párovaciu URL';
+    edit.onclick = () => openRowEditor(node, pairEditor(o, true), edit);
+    return edit;
+  };
   if (supHref) {
-    // reviewed decision link — authoritative, read-only (mení sa v párovacom tabe)
+    // reviewed decision link — correcting it here rewrites that decision itself
     const a = el('a', 'to-link'); a.href = supHref; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
+    row.appendChild(pairPencil(a));
   } else if (o.supplierUrl) {
-    // read-only slot with an unusable value — say so instead of faking a link
+    // slot with an unusable value — say so instead of faking a link, and let it be
+    // repaired right here (this is the row that most needs fixing)
     const bad = el('span', 'to-badlink', '🔗 ' + escapeHtml(o.itemCode || 'link'));
-    bad.title = 'Uložená adresa nie je platný http(s) odkaz — oprav ju v párovacom tabe';
+    bad.title = 'Uložená adresa nie je platný http(s) odkaz — oprav ju cez ✏️';
     row.appendChild(bad);
+    row.appendChild(pairPencil(bad));
   } else if (pairHref) {
     // inline-napárované → svieti rovnako ako ostatné napárované (🔗 odkaz) +
     // malá ✏️ na opravu, ak dal zlú URL
     const a = el('a', 'to-link'); a.href = pairHref; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
-    const edit = el('button', 'to-pairedit', '✏️');
-    edit.title = 'Zmeniť / opraviť párovaciu URL';
-    edit.onclick = () => openRowEditor(a, pairEditor(o, true), edit);
-    row.appendChild(edit);
+    row.appendChild(pairPencil(a));
   } else {
     // an unusable inline pairing falls through to the paste box (its value pre-filled,
     // inert in an input) so the manager can repair it right where he sees it
@@ -1948,10 +2039,13 @@ function renderOrderFilters(idx) {
 const _EDITORS = Object.assign(Object.create(null), {
   pair: {
     input: '.to-pairurl',
-    stored: (o) => o.pairUrl || '',
+    stored: rowPairUrl,          // reviewed decision or inline pairing — whichever shows
     same: (a, b) => a.trim() === b.trim(),
     open: (o, row) => {
-      const a = row.querySelector('a.to-link'), edit = row.querySelector('.to-pairedit');
+      // a reviewed link that is not usable renders as an inert .to-badlink, and that
+      // row is exactly the one the manager needs to repair — take it too (#242)
+      const a = row.querySelector('a.to-link, .to-badlink');
+      const edit = row.querySelector('.to-pairedit');
       if (!a || !edit) return null;
       const ed = pairEditor(o, false); a.replaceWith(ed); edit.remove(); return ed;
     },
@@ -2880,6 +2974,7 @@ function renderDev() {
 function renderDevRow(it) {
   const row = el('div', 'dev-row' + (it.state === 'closed' ? ' closed' : '')
                  + (it.priority ? ' prio-' + it.priority : ''));
+  row.dataset.num = it.number;      // lets a save re-open the detail on the rebuilt row
   const head = el('div', 'dev-head');
   head.appendChild(el('span', 'dev-num', '#' + it.number));
   // GitHub is fully hidden — the title is NOT a link out. Clicking it opens the
@@ -2954,10 +3049,26 @@ async function _devToggleDetail(row, number, canAdd) {
 // Render (or re-render) an issue's detail into `box`: zadanie + comments + editor.
 function _renderDetail(box, number, data, canAdd) {
   box.innerHTML = '';
-  if (data.body && data.body.trim()) {
-    box.appendChild(el('div', 'dev-detail-h', 'Zadanie'));
+  const hasBody = !!(data.body && data.body.trim());
+  // #243 — an already-sent request must stay CORRECTABLE. Without this the boss could
+  // only append a comment, so a request that came out wrong was abandoned instead
+  // („chcel som mu ešte niečo dopísať – nedá sa, tak som sa na to vykašlal").
+  // The header (and with it the ✏️) is rendered even when the body is EMPTY: an issue
+  // created straight on GitHub with no description could otherwise never have its
+  // TITLE corrected in the app at all — and the title is the whole request there.
+  if (hasBody || canAdd) {
+    const h = el('div', 'dev-detail-h', 'Zadanie');
+    if (canAdd) {
+      const ed = el('button', 'dev-edit-btn', '✏️ Upraviť zadanie');
+      ed.title = 'Opraviť alebo doplniť text tejto požiadavky';
+      ed.onclick = () => _devEditForm(box, number, data, canAdd);
+      h.appendChild(ed);
+    }
+    box.appendChild(h);
     const b = el('div', 'dev-detail-body');
-    b.textContent = data.body;                 // textContent → no XSS, no HTML render
+    // an empty request has no text to show — say so instead of an unexplained blank
+    if (hasBody) b.textContent = data.body;    // textContent → no XSS, no HTML render
+    else { b.className = 'dev-detail-body dev-detail-empty'; b.textContent = 'Bez textu — zatiaľ len názov.'; }
     box.appendChild(b);
   }
   const comments = data.comments || [];
@@ -3015,6 +3126,65 @@ function _renderDetail(box, number, data, canAdd) {
   ta.focus();
 }
 
+// #243 — the edit form for an already-submitted request: name + text, prefilled with
+// what is actually there. `data.editable` is the body WITHOUT the app's own signature
+// lines, so the boss neither sees nor can accidentally delete bookkeeping he did not
+// write (the server puts them back on save).
+function _devEditForm(box, number, data, canAdd) {
+  box.innerHTML = '';
+  box.appendChild(el('div', 'dev-detail-h', 'Upraviť požiadavku'));
+  const ti = el('input', 'dev-edit-title'); ti.type = 'text'; ti.maxLength = 200;
+  ti.value = data.title || '';
+  ti.placeholder = 'Názov požiadavky…';
+  const ta = el('textarea', 'dev-edit-ta'); ta.maxLength = 5000;
+  ta.value = data.editable || '';
+  ta.placeholder = 'Popis požiadavky…';
+  const bar = el('div', 'dev-note-bar');
+  const save = el('button', 'dev-note-save', 'Uložiť zmeny');
+  const cancel = el('button', 'dev-edit-cancel', 'Zrušiť');
+  const msg = el('span', 'dev-note-msg', '');
+  cancel.onclick = () => _renderDetail(box, number, data, canAdd);
+  save.onclick = async () => {
+    const title = ti.value.trim();
+    if (!title) {
+      msg.textContent = 'Názov nemôže byť prázdny.'; msg.className = 'dev-note-msg err';
+      ti.focus(); return;
+    }
+    save.disabled = true; cancel.disabled = true;
+    msg.textContent = 'Ukladám…'; msg.className = 'dev-note-msg';
+    let ok = false, err = '';
+    try {
+      const r = await fetch(`/api/dev/issue/${number}/edit`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, text: ta.value }),
+      });
+      const j = await r.json(); ok = j.ok; err = j.error || '';
+    } catch (_) { err = 'sieť'; }
+    if (!ok) {
+      save.disabled = false; cancel.disabled = false;
+      msg.textContent = 'Nepodarilo sa: ' + err; msg.className = 'dev-note-msg err';
+      return;                                  // his text stays in the form, not lost
+    }
+    // re-read so the box shows the STORED text (the server re-attached its markers),
+    // and refresh the list so the corrected NAME shows there too
+    let fresh = null;
+    try { fresh = await (await fetch(`/api/dev/issue/${number}`)).json(); } catch (_) {}
+    await loadDevIssues();
+    if (ACTIVE_TAB === 'dev') renderDev(); else renderTabs();
+    // renderDev() rebuilds the list, so `box` is now detached — re-open the detail on
+    // the NEW row, otherwise the boss's edit would appear to close his own detail
+    const row = document.querySelector(`.dev-row[data-num="${number}"]`);
+    if (row && fresh && fresh.ok) {
+      const nb = el('div', 'dev-detail-box');
+      row.appendChild(nb);
+      _renderDetail(nb, number, fresh, canAdd);
+    }
+  };
+  bar.appendChild(save); bar.appendChild(cancel); bar.appendChild(msg);
+  box.appendChild(ti); box.appendChild(ta); box.appendChild(bar);
+  ti.focus();
+}
+
 // Idea lightbulb — any logged-in user writes an idea → POST /api/dev/idea creates a
 // GitHub issue that then appears in the Vývoj list. The token stays server-side.
 function _ideaMsg(text, cls) {
@@ -3023,10 +3193,27 @@ function _ideaMsg(text, cls) {
   if (!text) { msg.hidden = true; msg.textContent = ''; return; }
   msg.hidden = false; msg.className = 'idea-msg' + (cls ? ' ' + cls : ''); msg.textContent = text;
 }
+// One submission at a time, guarded on a FLAG rather than on `btn.disabled`. The button
+// property only stops a second CLICK dispatch, and the title input's keydown-Enter calls
+// _ideaSubmit() DIRECTLY — so with the click-only guard, Enter+Enter sent two POSTs and
+// created two GitHub issues. Enter on a one-line title is the boss's primary submit
+// affordance, so that was the live path. The flag sits inside the function every entry
+// point goes through, and is cleared only on the error path (retry is fine) and in
+// _ideaOpen — the success path stays locked exactly like the button.
+let _ideaBusy = false;
+
 function _ideaOpen() {
   const m = document.getElementById('ideaModal'); if (!m) return;
+  _ideaBusy = false;
   document.getElementById('ideaTitleInput').value = '';
   document.getElementById('ideaDescInput').value = '';
+  // back to the form — the previous open may have ended on the confirmation panel
+  const form = document.getElementById('ideaForm'), done = document.getElementById('ideaDone');
+  if (form && done) { form.hidden = false; done.hidden = true; }
+  // the submit button stays disabled from the moment a submission is accepted until the
+  // dialog is opened again — this is the one place it comes back
+  const sb = document.getElementById('ideaSubmit');
+  if (sb) sb.disabled = false;
   _ideaMsg('');
   m.hidden = false;
   document.getElementById('ideaTitleInput').focus();
@@ -3035,13 +3222,15 @@ function _ideaClose() {
   const m = document.getElementById('ideaModal'); if (m) m.hidden = true;
 }
 async function _ideaSubmit() {
+  if (_ideaBusy) return;                 // click OR Enter — both come through here
   const ti = document.getElementById('ideaTitleInput');
   const de = document.getElementById('ideaDescInput');
   const btn = document.getElementById('ideaSubmit');
   const title = ti.value.trim();
   if (!title) { _ideaMsg('Napíš aspoň názov nápadu.', 'err'); ti.focus(); return; }
+  _ideaBusy = true;
   btn.disabled = true;
-  let ok = false, err = '';
+  let ok = false, err = '', number = 0;
   try {
     const r = await fetch('/api/dev/idea', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3049,19 +3238,53 @@ async function _ideaSubmit() {
     });
     const j = await r.json().catch(() => ({}));
     ok = r.ok && j.ok;
+    number = (j.issue && j.issue.number) || 0;
     if (!ok) err = j.error || ('chyba ' + r.status);
   } catch (_) { err = 'sieťová chyba'; }
-  btn.disabled = false;
-  if (!ok) { _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
-  _ideaClose();
+  if (!ok) { _ideaBusy = false; btn.disabled = false; _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
+  // #243 — the dialog used to just vanish. The lightbulb is on EVERY tab, so unless he
+  // happened to be standing in „Vývoj" he got no number, no confirmation and no way
+  // back to what he had just sent. Say it landed, and offer to open it right away.
+  //
+  // Confirm FIRST, refresh the list AFTER — and never re-enable the button here. It used
+  // to be re-enabled and the form left standing across `await loadDevIssues()`, so a
+  // second click inside that window (6 s with a slow /api/dev/issues) sent a SECOND POST
+  // and created a SECOND GitHub issue. It also made the new E2E flaky: 2 of 3 full runs
+  // failed waiting for #ideaDone, because the confirmation only appeared after the list
+  // round-trip. The button comes back when the dialog is opened again (_ideaOpen).
+  _ideaDone(number);
   await loadDevIssues();                       // new issue appears + nav badge updates
   if (ACTIVE_TAB === 'dev') render(); else renderTabs();
+}
+
+// Success state of the idea dialog: confirmation + a way straight into the request.
+// A number is required — without it there is nothing to confirm or open, so fall back
+// to the old silent close rather than promise something the panel cannot deliver.
+function _ideaDone(number) {
+  const form = document.getElementById('ideaForm');
+  const done = document.getElementById('ideaDone');
+  const txt = document.getElementById('ideaDoneText');
+  if (!form || !done || !number) { _ideaClose(); return; }
+  txt.textContent = 'Zapísali sme ju ako úlohu č. ' + number
+    + ' — nájdeš ju v záložke „Vývoj". Môžeš ju tam kedykoľvek doplniť alebo opraviť.';
+  const open = document.getElementById('ideaDoneOpen');
+  open.onclick = async () => {
+    _ideaClose();
+    await switchTab('dev');
+    const row = document.querySelector(`.dev-row[data-num="${number}"]`);
+    if (row) {
+      row.scrollIntoView({ block: 'center' });
+      _devToggleDetail(row, number, true);
+    }
+  };
+  form.hidden = true; done.hidden = false;
 }
 function initIdea() {
   const btn = document.getElementById('ideaBtn'); if (btn) btn.onclick = _ideaOpen;
   const cancel = document.getElementById('ideaCancel'); if (cancel) cancel.onclick = _ideaClose;
   const back = document.getElementById('ideaBackdrop'); if (back) back.onclick = _ideaClose;
   const submit = document.getElementById('ideaSubmit'); if (submit) submit.onclick = _ideaSubmit;
+  const dclose = document.getElementById('ideaDoneClose'); if (dclose) dclose.onclick = _ideaClose;
   const ti = document.getElementById('ideaTitleInput');
   if (ti) ti.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); _ideaSubmit(); }

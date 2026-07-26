@@ -60,7 +60,8 @@ def _admin_session_cookie(base: str) -> str:
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
                     "automations_server", "imgfail_server", "imgflood_server", "dev_server",
-                    "nedostupne_server", "vystavy_server", "toorder_server")
+                    "nedostupne_server", "vystavy_server", "toorder_server",
+                    "toorder_wide_server")
 
 
 @pytest.fixture(autouse=True)
@@ -208,6 +209,12 @@ class _GHStub:
             {"number": 6, "title": "E2E hotova uloha", "state": "closed", "labels": [],
              "body": "Zadanie hotovej úlohy.", "updated_at": "2026-07-20T10:00:00Z",
              "html_url": "https://example.test/issues/6", "comments": 0, "_comments": []},
+            # created straight ON GitHub, so it has NO description at all — the app
+            # must still let its TITLE be corrected (the ✏️ used to hang off a
+            # non-empty body, so such a request was uneditable forever)
+            {"number": 4, "title": "E2E uloha bez textu", "state": "open", "labels": [],
+             "body": "", "updated_at": "2026-07-18T10:00:00Z",
+             "html_url": "https://example.test/issues/4", "comments": 0, "_comments": []},
             {"number": 5, "title": "E2E toto je pull request", "state": "open", "labels": [],
              "body": "", "updated_at": "2026-07-19T10:00:00Z",
              "html_url": "https://example.test/pull/5", "comments": 0, "_comments": [],
@@ -285,10 +292,27 @@ def _start_gh_stub():
             issue = {"number": state.next_num, "title": data.get("title", ""),
                      "state": "open", "labels": [], "updated_at": "2026-07-22T12:00:00Z",
                      "html_url": f"https://example.test/issues/{state.next_num}",
-                     "comments": 0}
+                     "comments": 0, "body": data.get("body", ""), "_comments": []}
             state.next_num += 1
             state.issues.insert(0, issue)
             self._send(201, issue)
+
+        def do_PATCH(self):
+            """#243 — edit an issue's title/body (REST; `gh issue edit` cannot do this
+            on this repo). Mutates the stub state so the next GET reflects the edit."""
+            data = self._read()
+            m = re.search(r"/issues/(\d+)(\?|$)", self.path)
+            if not m:
+                self._send(404, {"message": "not found"})
+                return
+            it = self._issue_by_num(int(m.group(1)))
+            if it is None:
+                self._send(404, {"message": "not found"})
+                return
+            for field in ("title", "body"):
+                if field in data:
+                    it[field] = data[field]
+            self._send(200, it)
 
         def do_DELETE(self):
             m = re.search(r"/issues/(\d+)/labels/(.+)$", self.path)
@@ -647,6 +671,109 @@ def toorder_server(tmp_path_factory):
         "20260900;2026-05-16 09:00:00;Vybavuje sa;;Nohavice Orb Test;1;S1;Veľkosť: M;ORBIS\r\n"
         "20260890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
         "20260001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(out / "no_products_here.csv"),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def toorder_wide_server(tmp_path_factory):
+    """Isolated webreview instance for the „Na objednanie" ROW-WIDTH + pairing-edit E2E
+    (#241 row overflows past the viewport under ~1780 px, #242 a reviewed link has no
+    edit affordance at all).
+
+    Deliberately NOT the shared `toorder_server`: that one is all-unpaired with short
+    strings, and a short fixture cannot reproduce a width bug (the #82 lesson — nothing
+    has to shrink, so RED never happens). Here every cell a real row can carry is
+    present AND realistically long: a reviewed pairing link, a long product name, a long
+    shop remark, a supplier-less line (inline assign editor), and two lines sharing one
+    itemCode plus a sibling variant of the same reviewed product.
+
+    Seeded so that:
+      * 61247/L + 61247/XL belong to review product BETALOV|231 with a `good` decision
+        → both rows render the reviewed 🔗 and must both become editable + propagate;
+      * 99999/M is outside the review set → keeps the inline paste box (control);
+      * N1 has no supplier → shows the inline supplier-assign editor (extra width);
+      * 77777/S carries a reviewed decision whose stored URL is NOT http(s)
+        (/api/decision does not validate the scheme, so this reaches the store in
+        practice) → the inert `.to-badlink` slot, which is the row that most needs
+        repairing and had ZERO coverage: deleting its ✏️, and narrowing the editor
+        selector back to `a.to-link`, both left the whole suite green;
+      * 55555/M belongs to a `split` product (#174 — one supplier page PER SIZE) with a
+        per-size link, so it must show that link and route its button to the per-size
+        panel instead of a product-wide save that can only 409 or clobber.
+    WEBREVIEW_PRODUCTS points at a nonexistent file so a dev box's real
+    data/products.csv can never influence the run (CI has none)."""
+    out = tmp_path_factory.mktemp("wr_toorder_wide_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "review_data.json").write_text(json.dumps([
+        {
+            "key": "BETALOV|231", "supplier": "BETALOV",
+            "name": "Polokosela FOREST Single Jersey 180g panska dlhy rukav",
+            "pairCode": "231", "variant_codes": ["61247/L", "61247/XL"],
+            "our_url": "https://www.forestshop.sk/polokosela-forest/",
+            "our_images": [], "candidates": [], "current": {},
+            "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+        },
+        {
+            "key": "CITRADE|777", "supplier": "CITRADE",
+            "name": "Rukavice CITRADE zimne panske",
+            "pairCode": "777", "variant_codes": ["77777/S"],
+            "our_url": "", "our_images": [], "candidates": [], "current": {},
+            "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+        },
+        {
+            "key": "ORBIS|555", "supplier": "ORBIS",
+            "name": "Termopodvlecenie ORBIS po velkostiach",
+            "pairCode": "555", "variant_codes": ["55555/M", "55555/L"],
+            "our_url": "", "our_images": [], "candidates": [], "current": {},
+            "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+        },
+    ]), encoding="utf-8")
+    (out / "decisions.json").write_text(json.dumps({
+        "BETALOV|231": {"status": "good",
+                        "url": "https://www.huntingshop.eu/polokosela-forest-single-jersey-180g/"},
+        # scheme-less: a real typo that /api/decision accepts → inert .to-badlink slot
+        "CITRADE|777": {"status": "manual", "url": "www.citrade.sk/rukavice-zimne"},
+        "ORBIS|555": {"status": "split", "url": ""},
+    }), encoding="utf-8")
+    (out / "variant_links.json").write_text(json.dumps({
+        "55555/M": "https://www.orbis.sk/termopodvlecenie-velkost-M",
+    }), encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
+        "20261217;2026-05-20 09:00:00;Vybavuje sa;"
+        "nemame percussion tricko, zakaznik caka na potvrdenie terminu;"
+        "Polokosela FOREST Single Jersey 180g panska;1;61247/L;Velkost: L;BETALOV\r\n"
+        "20261218;2026-05-21 09:00:00;Vybavuje sa;;"
+        "Polokosela FOREST Single Jersey 180g panska;2;61247/XL;Velkost: XL;BETALOV\r\n"
+        "20261219;2026-05-22 09:00:00;Vybavuje sa;;"
+        "Nohavice ORBIS Trophy zimne zateplene panske;1;99999/M;Velkost: M;ORBIS\r\n"
+        "20261220;2026-05-23 09:00:00;Vybavuje sa;;"
+        "Ciapka bez dodavatela s dlhym nazvom produktu;1;N1;Velkost: uni;\r\n"
+        "20261221;2026-05-24 09:00:00;Vybavuje sa;;"
+        "Rukavice CITRADE zimne panske;1;77777/S;Velkost: S;CITRADE\r\n"
+        "20261222;2026-05-25 09:00:00;Vybavuje sa;;"
+        "Termopodvlecenie ORBIS po velkostiach;1;55555/M;Velkost: M;ORBIS\r\n",
         encoding="cp1250")
     env = {
         **os.environ,

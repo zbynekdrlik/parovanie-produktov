@@ -258,11 +258,37 @@ def link_rows(products, decisions, code2pair, variant_links=None):
     URL (productId-rebuild via `to_grube_de`, strips mangled slug/query/single-size
     #itemId); a non-grube product's URL is written verbatim. Fallback to the raw URL
     if `to_grube_de` can't parse a productId."""
+    return [[c, pc, url] for c, pc, url, _key, _st
+            in link_row_specs(products, decisions, code2pair, variant_links)]
+
+
+def link_row_specs(products, decisions, code2pair, variant_links=None):
+    """The ONE loop behind link_rows() and the to-order tab's owner map: yields
+    `(code, pairCode, url, review_key, decision_status)` per emitted variant.
+
+    Kept as a single generator on purpose — the "each code appears ONCE, first
+    pairing wins" dedup decides BOTH what the eshop receives and which decision owns
+    a given code, and a second copy of those rules would eventually disagree with
+    this one. Naming the owner is what lets the „Na objednanie" tab edit the decision
+    that actually produced the link it shows (#242) instead of a parallel store the
+    write-back would discard — `build_to_order_rows` consumes this generator directly
+    (a separate `link_owners` wrapper existed and was never called by production
+    code, so it is gone: dead code cannot guard anything)."""
     variant_links = variant_links or {}
-    rows = []
     seen = set()
     for p in products:
-        d = decisions.get(p.get("key"))
+        key = p.get("key")
+        # A spec has to NAME its owner, so a product without a usable key yields
+        # nothing at all — here, rather than in one consumer. Filtering it downstream
+        # (the to-order owner map did) makes the readers disagree about the same code:
+        # the row still showed the decision's link plus a ✏️, but with an empty
+        # `reviewKey`, so the correction went to order_pairings — which the write-back
+        # then excludes, because `owned_codes` comes from link_rows() and never
+        # filtered on the key. Accepted, and never shipped: the silent no-op #242
+        # exists to remove. One loop, one rule, all three readers.
+        if not key:
+            continue
+        d = decisions.get(key)
         if not d:
             continue
         st = d.get("status")
@@ -277,7 +303,7 @@ def link_rows(products, decisions, code2pair, variant_links=None):
                 seen.add(c)
                 if is_grube:
                     vurl = to_grube_de(vurl) or vurl
-                rows.append([c, code2pair.get(c, ""), vurl])
+                yield [c, code2pair.get(c, ""), vurl, key, st]
         elif st in ("good", "manual") and (d.get("url") or "").strip():
             url = d["url"].strip()
             if is_grube:
@@ -286,8 +312,7 @@ def link_rows(products, decisions, code2pair, variant_links=None):
                 if c in seen:
                     continue
                 seen.add(c)
-                rows.append([c, code2pair.get(c, ""), url])
-    return rows
+                yield [c, code2pair.get(c, ""), url, key, st]
 
 
 def order_pairing_rows(order_pairings, code2pair, exclude_codes=None):
