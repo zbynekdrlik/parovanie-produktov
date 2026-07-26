@@ -6,6 +6,7 @@ Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:879
 """
 from __future__ import annotations
 import csv
+import fcntl
 import hmac
 import io
 import json
@@ -6105,6 +6106,62 @@ AUTOMATIONS_REG = [
 ]
 RUNNER = AutomationRunner(AUTOMATIONS_STATE, AUTOMATIONS_REG)
 
+# #262 — ONE scheduler per data dir. A throwaway instance booted on another port for
+# a screenshot (see the playbook recipe) was never killed and ran four days beside the
+# real service with its scheduler enabled: two runners racing the same nightly jobs
+# over the same data/out, unlogged — the customer-mail automations were one release
+# away from mailing everybody twice. The claim below is an flock held for the whole
+# process lifetime, so a crashed instance releases it automatically (no stale pidfile).
+SCHEDULER_CLAIM = _store(".scheduler.lock")
+_scheduler_claim_fd = None
+
+
+def _scheduler_enabled() -> bool:
+    """False only when WEBREVIEW_NO_SCHEDULER is explicitly set (empty/`0` = on).
+
+    The throwaway preview instance boots with it: no scheduler at all means a
+    forgotten process can never send a customer e-mail, write to the eshop or spend
+    money scraping — not even if it outlives the session that started it."""
+    return os.environ.get("WEBREVIEW_NO_SCHEDULER", "").strip() in ("", "0")
+
+
+def _claim_scheduler() -> bool:
+    """Take the exclusive cross-process scheduler claim for this data dir."""
+    global _scheduler_claim_fd
+    p = os.fspath(SCHEDULER_CLAIM)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            with open(p, encoding="utf-8") as f:
+                holder = f.read().strip()
+        except OSError:
+            holder = ""
+        os.close(fd)
+        log.error("automation scheduler NOT started: another instance already holds %s "
+                  "(%s). Two schedulers over one data dir race the nightly jobs and can "
+                  "mail a customer twice (#262) — stop the other instance first.",
+                  p, holder or "holder unknown")
+        return False
+    os.ftruncate(fd, 0)
+    os.write(fd, f"pid={os.getpid()} port={os.environ.get('WEBREVIEW_PORT', '8801')} "
+                 f"started={datetime.now().isoformat(timespec='seconds')}\n".encode())
+    _scheduler_claim_fd = fd   # never closed — the claim lasts as long as this process
+    return True
+
+
+def _start_scheduler() -> bool:
+    """Start the automation runner iff this instance may and can own it."""
+    if not _scheduler_enabled():
+        log.warning("automation scheduler DISABLED (WEBREVIEW_NO_SCHEDULER) — this "
+                    "instance runs no automation: no e-mails, no eshop writes")
+        return False
+    if not _claim_scheduler():
+        return False
+    RUNNER.start()
+    return True
+
 # Valid /api/ui-label rename keys (#173): every NAV key the frontend actually
 # renders a button for — mirrors app.js's TABS + AUTOMATION_TABS arrays + the
 # two standalone admin/dev tabs, verbatim. Deliberately NOT derived from
@@ -6560,6 +6617,6 @@ def api_stock_skladom():
 
 
 if __name__ == "__main__":
-    RUNNER.start()
+    _start_scheduler()
     app.run(host="0.0.0.0", port=int(os.environ.get("WEBREVIEW_PORT", "8801")),
             threaded=True)

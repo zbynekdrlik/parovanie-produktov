@@ -90,9 +90,21 @@ bootstrapne reálneho admina do svojho tmp store — prihlás sa jeho údajmi, a
 vlastné `ADMIN_EMAIL`/`ADMIN_PW` (env vyhráva nad súborom).
 
 Náhľad reálneho vzhľadu (reálne dáta, nie fixture): bootni ODHODENÚ inštanciu na inom porte
-`WEBREVIEW_PORT=8811 PYTHONPATH=src nohup .venv/bin/python webreview/app.py &`, Playwright
-screenshot (LEN GET — nav prepínanie + tmavý mód sú bezpečné; NEklikaj row-toggly = POST do
-živých dát), potom `kill`. NIKDY nereštartuj živú :8801 kvôli náhľadu.
+**vždy s vypnutým plánovačom**
+`WEBREVIEW_NO_SCHEDULER=1 WEBREVIEW_PORT=8811 PYTHONPATH=src nohup .venv/bin/python webreview/app.py &`,
+Playwright screenshot (LEN GET — nav prepínanie + tmavý mód sú bezpečné; NEklikaj row-toggly =
+POST do živých dát), potom **`kill`** (ten krok NEVYNECHAJ). NIKDY nereštartuj živú :8801 kvôli
+náhľadu.
+
+**PREČO `WEBREVIEW_NO_SCHEDULER=1` (#262):** presne táto odhodená inštancia raz osirela a bežala
+ŠTYRI DNI vedľa ostrej služby — s vlastným plánovačom automatizácií nad tými istými `data/out`
+a so štyri týždne starým kódom (zákaznícke maily 09:00, nočný zápis do eshopu 21:00, platený
+scrape 05:00). Dva plánovače nad jedným dátovým priečinkom si pretekajú nočné behy a vedia
+poslať zákazníkovi mail dvakrát. S tou premennou inštancia NEMÁ plánovač vôbec, takže ani
+zabudnutý proces nič neodošle ani nezapíše. Druhá poistka je v appke: plánovač si berie
+medziprocesový nárok (`data/out/.scheduler.lock`, flock) a druhá inštancia ho nespustí — do logu
+napíše, kto ho drží. Nárok drží otvorený deskriptor, takže pád procesu ho uvoľní sám (žiadny
+zabudnutý pidfile).
 
 Dva taby: **Kontrola párovania** (review kariet) a **Na objednanie** (doobjednanie u dodávateľa).
 
