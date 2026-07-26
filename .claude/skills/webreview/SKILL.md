@@ -916,6 +916,35 @@ odfiltruj cez `pull_request` kľúč). Fixná žiarovka vpravo dole (`#ideaBtn` 
 - **E2E stub musí vedieť aj comments/labels/delete** (`_GHStub` v `tests/e2e/conftest.py`): `do_POST` vetvi na `/issues/<n>/comments` (bump count), `/issues/<n>/labels` (mutuj `it["labels"]`), `/labels` (ensure), inak create-issue; `do_DELETE` na `/issues/<n>/labels/<encoded>` (odstráň z issue). Tak e2e overí prioritný split naživo. Backend testy: guard mockuj aj `webapp.requests.delete` (nielen get/post).
 - **Post-deploy overenie bez špiny**: prioritu nastav→vyčisti (`none` zmaže label, GitHub čistý); detail-komentár je trvalý → píš ho len na VLASTNÝ tracking issue („overené naživo"), nie na cudzí. Reálne over cez `gh issue view <n> --json labels,comments`.
 
+### Úprava už odoslanej požiadavky — REST PATCH + podpisy sa zachovávajú (#243, v0.94.0)
+
+Komentár (`/note` vyššie) je **doplnenie**, nie oprava. Prepis samotného zadania robí
+`POST /api/dev/issue/<n>/edit` → `PATCH repos/{repo}/issues/{n}` (`gh issue edit` padá,
+viď classic-Project gotcha nižšie; `requests.patch`, nie post).
+
+- **Podpisy appky v TELE sú bookkeeping, nie šéfov text.** `_split_app_markers` odreže
+  koncové `_Nápad|Upravené cez appku (Vývoj) — …_` riadky, detail ich vracia zvlášť
+  (`editable` = telo bez nich, `body` = celé). Pri uložení `_compose_edited_body`
+  **zachová** `_Nápad …_` (jediný záznam, kto o vec požiadal) a `_Upravené …_`
+  **PREPÍŠE, nepridá** — inak by z tela po pár úpravách bol changelog. Nový podpisový
+  riadok pridávaj do `_APP_BODY_MARKER`, inak ho ďalšia úprava nechá napevno v texte.
+- **Uzavretú úlohu odmietaj** (prečítaj `state` PRED patchom): prepísať zadanie, podľa
+  ktorého už niekto konal, je preňho neviditeľné — na to je komentár.
+- **Rozsah = ako komentáre a priority** (každý prihlásený, otvorené úlohy). Užšie „len
+  úlohy vytvorené cez appku" by šéfovi znemožnilo opraviť práve požiadavky prepísané
+  za neho z Discordu — teda ten prípad, kvôli ktorému #243 vznikla.
+- **Hermetický guard v `tests/test_webreview_dev.py` musí stubovať aj `requests.patch`.**
+  Dev box má reálny `data/.gh_env`, takže zabudnutý mock by trafil ŽIVÉ repo. Pri
+  pridaní ďalšieho HTTP slovesa ho do guardu dopíš hneď. E2E `_GHStub` má `do_PATCH`
+  (mutuje stav, takže ďalší GET vidí úpravu) a create-issue ukladá `body`/`_comments`.
+- **Potvrdenie po odoslaní cez žiarovku je SAMOSTATNÝ skrytý panel (`#ideaDone`), nie
+  prepis `innerHTML` dialógu** — `_ideaOpen` očakáva prvky formulára, takže prepis by
+  rozbil ďalšie otvorenie. `_ideaOpen` panely prepína späť. Žiarovka je na KAŽDEJ
+  záložke, takže tiché zavretie znamenalo, že šéf mimo „Vývoja" nedostal ani číslo úlohy.
+- **Po uložení sa zoznam prekresľuje (`renderDev`), takže pôvodný `.dev-detail-box` je
+  odpojený** — riadky nesú `data-num`, aby sa detail dal znova otvoriť na NOVOM riadku;
+  bez toho vyzerá úprava ako zavretie vlastného detailu.
+
 ## Admin premenovanie záložiek + popis automatizácií (#173, v0.70.0)
 
 Šéf chcel (1) jasný SK popis čo/kedy automatizácia robí a (2) vedieť premenovať KAŽDÚ záložku
@@ -998,6 +1027,26 @@ do JEDNÉHO combined `import_links.csv` v tom istom behu:
 | `decisions.json` | review **`key`** = `SUPPLIER\|pairCode` | ručný zip (`/api/import`) AJ nočne `/api/n8n/upload-pairings` | **ÁNO** — pri štarte sa decision s kľúčom mimo review_data **TICHO zmaže** (`app.py` prune) |
 | `order_pairings.json` | forestshop **kód** (ľubovoľný) | ručný zip AJ nočne (`_do_upload_pairings` → `order_pairing_rows(..., exclude_codes=<kódy už v decision rows>)`) | nie |
 
+**Rozhodnutie VYHRÁVA nad inline párovaním — a to isté poradie musí platiť aj v UI (#242).**
+`exclude_codes` znamená, že kód pokrytý rozhodnutím sa z `order_pairings` do eshopu NIKDY
+nedostane; `renderOrderRow` to zrkadlí (`supplierUrl` → potom `pairUrl`). Dôsledok, na ktorý
+sa dá naletieť: **editačné pole, ktoré zapisuje do `order_pairings` na riadku s rozhodnutím,
+je TICHÝ NO-OP** — uloží sa, endpoint vráti 200, a riadok aj eshop ďalej nesú starú
+rozhodnutú URL („som to naparoval, ale tie linky vobec nefungujú"). Na živých dátach malo
+8 kódov obe hodnoty naraz, aspoň jedna rozdielna. **Pravidlo pre KAŽDÝ nový editor na tomto
+tabe: edituj to úložisko, ktoré riadok naozaj ZOBRAZUJE a ktoré sa naozaj EXPEDUJE** —
+riadok preto nesie `reviewKey`/`reviewStatus` (z `import_builder.link_owners`) a
+`savePairUrl` podľa nich smeruje zápis: `POST /api/order-decision-url` (prepíše rozhodnutie,
+`status:'manual'`, 409 na `split`) vs. `POST /api/order-pair` (inline). Pomocník
+`rowPairUrl(o)` je JEDINÁ definícia „ktorá URL na tomto riadku platí" — používa ju prefill
+editora, `_EDITORS.pair.stored` aj porovnanie „zhodné s uloženým".
+
+**`import_builder.link_row_specs` je JEDNA slučka za `link_rows` aj `link_owners`.** Pravidlo
+„každý kód raz, prvé párovanie vyhráva" rozhoduje AJ o tom, ktorý kód komu patrí, takže
+druhá kópia tej dedup logiky by sa časom rozišla s tým, čo sa naozaj zapisuje. Nový
+konzument „ktoré rozhodnutie vlastní tento kód" berie `link_owners`, NEpíše si vlastný
+prechod; pinnuté testom, že množina kódov oboch výstupov je identická.
+
 `order_pairings` kód pokrytý reviewed decisiou v TOM ISTOM behu sa **vynechá** (Shoptet
 padá na duplicitný `code` v jednom importe — decision vyhráva). Dedup nočného stavu pre
 `order_pairings` žije v TOM ISTOM `uploaded_pairings.json` ako decisions, ale pod
@@ -1060,6 +1109,12 @@ zobrazí len takému). Nezabudni ju pridať do `_SERVER_FIXTURES` (auth cookie) 
 `WEBREVIEW_PRODUCTS` na neexistujúci súbor — inak dev box ťahá reálny `data/products.csv`
 a test sa správa inak než na CI.
 
+**Na ŠÍRKU riadku a na recenzované párovanie použi `toorder_wide_server` (#241/#242), nie
+tento.** `toorder_server` je all-unpaired a krátky — bunky sa nemajú prečo zmenšovať, takže
+šírkový RED nikdy nenastane a riadok s rozhodnutím tam vôbec nie je. Tá fixtúra má
+review_data + `decisions.json` (dva riadky s tým istým rozhodnutím, na propagáciu),
+realisticky dlhé názvy a poznámku e-shopu, a jeden riadok bez dodávateľa.
+
 ## Živé Playwright overenie bez znečistenia dát
 
 To-order flagy píšu do živých stores. Pri overovaní na živom webe **toggluj on→off** (skonči v pôvodnom stave) a potom over `data/out/<store>.json` že je zase `{}` (resp. pôvodný počet) — nikdy nenechaj reálnu objednávku označenú z testu.
@@ -1067,6 +1122,33 @@ To-order flagy píšu do živých stores. Pri overovaní na živom webe **togglu
 ## Gotcha — `.card{display:grid}` deti potrebujú `min-width:0`, inak sa button „stratí" na úzkom displeji
 
 `.card` je CSS Grid (`grid-template-columns:1fr 1fr`, mobil `1fr`). Grid ITEM (`.side.left`/`.side.right`) má bez `min-width:0` automatickú minimálnu šírku = min-content jeho OBSAHU — dlhý nezalomiteľný text (candidate name, URL) v `.manualrow`/`.cand` vnútri vie natiahnuť grid TRACK ďaleko za viewport; `.card` samo zostane správne úzke (`overflow:hidden`), ale JEHO VNÚTRO pretečie a zelené tlačidlo („Uložiť URL"/„Vybrať") skončí v odrezanej oblasti — neviditeľné a neklikateľné (#82). Samotné `flex-wrap`/`min-width:0` na `.manualrow`/`.cand` NESTAČÍ, ak `.side` sám o sebe nemá `min-width:0` — fix musí byť na GRID ITEME (`.side{min-width:0}`), flex-level úpravy sú len defense-in-depth. **Krátky test fixture (krátky názov/URL) bug NEREPRODUKUJE** — nič sa nemusí zmenšovať, takže RED nikdy nenastane; na overenie/regression e2e treba REALISTICKY DLHÝ obsah (skutočná dĺžka candidate name + supplier URL). Diagnostika: `page.evaluate("el => ({sw: el.scrollWidth, cw: el.clientWidth})")` na `.card`/`.side.*` — `scrollWidth > clientWidth` = vnútri pretieklo.
+
+## Gotcha — riadok „Na objednanie" ZALAMUJE na každej šírke; nová bunka nesmie čakať jeden riadok (#241/#242)
+
+Sesterský problém k `.card` gotche vyššie, ale vo `flex` riadku a bez `overflow:hidden`,
+takže sa NEOREŽE — utečie mimo obrazovku. `.toorder-row` mala `flex-wrap` len pod 760 px,
+pričom skoro každá bunka je `flex:0 0 auto` + `white-space:nowrap`. Merané naživo pri
+viewport 1280: `document.scrollWidth` **1778** (1862 s otvoreným editorom), `.to-name`
+stlačená na **0 px** (názov produktu neviditeľný) a päť buniek vrátane „💬 Komentár",
+„✓ Skladom" a „✗ Nedostupné" mimo plochy — teda **nedosiahnuteľné ovládanie**, nie kozmetika.
+
+- **Breakpoint tu nikdy nebol správny nástroj**: koľko buniek riadok nesie (grube čip, Σ čip,
+  badge starej objednávky, poznámka e-shopu, komentár, priraďovací editor — všetko voliteľné)
+  rozhoduje viac než viewport. Preto `flex-wrap:wrap` NATVRDO, media query len dolaďuje medzery.
+- **Pružná textová bunka potrebuje reálny `flex-basis`, nie `flex:1`.** Pri `flex:1`
+  (basis 0) dostane `.to-name` len omrvinky z prvého riadku — meranie ju našlo na 0 px.
+  `flex:1 1 220px` ju pri stiesnenom riadku pošle na vlastný riadok a je čitateľná.
+- **`min-width` bunky s vlastným inputom drž nad použiteľnosťou vstupu**: `.to-pair` mala
+  230 px, ale `.to-pairurl` má vlastný 110 px floor → pole na dodávateľskú URL sa scvrklo
+  na ~110 px, kde sa adresa nedá ani prečítať, nieto opraviť. Teraz 260 px.
+- **Testuj INVARIANT, nie pixel**: „žiadna bunka riadku nekončí za viewportom"
+  (`getBoundingClientRect().right > clientWidth`) prežije zmenu palety aj popiskov;
+  magické číslo (1777) nie. Parametrizuj cez 1280/1440/1600/1780/1920 a NECHAJ v sade aj
+  šírky, ktoré boli zelené už predtým — sú to kontroly, že sa široké šírky nezhoršili.
+- Fixtúra na to je **`toorder_wide_server`** (e2e conftest) — zámerne dlhá a plná (recenzované
+  párovanie, dlhý názov, dlhá poznámka e-shopu, riadok bez dodávateľa, dva riadky s tým istým
+  kódom). Platí tu to isté ako pri #82: **krátka fixtúra šírkový bug NEREPRODUKUJE**, RED by
+  nikdy nenastal. `toorder_server` je all-unpaired a krátky — na šírku ho nepoužívaj.
 
 ## Gotcha — `gh pr edit` / `gh issue edit` na tomto repo ZLYHÁ (classic Project)
 
