@@ -100,8 +100,10 @@ náhľadu.
 ŠTYRI DNI vedľa ostrej služby — s vlastným plánovačom automatizácií nad tými istými `data/out`
 a so štyri týždne starým kódom (zákaznícke maily 09:00, nočný zápis do eshopu 21:00, platený
 scrape 05:00). Dva plánovače nad jedným dátovým priečinkom si pretekajú nočné behy a vedia
-poslať zákazníkovi mail dvakrát. S tou premennou inštancia NEMÁ plánovač vôbec, takže ani
-zabudnutý proces nič neodošle ani nezapíše. Druhá poistka je v appke: plánovač si berie
+poslať zákazníkovi mail dvakrát. S tou premennou inštancia NEMÁ plánovač vôbec, takže
+zabudnutý proces sám od seba nikdy nič nespustí (žiadne 09:00 maily, žiadny 21:00 zápis do
+eshopu, žiadny platený 05:00 scrape). Ručné „⚡ Spustiť teraz" v jej UI beží ďalej — vypína sa
+NEobsluhovaný plán, nie klik prihláseného človeka; preto ju aj tak ZABI, keď dokončíš screenshot. Druhá poistka je v appke: plánovač si berie
 medziprocesový nárok (`data/out/.scheduler.lock`, flock) a druhá inštancia ho nespustí — do logu
 napíše, kto ho drží. Nárok drží otvorený deskriptor, takže pád procesu ho uvoľní sám (žiadny
 zabudnutý pidfile).

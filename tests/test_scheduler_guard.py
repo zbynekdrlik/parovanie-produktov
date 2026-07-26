@@ -8,7 +8,9 @@ the same nightly jobs over the same data/out, unlogged. Nothing stops that today
 
 Two guards are pinned here: a cross-process claim (a second instance refuses to start
 the scheduler and says who holds it), and an explicit off switch so the preview boot
-carries no scheduler at all and can never mail a customer or write to the eshop.
+carries no scheduler at all — nothing in it ever fires on a timer, however long it is
+forgotten. (A manual „Spustiť teraz" click by a logged-in human still runs; the flag
+removes the unattended schedule, which is what the orphan was doing.)
 """
 import fcntl
 import os
@@ -110,17 +112,18 @@ def test_every_e2e_fixture_server_boots_without_a_scheduler():
         f"{servers - pinned} fixture server(s) build an env without the shared pins"
 
 
-def test_run_now_is_refused_on_an_instance_without_a_scheduler(monkeypatch):
-    """„⚡ Spustiť teraz" runs the automation IN THIS PROCESS, so a preview instance
-    could mail customers from its own UI however loudly the boot log says it runs
-    no automation."""
+def test_a_manual_run_still_works_without_a_scheduler(monkeypatch):
+    """Deliberate boundary: the flag removes the unattended TIMER (what an orphaned
+    instance does on its own), not an explicit click by a logged-in human. Three e2e
+    fixtures depend on a hermetic „⚡ Spustiť teraz", and blocking it would say the
+    forgotten-instance risk lives in the click rather than in the schedule."""
     from tests.conftest import authed_client
     monkeypatch.setenv("WEBREVIEW_NO_SCHEDULER", "1")
     called = []
     monkeypatch.setattr(webapp.RUNNER, "run_now", lambda key: called.append(key) or True)
     r = authed_client().post("/api/automations/posta_uncollected/run")
-    assert r.status_code == 503, r.data
-    assert called == []
+    assert r.status_code == 200, r.data
+    assert called == ["posta_uncollected"]
 
 
 def test_the_playbook_preview_recipe_disables_the_scheduler():

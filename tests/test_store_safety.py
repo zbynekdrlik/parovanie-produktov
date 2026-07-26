@@ -253,7 +253,8 @@ def test_a_refused_write_answers_503_with_something_to_fix(monkeypatch, tmp_path
     must be told what happened (same shape as the corrupt-dedup-store handler)."""
     for exc in (webapp.StoreWipeRefused("x"), webapp.StoreLockTimeout("y")):
         handler = webapp.app.error_handler_spec[None][None][type(exc)]
-        body, status = handler(exc)
+        with webapp.app.test_request_context():
+            body, status = handler(exc)
         assert status == 503 and body.get_json()["ok"] is False
         assert body.get_json()["error"]
 

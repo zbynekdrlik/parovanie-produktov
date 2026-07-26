@@ -154,11 +154,11 @@ class _StoreLock:
         self._depth = 0
         self._fd = None
 
-    def _flock(self) -> int:
+    def _flock(self, timeout=None) -> int:
         p = os.fspath(self.path)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -166,18 +166,28 @@ class _StoreLock:
             except OSError:
                 if time.monotonic() >= deadline:
                     os.close(fd)
-                    log.error("store lock %s still held by another process after %.0fs "
-                              "— refusing to write (a second instance? see #262)",
-                              p, self.timeout)
-                    raise StoreLockTimeout(p) from None
+                    log.error("store lock %s still held by another process — refusing "
+                              "to write (a second instance? see #262)", p)
+                    raise StoreLockTimeout(
+                        f"Úložisko {os.path.basename(p)} drží iný proces a nepustilo "
+                        "ho — nič sa nezapísalo. Skús to o chvíľu znova; ak to trvá, "
+                        "beží pravdepodobne druhá inštancia aplikácie (#262).") from None
                 time.sleep(0.02)
 
     def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        started = time.monotonic()
         if not self._rlock.acquire(blocking, timeout):
             return False
         if self._depth == 0:
+            # the caller's budget governs BOTH halves — a non-blocking acquire that
+            # then waits 30s on the file lock would be a trap
+            budget = None
+            if not blocking:
+                budget = 0.0
+            elif timeout is not None and timeout >= 0:
+                budget = max(0.0, timeout - (time.monotonic() - started))
             try:
-                self._fd = self._flock()
+                self._fd = self._flock(budget)
             except BaseException:
                 self._rlock.release()
                 raise
@@ -235,19 +245,33 @@ def _read_json_store(path, default):
     mid-UTF-8 raises UnicodeDecodeError, which is a ValueError like JSONDecodeError
     and degrades the same way instead of escaping as a 500.
 
-    It also records how many entries this process just saw on disk, which is what the
-    wipe guard checks. NOTE: the two FAIL-CLOSED dedup stores (orders_reminder,
-    posta_uncollected — #225) deliberately do NOT use this reader; losing THEIR
-    contents means mailing a customer twice, so they raise instead of degrading."""
+    An I/O error on a store that IS there (permissions, EIO, a directory in its place)
+    is NOT one of those cases and propagates: „the file is unreadable" is not evidence
+    that the manager did no work, and degrading it to `{}` would let the next click
+    persist a one-entry file over a full one — the silent loss this module exists to
+    prevent (found in review of this change).
+
+    The read is recorded (how many entries this process saw on disk — what the wipe
+    guard checks) ONLY when it really yielded the stored content. A default handed
+    back after a failed or wrong-type read must never legitimise a later shrink.
+
+    NOTE: the two FAIL-CLOSED dedup stores (orders_reminder, posta_uncollected — #225)
+    deliberately do NOT use this reader; losing THEIR contents means mailing a customer
+    twice, so they raise instead of degrading."""
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-    except (OSError, ValueError):
-        d = default
+    except (FileNotFoundError, ValueError):
+        return default
     if not isinstance(d, type(default)):
-        d = default
-    _store_reads[os.fspath(path)] = len(d)
+        return default
+    _note_store_read(path, d)
     return d
+
+
+def _note_store_read(path, data) -> None:
+    """Remember what this process last saw on disk for `path` (#261 wipe guard)."""
+    _store_reads[os.fspath(path)] = len(data)
 
 
 def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> None:
@@ -258,15 +282,17 @@ def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> Non
     written, so a store holding secrets is never briefly world-readable.
 
     `protect=True` marks a store holding IRREPLACEABLE work — the manager's
-    decisions / flags / pairings. There the writer refuses to replace a populated
-    store with an EMPTY one *unless this process actually read that exact store
-    first*: emptying it is legitimate only as the tail of a read-modify-write the
-    manager just performed (undo the last decision, un-mark a whole supplier group
-    via /api/ordered/bulk), and those all load the live store under `_lock` moments
-    earlier. The 2026-07-26 wipe had exactly the opposite shape — `_load_decisions`
-    was stubbed to a fixture, so nothing ever read the 2831 entries that the empty
-    map then erased. A stale count (another process wrote in between) refuses too:
-    that write is a lost update, which is the #264 half of the same story.
+    decisions / flags / pairings. There the writer refuses any write that SHRINKS the
+    store *unless this process actually read that exact store first*: losing entries
+    is legitimate only as the tail of a read-modify-write the manager just performed
+    (undo the last decision, un-mark a whole supplier group via /api/ordered/bulk),
+    and those all load the live store under `_lock` moments earlier. The 2026-07-26
+    wipe had exactly the opposite shape — `_load_decisions` was stubbed to a fixture,
+    so nothing ever read the 2831 entries that the fixture then erased. It is
+    deliberately not an „empty payload" rule: that fixture was small, not empty, and
+    would have overwritten 2831 entries just as happily. Growth never needs a read (an
+    incremental upload state only ever adds), and a stale count (another process wrote
+    in between) refuses too: that write is a lost update, the #264 half of this story.
 
     Nothing is written when it refuses — not even a stray .tmp — and it raises rather
     than logging quietly, so the failure is visible in the response and in tests."""
@@ -277,25 +303,59 @@ def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> Non
 
 def _write_json_locked(p, data, indent, mode, protect) -> None:
     """The body of `_atomic_write_json`, always under the store lock."""
-    if protect and not data:
+    if protect:
         n = _stored_entry_count(p)
-        if n and _store_reads.get(p) != n:
-            log.error("REFUSED to overwrite %s (%d entries on disk, this process last "
-                      "read %s) with an EMPTY store (#261) — nothing was written",
-                      p, n, _store_reads.get(p))
+        if n and len(data) < n and _store_reads.get(p) != n:
+            log.error("REFUSED to shrink %s from %d to %d entries (#261): this process "
+                      "last read %s of them, so the smaller map is not something the "
+                      "manager just did — nothing was written",
+                      p, n, len(data), _store_reads.get(p))
             raise StoreWipeRefused(
-                f"{p}: refusing to replace {n} entries with an empty store")
+                f"Zápis do {os.path.basename(p)} zamietnutý: {n} záznamov by sa "
+                f"zmenšilo na {len(data)}, ale tento proces ich predtým nenačítal. "
+                "Dáta ostali nedotknuté — načítaj stránku znova a skús to ešte raz; "
+                "ak to nepomôže, súbor NEMAŽ a ozvi sa.")
     tmp = f"{p}.{os.getpid()}.tmp"   # per-process: two instances never share a temp
     if mode is None:
         f = open(tmp, "w", encoding="utf-8")
     else:
         f = os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode),
                       "w", encoding="utf-8")
-    with f:
-        json.dump(data, f, ensure_ascii=False, indent=indent)
-    if mode is not None:
-        os.chmod(tmp, mode)   # exact perms regardless of the process umask
-    os.replace(tmp, p)
+    try:
+        with f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+        if mode is not None:
+            os.chmod(tmp, mode)   # exact perms regardless of the process umask
+        os.replace(tmp, p)
+    except BaseException:
+        # temp files are per-process now, so a failed dump would otherwise leave one
+        # orphan per process lifetime; the store itself is untouched either way
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _record_uploaded(load_fn, save_fn, entries: dict) -> dict:
+    """Merge freshly-uploaded keys into the CURRENT on-disk incremental state.
+
+    The nightly write-backs read their state, then spend MINUTES inside the Shoptet
+    import subprocess, and only then record what landed. Saving the map they read up
+    front would discard everything written meanwhile — and a lost review key means the
+    next run re-uploads a link the manager has since corrected. `_import_lock` is
+    in-process only, so the second-instance scenario this PR is about (#262/#264)
+    reaches straight into that window. Re-read under the store lock and merge.
+
+    Returns the post-run map — the run's summary counts are built from it, so they
+    describe what is really on disk rather than a snapshot from before the import."""
+    if not entries:
+        return load_fn()
+    with _lock:
+        fresh = load_fn()
+        fresh.update(entries)
+        save_fn(fresh)
+    return fresh
 
 
 def _atomic_write_bytes(path, data: bytes) -> None:
@@ -303,10 +363,12 @@ def _atomic_write_bytes(path, data: bytes) -> None:
     orders, customers) — a half-written cache would poison every reader."""
     p = os.fspath(path)
     tmp = f"{p}.{os.getpid()}.tmp"
-    with _lock:
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, p)
+    # No store lock here on purpose: these caches have a single writer, tmp+replace is
+    # already atomic, and the export dump is ~55 MB — holding the cross-process lock
+    # across it would queue every other instance's writes behind a multi-second write.
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, p)
 
 try:
     with open(DATA, encoding="utf-8") as f:
@@ -1284,8 +1346,8 @@ def _prune_orphan_decisions(products) -> None:
     """At startup, drop decisions whose key matches no product (a stale 'None'/'bad'
     from before stable keys) so the progress count == the import count.
 
-    NEVER prunes against an EMPTY product list: review_data.json missing or
-    unreadable leaves PRODUCTS == [] (the app deliberately boots dataless), which
+    NEVER prunes against an EMPTY product list: a missing review_data.json leaves
+    PRODUCTS == [] (the app deliberately boots dataless), which
     would make EVERY decision look orphaned and delete the manager's whole history
     on the next restart — the same wipe as #261, just via a second door."""
     if not products:
@@ -1301,7 +1363,11 @@ def _prune_orphan_decisions(products) -> None:
             _save_decisions(d1)
 
 
-_prune_orphan_decisions(PRODUCTS)
+try:
+    _prune_orphan_decisions(PRODUCTS)
+except StoreLockTimeout:
+    # tidying orphans is housekeeping — never a reason for the service to fail to boot
+    log.error("startup decision prune skipped: the store lock was held too long")
 
 
 _IMG_NOISE = ("logo", "/producer/", ".svg", "/svg/", "placeholder", "no-image",
@@ -1645,10 +1711,13 @@ def api_images():
         title, imgs, price, avail = "", [], "", ""
     data = {"title": title, "images": imgs, "price": price, "availability": avail}
     # the dir is created at boot, but OUT can be repointed afterwards (#261 lazy
-    # paths) — a missing imgcache must degrade to "no cache", never 500 the request
-    os.makedirs(IMGCACHE, exist_ok=True)
-    with open(cache, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    # paths) — a missing/unwritable imgcache degrades to "no cache", never a 500
+    try:
+        os.makedirs(IMGCACHE, exist_ok=True)
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError as e:  # noqa: BLE001 — the scrape result is still returned below
+        log.warning("image cache write failed (%s): %r", cache, e)
     return jsonify(data)
 
 
@@ -3831,12 +3900,12 @@ def _do_upload_pairings(dry):
             if (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])) <= success]
         uploaded_order_codes = [c for c in new_order_codes
                                 if c in order_written_codes and c in success]
-        if not dry and (uploaded_keys or uploaded_order_codes):
-            for k in uploaded_keys:          # ONLY keys whose codes all imported OK
-                uploaded[k] = (dec[k].get("url") or "").strip()
-            for c in uploaded_order_codes:   # ONLY order codes that imported OK
-                uploaded[f"order:{c}"] = (order_pairings[c] or "").strip()
-            _save_uploaded(uploaded)
+        if not dry:
+            done = {k: (dec[k].get("url") or "").strip()      # keys fully imported OK
+                    for k in uploaded_keys}
+            done.update({f"order:{c}": (order_pairings[c] or "").strip()
+                         for c in uploaded_order_codes})      # order codes imported OK
+            uploaded = _record_uploaded(_load_uploaded, _save_uploaded, done)
     finally:
         _import_lock.release()
 
@@ -3996,10 +4065,10 @@ def _do_upload_suppliers(dry):
         ok = res["ok"]
         success = res["success_codes"]
         uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry and uploaded_codes:       # record only codes that imported OK
-            for c in uploaded_codes:
-                uploaded[c] = (assigns[c] or "").strip()
-            _save_uploaded_suppliers(uploaded)
+        if not dry:                          # record only codes that imported OK
+            uploaded = _record_uploaded(
+                _load_uploaded_suppliers, _save_uploaded_suppliers,
+                {c: (assigns[c] or "").strip() for c in uploaded_codes})
     finally:
         _import_lock.release()
 
@@ -4120,10 +4189,10 @@ def _do_upload_externalcodes(dry):
         ok = res["ok"]
         success = res["success_codes"]
         uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry and uploaded_codes:       # record only codes that imported OK
-            for c in uploaded_codes:
-                uploaded[c] = str(grube[c].get("itemId", "")).strip()
-            _save_uploaded_externalcodes(uploaded)
+        if not dry:                          # record only codes that imported OK
+            uploaded = _record_uploaded(
+                _load_uploaded_externalcodes, _save_uploaded_externalcodes,
+                {c: str(grube[c].get("itemId", "")).strip() for c in uploaded_codes})
     finally:
         _import_lock.release()
 
@@ -4265,10 +4334,10 @@ def _do_upload_variant_links(dry):
         ok = res["ok"]
         success = res["success_codes"]
         uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry and uploaded_codes:       # record only codes that imported OK
-            for c in uploaded_codes:
-                uploaded[c] = (vlinks[c] or "").strip()
-            _save_uploaded_variant_links(uploaded)
+        if not dry:                          # record only codes that imported OK
+            uploaded = _record_uploaded(
+                _load_uploaded_variant_links, _save_uploaded_variant_links,
+                {c: (vlinks[c] or "").strip() for c in uploaded_codes})
     finally:
         _import_lock.release()
 
@@ -4338,7 +4407,7 @@ class DedupStoreCorrupt(RuntimeError):
 # read on every display request too (the tab polls while a run is in flight), and re-scanning +
 # re-reading every existing backup on each of those reads is pure waste. The digest memo also makes
 # the scan-then-create sequence safe under the app's threads — it runs under its OWN small lock,
-# never the global `_lock` (which is NOT reentrant and is frequently already held by the caller).
+# never the global `_lock` (whose holder is frequently the caller of this helper).
 _quarantine_lock = threading.Lock()
 _quarantined: dict = {}                  # path -> (sha256 of the corrupt bytes, backup path)
 
@@ -4424,6 +4493,7 @@ def _load_dedup_store(path: str, label: str, dedup_keys: tuple = ()) -> dict:
     for key in dedup_keys:
         if key in d and not isinstance(d[key], dict):
             raise DedupStoreCorrupt(_corrupt_msg(path, label))
+    _note_store_read(path, d)   # #261 — these stores are write-guarded like the rest
     return d
 
 
@@ -4438,6 +4508,15 @@ def _corrupt_msg(path: str, label: str) -> str:
             # NEVER suggest deleting it: a missing file is a legitimate first run, so deleting is
             # exactly the wipe this guard prevents — every customer would be mailed again.
             + "POZOR: NEMAŽ ho — prázdna evidencia znamená, že každý zákazník dostane mail znova.")
+
+
+@app.errorhandler(StoreWipeRefused)
+@app.errorhandler(StoreLockTimeout)
+def _handle_store_write_refused(e):
+    """A refused write / a store lock we could not take answers 503 with a Slovak
+    „what to do", never a bare 500 — a 500 reads as a transient glitch and invites the
+    manager to click again, which is exactly the wrong reaction to either of these."""
+    return jsonify({"ok": False, "error": str(e)}), 503
 
 
 @app.errorhandler(DedupStoreCorrupt)
@@ -4466,7 +4545,7 @@ def _load_posta_state_display() -> tuple:
 
 
 def _save_posta_state(d: dict) -> None:
-    _atomic_write_json(POSTA_STATE, d, mode=0o600)
+    _atomic_write_json(POSTA_STATE, d, mode=0o600, protect=True)
 
 
 def _fetch_tracking(pkg: str) -> dict:
@@ -5336,7 +5415,7 @@ def _load_orders_reminder_display() -> tuple:
 
 
 def _save_orders_reminder(d: dict) -> None:
-    _atomic_write_json(ORDERS_REMINDER_STATE, d, mode=0o600)
+    _atomic_write_json(ORDERS_REMINDER_STATE, d, mode=0o600, protect=True)
 
 
 def _classify_contacted(shop_remark: str) -> bool:
@@ -6211,9 +6290,11 @@ _scheduler_claim_fd = None
 def _scheduler_enabled() -> bool:
     """False only when WEBREVIEW_NO_SCHEDULER is explicitly set (empty/`0` = on).
 
-    The throwaway preview instance boots with it: no scheduler at all means a
-    forgotten process can never send a customer e-mail, write to the eshop or spend
-    money scraping — not even if it outlives the session that started it."""
+    The throwaway preview instance boots with it: with no scheduler the process never
+    fires anything BY ITSELF — no 09:00 customer mails, no 21:00 eshop write, no paid
+    05:00 scrape — however long it is forgotten. (An explicit „⚡ Spustiť teraz" click
+    by someone who opens ITS port still runs; the flag removes the unattended timer,
+    not the logged-in human.)"""
     return os.environ.get("WEBREVIEW_NO_SCHEDULER", "").strip() in ("", "0")
 
 
@@ -6246,8 +6327,8 @@ def _claim_scheduler() -> bool:
 def _start_scheduler() -> bool:
     """Start the automation runner iff this instance may and can own it."""
     if not _scheduler_enabled():
-        log.warning("automation scheduler DISABLED (WEBREVIEW_NO_SCHEDULER) — this "
-                    "instance runs no automation: no e-mails, no eshop writes")
+        log.warning("automation scheduler DISABLED (WEBREVIEW_NO_SCHEDULER) — nothing "
+                    "will run on a timer in this instance (manual runs still work)")
         return False
     if not _claim_scheduler():
         return False
@@ -6336,6 +6417,9 @@ def api_automation_toggle(key):
 
 @app.route("/api/automations/<key>/run", methods=["POST"])
 def api_automation_run(key):
+    # NOTE: „⚡ Spustiť teraz" runs even on a WEBREVIEW_NO_SCHEDULER instance — the flag
+    # removes the SCHEDULER (nothing fires by itself, which is what an orphaned instance
+    # does), not the explicit action of a logged-in human who opened this instance's UI.
     try:
         started = RUNNER.run_now(key)
     except KeyError:
