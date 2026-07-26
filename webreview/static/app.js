@@ -1855,6 +1855,13 @@ function renderOrderToolbar(canon) {
 // 3 ks") over a clipboard asking for 2 ks — two numbers for one supplier order, which is
 // exactly what #206/#207 exist to remove. Same `outstandingOf` scope as both of them, and
 // deliberately NOT a repaint: it only touches `.to-total`, so no open editor is disturbed.
+// It only ever REWRITES a chip that is already on the row — it never adds or removes one.
+// It cannot need to: whether a product gets a chip depends solely on how many order LINES
+// of this supplier carry its code (`totalChipSpec` → `all.lines < 2`), which comes from
+// the ORDERS grouping — and the only callers are the four per-row flag toggles, which
+// change a flag map and nothing else. A change that DOES move a line between groups (a
+// supplier re-assignment) repaints the whole tab, and `renderOrderRow` builds the chips
+// there. So `spec` and the chip's presence always agree, and the guards below just skip.
 function refreshOrderTotals() {
   const rows = document.querySelectorAll('#list .toorder-row');
   if (!rows.length) return;
@@ -1868,20 +1875,15 @@ function refreshOrderTotals() {
   for (const row of rows) {
     const o = byKey[row.dataset.key];
     if (!o) continue;                       // a row whose line is gone → next paint drops it
+    const sum = row.querySelector('.to-total');
+    if (!sum) continue;                     // single-line product → it never had a chip
     const s = supFilterKey(o);
     // the totals are per SUPPLIER, over the supplier's OWN lines (a sibling hidden by
     // #205 belongs to the same product) — computed once per supplier, not once per row
     const t = totals[s] || (totals[s] = { open: groupQtyTotals(outstandingOf(bySup[s])),
                                           all: groupQtyTotals(bySup[s]) });
     const spec = totalChipSpec(t, o.itemCode || '');
-    let sum = row.querySelector('.to-total');
-    if (!spec) { if (sum) sum.remove(); continue; }
-    if (!sum) {
-      sum = totalChip(spec);
-      const qty = row.querySelector('.to-qty');   // same slot renderOrderRow puts it in
-      if (qty) qty.after(sum); else row.appendChild(sum);
-      continue;
-    }
+    if (!spec) continue;                    // …and a chip that is there is always still due
     sum.textContent = spec.text;
     sum.title = spec.title;
   }
@@ -1899,6 +1901,7 @@ function renderOrderFilters(idx) {
   // keyed by the NORMALISED supplier (#203) so case variants share one chip/count/colour.
   // renderToOrder passes its own index in (one pass per paint instead of two); a bare
   // toggle-triggered call builds it itself.
+  // `idx.repaint` = the caller is renderToOrder, which rebuilds every row right after
   const { canon } = idx || supplierSpellingIndex(ORDERS);
   const cnt = {}, newest = {}, unhandled = {};
   for (const o of ORDERS) {
@@ -1925,9 +1928,13 @@ function renderOrderFilters(idx) {
     fbar.appendChild(mk(s, `${escapeHtml(lbl(s))} (${cnt[s]})`, !unhandled[s]));
   }
   renderOrderToolbar(canon);   // #208 — the tally rides along with every chip repaint
-  refreshOrderTotals();        // …and so do the per-product „Σ spolu" chips (#206): this
-                               // is the ONE call every flag toggle already makes, and the
-                               // chips live in `#list`, which a toggle must not repaint
+  // …and so do the per-product „Σ spolu" chips (#206) — but ONLY on the toggle path. This
+  // is the ONE call every flag toggle already makes, and those chips live in `#list`,
+  // which a toggle must not repaint. renderToOrder calls us one line BEFORE
+  // `list.innerHTML = ''`, so there the rows we would walk are already doomed and their
+  // replacements get their chips from renderOrderRow — rewriting them first is a full
+  // groupQtyTotals pass per supplier over nodes nobody will ever see.
+  if (!(idx && idx.repaint)) refreshOrderTotals();
 }
 
 // A whole-tab repaint (a failed flag's rollback, a saved pair URL / supplier / comment)
@@ -2083,7 +2090,9 @@ function renderToOrder() {
     ORDER_SUPPLIER = 'all';
     localStorage.setItem('orderSupplier', 'all');
   }
-  renderOrderFilters({ canon, known });   // live-coloured chips (recomputed from the flag maps)
+  // live-coloured chips (recomputed from the flag maps). `repaint: true` — the rows below
+  // are rebuilt from scratch a line later, so the in-place „Σ spolu" refresh is skipped.
+  renderOrderFilters({ canon, known, repaint: true });
   const list = document.getElementById('list'); list.innerHTML = '';
   // #205 — „skryť poriešené" hides handled lines, with ONE exemption: a row holding
   // unsaved editor work stays visible. Hiding it would strand the half-typed pair URL /
