@@ -191,9 +191,28 @@ def _automations_json():
 
 
 def test_a_running_scheduler_reports_itself_as_running(scheduler_out, monkeypatch):
-    monkeypatch.setattr(webapp.RUNNER, "start", lambda: None)
+    """Starts the REAL loop thread (it used to stub `RUNNER.start` away, which is
+    precisely the state the API could not tell apart from a healthy one — see the
+    dead-thread test below). The module global is pinned through monkeypatch so the
+    test cannot leave the process reporting a scheduler it did not start."""
+    monkeypatch.setattr(webapp, "SCHEDULER_INTENT", webapp.SCHEDULER_INTENT)
+    try:
+        assert webapp._start_scheduler() is True
+        assert _automations_json()["scheduler"] == "running"
+    finally:
+        webapp.RUNNER.stop()
+
+
+def test_a_scheduler_whose_thread_is_gone_stops_claiming_to_run(scheduler_out, monkeypatch):
+    """`SCHEDULER_STATE` was assigned once at boot and never re-derived, so a runner
+    loop that died (an unhandled error escaping the thread, a stop nobody restarted)
+    left /api/automations reporting „running" forever — the healthy-looking tab this
+    whole banner exists to prevent, one level deeper (PR #265 second review)."""
+    monkeypatch.setattr(webapp, "SCHEDULER_INTENT", webapp.SCHEDULER_INTENT)
+    monkeypatch.setattr(webapp.RUNNER, "start", lambda: None)   # a loop that never runs
     assert webapp._start_scheduler() is True
-    assert _automations_json()["scheduler"] == "running"
+    assert webapp.RUNNER.is_alive() is False
+    assert _automations_json()["scheduler"] == "dead"
 
 
 def test_a_blocked_scheduler_is_visible_in_the_api(scheduler_out, monkeypatch):
@@ -201,6 +220,7 @@ def test_a_blocked_scheduler_is_visible_in_the_api(scheduler_out, monkeypatch):
     the persisted state file — so the tab renders every enabled automation with a healthy
     future „Ďalší beh" while nothing will ever fire. That is the same silent business
     failure the store guard exists to prevent, one level up (PR #265 review)."""
+    monkeypatch.setattr(webapp, "SCHEDULER_INTENT", webapp.SCHEDULER_INTENT)
     monkeypatch.setattr(webapp.RUNNER, "start", lambda: None)
     holder_fd = os.open(str(scheduler_out / ".scheduler.lock"), os.O_RDWR | os.O_CREAT, 0o600)
     fcntl.flock(holder_fd, fcntl.LOCK_EX)
@@ -214,6 +234,7 @@ def test_a_blocked_scheduler_is_visible_in_the_api(scheduler_out, monkeypatch):
 
 def test_a_preview_instance_reports_its_scheduler_as_off(scheduler_out, monkeypatch):
     monkeypatch.setenv("WEBREVIEW_NO_SCHEDULER", "1")
+    monkeypatch.setattr(webapp, "SCHEDULER_INTENT", webapp.SCHEDULER_INTENT)
     monkeypatch.setattr(webapp.RUNNER, "start", lambda: None)
     assert webapp._start_scheduler() is False
     assert _automations_json()["scheduler"] == "off"
@@ -230,3 +251,4 @@ def test_the_frontend_renders_the_scheduler_warning():
     assert 'id="schedWarn"' in html, "no banner element on the page"
     assert "schedWarn" in js and "SCHEDULER" in js, "app.js never fills the banner in"
     assert "sa nespustia" in js, "the banner must say plainly that nothing will run"
+    assert "'dead'" in js or '"dead"' in js, "a died-in-flight scheduler renders no banner"
