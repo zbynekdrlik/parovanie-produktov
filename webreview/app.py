@@ -423,22 +423,65 @@ def _store_receipts(p: str):
     yield from tuple(_store_reads.get(p, ()))
 
 
-def _is_derived_from(data, prev) -> bool:
+def _canonical(x) -> str:
+    """Order-independent text of one JSON value, for VALUE containment below."""
+    return json.dumps(x, sort_keys=True, ensure_ascii=False, default=repr)
+
+
+def _list_is_narrowing(data: list, prev: list) -> bool:
+    """Is every entry of `data` also in `prev`? Identity first — the common case is a
+    caller filtering the very list it read — then VALUE containment.
+
+    Identity alone refused a rebuild written the natural way
+    (`[dict(x) for x in prev if …]`) with a message saying the write „did not come from
+    a read of that store": wrong, and an invitation for the next author to reach for a
+    bypass instead of a `prev=` (PR #265 third review). The value pass is keyed on a
+    canonical projection so it stays linear rather than O(n·m) over unhashable dicts."""
+    kept = {id(x) for x in prev}
+    if all(id(x) in kept for x in data):
+        return True
+    try:
+        pool = collections.Counter(_canonical(x) for x in prev)
+        for x in data:
+            k = _canonical(x)
+            if not pool[k]:
+                return False
+            pool[k] -= 1
+    except (TypeError, ValueError):   # not projectable → identity is all we can trust
+        return False
+    return True
+
+
+def _is_derived_from(data, prev, keys=()) -> bool:
     """Is `data` something the caller could have BUILT from the map/list it read?
 
     `prev=` names the read a rebuilt map came from (the startup decision prune, the
     výstavy retention sweep). Without this check it was a complete BYPASS rather than a
     narrowing — the map being written was never compared to anything, so naming a real
     read authorised writing ANY map over the store (PR #265 second review). A rebuild
-    only ever DROPS entries, so what it writes must be contained in what it read: keys
-    for a map, entry identity for a list."""
+    only ever DROPS entries, so what it writes must be contained in what it read.
+
+    `keys` are the NESTED maps `protect=("orders",)` guards. Checking only the
+    top-level key set made the narrowing inert for exactly those two stores: every real
+    writer of `orders_reminder.json` / `posta_uncollected.json` keeps the same outer
+    keys, so a `prev=` write could keep the shape and empty the who-was-already-mailed
+    map — the loss that re-mails every customer (PR #265 third review)."""
     if data is prev:
         return True
     if isinstance(data, dict) and isinstance(prev, dict):
-        return set(data) <= set(prev)
+        if not set(data) <= set(prev):
+            return False
+        for k in keys:
+            if not k:
+                continue                      # "" is the top-level count, checked above
+            a, b = data.get(k), prev.get(k)
+            if isinstance(a, dict) and isinstance(b, dict) and not set(a) <= set(b):
+                return False
+            if isinstance(a, list) and isinstance(b, list) and not _list_is_narrowing(a, b):
+                return False
+        return True
     if isinstance(data, list) and isinstance(prev, list):
-        kept = {id(x) for x in prev}
-        return all(id(x) in kept for x in data)
+        return _list_is_narrowing(data, prev)
     return False
 
 
@@ -562,25 +605,32 @@ def _write_json_locked(p, data, indent, mode, protect, prev=None) -> None:
         keys, disk = _guarded_measures(p, protect)
         new = _measure_store(data)
         prev = data if prev is None else prev
-        derived = _is_derived_from(data, prev)
+        derived = _is_derived_from(data, prev, keys)
         for k in keys:
             was = disk.get(k, 0)
             if not was or new.get(k, 0) >= was:
                 continue                      # nothing to lose, or the map is growing
-            if derived and any(r[0] is prev and r[1].get(k, 0) == was
-                               for r in _store_receipts(p)):
+            receipted = any(r[0] is prev and r[1].get(k, 0) == was
+                            for r in _store_receipts(p))
+            if derived and receipted:
                 continue                      # the tail of a read-modify-write on THIS store
             what = "záznamov" if k == "" else f"položiek v „{k}“"
-            log.error("REFUSED to shrink %s%s from %d to %d entries (#261/#265): this "
-                      "write did not come from a read of that store (built from the "
-                      "map it names: %s), so the smaller map is not something the "
-                      "manager just did — nothing was written", p,
-                      f" [{k}]" if k else "", was, new.get(k, 0), derived)
+            # Name the check that actually failed — the two have different fixes, and a
+            # blanket „did not come from a read" over a rebuild that DID read the store
+            # sends the next author looking for a bypass (PR #265 third review).
+            why = ("obsahuje záznamy, ktoré v načítanom úložisku neboli"
+                   if not derived else
+                   "vychádza z inej (staršej) verzie, než akú má teraz disk")
+            log.error("REFUSED to shrink %s%s from %d to %d entries (#261/#265): "
+                      "derived-from-the-named-read=%s, receipt-matches-disk=%s — the "
+                      "smaller map is not something the manager just did; nothing was "
+                      "written", p, f" [{k}]" if k else "", was, new.get(k, 0),
+                      derived, receipted)
             raise StoreWipeRefused(
                 f"Zápis do {os.path.basename(p)} zamietnutý: {was} {what} by sa "
-                f"zmenšilo na {new.get(k, 0)}, ale zapisovaný obsah nepochádza z "
-                "načítania tohto úložiska (na disku je novšia verzia, alebo ju zapísal "
-                "iný proces/skript). Dáta ostali nedotknuté. V prehliadači načítaj "
+                f"zmenšilo na {new.get(k, 0)}, ale zapisovaný obsah {why} "
+                "(na disku môže byť novšia verzia, alebo ju zapísal iný proces/skript). "
+                "Dáta ostali nedotknuté. V prehliadači načítaj "
                 "stránku znova; ak to hlási automatizácia, spusti ju znova. Súbor NEMAŽ.")
     tmp = f"{p}.{os.getpid()}.tmp"   # per-process: two instances never share a temp
     if mode is None:
