@@ -116,10 +116,12 @@ def test_a_split_row_shows_its_per_size_link_and_names_its_owner():
     assert r["reviewStatus"] == "split"
 
 
-def test_a_split_variant_with_no_link_of_its_own_still_names_its_owner():
+def test_a_split_variant_with_no_link_of_its_own_keeps_the_inline_paste_box():
     """A size the manager has not linked yet emits no eshop row (never an empty
     internalNote cell), so it has no owner to name — and must therefore keep the
-    plain inline paste box rather than silently pretend to be unpaired-but-owned."""
+    plain inline paste box rather than pretend to be unpaired-but-owned. Its inline
+    value is genuinely what the eshop gets until that size is linked; once it is,
+    `split_links` owns the code and the nightly excludes the inline one."""
     rows = webapp.build_to_order_rows(ORDERS_CSV, PRODUCTS, SPLIT_DECISIONS, CODE2PAIR,
                                       {"61247/XL": SPLIT_LINKS["61247/XL"]})
     r = _by_code(rows, "61247/L")
