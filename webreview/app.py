@@ -819,13 +819,15 @@ def _bootstrap_admin() -> None:
 
 try:
     _bootstrap_admin()
-except (StoreLockTimeout, StoreWipeRefused, OSError) as e:  # noqa: BLE001
+except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
     # This runs at IMPORT. Anything raising here does not degrade a feature — it stops the
     # service from STARTING at all (systemd restart loop, no web UI, nothing to look at).
-    # All three are real: another instance holding the store lock for 30 s, a refused
-    # write, or the OSError `_load_users` deliberately re-raises on a users.json that is
-    # there but unreadable. Existing accounts are unaffected; only the first-run bootstrap
-    # is skipped (PR #265 review).
+    # All four are real: another instance holding the store lock for 30 s, a refused
+    # write, the OSError `_load_users` deliberately re-raises on a users.json that is
+    # there but unreadable, and — the most likely one of the lot — the ValueError a write
+    # cut mid-JSON or mid-UTF-8 raises, which is exactly the corruption the fsync work
+    # exists to make less likely and was the one shape NOT caught (PR #265 second review,
+    # C2). Existing accounts are unaffected; only the first-run bootstrap is skipped.
     log.error("auth: admin bootstrap skipped (%r) — the app keeps serving, existing "
               "accounts are unaffected; fix data/out/users.json and restart", e)
 
@@ -852,8 +854,23 @@ def _require_login():
     unless explicitly public. /api/n8n/* keep their own bearer auth."""
     if request.endpoint in _PUBLIC_ENDPOINTS or request.path.startswith("/api/n8n/"):
         return None
-    if _current_user():
-        return None
+    try:
+        if _current_user():
+            return None
+    except (ValueError, OSError) as e:
+        # `_load_users` fails CLOSED on purpose (nobody gets in over a store we cannot
+        # read) — but „fails closed" must still SAY what to fix. A bare 500 reads as a
+        # transient glitch and invites another click (PR #265 second review, C2).
+        log.error("auth: the account store is unreadable (%r) — refusing every request "
+                  "until data/out/users.json is repaired", e)
+        msg = ("Zoznam účtov (data/out/users.json) sa nedá prečítať — neúplný/poškodený "
+               "zápis. Nikoho nepustím dnu, kým sa neopraví: obnov súbor zo zálohy "
+               "(data/backups/state) a reštartuj službu. Súbor NEMAŽ — prázdny zoznam "
+               "účtov znamená, že sa vytvorí nový admin a všetky ostatné účty zmiznú.")
+        if request.path.startswith("/api/"):
+            return jsonify({"ok": False, "error": msg}), 503
+        # a browser must not get raw JSON on the page it actually opened
+        return Response(msg, status=503, mimetype="text/plain; charset=utf-8")
     log.info("auth: unauthenticated %s %s from %s", request.method, request.path,
              _client_ip())
     if request.path.startswith("/api/"):
