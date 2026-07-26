@@ -180,24 +180,37 @@ class AutomationRunner:
         started = datetime.now(tz)
         log.info("automation %s: run starting", key)
         try:
-            result = a.run_fn()
-            status, err = "ok", ""
-            log.info("automation %s: run OK result=%s", key, result)
-        except Exception as e:  # noqa: BLE001 — any failure = recorded error, runner survives
-            result, status, err = None, "error", f"{type(e).__name__}: {e}"
-            log.exception("automation %s: run FAILED", key)
-        with self._lock:
+            try:
+                result = a.run_fn()
+                status, err = "ok", ""
+                log.info("automation %s: run OK result=%s", key, result)
+            except Exception as e:  # noqa: BLE001 — any failure = recorded error, runner survives
+                result, status, err = None, "error", f"{type(e).__name__}: {e}"
+                log.exception("automation %s: run FAILED", key)
+        finally:
+            # OUTSIDE the lock, and before anything that can fail. The injected lock is
+            # the app's cross-process store lock (#264): it RAISES StoreLockTimeout where
+            # a threading.Lock never could, and clearing the claim inside it meant one
+            # 30 s hold by another instance left this automation claimed for the whole
+            # process lifetime — never scheduled again, „⚡ Spustiť teraz" answering „už
+            # beží" forever (PR #265 review). A dict item assignment needs no lock.
             self._running[key] = False
-            st = self._load()
-            ent = st.setdefault(key, {})
-            ent["last_run"] = started.isoformat(timespec="seconds")
-            ent["last_status"] = status
-            ent["last_error"] = err
-            if result is not None:
-                ent["last_result"] = result
-            if ent.get("enabled"):
-                ent["next_run"] = next_run_at(a.schedule).isoformat(timespec="seconds")
-            self._save(st)
+        try:
+            with self._lock:
+                st = self._load()
+                ent = st.setdefault(key, {})
+                ent["last_run"] = started.isoformat(timespec="seconds")
+                ent["last_status"] = status
+                ent["last_error"] = err
+                if result is not None:
+                    ent["last_result"] = result
+                if ent.get("enabled"):
+                    ent["next_run"] = next_run_at(a.schedule).isoformat(timespec="seconds")
+                self._save(st)
+        except Exception:  # noqa: BLE001 — the run already happened; losing its RECORD is bad, losing the automation is worse
+            log.exception("automation %s: run finished (%s) but its outcome could NOT be "
+                          "written to %s — last_run/next_run stay stale, the automation "
+                          "itself keeps running on schedule", key, status, self.state_path)
         return True
 
     def tick_once(self, now: datetime | None = None) -> None:

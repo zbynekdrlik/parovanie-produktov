@@ -738,7 +738,17 @@ def _bootstrap_admin() -> None:
     log.info("auth: bootstrapped admin %s from env", email)
 
 
-_bootstrap_admin()
+try:
+    _bootstrap_admin()
+except (StoreLockTimeout, StoreWipeRefused, OSError) as e:  # noqa: BLE001
+    # This runs at IMPORT. Anything raising here does not degrade a feature — it stops the
+    # service from STARTING at all (systemd restart loop, no web UI, nothing to look at).
+    # All three are real: another instance holding the store lock for 30 s, a refused
+    # write, or the OSError `_load_users` deliberately re-raises on a users.json that is
+    # there but unreadable. Existing accounts are unaffected; only the first-run bootstrap
+    # is skipped (PR #265 review).
+    log.error("auth: admin bootstrap skipped (%r) — the app keeps serving, existing "
+              "accounts are unaffected; fix data/out/users.json and restart", e)
 
 
 def _current_user():
@@ -1518,9 +1528,12 @@ def _prune_orphan_decisions(products) -> None:
 
 try:
     _prune_orphan_decisions(PRODUCTS)
-except StoreLockTimeout:
-    # tidying orphans is housekeeping — never a reason for the service to fail to boot
-    log.error("startup decision prune skipped: the store lock was held too long")
+except (StoreLockTimeout, StoreWipeRefused, OSError) as e:  # noqa: BLE001
+    # Tidying orphans is housekeeping — never a reason for the service to fail to boot.
+    # Widened past the lock timeout (PR #265 review): a refused write, or the OSError
+    # `_read_json_store` now re-raises on an unreadable decisions.json, would abort the
+    # import just as effectively and leave no UI to diagnose it from.
+    log.error("startup decision prune skipped (%r) — the app keeps serving", e)
 
 
 _IMG_NOISE = ("logo", "/producer/", ".svg", "/svg/", "placeholder", "no-image",
