@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from parovanie.shoptet_import import (  # noqa: E402
     ShoptetError,
     load_credentials,
+    log_entry_id,
     parse_import_log,
     pick_result_row,
     preflight_csv,
@@ -164,7 +165,10 @@ def _run_browser(args, creds, plan):
     if rc != 0:
         if log.get("error_detail"):
             # Shoptet aborted the WHOLE import (e.g. duplicate 'code') — no
-            # Spracované/Zlyhanie summary at all, only this hard error line
+            # Spracované/Zlyhanie summary at all, only this hard error line. Print it
+            # to STDOUT too (AFTER the VÝSLEDOK marker), so the app still sees WHY
+            # when it parses only its own result slice.
+            print(f"CHYBA LOGU: {log['error_detail']}")
             print(f"POZOR: Shoptet hlási chybu: {log['error_detail']}", file=sys.stderr)
         elif log["processed"] is None:
             # Výsledok sa nedal PRIRADIŤ tomuto behu (#257): buď sa náš riadok Logu
@@ -210,8 +214,12 @@ def _capture_baseline(page, creds):
     page.goto(f"{base}/{LOG_PATH}", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     baseline = pick_result_row(_row_texts(page))
-    print(f"[import] baseline (posledný riadok Logu pred behom): "
-          f"{baseline[:120] if baseline else '(žiadny)'}")
+    # Print the entry NUMBER, never the row text: webreview/app.py parses this stdout
+    # for the import result, and an echoed 'Spracované: N' from the PREVIOUS entry
+    # sits AHEAD of our own result line — parse_import_log takes the first match, so
+    # the app read the baseline's counts as this run's result (#196/#257).
+    print(f"[import] baseline (posledný záznam Logu pred behom): "
+          f"#{log_entry_id(baseline) if baseline else '(žiadny)'}")
     return baseline
 
 
@@ -275,16 +283,25 @@ def _read_result(page, baseline=None, expected_rows=None, retries=6, wait_s=2.0)
     skip past it to a PREVIOUS run's 'Spracované' row and report a stale
     success.
 
+    A pick is accepted only once TWO CONSECUTIVE reads agree on it (the result must
+    SETTLE). The row count alone cannot tell our entry from a concurrent import of
+    the same size — and every large batch is chunked to exactly IMPORT_CHUNK_ROWS
+    rows, so "same size" is the normal collision, not an exotic one. If a foreign
+    entry is momentarily the only match, the settle read gives our own entry time to
+    appear; two matching entries are then ambiguous → None → exit 2, instead of
+    crediting a whole chunk that never landed.
+
     Returns the picked row text, or None if our own entry never appeared / no
     log entry is found at all / two same-sized imports made it ambiguous.
     parse_import_log(None) then yields processed=None, which result_exit_code()
     treats as an UNREADABLE result (exit 2) — never a silent success."""
-    row = None
+    picked = None
     for attempt in range(retries):
         row = pick_result_row(_row_texts(page), baseline=baseline,
                               expected_rows=expected_rows)
-        if row is not None:
+        if row is not None and row == picked:
             return row
+        picked = row
         if attempt < retries - 1:
             page.wait_for_timeout(int(wait_s * 1000))
             page.reload(wait_until="networkidle")

@@ -138,15 +138,55 @@ _RESULT_ROW_RE = re.compile(r"spracov|zpracov|uprav|zlyhan|chyba|riadku", re.IGN
 
 
 # Shoptet prefixes every Log entry with its own increasing id ('#12689 26.07.2026
-# 21:00 …') — the only stable handle on WHICH entry a row is.
-_ENTRY_ID_RE = re.compile(r"#(\d+)")
+# 21:00 …') — the only stable handle on WHICH entry a row is. ANCHORED at the start
+# of the row: a '#42' further inside the text (an order number, a code) is not an
+# entry id, and mistaking one for it would cut the candidate list short.
+_ENTRY_ID_RE = re.compile(r"^\s*#(\d+)")
 
 
 def log_entry_id(text):
     """Shoptet's own Log entry number ('#12689 …' → 12689), or None when the row
     carries none (older/other renderings — callers must degrade, not crash)."""
-    m = _ENTRY_ID_RE.search(text or "")
+    m = _ENTRY_ID_RE.match(text or "")
     return int(m.group(1)) if m else None
+
+
+# The import script prints its own result after this marker. Everything BEFORE it is
+# progress chatter — including the echo of the baseline Log entry, whose own
+# 'Spracované: N' would otherwise be read as this run's result (#196/#257).
+RESULT_MARKER = "VÝSLEDOK:"
+# …and the raw Shoptet line of a HARD error (an import aborted with no summary at
+# all) is printed after it, so the reason survives the slicing below.
+HARD_ERROR_MARKER = "CHYBA LOGU:"
+
+
+def hard_error_detail(slice_text, parsed=None):
+    """The Shoptet error line ALONE (no surrounding chatter) when the import aborted
+    hard, else the parsed `error_detail`. Keeps what reaches n8n / the automation card
+    readable: 'Chyba | Číslo riadku: 42 - Data in column code are not unique', not the
+    whole result block it was printed in."""
+    text = slice_text or ""
+    if HARD_ERROR_MARKER in text:
+        return text.split(HARD_ERROR_MARKER, 1)[1].strip() or None
+    return (parsed or {}).get("error_detail")
+
+
+def result_stdout_slice(text):
+    """The part of scripts/shoptet_import.py's stdout that describes THIS run —
+    everything from its last RESULT_MARKER on. ALWAYS parse this slice, never the raw
+    stdout: `parse_import_log` returns the FIRST count it finds, and the stdout opens
+    with '[import] baseline …: #12688 … Spracované: 4. Upravené: 1.' — the PREVIOUS
+    entry. Reading that as the result is exactly the '#196' symptom (processed=1/
+    failed=1 while 260 rows were really processed) and it silently defeats the
+    partial-chunk accounting (the baseline counts never equal the rows we sent, so
+    every partially accepted chunk looks like a hard failure).
+
+    Returns '' when the marker is absent (the script died before printing a result),
+    which parses to processed=None → an unreadable, never-successful result."""
+    if not text:
+        return ""
+    idx = text.rfind(RESULT_MARKER)
+    return text[idx:] if idx >= 0 else ""
 
 
 def _new_entries(entries, baseline):
@@ -196,6 +236,12 @@ def pick_result_row(row_texts, baseline=None, expected_rows=None):
     """
     entries = [t for t in (row_texts or []) if _RESULT_ROW_RE.search(t or "")]
     if not entries:
+        return None
+    if expected_rows is not None and baseline is None:
+        # The baseline capture found nothing (Log page unreadable / not rendered), so
+        # EVERY visible entry — including days-old ones — would be a candidate and a
+        # stale row with a matching count would be credited as ours. Nothing here can
+        # be attributed: fail closed (the caller polls, then reports "unreadable").
         return None
     candidates = _new_entries(entries, baseline)
     if not candidates:

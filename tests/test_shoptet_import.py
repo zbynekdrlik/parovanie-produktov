@@ -8,6 +8,7 @@ from parovanie.shoptet_import import (
     ShoptetError,
     chunk_outcome,
     classify_row,
+    hard_error_detail,
     load_credentials,
     log_entry_id,
     parse_import_log,
@@ -379,6 +380,17 @@ def test_result_slice_ignores_the_baseline_echo_in_the_scripts_stdout():
     # …and the misread turns a partially accepted chunk into a hard failure
     assert chunk_outcome(2, whole, rows_sent=35) == "failed"
     assert chunk_outcome(2, ours, rows_sent=35) == "partial"
+
+
+def test_hard_error_detail_is_the_shoptet_line_alone():
+    sl = ("VÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+          "CHYBA LOGU: Chyba | Číslo riadku: 42 - Data in column code are not unique\n")
+    # what reaches n8n / the automation card is the reason, not the block around it
+    assert hard_error_detail(sl) == "Chyba | Číslo riadku: 42 - Data in column code are not unique"
+    # no marker → fall back to whatever parse_import_log could tell
+    plain = "Chyba | Číslo riadku: 7 - duplicitný kód"
+    assert hard_error_detail(plain, parse_import_log(plain)) == plain
+    assert hard_error_detail("", {}) is None
 
 
 def test_result_slice_keeps_a_hard_shoptet_error_and_survives_junk():

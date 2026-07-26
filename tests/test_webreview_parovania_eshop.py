@@ -480,21 +480,24 @@ def test_partial_stdout_is_read_from_the_scripts_own_result_line(iso, monkeypatc
     (#196's processed=1/failed=1 while 260 rows really went through) — and it silently
     disabled the whole partial-chunk fix, because the baseline counts never match the
     number of rows we sent, so every partial chunk was classified as a hard failure."""
+    codes = ("1/M", "1/L", "1/XL")
+    monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {c: "P1" for c in codes})
     _seed_pairing()
     real_stdout = (
-        "Súbor:   data/out/import_links_x.csv\nRiadkov: 1\n"
+        "Súbor:   data/out/import_links_x.csv\nRiadkov: 3\n"
         "[import] baseline (posledný riadok Logu pred behom): #12688 26.07.2026 20:12 "
         "Info Import dobehol úspešne. Spracované: 4. Upravené: 1.\n"
         "[import] spúšťam import …\n"
-        "\nVÝSLEDOK: spracované=1 upravené=0 zlyhania=1\n")
+        "\nVÝSLEDOK: spracované=3 upravené=2 zlyhania=1\n")
     monkeypatch.setattr(webapp, "run_import",
                         lambda p, dry_run=False, timeout=300: (2, real_stdout, ""))
 
-    result = webapp.run_parovania_eshop()
+    p, _status = webapp._do_upload_pairings(dry=False)
 
-    p = result["pairings"]
-    assert p["partial"] is True           # 1 row sent, 1 processed, 1 rejected
+    assert p["partial"] is True           # 3 rows sent, 3 processed, 1 rejected
     assert p["rejected"] == 1
+    assert p["processed"] == 3 and p["updated"] == 2   # ours, not the baseline's 4/1
     # nothing credited: the log cannot say WHICH row failed and here it was the only one
     assert (not (iso["tmp"] / "uploaded_pairings.json").exists()
             or json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) == {})
@@ -523,16 +526,25 @@ def test_partial_message_promises_export_confirmation_only_where_it_happens(iso,
     # only the pairings push reconciles against the export; the supplier write-back
     # writes a different column and never confirms anything, so its message must not
     # tell the manager the rows will be confirmed from the export.
+    codes = ("1/M", "1/L", "1/XL")
+    monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {**{c: "P1" for c in codes},
+                                              "9/Z": "777", "8/Z": "778"})
     _seed_pairing()
-    _seed_supplier()
-    partial = "VÝSLEDOK: spracované=1 upravené=0 zlyhania=1"
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (2, partial, ""))
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "8/Z": "CITRADE"})
+
+    def partial_run(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            n = len(list(_csv.reader(f, delimiter=";"))) - 1
+        return 2, f"VÝSLEDOK: spracované={n} upravené={n - 1} zlyhania=1", ""
+
+    monkeypatch.setattr(webapp, "run_import", partial_run)
 
     result = webapp.run_parovania_eshop()
 
+    assert "odmietol 1 z 3 riadkov" in result["pairings"]["error"]
     assert "z exportu" in result["pairings"]["error"]
-    assert "odmietol 1 z" in result["suppliers"]["error"]
+    assert "odmietol 1 z 2 riadkov" in result["suppliers"]["error"]
     assert "z exportu" not in result["suppliers"]["error"]
 
 

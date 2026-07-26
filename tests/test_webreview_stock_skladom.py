@@ -175,7 +175,9 @@ def test_run_never_flips_discontinued_with_residual_stock(iso, monkeypatch):
 def test_failed_import_read_back_records_error_not_success(iso, monkeypatch):
     # a HARD Shoptet abort (rc!=0, no summary) must land status=error, not 'ok'
     def boom(csv_path, dry_run=False, timeout=300):
-        return 1, "Chyba | Číslo riadku: 1 - Data in column code are not unique", "boom"
+        # as the real script prints it: its own result marker, then the Shoptet line
+        return 1, ("\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+                   "CHYBA LOGU: Chyba | Číslo riadku: 1 - Data in column code are not unique"), "boom"
     monkeypatch.setattr(webapp, "run_import", boom)
 
     stats = webapp.run_stock_skladom()

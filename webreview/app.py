@@ -46,7 +46,12 @@ from parovanie.automation_runner import (
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of, resync_current
-from parovanie.shoptet_import import chunk_outcome, parse_import_log
+from parovanie.shoptet_import import (
+    chunk_outcome,
+    hard_error_detail,
+    parse_import_log,
+    result_stdout_slice,
+)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Data dir is env-overridable so tests/E2E can boot the app against a fixture.
@@ -4090,7 +4095,7 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
     agg = {"processed": 0, "updated": 0, "failed": 0}
     seen = {"processed": False, "updated": False, "failed": False}
     rc, error_detail, stdout_tail, err_tail = 0, None, "", ""
-    chunks_ok = chunks_partial = rows_ok = partial_failed = 0
+    chunks_ok = chunks_partial = rows_ok = rows_partial = partial_failed = 0
     for i, chunk in enumerate(chunks, 1):
         chunk_path = _write_import_csv(header, chunk, prefix, csv_safe=csv_safe)
         try:
@@ -4103,11 +4108,15 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
             break
         finally:
             _safe_unlink(chunk_path)
-        parsed = parse_import_log(out)
+        # ONLY the script's own result slice — the raw stdout starts with an echo of
+        # the baseline Log entry, whose 'Spracované: N' parse_import_log would find
+        # FIRST and report as this run's result (#196/#257).
+        out_slice = result_stdout_slice(out)
+        parsed = parse_import_log(out_slice)
         stdout_tail, err_tail = (out or "")[-800:], (err or "")[-400:]
         outcome = chunk_outcome(crc, parsed, len(chunk))
         if outcome == "failed":
-            rc, error_detail = crc, parsed.get("error_detail")
+            rc, error_detail = crc, hard_error_detail(out_slice, parsed)
             log.error("import %schunk %d/%d FAILED rc=%s", prefix, i, len(chunks), crc)
             break
         for k in agg:
@@ -4120,6 +4129,7 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
             # batch CONTINUES — the remaining chunks are independent uploads.
             rc = rc or crc
             chunks_partial += 1
+            rows_partial += len(chunk)
             partial_failed += parsed.get("failed") or 0
             partial_codes.update(r[0] for r in chunk)
             log.warning("import %schunk %d/%d PARTIAL processed=%s failed=%s — "
@@ -4137,6 +4147,7 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
         "partial_codes": partial_codes, "partial": chunks_partial > 0,
         "partial_failed": partial_failed, "chunks_partial": chunks_partial,
         "chunks_total": len(chunks), "chunks_ok": chunks_ok, "rows_ok": rows_ok,
+        "rows_partial": rows_partial,
         "processed": agg["processed"] if seen["processed"] else None,
         "updated": agg["updated"] if seen["updated"] else None,
         "failed": agg["failed"] if seen["failed"] else None,
@@ -4145,7 +4156,7 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
     }
 
 
-def _chunk_error_msg(res, total_rows):
+def _chunk_error_msg(res, total_rows, confirms_from_export=False):
     """ONE message for a chunked import that did not finish fully clean (the same
     text every caller used to build inline — NEkopíruj logiku). Two distinct cases,
     because they mean opposite things to the manager:
@@ -4155,13 +4166,26 @@ def _chunk_error_msg(res, total_rows):
       * every chunk ran but Shoptet REJECTED some rows (#257 'Zlyhanie variantov')
         → the rest genuinely landed; which ones is only provable from the eshop's
         own export, so those rows are re-sent until the export confirms them.
+
+    `confirms_from_export` must be set ONLY by a caller that really reconciles
+    against the catalog export (today: the pairings push). The other write paths
+    (supplier / externalCode / restock / stock / raw n8n import) simply re-send, and
+    telling the manager their rows "will be confirmed from the export" would be a
+    promise nothing keeps.
     """
     done = res["chunks_ok"] + res.get("chunks_partial", 0)
     if done < res["chunks_total"]:
+        landed = f"naimportované {res['rows_ok']}"
+        if res.get("rows_partial"):
+            # rows_ok counts only fully clean chunks; a preceding partial chunk did
+            # write most of its rows, so report it instead of understating the push
+            landed += f" (+{res['rows_partial']} čiastočne prijatých)"
         return (f"import zlyhal na časti {done + 1}/{res['chunks_total']} "
-                f"(naimportované {res['rows_ok']} z {total_rows} riadkov)")
-    return (f"Shoptet odmietol {res.get('partial_failed', 0)} z {total_rows} riadkov "
-            f"(zvyšok sa naimportoval; potvrdí sa z exportu eshopu)")
+                f"({landed} z {total_rows} riadkov)")
+    tail = (" (zvyšok sa naimportoval; potvrdí sa z exportu eshopu)"
+            if confirms_from_export else " (zvyšok sa naimportoval)")
+    return (f"Shoptet odmietol {res.get('partial_failed', 0)} z {total_rows} riadkov"
+            + tail)
 
 
 def _export_internal_notes(text: str | None = None) -> dict:
@@ -4179,11 +4203,20 @@ def _export_internal_notes(text: str | None = None) -> dict:
     if not text:
         return {}
     csv.field_size_limit(10**9)
-    notes = {}
+    notes, conflicting = {}, set()
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
         code = (r.get("code") or "").strip()
-        if code:
-            notes[code] = (r.get("internalNote") or "").strip()
+        if not code:
+            continue
+        val = (r.get("internalNote") or "").strip()
+        if code in notes and notes[code] != val:
+            # the catalog holds duplicate products sharing variant codes (see
+            # import_builder.link_rows) — if two rows disagree about a code, neither
+            # proves anything, so the code must never count as confirmed
+            conflicting.add(code)
+        notes[code] = val
+    for code in conflicting:
+        notes.pop(code, None)
     return notes
 
 
@@ -4441,8 +4474,14 @@ def _do_upload_pairings(dry):
         # log, they wait for the export to confirm them.
         res = _import_rows_chunked(send_rows, import_builder.LINK_HEADER, dry,
                                    prefix="import_links_", timeout=900)
+        # `partial` already forces a non-zero rc (so res["ok"] is False); the explicit
+        # term keeps that invariant local — a partially rejected push is never "ok".
         ok = res["ok"] and not res["partial"]
         success = res["success_codes"] | confirmed
+        if res["partial_codes"]:
+            log.warning("n8n pairings: %d riadkov čaká na potvrdenie z exportu "
+                        "(Shoptet ich prijal v čiastočne odmietnutej dávke): %s",
+                        len(res["partial_codes"]), sorted(res["partial_codes"])[:10])
         # A decision key is recorded uploaded only when EVERY one of its written codes
         # landed in a SUCCESSFUL chunk — a key straddling the failed boundary stays
         # "new" (re-uploading its done codes next run is idempotent, same URL; marking
@@ -4465,7 +4504,7 @@ def _do_upload_pairings(dry):
 
     err_msg = ""
     if not ok:                               # clear, tab-surfaced message: which chunk + progress
-        err_msg = _chunk_error_msg(res, len(send_rows))
+        err_msg = _chunk_error_msg(res, len(send_rows), confirms_from_export=True)
     result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_keys),
               "rows": len(all_rows), "rows_sent": len(send_rows),
               "confirmed_in_export": len(confirmed),
