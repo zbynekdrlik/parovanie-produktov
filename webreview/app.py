@@ -41,7 +41,8 @@ from parovanie import (
     __version__, config, image_health, import_builder, nedostupne, orders_reminder,
     posta_uncollected, restock_skladom, riziko_vypadku, stock_skladom,
     supplier_stock, vystavy_imap, writer)
-from parovanie.automation_runner import Automation, AutomationRunner
+from parovanie.automation_runner import (
+    Automation, AutomationRunner, AutomationStateCorrupt)
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of, resync_current
@@ -4783,6 +4784,14 @@ def _handle_store_write_refused(e):
     """A refused write / a store lock we could not take answers 503 with a Slovak
     „what to do", never a bare 500 — a 500 reads as a transient glitch and invites the
     manager to click again, which is exactly the wrong reaction to either of these."""
+    return jsonify({"ok": False, "error": str(e)}), 503
+
+
+@app.errorhandler(AutomationStateCorrupt)
+def _handle_automation_state_corrupt(e: AutomationStateCorrupt):
+    """An unreadable automations.json fails CLOSED (#265 second review, C4) — it must
+    not pretend no automations are set up. The tab therefore answers 503 with what to
+    repair, exactly like a refused store write, instead of a 500 that reads transient."""
     return jsonify({"ok": False, "error": str(e)}), 503
 
 

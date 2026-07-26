@@ -11,6 +11,7 @@ a deploy must never start e-mailing real customers on its own.
 
 Pure-python (no Flask imports) so it is unit-testable without the web app.
 """
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +34,34 @@ class AutomationStateCorrupt(RuntimeError):
     reminder mail, pošta escalation and hourly sync while the tab renders a clean
     first-run state (PR #265 second review, C4). Fails closed, loudly, with a copy of
     the unreadable bytes kept for repair."""
+
+
+_quarantine_lock = threading.Lock()
+_quarantined: dict = {}                  # path -> (sha256 of the corrupt bytes, backup path)
+
+
+def _quarantine_state(path: str, raw: bytes) -> str:
+    """Preserve unreadable state bytes as `<path>.corrupt-<ts>` and return that path.
+
+    Deliberately a small local copy of app.py's store quarantine rather than an import
+    of it: this module is pure-python by design (no Flask, unit-testable on its own).
+    De-duplicated by CONTENT for the lifetime of the process — the tab polls
+    /api/automations every few seconds, and one copy per poll would bury the real one."""
+    digest = hashlib.sha256(raw).hexdigest()
+    with _quarantine_lock:
+        memo = _quarantined.get(path)
+        if memo and memo[0] == digest:
+            return memo[1]
+        backup = "%s.corrupt-%s" % (path, datetime.now().strftime("%Y%m%d-%H%M%S"))
+        try:
+            with open(backup, "wb") as f:
+                f.write(raw)
+            os.chmod(backup, 0o600)
+        except OSError as e:  # noqa: BLE001 — the caller is already failing closed; best effort
+            log.warning("automations: kópiu poškodeného stavu sa nepodarilo uložiť (%r)", e)
+            return ""
+        _quarantined[path] = (digest, backup)
+        return backup
 
 
 @dataclass
@@ -106,17 +135,52 @@ class AutomationRunner:
 
     # -- state ------------------------------------------------------------ #
     def _load(self) -> dict:
+        """The state as it is on disk. MISSING or empty is a legitimate first run
+        (`{}`); anything present that we cannot parse fails CLOSED — see
+        `AutomationStateCorrupt`. The original is left untouched for repair and a copy
+        of the unreadable bytes is preserved beside it."""
         try:
-            with open(self.state_path, encoding="utf-8") as f:
-                d = json.load(f)
-            return d if isinstance(d, dict) else {}
-        except (FileNotFoundError, json.JSONDecodeError):
+            with open(self.state_path, "rb") as f:
+                raw = f.read()
+        except FileNotFoundError:
             return {}
+        if not raw.strip():
+            return {}
+        try:
+            d = json.loads(raw.decode("utf-8"))
+        except ValueError as e:            # incl. UnicodeDecodeError — a write cut mid-character
+            raise AutomationStateCorrupt(self._corrupt_msg(raw)) from e
+        if not isinstance(d, dict):
+            # parses, but is not a state file — degrading THIS to {} is the same silent
+            # switch-off by a second door
+            raise AutomationStateCorrupt(self._corrupt_msg(raw))
+        return d
+
+    def _corrupt_msg(self, raw: bytes) -> str:
+        backup = _quarantine_state(self.state_path, raw)
+        log.error("automations: NEČITATEĽNÝ stav %s (neúplný/poškodený zápis) — "
+                  "nepredstieram, že nie sú nastavené žiadne automatizácie; kópia: %s",
+                  self.state_path, backup or "-")
+        return (f"Stav automatizácií ({os.path.basename(self.state_path)}) sa nedá "
+                "prečítať (neúplný/poškodený zápis). Nepokračujem — prázdny stav by "
+                "znamenal, že sa ticho vypnú všetky automatizácie (pripomienky, pošta, "
+                "hodinová synchronizácia). Obnov súbor zo zálohy (data/backups/state) a "
+                "reštartuj službu. "
+                + (f"Kópia poškodeného súboru: {os.path.basename(backup)}. " if backup
+                   else "")
+                # NEVER suggest deleting it: a missing file is a legitimate first run,
+                # which is precisely the silent switch-off this guard prevents.
+                + "Súbor NEMAŽ — prázdny stav vypne všetky automatizácie.")
 
     def _save(self, st: dict) -> None:
         tmp = "%s.%d.tmp" % (os.fspath(self.state_path), os.getpid())
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False, indent=2)
+            # os.replace is atomic against concurrent READERS, not against a crash: the
+            # rename can be durable while the bytes are not, and a half-written state
+            # file is exactly what `_load` now refuses to read (PR #265 second review).
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.state_path)
 
