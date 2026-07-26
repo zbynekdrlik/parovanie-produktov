@@ -41,6 +41,7 @@ def _no_real_github(monkeypatch):
     monkeypatch.setattr(webapp.requests, "get", _boom)
     monkeypatch.setattr(webapp.requests, "post", _boom)
     monkeypatch.setattr(webapp.requests, "delete", _boom)
+    monkeypatch.setattr(webapp.requests, "patch", _boom)   # #243 — the edit verb
 
 
 def _configure(monkeypatch):
@@ -470,3 +471,140 @@ def test_dev_issue_detail_token_missing_degrades_gracefully():
     assert r.status_code == 200
     j = r.get_json()
     assert j["ok"] is False and j["available"] is False
+
+
+# --- #243: editing an already-submitted request ----------------------------- #
+# The boss could add a comment but never CORRECT what he had already sent, so a request
+# that came out wrong was simply abandoned („nedá sa, tak som sa na to vykašlal").
+# `gh issue edit` cannot do this on this repo (deprecated classic-Projects GraphQL), so
+# the endpoint is a plain REST PATCH.
+_ISSUE_WITH_MARKER = {
+    "number": 5, "title": "Pôvodný názov", "state": "open",
+    "body": "Pôvodný text požiadavky.\n\n_Nápad cez appku (Vývoj) — sef@forestshop.sk_",
+    "labels": [], "updated_at": "2026-07-26T09:00:00Z",
+    "html_url": "https://example.test/issues/5", "comments": 0,
+}
+
+
+def _arm_edit(monkeypatch, current=None, patch_status=200):
+    """GET returns the current issue, PATCH records what was sent."""
+    _configure(monkeypatch)
+    sent = {}
+    monkeypatch.setattr(webapp.requests, "get",
+                        lambda *a, **k: _Resp(200, dict(current or _ISSUE_WITH_MARKER)))
+
+    def fake_patch(url, json=None, headers=None, timeout=None):
+        sent["url"] = url
+        sent["json"] = json
+        sent["headers"] = headers
+        merged = dict(current or _ISSUE_WITH_MARKER)
+        merged.update(json or {})
+        return _Resp(patch_status, merged)
+
+    monkeypatch.setattr(webapp.requests, "patch", fake_patch)
+    return sent
+
+
+def test_dev_edit_requires_login(monkeypatch):
+    _configure(monkeypatch)
+    r = webapp.app.test_client().post("/api/dev/issue/5/edit",
+                                      json={"title": "X", "text": "Y"})
+    assert r.status_code == 401
+
+
+def test_dev_edit_rewrites_title_and_body(monkeypatch):
+    sent = _arm_edit(monkeypatch)
+    r = _client().post("/api/dev/issue/5/edit",
+                       json={"title": "Opravený názov", "text": "Doplnený text."})
+    assert r.status_code == 200 and r.get_json()["ok"] is True
+    assert sent["url"].endswith("/repos/owner/repo/issues/5")
+    assert sent["json"]["title"] == "Opravený názov"
+    assert sent["json"]["body"].startswith("Doplnený text.")
+    assert "test-token" not in sent["url"]
+    assert sent["headers"]["Authorization"] == "Bearer test-token"
+
+
+def test_dev_edit_keeps_who_first_raised_the_request(monkeypatch):
+    """An edit must not erase the author marker — it is the only record of who asked."""
+    sent = _arm_edit(monkeypatch)
+    _client().post("/api/dev/issue/5/edit", json={"title": "T", "text": "Nový text."})
+    assert "_Nápad cez appku (Vývoj) — sef@forestshop.sk_" in sent["json"]["body"]
+
+
+def test_dev_edit_marker_is_rewritten_not_stacked(monkeypatch):
+    """Repeated edits must not grow a changelog nobody asked for: the „Upravené" line
+    is replaced each time, never appended."""
+    already = dict(_ISSUE_WITH_MARKER)
+    already["body"] = ("Text.\n\n_Nápad cez appku (Vývoj) — sef@forestshop.sk_"
+                       "\n_Upravené cez appku (Vývoj) — admin@e2e.test_")
+    sent = _arm_edit(monkeypatch, already)
+    _client().post("/api/dev/issue/5/edit", json={"title": "T", "text": "Iný text."})
+    body = sent["json"]["body"]
+    assert body.count("_Upravené cez appku (Vývoj)") == 1
+    assert body.count("_Nápad cez appku (Vývoj)") == 1
+
+
+def test_dev_edit_does_not_make_the_boss_retype_the_markers(monkeypatch):
+    """The detail hands back `editable` (body minus the app's own signature lines), so
+    what he edits is only ever his own text."""
+    _configure(monkeypatch)
+    monkeypatch.setattr(webapp.requests, "get",
+                        lambda url, **k: _Resp(200, dict(_ISSUE_WITH_MARKER))
+                        if "/comments" not in url else _Resp(200, []))
+    j = _client().get("/api/dev/issue/5").get_json()
+    assert j["title"] == "Pôvodný názov"
+    assert j["editable"] == "Pôvodný text požiadavky."      # marker stripped
+    assert "_Nápad cez appku" in j["body"]                  # full body still shown
+
+
+def test_dev_edit_of_a_closed_issue_is_refused(monkeypatch):
+    """Silently rewriting a request somebody already acted on would be invisible to
+    them — a comment is the right tool there."""
+    closed = dict(_ISSUE_WITH_MARKER, state="closed")
+    sent = _arm_edit(monkeypatch, closed)
+    r = _client().post("/api/dev/issue/5/edit", json={"title": "T", "text": "X"})
+    assert r.status_code == 200 and r.get_json()["ok"] is False
+    assert sent == {}, "must not PATCH a closed issue"
+
+
+def test_dev_edit_empty_title_rejected_before_github(monkeypatch):
+    _configure(monkeypatch)   # requests.get/patch are still the raising guards
+    r = _client().post("/api/dev/issue/5/edit", json={"title": "   ", "text": "X"})
+    assert r.status_code == 400 and r.get_json()["ok"] is False
+
+
+def test_dev_edit_too_long_rejected_before_github(monkeypatch):
+    _configure(monkeypatch)
+    r = _client().post("/api/dev/issue/5/edit",
+                       json={"title": "T" * 201, "text": "X"})
+    assert r.status_code == 400
+    r = _client().post("/api/dev/issue/5/edit",
+                       json={"title": "T", "text": "X" * 5001})
+    assert r.status_code == 400
+
+
+def test_dev_edit_upstream_error_degrades_gracefully(monkeypatch):
+    _arm_edit(monkeypatch, patch_status=422)
+    r = _client().post("/api/dev/issue/5/edit", json={"title": "T", "text": "X"})
+    assert r.status_code == 200                      # never 500
+    assert r.get_json()["ok"] is False
+
+
+def test_dev_edit_token_missing_degrades_gracefully():
+    # no token; requests.get/patch are the raising guards → must NOT be called
+    r = _client().post("/api/dev/issue/5/edit", json={"title": "T", "text": "X"})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["ok"] is False and j["available"] is False
+
+
+def test_split_app_markers_is_conservative():
+    """Pure helper. Only the app's OWN trailing signature lines are stripped — an
+    italic line the boss wrote himself must survive, or editing would eat his text."""
+    text, markers = webapp._split_app_markers(
+        "Prvý riadok.\n\n_toto napísal šéf kurzívou_\n\n"
+        "_Nápad cez appku (Vývoj) — sef@forestshop.sk_\n")
+    assert text == "Prvý riadok.\n\n_toto napísal šéf kurzívou_"
+    assert markers == ["_Nápad cez appku (Vývoj) — sef@forestshop.sk_"]
+    assert webapp._split_app_markers("") == ("", [])
+    assert webapp._split_app_markers(None) == ("", [])

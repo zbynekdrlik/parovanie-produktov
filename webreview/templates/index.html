@@ -130,16 +130,30 @@
   <div id="ideaModal" class="idea-modal" hidden>
     <div class="idea-backdrop" id="ideaBackdrop"></div>
     <div class="idea-dialog" role="dialog" aria-modal="true" aria-labelledby="ideaHead">
-      <h2 id="ideaHead">💡 Nový nápad na vývoj</h2>
-      <p class="idea-hint">Zapíš nápad — vytvorí sa úloha v zozname „Vývoj".</p>
-      <input id="ideaTitleInput" type="text" maxlength="200"
-             placeholder="Nápad v skratke (názov)…" autocomplete="off">
-      <textarea id="ideaDescInput" rows="4" maxlength="5000"
-                placeholder="Podrobnosti (voliteľné)…"></textarea>
-      <div id="ideaMsg" class="idea-msg" hidden></div>
-      <div class="idea-acts">
-        <button id="ideaCancel" class="btn ghost" type="button">Zrušiť</button>
-        <button id="ideaSubmit" class="btn good" type="button">➕ Vytvoriť úlohu</button>
+      <div id="ideaForm">
+        <h2 id="ideaHead">💡 Nový nápad na vývoj</h2>
+        <p class="idea-hint">Zapíš nápad — vytvorí sa úloha v zozname „Vývoj".</p>
+        <input id="ideaTitleInput" type="text" maxlength="200"
+               placeholder="Nápad v skratke (názov)…" autocomplete="off">
+        <textarea id="ideaDescInput" rows="4" maxlength="5000"
+                  placeholder="Podrobnosti (voliteľné)…"></textarea>
+        <div id="ideaMsg" class="idea-msg" hidden></div>
+        <div class="idea-acts">
+          <button id="ideaCancel" class="btn ghost" type="button">Zrušiť</button>
+          <button id="ideaSubmit" class="btn good" type="button">➕ Vytvoriť úlohu</button>
+        </div>
+      </div>
+      <!-- #243 — the dialog used to just vanish on success, so from any tab other than
+           „Vývoj" the boss got no number, no confirmation and no way back to what he
+           had just sent. A separate panel (not an innerHTML swap) keeps the form intact
+           for the next open. -->
+      <div id="ideaDone" hidden>
+        <h2>✅ Požiadavka bola prijatá</h2>
+        <p class="idea-hint" id="ideaDoneText"></p>
+        <div class="idea-acts">
+          <button id="ideaDoneClose" class="btn ghost" type="button">Zavrieť</button>
+          <button id="ideaDoneOpen" class="btn good" type="button">Otvoriť a doplniť</button>
+        </div>
       </div>
     </div>
   </div>

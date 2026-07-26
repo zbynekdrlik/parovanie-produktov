@@ -2682,6 +2682,78 @@ def _do_add_note(number: int, text: str, author: str = ""):
         return {"ok": False, "error": "GitHub nedostupný"}, 200
 
 
+# The app's own trailing signature lines in an issue BODY. They are bookkeeping, not
+# the boss's text, so the edit form must neither show them nor make him retype them —
+# they are stripped before editing and rewritten on save (#243). Matching „Upravené"
+# too is what keeps them from stacking up one line per edit.
+_APP_BODY_MARKER = re.compile(r"^_(?:Nápad|Upravené) cez appku \(Vývoj\) — .*_$")
+
+
+def _split_app_markers(body: str):
+    """(text the boss wrote, [the app's own trailing marker lines])."""
+    lines = (body or "").replace("\r\n", "\n").split("\n")
+    markers = []
+    while lines and (not lines[-1].strip() or _APP_BODY_MARKER.match(lines[-1].strip())):
+        line = lines.pop().strip()
+        if line:
+            markers.insert(0, line)
+    return "\n".join(lines).rstrip(), markers
+
+
+def _compose_edited_body(text: str, prev_markers, editor: str) -> str:
+    """The boss's new text + the preserved „who first wrote this" line + ONE fresh
+    „who last edited it" line. The origin marker is kept because an edit must not
+    erase who raised the request; the edit marker is rewritten (never appended) so
+    repeated edits cannot grow a changelog nobody asked for."""
+    keep = [m for m in prev_markers if m.startswith("_Nápad ")]
+    if editor:
+        keep.append(f"_Upravené cez appku (Vývoj) — {editor}_")
+    tail = "\n".join(keep)
+    text = (text or "").strip()
+    if text and tail:
+        return text + "\n\n" + tail
+    return text or tail
+
+
+def _do_edit_issue(number: int, title: str, text: str, author: str = ""):
+    """(payload, status) — rewrite an issue's title + text (#243).
+
+    The boss could add a comment but never CORRECT what he had already sent, so a
+    request that came out wrong was simply abandoned („nedá sa, tak som sa na to
+    vykašlal"). `gh issue edit` cannot do this on this repo (it goes through the
+    deprecated classic-Projects GraphQL and fails), so this is a plain REST PATCH.
+    A closed issue is refused — reopening work by editing it would be invisible to
+    whoever already acted on it; a comment is the right tool there."""
+    token, repo = _gh_config()
+    if not token:
+        return {"ok": False, "available": False,
+                "error": "GitHub nedostupný — token nie je nastavený"}, 200
+    try:
+        rg = requests.get(f"{GITHUB_API}/repos/{repo}/issues/{number}",
+                          headers=_gh_headers(token), timeout=GH_TIMEOUT)
+        if rg.status_code != 200:
+            log.warning("gh edit issue (read): HTTP %s for %s#%s",
+                        rg.status_code, repo, number)
+            return {"ok": False, "error": f"GitHub API vrátil {rg.status_code}"}, 200
+        cur = rg.json() if isinstance(rg.json(), dict) else {}
+        if (cur.get("state") or "open") != "open":
+            return {"ok": False,
+                    "error": "úloha je už uzavretá — doplň ju radšej detailom"}, 200
+        _prev, markers = _split_app_markers(cur.get("body") or "")
+        r = requests.patch(
+            f"{GITHUB_API}/repos/{repo}/issues/{number}",
+            json={"title": title, "body": _compose_edited_body(text, markers, author)},
+            headers=_gh_headers(token), timeout=GH_TIMEOUT)
+        if r.status_code != 200:
+            log.warning("gh edit issue: HTTP %s for %s#%s", r.status_code, repo, number)
+            return {"ok": False, "error": f"GitHub API vrátil {r.status_code}"}, 200
+        log.info("gh issue %s edited by %s: %r", number, author or "?", title)
+        return {"ok": True, "issue": _slim_issue(r.json())}, 200
+    except Exception as e:  # noqa: BLE001 — never crash on GitHub trouble
+        log.warning("gh edit issue failed: %r", e)
+        return {"ok": False, "error": "GitHub nedostupný"}, 200
+
+
 def _do_issue_detail(number: int):
     """(payload, status) — one issue's full text (body) + ALL its comments, so the
     boss reads everything IN the app (GitHub stays hidden). No token → graceful
@@ -2705,7 +2777,13 @@ def _do_issue_detail(number: int):
             comments = [{"body": c.get("body") or "",
                          "created_at": c.get("created_at") or ""}
                         for c in rc.json() if isinstance(c, dict)]
-        return {"ok": True, "body": it.get("body") or "", "comments": comments}, 200
+        # `title` + `editable` feed the in-app edit form (#243): `editable` is the body
+        # WITHOUT the app's own signature lines, so the boss never has to see — or
+        # accidentally delete — bookkeeping he did not write.
+        editable, _markers = _split_app_markers(it.get("body") or "")
+        return {"ok": True, "body": it.get("body") or "", "comments": comments,
+                "title": it.get("title") or "", "editable": editable,
+                "state": it.get("state") or "open"}, 200
     except Exception as e:  # noqa: BLE001 — never crash on GitHub trouble
         log.warning("gh issue detail failed: %r", e)
         return {"ok": False, "error": "GitHub nedostupný"}, 200
@@ -2829,6 +2907,32 @@ def api_dev_note(number):
         return jsonify({"ok": False,
                         "error": "priveľa zápisov za krátky čas — skús o chvíľu"}), 429
     payload, status = _do_add_note(number, text, email)
+    return jsonify(payload), status
+
+
+@app.route("/api/dev/issue/<int:number>/edit", methods=["POST"])
+def api_dev_edit(number):
+    """#243 — correct/extend an already-submitted request. Same scope as the detail
+    comment and the priority buttons (any logged-in user, open issues only): the boss
+    also needs to fix the requests that were written down FOR him, which is exactly the
+    case that prompted this. GitHub keeps the full edit history, so nothing is lost."""
+    body = request.get_json(force=True, silent=True) or {}
+    title = str(body.get("title") or "").strip()
+    text = str(body.get("text") or "")
+    if not title:
+        return jsonify({"ok": False, "error": "názov úlohy je povinný"}), 400
+    if len(title) > IDEA_TITLE_MAX:
+        return jsonify({"ok": False,
+                        "error": f"názov môže mať najviac {IDEA_TITLE_MAX} znakov"}), 400
+    if len(text) > IDEA_BODY_MAX:
+        return jsonify({"ok": False,
+                        "error": f"text môže mať najviac {IDEA_BODY_MAX} znakov"}), 400
+    u = _current_user()
+    email = u["email"] if u else ""
+    if _idea_rate_limited(email):
+        return jsonify({"ok": False,
+                        "error": "priveľa zápisov za krátky čas — skús o chvíľu"}), 429
+    payload, status = _do_edit_issue(number, title, text, email)
     return jsonify(payload), status
 
 

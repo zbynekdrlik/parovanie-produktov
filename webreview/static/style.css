@@ -568,7 +568,21 @@ body[data-theme=dark] .dev-state.open{background:#064e3b;color:#6ee7b7}
 .dev-detail-load,.dev-detail-empty{font-size:12.5px;color:var(--soft)}
 .dev-detail-err{font-size:12.5px;color:#b23b2c}
 .dev-detail-h{font-size:11px;font-weight:800;letter-spacing:.03em;text-transform:uppercase;
-  color:var(--soft);margin-top:2px}
+  color:var(--soft);margin-top:2px;display:flex;align-items:center;gap:10px}
+/* #243 — „✏️ Upraviť zadanie" sits in the Zadanie heading, next to the text it edits */
+.dev-edit-btn{font-size:11px;font-weight:700;text-transform:none;letter-spacing:0;
+  border:1px solid var(--border);background:transparent;color:var(--soft);
+  padding:2px 8px;border-radius:8px;cursor:pointer}
+.dev-edit-btn:hover{border-color:var(--accent);color:var(--accent)}
+.dev-edit-title{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:9px;
+  font:inherit;font-size:13px;font-weight:600;background:var(--panel);color:var(--text)}
+.dev-edit-ta{width:100%;min-height:120px;padding:8px 10px;border:1px solid var(--border);
+  border-radius:9px;font:inherit;font-size:13px;background:var(--panel);color:var(--text);
+  resize:vertical}
+.dev-edit-cancel{font-size:12.5px;font-weight:600;border:1px solid var(--border);
+  background:transparent;color:var(--soft);padding:6px 12px;border-radius:9px;cursor:pointer}
+.dev-edit-cancel:hover{color:var(--text)}
+.dev-edit-cancel:disabled{opacity:.6;cursor:default}
 .dev-detail-body{font-size:13px;line-height:1.5;color:var(--text);white-space:pre-wrap;
   word-break:break-word}
 .dev-comment{border-left:3px solid var(--accent-soft);padding:4px 0 4px 10px}

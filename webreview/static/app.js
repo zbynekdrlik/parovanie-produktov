@@ -2923,6 +2923,7 @@ function renderDev() {
 function renderDevRow(it) {
   const row = el('div', 'dev-row' + (it.state === 'closed' ? ' closed' : '')
                  + (it.priority ? ' prio-' + it.priority : ''));
+  row.dataset.num = it.number;      // lets a save re-open the detail on the rebuilt row
   const head = el('div', 'dev-head');
   head.appendChild(el('span', 'dev-num', '#' + it.number));
   // GitHub is fully hidden — the title is NOT a link out. Clicking it opens the
@@ -2998,7 +2999,17 @@ async function _devToggleDetail(row, number, canAdd) {
 function _renderDetail(box, number, data, canAdd) {
   box.innerHTML = '';
   if (data.body && data.body.trim()) {
-    box.appendChild(el('div', 'dev-detail-h', 'Zadanie'));
+    const h = el('div', 'dev-detail-h', 'Zadanie');
+    // #243 — an already-sent request must stay CORRECTABLE. Without this the boss could
+    // only append a comment, so a request that came out wrong was abandoned instead
+    // („chcel som mu ešte niečo dopísať – nedá sa, tak som sa na to vykašlal").
+    if (canAdd) {
+      const ed = el('button', 'dev-edit-btn', '✏️ Upraviť zadanie');
+      ed.title = 'Opraviť alebo doplniť text tejto požiadavky';
+      ed.onclick = () => _devEditForm(box, number, data, canAdd);
+      h.appendChild(ed);
+    }
+    box.appendChild(h);
     const b = el('div', 'dev-detail-body');
     b.textContent = data.body;                 // textContent → no XSS, no HTML render
     box.appendChild(b);
@@ -3058,6 +3069,65 @@ function _renderDetail(box, number, data, canAdd) {
   ta.focus();
 }
 
+// #243 — the edit form for an already-submitted request: name + text, prefilled with
+// what is actually there. `data.editable` is the body WITHOUT the app's own signature
+// lines, so the boss neither sees nor can accidentally delete bookkeeping he did not
+// write (the server puts them back on save).
+function _devEditForm(box, number, data, canAdd) {
+  box.innerHTML = '';
+  box.appendChild(el('div', 'dev-detail-h', 'Upraviť požiadavku'));
+  const ti = el('input', 'dev-edit-title'); ti.type = 'text'; ti.maxLength = 200;
+  ti.value = data.title || '';
+  ti.placeholder = 'Názov požiadavky…';
+  const ta = el('textarea', 'dev-edit-ta'); ta.maxLength = 5000;
+  ta.value = data.editable || '';
+  ta.placeholder = 'Popis požiadavky…';
+  const bar = el('div', 'dev-note-bar');
+  const save = el('button', 'dev-note-save', 'Uložiť zmeny');
+  const cancel = el('button', 'dev-edit-cancel', 'Zrušiť');
+  const msg = el('span', 'dev-note-msg', '');
+  cancel.onclick = () => _renderDetail(box, number, data, canAdd);
+  save.onclick = async () => {
+    const title = ti.value.trim();
+    if (!title) {
+      msg.textContent = 'Názov nemôže byť prázdny.'; msg.className = 'dev-note-msg err';
+      ti.focus(); return;
+    }
+    save.disabled = true; cancel.disabled = true;
+    msg.textContent = 'Ukladám…'; msg.className = 'dev-note-msg';
+    let ok = false, err = '';
+    try {
+      const r = await fetch(`/api/dev/issue/${number}/edit`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, text: ta.value }),
+      });
+      const j = await r.json(); ok = j.ok; err = j.error || '';
+    } catch (_) { err = 'sieť'; }
+    if (!ok) {
+      save.disabled = false; cancel.disabled = false;
+      msg.textContent = 'Nepodarilo sa: ' + err; msg.className = 'dev-note-msg err';
+      return;                                  // his text stays in the form, not lost
+    }
+    // re-read so the box shows the STORED text (the server re-attached its markers),
+    // and refresh the list so the corrected NAME shows there too
+    let fresh = null;
+    try { fresh = await (await fetch(`/api/dev/issue/${number}`)).json(); } catch (_) {}
+    await loadDevIssues();
+    if (ACTIVE_TAB === 'dev') renderDev(); else renderTabs();
+    // renderDev() rebuilds the list, so `box` is now detached — re-open the detail on
+    // the NEW row, otherwise the boss's edit would appear to close his own detail
+    const row = document.querySelector(`.dev-row[data-num="${number}"]`);
+    if (row && fresh && fresh.ok) {
+      const nb = el('div', 'dev-detail-box');
+      row.appendChild(nb);
+      _renderDetail(nb, number, fresh, canAdd);
+    }
+  };
+  bar.appendChild(save); bar.appendChild(cancel); bar.appendChild(msg);
+  box.appendChild(ti); box.appendChild(ta); box.appendChild(bar);
+  ti.focus();
+}
+
 // Idea lightbulb — any logged-in user writes an idea → POST /api/dev/idea creates a
 // GitHub issue that then appears in the Vývoj list. The token stays server-side.
 function _ideaMsg(text, cls) {
@@ -3070,6 +3140,9 @@ function _ideaOpen() {
   const m = document.getElementById('ideaModal'); if (!m) return;
   document.getElementById('ideaTitleInput').value = '';
   document.getElementById('ideaDescInput').value = '';
+  // back to the form — the previous open may have ended on the confirmation panel
+  const form = document.getElementById('ideaForm'), done = document.getElementById('ideaDone');
+  if (form && done) { form.hidden = false; done.hidden = true; }
   _ideaMsg('');
   m.hidden = false;
   document.getElementById('ideaTitleInput').focus();
@@ -3084,7 +3157,7 @@ async function _ideaSubmit() {
   const title = ti.value.trim();
   if (!title) { _ideaMsg('Napíš aspoň názov nápadu.', 'err'); ti.focus(); return; }
   btn.disabled = true;
-  let ok = false, err = '';
+  let ok = false, err = '', number = 0;
   try {
     const r = await fetch('/api/dev/idea', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3092,19 +3165,47 @@ async function _ideaSubmit() {
     });
     const j = await r.json().catch(() => ({}));
     ok = r.ok && j.ok;
+    number = (j.issue && j.issue.number) || 0;
     if (!ok) err = j.error || ('chyba ' + r.status);
   } catch (_) { err = 'sieťová chyba'; }
   btn.disabled = false;
   if (!ok) { _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
-  _ideaClose();
   await loadDevIssues();                       // new issue appears + nav badge updates
   if (ACTIVE_TAB === 'dev') render(); else renderTabs();
+  // #243 — the dialog used to just vanish. The lightbulb is on EVERY tab, so unless he
+  // happened to be standing in „Vývoj" he got no number, no confirmation and no way
+  // back to what he had just sent. Say it landed, and offer to open it right away.
+  _ideaDone(number);
+}
+
+// Success state of the idea dialog: confirmation + a way straight into the request.
+// A number is required — without it there is nothing to confirm or open, so fall back
+// to the old silent close rather than promise something the panel cannot deliver.
+function _ideaDone(number) {
+  const form = document.getElementById('ideaForm');
+  const done = document.getElementById('ideaDone');
+  const txt = document.getElementById('ideaDoneText');
+  if (!form || !done || !number) { _ideaClose(); return; }
+  txt.textContent = 'Zapísali sme ju ako úlohu č. ' + number
+    + ' — nájdeš ju v záložke „Vývoj". Môžeš ju tam kedykoľvek doplniť alebo opraviť.';
+  const open = document.getElementById('ideaDoneOpen');
+  open.onclick = async () => {
+    _ideaClose();
+    await switchTab('dev');
+    const row = document.querySelector(`.dev-row[data-num="${number}"]`);
+    if (row) {
+      row.scrollIntoView({ block: 'center' });
+      _devToggleDetail(row, number, true);
+    }
+  };
+  form.hidden = true; done.hidden = false;
 }
 function initIdea() {
   const btn = document.getElementById('ideaBtn'); if (btn) btn.onclick = _ideaOpen;
   const cancel = document.getElementById('ideaCancel'); if (cancel) cancel.onclick = _ideaClose;
   const back = document.getElementById('ideaBackdrop'); if (back) back.onclick = _ideaClose;
   const submit = document.getElementById('ideaSubmit'); if (submit) submit.onclick = _ideaSubmit;
+  const dclose = document.getElementById('ideaDoneClose'); if (dclose) dclose.onclick = _ideaClose;
   const ti = document.getElementById('ideaTitleInput');
   if (ti) ti.addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); _ideaSubmit(); }

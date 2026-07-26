@@ -286,10 +286,27 @@ def _start_gh_stub():
             issue = {"number": state.next_num, "title": data.get("title", ""),
                      "state": "open", "labels": [], "updated_at": "2026-07-22T12:00:00Z",
                      "html_url": f"https://example.test/issues/{state.next_num}",
-                     "comments": 0}
+                     "comments": 0, "body": data.get("body", ""), "_comments": []}
             state.next_num += 1
             state.issues.insert(0, issue)
             self._send(201, issue)
+
+        def do_PATCH(self):
+            """#243 — edit an issue's title/body (REST; `gh issue edit` cannot do this
+            on this repo). Mutates the stub state so the next GET reflects the edit."""
+            data = self._read()
+            m = re.search(r"/issues/(\d+)(\?|$)", self.path)
+            if not m:
+                self._send(404, {"message": "not found"})
+                return
+            it = self._issue_by_num(int(m.group(1)))
+            if it is None:
+                self._send(404, {"message": "not found"})
+                return
+            for field in ("title", "body"):
+                if field in data:
+                    it[field] = data[field]
+            self._send(200, it)
 
         def do_DELETE(self):
             m = re.search(r"/issues/(\d+)/labels/(.+)$", self.path)

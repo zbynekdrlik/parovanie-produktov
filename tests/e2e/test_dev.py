@@ -58,7 +58,11 @@ def test_lightbulb_creates_idea_that_appears_in_list(page, dev_server):
     with page.expect_response("**/api/dev/idea") as resp:
         page.locator("#ideaSubmit").click()
     assert resp.value.status == 201
-    # modal closes on success
+    # #243 — the dialog no longer just vanishes: it confirms the request landed (and
+    # says which number it got), because the lightbulb is on every tab and a silent
+    # close left the boss with nothing. Closing that panel closes the modal.
+    page.wait_for_selector("#ideaDone:not([hidden])")
+    page.locator("#ideaDoneClose").click()
     page.locator("#ideaModal").wait_for(state="hidden")
 
     # the new issue shows up in the Vývoj list (created issues are 'open').
@@ -181,5 +185,156 @@ def test_empty_title_shows_inline_error_no_issue(page, dev_server):
     # close without creating anything
     page.locator("#ideaCancel").click()
     page.locator("#ideaModal").wait_for(state="hidden")
+
+    assert console == [], f"console not clean: {console}"
+
+
+# --- #243: correcting an already-submitted request -------------------------- #
+# The boss could add a comment but never fix the request itself, so one that came out
+# wrong was abandoned („chcel som mu ešte niečo dopísať – nedá sa, tak som sa na to
+# vykašlal"), and the lightbulb closed with no confirmation at all.
+
+def _open_dev_tab(page, dev_server):
+    page.goto(dev_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.locator("#devNav .tab").click()
+    page.wait_for_selector("#tab-dev .dev-row")
+
+
+def test_the_boss_can_correct_an_already_sent_request(page, dev_server):
+    console = _console(page)
+    _open_dev_tab(page, dev_server)
+
+    row = page.locator('#tab-dev .dev-row[data-num="7"]')
+    row.locator(".dev-title").click()                    # open the detail
+    page.wait_for_selector('.dev-row[data-num="7"] .dev-detail-box .dev-detail-body')
+
+    row.locator(".dev-edit-btn").click()
+    page.wait_for_selector(".dev-edit-title")
+    assert row.locator(".dev-edit-title").input_value() == "E2E otvorena uloha"
+    assert "Zadanie otvorenej úlohy" in row.locator(".dev-edit-ta").input_value()
+
+    row.locator(".dev-edit-title").fill("E2E opravena uloha")
+    row.locator(".dev-edit-ta").fill("Opraveny text zadania, este som chcel doplnit toto.")
+    with page.expect_response("**/api/dev/issue/7/edit") as resp:
+        row.locator(".dev-note-save").click()
+    assert resp.value.status == 200
+
+    # the corrected NAME must show in the list (not only inside the detail), and the
+    # detail must re-open showing the stored text — no reload, that is what he sees
+    page.wait_for_function(
+        "() => !!document.querySelector('.dev-row[data-num=\"7\"] .dev-title')"
+        " && document.querySelector('.dev-row[data-num=\"7\"] .dev-title')"
+        "        .textContent.includes('opravena')")
+    body = page.locator('.dev-row[data-num="7"] .dev-detail-box .dev-detail-body')
+    assert "este som chcel doplnit toto" in body.inner_text()
+
+    page.reload()
+    page.locator("#devNav .tab").click()
+    page.wait_for_selector("#tab-dev .dev-row")
+    assert "E2E opravena uloha" in page.locator('#tab-dev .dev-row[data-num="7"]').inner_text()
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_the_edit_form_never_asks_him_to_retype_the_apps_own_signature(page, dev_server):
+    """A request created from the lightbulb carries `_Nápad cez appku (Vývoj) — …_`.
+    That is bookkeeping, not his text: the form must not show it, and saving must not
+    lose it either."""
+    console = _console(page)
+    page.goto(dev_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.locator("#ideaBtn").click()
+    page.locator("#ideaTitleInput").fill("Poziadavka na upravu")
+    page.locator("#ideaDescInput").fill("Prvy text.")
+    with page.expect_response("**/api/dev/idea") as resp:
+        page.locator("#ideaSubmit").click()
+    assert resp.value.status == 201
+    num = resp.value.json()["issue"]["number"]
+
+    page.locator("#ideaDoneClose").click()
+    page.locator("#devNav .tab").click()
+    page.wait_for_selector(f'#tab-dev .dev-row[data-num="{num}"]')
+    row = page.locator(f'#tab-dev .dev-row[data-num="{num}"]')
+    row.locator(".dev-title").click()
+    page.wait_for_selector(f'.dev-row[data-num="{num}"] .dev-detail-body')
+    # the stored body DOES carry the marker …
+    assert "Nápad cez appku" in row.locator(".dev-detail-body").inner_text()
+
+    row.locator(".dev-edit-btn").click()
+    page.wait_for_selector(".dev-edit-ta")
+    # … but what he edits is only his own text
+    assert row.locator(".dev-edit-ta").input_value() == "Prvy text."
+
+    row.locator(".dev-edit-ta").fill("Prvy text. A este toto.")
+    with page.expect_response(f"**/api/dev/issue/{num}/edit") as resp:
+        row.locator(".dev-note-save").click()
+    assert resp.value.status == 200
+    page.wait_for_selector(f'.dev-row[data-num="{num}"] .dev-detail-body')
+    stored = row.locator(".dev-detail-body").inner_text()
+    assert "A este toto." in stored
+    assert "Nápad cez appku" in stored, "the author marker must survive an edit"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_cancelling_an_edit_leaves_the_request_untouched(page, dev_server):
+    console = _console(page)
+    _open_dev_tab(page, dev_server)
+    row = page.locator('#tab-dev .dev-row[data-num="7"]')
+    row.locator(".dev-title").click()
+    page.wait_for_selector('.dev-row[data-num="7"] .dev-detail-body')
+
+    row.locator(".dev-edit-btn").click()
+    page.wait_for_selector(".dev-edit-ta")
+    row.locator(".dev-edit-ta").fill("nezmysel ktory nechcem ulozit")
+    row.locator(".dev-edit-cancel").click()
+
+    page.wait_for_selector('.dev-row[data-num="7"] .dev-detail-body')
+    assert "Zadanie otvorenej úlohy" in row.locator(".dev-detail-body").inner_text()
+    assert row.locator(".dev-edit-ta").count() == 0
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_closed_request_offers_no_edit_button(page, dev_server):
+    """Rewriting a request somebody already acted on would be invisible to them."""
+    console = _console(page)
+    _open_dev_tab(page, dev_server)
+    page.get_by_role("button", name="Hotové").click()
+    page.wait_for_selector('#tab-dev .dev-row[data-num="6"]')
+    row = page.locator('#tab-dev .dev-row[data-num="6"]')
+    row.locator(".dev-title").click()
+    page.wait_for_selector('.dev-row[data-num="6"] .dev-detail-body')
+    assert row.locator(".dev-edit-btn").count() == 0
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_the_lightbulb_confirms_the_request_landed_and_opens_it(page, dev_server):
+    """It used to just close, so from any tab other than „Vývoj" he got no number, no
+    confirmation and no way back to what he had just sent."""
+    console = _console(page)
+    page.goto(dev_server + "/?tab=toorder")          # deliberately NOT the Vývoj tab
+    page.wait_for_selector(".sidebar #tabs button")
+    page.locator("#ideaBtn").click()
+    page.locator("#ideaTitleInput").fill("Chcem to vidiet potvrdene")
+    with page.expect_response("**/api/dev/idea") as resp:
+        page.locator("#ideaSubmit").click()
+    num = resp.value.json()["issue"]["number"]
+
+    page.wait_for_selector("#ideaDone:not([hidden])")
+    assert page.locator("#ideaForm").is_hidden()
+    assert str(num) in page.locator("#ideaDoneText").inner_text()
+
+    page.locator("#ideaDoneOpen").click()
+    page.wait_for_selector(f'#tab-dev .dev-row[data-num="{num}"] .dev-detail-box')
+    assert page.locator("#ideaModal").is_hidden()
+
+    # re-opening the lightbulb must give the FORM back, not the confirmation panel
+    page.locator("#ideaBtn").click()
+    page.wait_for_selector("#ideaForm:not([hidden])")
+    assert page.locator("#ideaDone").is_hidden()
+    assert page.locator("#ideaTitleInput").input_value() == ""
 
     assert console == [], f"console not clean: {console}"
