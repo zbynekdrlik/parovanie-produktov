@@ -32,14 +32,14 @@ def test_vyvoj_tab_lists_issues_open_and_closed(page, dev_server):
     # switch to 'Všetky' to see open + closed together.
     page.get_by_role("button", name="Všetky").click()
     page.wait_for_function(
-        "() => document.querySelectorAll('#tab-dev .dev-row').length === 2")
+        "() => document.querySelectorAll('#tab-dev .dev-row').length === 3")
 
     joined = "\n".join(page.locator("#tab-dev .dev-row").all_inner_texts())
     assert "E2E otvorena uloha" in joined       # open issue shown
     assert "E2E hotova uloha" in joined         # closed issue shown (already done)
     assert "pull request" not in joined.lower()  # PR #5 filtered out
     # one open + one closed state pill (class-based — robust vs CSS text-transform)
-    assert page.locator("#tab-dev .dev-state.open").count() == 1
+    assert page.locator("#tab-dev .dev-state.open").count() == 2   # incl. the body-less one
     assert page.locator("#tab-dev .dev-state.done").count() == 1
 
     assert console == [], f"console not clean: {console}"
@@ -337,4 +337,71 @@ def test_the_lightbulb_confirms_the_request_landed_and_opens_it(page, dev_server
     assert page.locator("#ideaDone").is_hidden()
     assert page.locator("#ideaTitleInput").input_value() == ""
 
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_request_with_no_text_can_still_have_its_title_corrected(page, dev_server):
+    """The ✏️ hung off a non-empty body, so a request created straight on GitHub with
+    no description could never be corrected in the app at all — and there the TITLE is
+    the whole request."""
+    console = _console(page)
+    _open_dev_tab(page, dev_server)
+    page.wait_for_selector('#tab-dev .dev-row[data-num="4"]')
+    row = page.locator('#tab-dev .dev-row[data-num="4"]')
+    row.locator(".dev-title").click()
+    page.wait_for_selector('.dev-row[data-num="4"] .dev-edit-btn')
+
+    row.locator(".dev-edit-btn").click()
+    page.locator('.dev-row[data-num="4"] .dev-edit-title').fill("Opraveny nazov bez textu")
+    with page.expect_response("**/api/dev/issue/4/edit") as resp:
+        page.locator('.dev-row[data-num="4"] .dev-note-save').click()
+    assert resp.value.status == 200
+
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('#tab-dev .dev-row')]"
+        ".some(r => r.textContent.includes('Opraveny nazov bez textu'))")
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_one_click_on_the_lightbulb_creates_exactly_one_request(page, dev_server):
+    """`_ideaSubmit` re-enabled the submit button and only THEN awaited
+    `loadDevIssues()` before dismissing the dialog, so a second click inside that
+    window (6 s measured with a slow /api/dev/issues) sent a SECOND POST and created a
+    SECOND GitHub issue. The same window is why the confirmation appeared late enough
+    to make this file flaky in a full run (2 of 3 runs failed waiting for #ideaDone).
+
+    The list refresh is HELD open (never resolved until the end) rather than stubbed —
+    a stub answers too fast to expose the window at all."""
+    console = _console(page)
+    posts = []
+    page.goto(dev_server + "/?tab=toorder")          # deliberately NOT the Vývoj tab
+    page.wait_for_selector(".sidebar #tabs button")
+    page.on("request", lambda r: posts.append(r.url)
+            if r.method == "POST" and r.url.endswith("/api/dev/idea") else None)
+
+    held = []
+    page.route("**/api/dev/issues", lambda route: held.append(route))
+
+    page.locator("#ideaBtn").click()
+    page.locator("#ideaTitleInput").fill("Iba jedna uloha prosim")
+    btn = page.locator("#ideaSubmit")
+    with page.expect_response("**/api/dev/idea") as resp:
+        btn.click()
+    assert resp.value.status == 201
+
+    # the confirmation is up IMMEDIATELY — it must not wait for the list round-trip
+    page.wait_for_selector("#ideaDone:not([hidden])", timeout=3000)
+    assert btn.is_disabled(), "the submit button is clickable again → double submit"
+    assert page.locator("#ideaForm").is_hidden()
+
+    # what an impatient double-click does (a disabled button ignores the dispatch)
+    page.evaluate("() => document.getElementById('ideaSubmit').click()")
+    page.wait_for_timeout(300)
+    assert len(posts) == 1, f"created {len(posts)} requests: {posts}"
+
+    for route in held:                                # let the held refresh finish
+        route.continue_()
+    page.unroute("**/api/dev/issues")
+    page.wait_for_timeout(200)
     assert console == [], f"console not clean: {console}"

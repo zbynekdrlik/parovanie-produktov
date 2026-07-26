@@ -70,10 +70,11 @@ def test_every_variant_of_the_product_names_the_same_owner():
     assert _by_code(rows, "61247/L")["reviewKey"] == "BETALOV|231"
 
 
-# --- link_owners cannot drift away from link_rows --------------------------- #
-def test_link_owners_covers_exactly_the_codes_link_rows_writes():
-    """Both come from ONE loop, so this pins the identity rather than a copy of the
-    dedup rules ('first pairing wins' must not be reimplemented twice)."""
+# --- the owner map cannot drift away from what link_rows writes ------------- #
+def test_link_row_specs_names_the_owner_of_exactly_the_codes_link_rows_writes():
+    """`link_row_specs` is the ONE loop behind both the eshop rows and the row's
+    `reviewKey` (app.py calls it directly), so this pins the identity rather than a
+    copy of the dedup rules ('first pairing wins' must not be reimplemented twice)."""
     products = [
         {"key": "A|1", "supplier": "BETALOV", "variant_codes": ["c1", "shared"],
          "pairCode": "1"},
@@ -86,11 +87,58 @@ def test_link_owners_covers_exactly_the_codes_link_rows_writes():
                  "B|2": {"status": "manual", "url": "https://b.test/y"},
                  "C|3": {"status": "unavailable", "url": ""}}   # no URL → no row
     rows = import_builder.link_rows(products, decisions, {})
-    owners = import_builder.link_owners(products, decisions, {})
+    owners = {c: (key, st) for c, _pc, _url, key, st
+              in import_builder.link_row_specs(products, decisions, {})}
     assert set(owners) == {r[0] for r in rows}
     assert owners["shared"] == ("A|1", "good")        # first pairing wins, same as rows
     assert owners["c2"] == ("B|2", "manual")
     assert "c3" not in owners
+
+
+# --- a split product must not be a blind spot on the to-order tab ----------- #
+SPLIT_DECISIONS = {"BETALOV|231": {"status": "split", "url": ""}}
+SPLIT_LINKS = {"61247/L": "https://www.huntingshop.eu/velkost-L",
+               "61247/XL": "https://www.huntingshop.eu/velkost-XL"}
+
+
+def test_a_split_row_shows_its_per_size_link_and_names_its_owner():
+    """Without variant_links the `split` branch of link_row_specs yields nothing, so
+    the row rendered `supplierUrl=''` + `reviewKey=''` — an empty paste box for a
+    product that IS paired per size. `savePairUrl` then wrote to order_pairings, which
+    the manual zip throws away while the nightly ships it — and because split_links
+    keeps its own uploaded_variant_links.json idempotency, that inline write
+    permanently clobbers an already-uploaded per-size link."""
+    rows = webapp.build_to_order_rows(ORDERS_CSV, PRODUCTS, SPLIT_DECISIONS, CODE2PAIR,
+                                      SPLIT_LINKS)
+    r = _by_code(rows, "61247/L")
+    assert r["supplierUrl"] == "https://www.huntingshop.eu/velkost-L"
+    assert r["reviewKey"] == "BETALOV|231"
+    assert r["reviewStatus"] == "split"
+
+
+def test_a_split_variant_with_no_link_of_its_own_still_names_its_owner():
+    """A size the manager has not linked yet emits no eshop row (never an empty
+    internalNote cell), so it has no owner to name — and must therefore keep the
+    plain inline paste box rather than silently pretend to be unpaired-but-owned."""
+    rows = webapp.build_to_order_rows(ORDERS_CSV, PRODUCTS, SPLIT_DECISIONS, CODE2PAIR,
+                                      {"61247/XL": SPLIT_LINKS["61247/XL"]})
+    r = _by_code(rows, "61247/L")
+    assert r["supplierUrl"] == "" and r["reviewKey"] == "" and r["reviewStatus"] == ""
+
+
+def test_an_owner_without_a_usable_key_is_reported_as_no_owner_at_all():
+    """`"reviewKey": owner_key or ""` conflated 'no owner' with 'falsy key': the row
+    then advertised `reviewStatus:'good'` with an EMPTY `reviewKey`, so `savePairUrl`
+    routed the correction to order_pairings — which the write-back discards for a code
+    link_rows already covers. That is the very silent no-op #242 exists to remove, so
+    a spec with no usable key must report no owner at all (→ plain inline path)."""
+    products = [dict(PRODUCTS[0], key="")]
+    rows = webapp.build_to_order_rows(ORDERS_CSV, products,
+                                      {"": {"status": "good", "url": "https://a.test/x"}},
+                                      CODE2PAIR)
+    r = _by_code(rows, "61247/L")
+    assert r["supplierUrl"] == "https://a.test/x"        # the link is still shown
+    assert r["reviewKey"] == "" and r["reviewStatus"] == ""
 
 
 # --- the endpoint that rewrites the reviewed link --------------------------- #
@@ -162,6 +210,107 @@ def test_a_split_decision_is_never_clobbered(monkeypatch, tmp_path):
                        json={"key": "BETALOV|231", "url": "https://www.huntingshop.eu/nova"})
     assert r.status_code == 409
     assert webapp._load_decisions()["BETALOV|231"]["status"] == "split"
+
+
+def test_a_status_that_is_not_a_pairing_is_never_overwritten(monkeypatch, tmp_path):
+    """`reviewKey` is frozen in the client's ORDERS snapshot, so anything the manager
+    changes in the review tab afterwards (another window, a tab left open) was
+    clobbered by the next ✏️ save: 'unavailable' silently became 'manual' and the eshop
+    stopped getting the Vypredané/stock-0 assertion; 'discontinued' lost its
+    „Predaj skončil" row. Only a real pairing may be rewritten from this tab."""
+    for st in ("unavailable", "discontinued", "bad"):
+        _arm(monkeypatch, tmp_path, {"BETALOV|231": {"status": st, "url": ""}})
+        r = _client().post("/api/order-decision-url",
+                           json={"key": "BETALOV|231", "url": "https://x.test/y"})
+        assert r.status_code == 409, st
+        assert webapp._load_decisions()["BETALOV|231"]["status"] == st, st
+
+
+def test_the_state_rows_of_an_unavailable_product_survive_a_stale_edit(monkeypatch, tmp_path):
+    """The concrete damage: the row that tells Shoptet 'Vypredané, stock 0' simply
+    disappeared once the decision had been flipped to 'manual'."""
+    _arm(monkeypatch, tmp_path, {"BETALOV|231": {"status": "unavailable", "url": ""}})
+    before = import_builder.state_rows(PRODUCTS, webapp._load_decisions(), CODE2PAIR)
+    assert before, "fixture must produce a state row to begin with"
+    _client().post("/api/order-decision-url",
+                   json={"key": "BETALOV|231", "url": "https://x.test/y"})
+    assert import_builder.state_rows(PRODUCTS, webapp._load_decisions(), CODE2PAIR) == before
+
+
+def test_a_product_with_no_decision_is_not_marked_reviewed(monkeypatch, tmp_path):
+    """The manager pressed „↩ Vrátiť" meanwhile: the endpoint used to CREATE a
+    'manual' decision, marking an unreviewed product reviewed behind his back."""
+    _arm(monkeypatch, tmp_path, {})
+    r = _client().post("/api/order-decision-url",
+                       json={"key": "BETALOV|231", "url": "https://x.test/y"})
+    assert r.status_code == 409
+    assert "BETALOV|231" not in webapp._load_decisions()
+
+
+def test_correcting_a_reviewed_link_drops_the_superseded_inline_pairing(monkeypatch, tmp_path):
+    """The nightly can only exclude what the decision covers; the inline value for the
+    same code is dead weight that used to sit there waiting to be shipped. At THIS
+    moment it is provably superseded, so drop it — other codes are untouched."""
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
+    webapp._save_order_pairings({"61247/L": "https://stale.test/inline",
+                                 "61247/XL": "https://stale.test/inline-xl",
+                                 "99999/M": "https://other.test/keep"})
+    r = _client().post("/api/order-decision-url",
+                       json={"key": "BETALOV|231", "url": "https://www.huntingshop.eu/nova"})
+    assert r.status_code == 200
+    left = webapp._load_order_pairings()
+    assert "61247/L" not in left and "61247/XL" not in left
+    assert left == {"99999/M": "https://other.test/keep"}
+
+
+def test_an_absurdly_long_url_is_refused(monkeypatch, tmp_path):
+    """A 300 000-char URL was accepted and grew decisions.json to 300 kB — a store
+    re-read on every /api/orders, whose value also lands in a Shoptet internalNote
+    cell. The same cap guards /api/order-pair and /api/decision."""
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
+    long_url = "https://x.test/" + "a" * 300000
+    assert _client().post("/api/order-decision-url",
+                          json={"key": "BETALOV|231", "url": long_url}).status_code == 400
+    assert webapp._load_decisions()["BETALOV|231"]["url"] == "https://www.huntingshop.eu/stara"
+    assert _client().post("/api/order-pair",
+                          json={"code": "99999/M", "url": long_url}).status_code == 400
+    assert webapp._load_order_pairings() == {}
+    assert _client().post("/api/decision",
+                          json={"key": "BETALOV|231", "status": "manual",
+                                "url": long_url}).status_code == 400
+    assert webapp._load_decisions()["BETALOV|231"]["url"] == "https://www.huntingshop.eu/stara"
+
+
+def test_a_crlf_in_the_url_cannot_forge_a_log_line(monkeypatch, tmp_path, caplog):
+    """`log.info("order-decision-url key=%s url=%s", …)` echoed the raw value, so
+    posting `https://x.test/a\\r\\nSet-Cookie: x` produced a bare `Set-Cookie: x` log
+    line of its own."""
+    _arm(monkeypatch, tmp_path)
+    monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
+    forged = "https://x.test/a\r\nSet-Cookie: x"
+    with caplog.at_level("INFO"):
+        _client().post("/api/order-decision-url", json={"key": "BETALOV|231", "url": forged})
+        _client().post("/api/order-pair", json={"code": "99999/M", "url": forged})
+    for rec in caplog.records:
+        assert "\r" not in rec.getMessage() and "\n" not in rec.getMessage(), rec.getMessage()
+
+
+def test_the_manager_reads_the_endpoints_refusals_in_slovak(monkeypatch, tmp_path):
+    """`postToOrder` surfaces `j.error` verbatim into a Slovak alert, so an English
+    'unknown review key' (the reachable one — a stale tab after a resync pruned the
+    product) reached him as-is."""
+    _arm(monkeypatch, tmp_path)
+    cases = [
+        {"key": "", "url": "https://x.test/y"},
+        {"key": "BETALOV|231", "url": ""},
+        {"key": "BETALOV|231", "url": "javascript:alert(1)"},
+        {"key": "NIEKTO|999", "url": "https://x.test/y"},
+    ]
+    for payload in cases:
+        err = _client().post("/api/order-decision-url", json=payload).get_json()["error"]
+        assert err and not err.isascii(), f"not Slovak: {err!r} for {payload}"
 
 
 def test_the_endpoint_requires_a_login(monkeypatch, tmp_path):

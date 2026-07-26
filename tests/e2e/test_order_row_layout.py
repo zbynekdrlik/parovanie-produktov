@@ -134,6 +134,150 @@ def test_fixing_a_reviewed_link_sticks_and_reaches_the_import(page, toorder_wide
     assert console == [], f"console not clean: {console}"
 
 
+def test_the_url_box_never_collapses_below_a_readable_width(page, toorder_wide_server):
+    """`.to-pair{min-width:260px}` was the only unpinned hunk of #241 — mutating it back
+    to 230px left all nine layout tests green.
+
+    It cannot be pinned by a RENDERED width: the cell's flex-basis is 320px, so on every
+    viewport this fixture can reach the floor never binds. What the floor actually
+    guarantees is what happens WHEN it binds — `.to-pairurl` has its own 110px floor, so
+    a cell floor too small to hold the save button, the gaps AND a readable address
+    field lets the field's own floor win and the URL becomes an unreadable 110px stub
+    (the reported „pole na dodávateľskú URL sa scvrklo"). So assert that relationship on
+    the DECLARED floors, with every component measured off the live page — it survives a
+    label or palette change, unlike the pixel number itself."""
+    console = _console(page)
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row .to-pairurl")
+
+    m = page.evaluate("""() => {
+      const p = document.querySelector('.toorder-row .to-pair');
+      const cs = getComputedStyle(p);
+      const save = p.querySelector('.to-pairsave').getBoundingClientRect().width;
+      return {cellFloor: parseFloat(cs.minWidth),
+              inputFloor: parseFloat(getComputedStyle(p.querySelector('.to-pairurl')).minWidth),
+              save: Math.round(save), gap: parseFloat(cs.columnGap || cs.gap || 0)};
+    }""")
+    room = m["cellFloor"] - m["save"] - 2 * m["gap"]      # left for the address field
+    assert room >= m["inputFloor"] + 35, (
+        f"at its narrowest the cell leaves the URL box only {room}px — barely its own "
+        f"{m['inputFloor']}px floor, i.e. an unreadable stub: {m}")
+
+    assert console == [], f"console not clean: {console}"
+
+
+# --- the .to-badlink branch: an unusable reviewed link is the row that most --- #
+# --- needs repairing, and it had ZERO coverage.                             --- #
+_BAD = '.toorder-row[data-key="20261221|77777/S"]'
+
+
+def test_an_unusable_reviewed_link_is_inert_and_still_repairable(page, toorder_wide_server):
+    """`/api/decision` does not validate the scheme, so a scheme-less URL really does
+    reach the store. It must NOT become an `<a href="">` (that navigates to the page
+    itself and takes every open editor with it), and the ✏️ must still be there —
+    deleting `row.appendChild(pairPencil(bad))` left the whole suite green."""
+    console = _console(page)
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    row = page.locator(_BAD)
+    assert row.locator(".to-badlink").count() == 1, "unusable value must render inert"
+    assert row.locator("a.to-link").count() == 0, "must never be a link"
+    assert row.locator(".to-badlink").get_attribute("title") is not None
+    assert row.locator(".to-pairedit").count() == 1, \
+        "the row that most needs fixing must carry the ✏️"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_the_editor_on_an_unusable_link_prefills_with_the_stored_value(page, toorder_wide_server):
+    """He has to SEE the broken address to spot the typo — an empty box would make him
+    retype the whole URL."""
+    console = _console(page)
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    row = page.locator(_BAD)
+    row.locator(".to-pairedit").click()
+    assert row.locator(".to-pairurl").input_value() == "www.citrade.sk/rukavice-zimne"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_typing_on_an_unusable_link_row_survives_a_repaint(page, toorder_wide_server):
+    """A successful save on ANOTHER row repaints the whole tab (#233 — `saveSupplier`
+    calls `renderToOrder()`), and `_EDITORS.pair.open` is what puts each half-typed
+    editor back. It finds the node to replace through `a.to-link, .to-badlink`;
+    narrowing that selector back to `a.to-link` drops the correction on exactly this
+    row — the one the manager most needs to fix — and left the whole suite green.
+
+    NOTE: a per-line FLAG toggle is deliberately NOT a repaint (it only re-styles the
+    row + the chips), so it cannot be used to provoke this."""
+    console = _console(page)
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    row = page.locator(_BAD)
+    row.locator(".to-pairedit").click()
+    row.locator(".to-pairurl").fill("https://www.citrade.sk/rukavice-ZATIAL-NEULOZENE")
+
+    # assign a supplier on the supplier-less row → saveSupplier() → renderToOrder()
+    n1 = page.locator('.toorder-row[data-key="20261220|N1"]')
+    n1.locator(".to-supinput").fill("CITRADE")
+    with page.expect_response("**/api/order-supplier") as resp:
+        n1.locator(".to-supsave").click()
+    assert resp.value.status == 200
+    page.wait_for_selector('.toorder-row[data-key="20261220|N1"] .to-suptag')
+
+    assert row.locator(".to-pairurl").count() == 1, "the editor was thrown away by the repaint"
+    assert row.locator(".to-pairurl").input_value() == \
+        "https://www.citrade.sk/rukavice-ZATIAL-NEULOZENE"
+
+    assert console == [], f"console not clean: {console}"
+
+
+# --- a split product is not a blind spot ------------------------------------ #
+_SPLIT = '.toorder-row[data-key="20261222|55555/M"]'
+
+
+def test_a_split_product_shows_its_per_size_link(page, toorder_wide_server):
+    """Without variant_links the split branch of `link_row_specs` yields nothing, so the
+    row rendered an EMPTY paste box for a product that IS paired per size — and the save
+    went to order_pairings, which the zip discards while the nightly ships it,
+    permanently clobbering the already-uploaded per-size link."""
+    console = _console(page)
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    row = page.locator(_SPLIT)
+    assert row.locator("a.to-link").get_attribute("href") == \
+        "https://www.orbis.sk/termopodvlecenie-velkost-M"
+    assert row.locator(".to-pair .to-pairurl").count() == 0, \
+        "a per-size paired row must not offer an empty paste box"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_split_row_sends_the_edit_to_the_per_size_panel(page, toorder_wide_server):
+    """A product-wide save on a split row can only 409 (the endpoint refuses to discard
+    the per-size links) or, on the inline path, corrupt one. So the button opens the
+    per-size editor in the review tab instead of a paste box."""
+    console = _console(page)
+    page.goto(toorder_wide_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    row = page.locator(_SPLIT)
+    assert row.locator(".to-pairedit").count() == 0, "no product-wide ✏️ on a split row"
+    assert row.locator(".to-splitedit").count() == 1
+
+    row.locator(".to-splitedit").click()
+    page.wait_for_selector('#list .card[data-key="ORBIS|555"] .splitrow')
+    assert page.locator("#pageTitle").inner_text() == "Kontrola párovania"
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_a_row_outside_the_review_set_keeps_its_inline_paste_box(page, toorder_wide_server):
     """The existing inline-pairing path must be untouched — it writes to order_pairings,
     which is still the right store for a code that has no reviewed decision."""

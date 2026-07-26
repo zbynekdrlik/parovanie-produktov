@@ -209,6 +209,12 @@ class _GHStub:
             {"number": 6, "title": "E2E hotova uloha", "state": "closed", "labels": [],
              "body": "Zadanie hotovej úlohy.", "updated_at": "2026-07-20T10:00:00Z",
              "html_url": "https://example.test/issues/6", "comments": 0, "_comments": []},
+            # created straight ON GitHub, so it has NO description at all — the app
+            # must still let its TITLE be corrected (the ✏️ used to hang off a
+            # non-empty body, so such a request was uneditable forever)
+            {"number": 4, "title": "E2E uloha bez textu", "state": "open", "labels": [],
+             "body": "", "updated_at": "2026-07-18T10:00:00Z",
+             "html_url": "https://example.test/issues/4", "comments": 0, "_comments": []},
             {"number": 5, "title": "E2E toto je pull request", "state": "open", "labels": [],
              "body": "", "updated_at": "2026-07-19T10:00:00Z",
              "html_url": "https://example.test/pull/5", "comments": 0, "_comments": [],
@@ -705,23 +711,53 @@ def toorder_wide_server(tmp_path_factory):
       * 61247/L + 61247/XL belong to review product BETALOV|231 with a `good` decision
         → both rows render the reviewed 🔗 and must both become editable + propagate;
       * 99999/M is outside the review set → keeps the inline paste box (control);
-      * N1 has no supplier → shows the inline supplier-assign editor (extra width).
+      * N1 has no supplier → shows the inline supplier-assign editor (extra width);
+      * 77777/S carries a reviewed decision whose stored URL is NOT http(s)
+        (/api/decision does not validate the scheme, so this reaches the store in
+        practice) → the inert `.to-badlink` slot, which is the row that most needs
+        repairing and had ZERO coverage: deleting its ✏️, and narrowing the editor
+        selector back to `a.to-link`, both left the whole suite green;
+      * 55555/M belongs to a `split` product (#174 — one supplier page PER SIZE) with a
+        per-size link, so it must show that link and route its button to the per-size
+        panel instead of a product-wide save that can only 409 or clobber.
     WEBREVIEW_PRODUCTS points at a nonexistent file so a dev box's real
     data/products.csv can never influence the run (CI has none)."""
     out = tmp_path_factory.mktemp("wr_toorder_wide_out")
     port = _free_port()
     base = f"http://127.0.0.1:{port}"
-    (out / "review_data.json").write_text(json.dumps([{
-        "key": "BETALOV|231", "supplier": "BETALOV",
-        "name": "Polokosela FOREST Single Jersey 180g panska dlhy rukav",
-        "pairCode": "231", "variant_codes": ["61247/L", "61247/XL"],
-        "our_url": "https://www.forestshop.sk/polokosela-forest/",
-        "our_images": [], "candidates": [], "current": {},
-        "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
-    }]), encoding="utf-8")
+    (out / "review_data.json").write_text(json.dumps([
+        {
+            "key": "BETALOV|231", "supplier": "BETALOV",
+            "name": "Polokosela FOREST Single Jersey 180g panska dlhy rukav",
+            "pairCode": "231", "variant_codes": ["61247/L", "61247/XL"],
+            "our_url": "https://www.forestshop.sk/polokosela-forest/",
+            "our_images": [], "candidates": [], "current": {},
+            "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+        },
+        {
+            "key": "CITRADE|777", "supplier": "CITRADE",
+            "name": "Rukavice CITRADE zimne panske",
+            "pairCode": "777", "variant_codes": ["77777/S"],
+            "our_url": "", "our_images": [], "candidates": [], "current": {},
+            "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+        },
+        {
+            "key": "ORBIS|555", "supplier": "ORBIS",
+            "name": "Termopodvlecenie ORBIS po velkostiach",
+            "pairCode": "555", "variant_codes": ["55555/M", "55555/L"],
+            "our_url": "", "our_images": [], "candidates": [], "current": {},
+            "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
+        },
+    ]), encoding="utf-8")
     (out / "decisions.json").write_text(json.dumps({
         "BETALOV|231": {"status": "good",
                         "url": "https://www.huntingshop.eu/polokosela-forest-single-jersey-180g/"},
+        # scheme-less: a real typo that /api/decision accepts → inert .to-badlink slot
+        "CITRADE|777": {"status": "manual", "url": "www.citrade.sk/rukavice-zimne"},
+        "ORBIS|555": {"status": "split", "url": ""},
+    }), encoding="utf-8")
+    (out / "variant_links.json").write_text(json.dumps({
+        "55555/M": "https://www.orbis.sk/termopodvlecenie-velkost-M",
     }), encoding="utf-8")
     (out / "orders_cache.csv").write_text(
         "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
@@ -733,7 +769,11 @@ def toorder_wide_server(tmp_path_factory):
         "20261219;2026-05-22 09:00:00;Vybavuje sa;;"
         "Nohavice ORBIS Trophy zimne zateplene panske;1;99999/M;Velkost: M;ORBIS\r\n"
         "20261220;2026-05-23 09:00:00;Vybavuje sa;;"
-        "Ciapka bez dodavatela s dlhym nazvom produktu;1;N1;Velkost: uni;\r\n",
+        "Ciapka bez dodavatela s dlhym nazvom produktu;1;N1;Velkost: uni;\r\n"
+        "20261221;2026-05-24 09:00:00;Vybavuje sa;;"
+        "Rukavice CITRADE zimne panske;1;77777/S;Velkost: S;CITRADE\r\n"
+        "20261222;2026-05-25 09:00:00;Vybavuje sa;;"
+        "Termopodvlecenie ORBIS po velkostiach;1;55555/M;Velkost: M;ORBIS\r\n",
         encoding="cp1250")
     env = {
         **os.environ,

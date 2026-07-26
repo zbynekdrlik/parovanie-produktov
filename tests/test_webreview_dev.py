@@ -567,6 +567,36 @@ def test_dev_edit_of_a_closed_issue_is_refused(monkeypatch):
     assert sent == {}, "must not PATCH a closed issue"
 
 
+def test_dev_edit_of_a_pull_request_is_refused(monkeypatch):
+    """GitHub's /issues/{n} also covers PULL REQUESTS, so a logged-in user could
+    rewrite a PR's title and body through this endpoint just by typing its number.
+    The list endpoint filters PRs out; this one must too."""
+    pr = dict(_ISSUE_WITH_MARKER, pull_request={"url": "https://api.test/pulls/5"})
+    sent = _arm_edit(monkeypatch, pr)
+    r = _client().post("/api/dev/issue/5/edit", json={"title": "T", "text": "X"})
+    assert r.status_code == 200 and r.get_json()["ok"] is False
+    assert sent == {}, "must not PATCH a pull request"
+
+
+def test_dev_edit_reads_the_issue_once(monkeypatch):
+    """`_do_edit_issue` parsed the same response body three times."""
+    _configure(monkeypatch)
+    calls = {"n": 0}
+
+    class _Counting(_Resp):
+        def json(self):
+            calls["n"] += 1
+            return self._data
+
+    monkeypatch.setattr(webapp.requests, "get",
+                        lambda *a, **k: _Counting(200, dict(_ISSUE_WITH_MARKER)))
+    monkeypatch.setattr(webapp.requests, "patch",
+                        lambda url, json=None, headers=None, timeout=None:
+                        _Resp(200, dict(_ISSUE_WITH_MARKER)))
+    _client().post("/api/dev/issue/5/edit", json={"title": "T", "text": "X"})
+    assert calls["n"] == 1, f"read the GET body {calls['n']}× instead of once"
+
+
 def test_dev_edit_empty_title_rejected_before_github(monkeypatch):
     _configure(monkeypatch)   # requests.get/patch are still the raising guards
     r = _client().post("/api/dev/issue/5/edit", json={"title": "   ", "text": "X"})
