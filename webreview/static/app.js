@@ -17,6 +17,10 @@ let VY_OPEN = new Set();    // ids of výstavy whose detail/edit panel is expand
 let VY_ADD_OPEN = false;    // the „+ Pridať výstavu" form is showing (transient)
 let NOTES = [];             // [{id, text, done, ts}] — 'Poznámky' tab
 let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
+// 'running' | 'blocked' (iná inštancia drží plánovač) | 'off' (WEBREVIEW_NO_SCHEDULER).
+// Bez tohto vyzerá zablokovaná inštancia úplne zdravo: „Ďalší beh" sa číta z uloženého
+// stavu, takže tab ukazuje budúci čas aj keď sa nikdy nič nespustí (review PR #265).
+let SCHEDULER = 'running';
 let POSTA = null;           // /api/posta-uncollected — last run's display data
 let SUPPLIER_STOCK = null;  // /api/supplier-stock — last scraper run's rows (#106)
 let STOCK_FILTER = 'all';   // dodávateľský sklad filter: all | errors | llm | <supplier>
@@ -3295,8 +3299,25 @@ function initIdea() {
 // ---- Automatizácie (#93): tab „Nevyzdvihnuté zásielky" -------------------- //
 // ---- + „Sync zo Shoptetu" (#119, plain status-only tab, no per-item table) - //
 async function loadAutomations() {
-  try { AUTOMATIONS = (await (await fetch('/api/automations')).json()).automations || []; }
-  catch (_) { AUTOMATIONS = []; }
+  try {
+    const j = await (await fetch('/api/automations')).json();
+    AUTOMATIONS = j.automations || [];
+    SCHEDULER = j.scheduler || 'running';
+  } catch (_) { AUTOMATIONS = []; }
+}
+
+// Banner nad obsahom: automatizácie v tejto inštancii nebežia na časovač.
+function renderSchedulerWarning(onAutomationTab) {
+  const box = document.getElementById('schedWarn');
+  if (!box) return;
+  if (!onAutomationTab || SCHEDULER === 'running') { box.hidden = true; box.textContent = ''; return; }
+  box.textContent = SCHEDULER === 'blocked'
+    ? '⚠ Plánovač v tejto inštancii nebeží — drží ho iná spustená inštancia aplikácie. '
+      + 'Automatizácie sa tu samy nespustia (ručné „⚡ Spustiť teraz" funguje). '
+      + 'Časy „Ďalší beh" nižšie sú z uloženého stavu, nie prísľub.'
+    : '⚠ Plánovač je v tejto inštancii vypnutý — automatizácie sa nespustia samé '
+      + '(ručné „⚡ Spustiť teraz" funguje). Toto je náhľadová/testovacia inštancia.';
+  box.hidden = false;
 }
 
 // Admin-set custom nav/automation names (#173) — GET is open to every logged-in
@@ -4621,6 +4642,7 @@ function render() {
   const dev = ACTIVE_TAB === 'dev';
   const auto = posta || shoptetSync || parovaniaEshop || grubeExternalcode || splitLinks || dodavatelskySklad || rizikoVypadku || restockSkladom || stockSkladom || ordersReminder || imageHealth;  // any automation tab
   const plain = nedostupne || vystavy || search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
+  renderSchedulerWarning(auto || vystavy);   // výstavy majú vlastnú automatizáciu v tabe
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
   const prog = document.querySelector('.progress'); if (prog) prog.style.display = (toorder || plain) ? 'none' : '';
   const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || plain) ? 'none' : '';

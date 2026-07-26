@@ -22,7 +22,12 @@ BK="data/backups/state"
 mkdir -p "$BK"
 TS="$(date +%Y%m%d-%H%M%S)"
 
+# Every store app.py writes with `protect=` belongs here (that flag MEANS „losing this
+# costs work nobody can redo"), plus automations.json for the run history. The three
+# uploaded_* write-back states were guarded in code and missing here until the coverage
+# test stopped restating this list and started deriving it from app.py (review PR #265).
 FILES="decisions.json review_data.json ordered_items.json uploaded_pairings.json
+       uploaded_suppliers.json uploaded_externalcodes.json uploaded_variant_links.json
        orders_reminder.json posta_uncollected.json automations.json
        order_pairings.json supplier_assignments.json variant_links.json
        waiting_items.json instock_items.json unavailable_items.json

@@ -144,3 +144,24 @@ def test_posta_preview_button_shows_the_escalation_mail_without_sending(page, au
     modal.locator("#emClose").click()
     page.wait_for_selector("#emModal", state="hidden")
     assert console == [], f"console not clean: {console}"
+
+
+def test_a_preview_instance_says_plainly_that_nothing_will_run_on_a_timer(
+        page, automations_server):
+    """Every e2e fixture server boots with WEBREVIEW_NO_SCHEDULER=1 — exactly the
+    throwaway-preview shape from #262. The tab must SAY so: „Ďalší beh" is read from the
+    persisted state file, so without this banner a blocked or switched-off instance shows
+    healthy future run times while nothing will ever fire (review PR #265)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    warn = page.locator('[data-testid="sched-warn"]')
+    assert warn.is_visible(), "no scheduler banner on an instance with no scheduler"
+    assert "nespustia" in warn.inner_text()
+
+    # …and it is not in the way on an ordinary tab
+    page.get_by_role("button", name="Poznámky").first.click()
+    page.wait_for_timeout(200)
+    assert not warn.is_visible()
+
+    assert console == [], f"console not clean: {console}"

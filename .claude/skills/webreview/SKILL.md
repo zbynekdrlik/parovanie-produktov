@@ -106,7 +106,16 @@ eshopu, žiadny platený 05:00 scrape). Ručné „⚡ Spustiť teraz" v jej UI 
 NEobsluhovaný plán, nie klik prihláseného človeka; preto ju aj tak ZABI, keď dokončíš screenshot. Druhá poistka je v appke: plánovač si berie
 medziprocesový nárok (`data/out/.scheduler.lock`, flock) a druhá inštancia ho nespustí — do logu
 napíše, kto ho drží. Nárok drží otvorený deskriptor, takže pád procesu ho uvoľní sám (žiadny
-zabudnutý pidfile).
+zabudnutý pidfile). V UI to už aj VIDNO: `/api/automations` vracia `scheduler`
+(`running` / `blocked` / `off`) a nad automatizačnými tabmi sa zobrazí žltý banner — bez neho
+vyzerala vypnutá aj zablokovaná inštancia úplne zdravo, lebo „Ďalší beh" sa číta z uloženého
+stavu, nie z bežiaceho časovača.
+
+**POZOR — `WEBREVIEW_NO_SCHEDULER=1` NIE JE izolácia od ostrej služby:** náhľadová inštancia
+zdieľa ten istý `data/out/automations.json`, takže keď v NEJ klikneš „▶ Štart"/„⏹ Stop",
+prepíšeš `enabled`/`next_run` pre OSTRÚ službu — jej plánovač tú automatizáciu odteraz spustí
+(alebo prestane spúšťať). Premenná odoberá časovač TEJTO inštancii, nie jej schopnosť
+naplánovať cudzí. V náhľade preto nič neprepínaj — len sa pozeraj.
 
 Dva taby: **Kontrola párovania** (review kariet) a **Na objednanie** (doobjednanie u dodávateľa).
 

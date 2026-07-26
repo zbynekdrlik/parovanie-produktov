@@ -6521,15 +6521,28 @@ def _claim_scheduler() -> bool:
     return True
 
 
+# "running" | "blocked" (another instance holds the claim) | "off" (WEBREVIEW_NO_SCHEDULER).
+# Reported by /api/automations and rendered as a banner: the boot log line used to be the
+# ONLY trace, while the tab kept showing every enabled automation with a healthy future
+# „Ďalší beh" (it comes from the persisted state file) although nothing would ever fire —
+# a silent business failure of exactly the kind the store guard exists to prevent, one
+# level up (PR #265 review). Starts "off": until _start_scheduler() runs, nothing schedules.
+SCHEDULER_STATE = "off"
+
+
 def _start_scheduler() -> bool:
     """Start the automation runner iff this instance may and can own it."""
+    global SCHEDULER_STATE
     if not _scheduler_enabled():
         log.warning("automation scheduler DISABLED (WEBREVIEW_NO_SCHEDULER) — nothing "
                     "will run on a timer in this instance (manual runs still work)")
+        SCHEDULER_STATE = "off"
         return False
     if not _claim_scheduler():
+        SCHEDULER_STATE = "blocked"
         return False
     RUNNER.start()
+    SCHEDULER_STATE = "running"
     return True
 
 # Valid /api/ui-label rename keys (#173): every NAV key the frontend actually
@@ -6560,7 +6573,9 @@ def api_automations():
     for a in RUNNER.status():
         a["description"] = AUTOMATION_DESCRIPTIONS.get(a["key"], "")
         out.append(a)
-    return jsonify({"automations": out})
+    # `scheduler` — see SCHEDULER_STATE: without it a blocked/switched-off instance is
+    # indistinguishable from a healthy one in the UI.
+    return jsonify({"automations": out, "scheduler": SCHEDULER_STATE})
 
 
 @app.route("/api/ui-labels")
