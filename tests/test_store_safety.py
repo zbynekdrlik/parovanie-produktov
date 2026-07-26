@@ -618,3 +618,42 @@ def test_the_receipt_of_one_thread_is_not_a_receipt_for_another(monkeypatch, tmp
     t.join(timeout=10)
     assert boom == ["refused"], "a foreign thread wiped the store"
     assert webapp._load_decisions() == _two_decisions() and read
+
+
+# --------------------------------------------------------------------------- #
+# `prev=` narrows the receipt — it must never be a way AROUND it
+#
+# `prev = data if prev is None else prev` followed by `rec[0] is prev` never compared
+# `data` to anything at all, so naming a real read authorised writing ANY map over the
+# store: `_save_decisions({}, prev=_load_decisions())` wiped 2831 entries without a
+# complaint. Both callers in the tree are honest rebuilds; the idiom is what re-opens
+# the incident for the next one (PR #265 second review).
+# --------------------------------------------------------------------------- #
+def test_naming_a_read_does_not_authorise_writing_an_unrelated_map(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    d0 = webapp._load_decisions()
+    foreign = {"NOT|FROM|d0": {"status": "manual", "url": "https://x.test/zz"}}
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions(foreign, prev=d0)      # a real read, an unrelated map
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_a_rebuilt_list_that_only_drops_entries_is_still_allowed(monkeypatch, tmp_path):
+    """The výstavy retention sweep keeps a SUBSET of the list it read (#220) — the
+    narrowing must not break it."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
+    v0 = webapp._load_vystavy()
+    kept = [v for v in v0 if v["id"] != "b"]
+    webapp._save_vystavy(kept, prev=v0)
+    assert [v["id"] for v in webapp._load_vystavy()] == ["a", "c"]
+
+
+def test_a_rebuilt_list_that_smuggles_in_a_foreign_entry_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_vystavy([{"id": "a"}, {"id": "b"}, {"id": "c"}])
+    v0 = webapp._load_vystavy()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_vystavy([{"id": "smuggled"}], prev=v0)
+    assert len(webapp._load_vystavy()) == 3
