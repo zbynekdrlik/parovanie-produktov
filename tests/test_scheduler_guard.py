@@ -15,6 +15,7 @@ removes the unattended schedule, which is what the orphan was doing.)
 import ast
 import fcntl
 import os
+import re
 import sys
 
 import pytest
@@ -252,3 +253,37 @@ def test_the_frontend_renders_the_scheduler_warning():
     assert "schedWarn" in js and "SCHEDULER" in js, "app.js never fills the banner in"
     assert "sa nespustia" in js, "the banner must say plainly that nothing will run"
     assert "'dead'" in js or '"dead"' in js, "a died-in-flight scheduler renders no banner"
+
+
+def _js_function_body(js: str, signature: str) -> str:
+    """Source of the function that starts with `signature`, by brace matching."""
+    start = js.index(signature)
+    i = js.index("{", start)
+    depth = 0
+    for j in range(i, len(js)):
+        if js[j] == "{":
+            depth += 1
+        elif js[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[i:j + 1]
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
+
+def test_the_frontend_fails_closed_when_the_automation_state_is_unreadable():
+    """C4 fails closed on the SERVER (503 + a Slovak repair message over a corrupt
+    `automations.json`) — and the tab rendered that answer as the clean first-run state
+    the guard exists to prevent. `loadAutomations` never checked the status, and the
+    global fetch wrapper only handles 401, so `j.automations || []` and
+    `j.scheduler || 'running'` yielded „no automations configured, scheduler healthy"
+    while every reminder mail, pošta escalation and hourly sync was off —
+    `AutomationStateCorrupt`'s own banned outcome, one layer up (third review, I3)."""
+    with open(os.path.join(ROOT, "webreview", "static", "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    body = _js_function_body(js, "async function loadAutomations()")
+    assert re.search(r"\.ok\b|\.status\b", body), \
+        "loadAutomations ignores the HTTP status — a 503 renders as a healthy tab"
+    assert "corrupt" in body, "a fail-closed answer must set a distinct scheduler state"
+    assert re.search(r"\berror\b", body), "the server's repair message is never read"
+    warn = _js_function_body(js, "function renderSchedulerWarning(")
+    assert "corrupt" in warn, "the corrupt state renders no banner"

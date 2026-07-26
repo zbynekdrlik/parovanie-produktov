@@ -165,3 +165,28 @@ def test_a_preview_instance_says_plainly_that_nothing_will_run_on_a_timer(
     assert not warn.is_visible()
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_a_fail_closed_automation_state_shows_the_repair_message_not_a_healthy_tab(
+        page, automations_server):
+    """C4 (#265) makes the SERVER refuse to pretend a corrupt `automations.json` means
+    „no automations configured": /api/automations answers 503 with a Slovak repair
+    message. The tab used to render that as the clean first-run state anyway —
+    `loadAutomations` ignored the status and `j.scheduler || 'running'` HID the banner,
+    so the manager saw a healthy scheduler while every reminder mail, pošta escalation
+    and hourly sync was off. Driven here through a real 503 on the wire (third review).
+    """
+    import json as _json
+    page.route("**/api/automations", lambda route: route.fulfill(
+        status=503, content_type="application/json",
+        body=_json.dumps({"ok": False, "error": (
+            "Stav automatizácií (automations.json) sa nedá prečítať "
+            "(neúplný/poškodený zápis). Súbor NEMAŽ.")}, ensure_ascii=False)))
+
+    page.goto(automations_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.get_by_role("button", name="Nevyzdvihnuté zásielky").click()
+
+    warn = page.locator('[data-testid="sched-warn"]')
+    warn.wait_for(state="visible")
+    assert "NEMAŽ" in warn.inner_text(), warn.inner_text()
