@@ -491,6 +491,10 @@ def _sweep_stale_tmp(*dirs: str, max_age_h: float = 12.0) -> int:
     cutoff = time.time() - max_age_h * 3600
     removed = 0
     for d in dirs:
+        # The one destructive operation here — and the only one in the module that used
+        # to skip the pytest net (PR #265 third review, I4). A test run with an un-pinned
+        # WEBREVIEW_OUT is the incident's own configuration, and this unlinks at IMPORT.
+        _refuse_live_data_under_pytest(d)
         try:
             names = os.listdir(d)
         except OSError as e:  # noqa: BLE001 — housekeeping, never a reason to fail the boot
@@ -1722,7 +1726,9 @@ def _sweep_stale_tmp_at_startup() -> int:
 
 try:
     _sweep_stale_tmp_at_startup()
-except OSError as e:  # noqa: BLE001 — housekeeping; never a reason for the service not to start
+except (OSError, StoreWipeRefused) as e:  # noqa: BLE001 — housekeeping; never a reason for the service not to start
+    # StoreWipeRefused: the pytest net now guards the sweep too, and a test importing the
+    # app with an un-pinned WEBREVIEW_OUT must get a skipped sweep, not a dead import.
     log.error("startup temp-file sweep skipped (%r) — the app keeps serving", e)
 
 
