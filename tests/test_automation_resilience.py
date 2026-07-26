@@ -141,3 +141,48 @@ def test_the_service_still_boots_with_an_unreadable_store(tmp_path, broken):
                        capture_output=True, timeout=120)
     assert p.returncode == 0, p.stderr.decode()[-3000:]
     assert b"BOOTED" in p.stdout, p.stderr.decode()[-3000:]
+
+
+@pytest.mark.parametrize("broken", ["decisions.json", "users.json"])
+def test_the_service_still_boots_with_a_TRUNCATED_store(tmp_path, broken):
+    """The unreadable-store boot test above uses a DIRECTORY in the store's place —
+    an OSError. The corruption the fsync work exists to make less likely is a write
+    cut mid-JSON or mid-UTF-8, which is a ValueError, and neither was caught: a
+    truncated users.json took `_bootstrap_admin` (and therefore the whole import)
+    down with a JSONDecodeError — no web UI, systemd restart loop (PR #265 second
+    review, C2)."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / broken).write_text('{"admin@test.local": {"pw_ha', encoding="utf-8")
+    code = ("import os, sys; sys.path.insert(0, os.path.join(sys.argv[1], 'webreview')); "
+            "import app; print('BOOTED', app.__version__)")
+    env = dict(os.environ,
+               WEBREVIEW_OUT=str(out),
+               WEBREVIEW_PRODUCTS=str(tmp_path / "nonexistent.csv"),
+               WEBREVIEW_NO_SCHEDULER="1",
+               ADMIN_EMAIL="admin@test.local", ADMIN_PW="dost-dlhe-heslo",
+               PYTHONPATH=os.path.join(ROOT, "src"))
+    p = subprocess.run([sys.executable, "-c", code, ROOT], env=env,
+                       capture_output=True, timeout=120)
+    assert p.returncode == 0, p.stderr.decode()[-3000:]
+    assert b"BOOTED" in p.stdout, p.stderr.decode()[-3000:]
+    # and the corrupt store is still there for repair, never replaced
+    assert (out / broken).read_text(encoding="utf-8") == '{"admin@test.local": {"pw_ha'
+
+
+def test_a_corrupt_user_store_answers_503_with_something_to_fix(tmp_path, monkeypatch):
+    """A per-request 500 reads as a transient glitch and invites another click; an
+    unreadable account list is neither transient nor clickable-away (PR #265, C2)."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(ROOT, "webreview"))
+    import app as webapp
+
+    broken = tmp_path / "users.json"
+    broken.write_text('{"someone@test.local": {"pw_ha', encoding="utf-8")
+    monkeypatch.setattr(webapp, "USERS", str(broken))
+    c = webapp.app.test_client()
+    with c.session_transaction() as s:
+        s["user"] = "someone@test.local"
+    r = c.get("/api/orders")
+    assert r.status_code == 503, r.status_code
+    assert r.get_json()["ok"] is False and r.get_json()["error"]
