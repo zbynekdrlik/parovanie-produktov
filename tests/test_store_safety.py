@@ -331,6 +331,7 @@ def test_growing_a_store_never_needs_a_read(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     webapp._save_decisions(_two_decisions())
     webapp._store_reads.pop(os.fspath(webapp.DECISIONS), None)
+    webapp._thread_ring(os.fspath(webapp.DECISIONS)).clear()   # both receipt rings
     bigger = dict(_two_decisions(), **{"S|3": {"status": "good", "url": "https://x.test/c"}})
     webapp._save_decisions(bigger)
     assert len(webapp._load_decisions()) == 3
