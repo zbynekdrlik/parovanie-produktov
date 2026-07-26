@@ -1238,7 +1238,13 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
     key = '<orderCode>|<itemCode>'. Pure (no network) -> unit-testable."""
     text = (orders_csv.decode("cp1250", errors="replace")
             if isinstance(orders_csv, bytes) else orders_csv)
-    code2url = {r[0]: r[2] for r in import_builder.link_rows(products, decisions, code2pair)}
+    # ONE pass gives both the URL and the decision that produced it: the row must be
+    # able to say WHICH reviewed decision owns its link, so the tab can correct that
+    # decision in place instead of writing to a parallel store the eshop write-back
+    # would discard (#242 — `order_pairing_rows` excludes codes already covered here).
+    specs = list(import_builder.link_row_specs(products, decisions, code2pair))
+    code2url = {s[0]: s[2] for s in specs}
+    code2owner = {s[0]: (s[3], s[4]) for s in specs}
     rows = []
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
         if (r.get("statusName") or "").strip() != "Vybavuje sa":
@@ -1247,6 +1253,7 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
         if not code or re.match(r"^(SHIPPING|BILLING)", code, re.I):
             continue
         order = (r.get("code") or "").strip()
+        owner_key, owner_status = code2owner.get(code, ("", ""))
         rows.append({
             "key": f"{order}|{code}",
             "orderCode": order,
@@ -1257,6 +1264,11 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
             "supplier": (r.get("itemSupplier") or "").strip(),
             "name": (r.get("itemName") or "").strip(),
             "supplierUrl": code2url.get(code, ""),
+            # #242 — the reviewed decision behind `supplierUrl` (empty for a code with
+            # no decision, which keeps the inline-pairing path exactly as it was). The
+            # tab uses it to route a correction at the value it is actually showing.
+            "reviewKey": owner_key or "",
+            "reviewStatus": owner_status or "",
             # #101 — the shop's own internal note about this order ("Poznámka e-shopu"
             # in the admin). Per-ORDER value (same on every line of the order); shown
             # read-only on the row as context next to our editable comment.
@@ -2860,6 +2872,51 @@ def api_order_pair():
             d.pop(code, None)
         _save_order_pairings(d)
     log.info("order-pair code=%s url=%s", code, url)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/order-decision-url", methods=["POST"])
+def api_order_decision_url():
+    """#242 — correct the reorder URL of a REVIEWED pairing straight from the
+    „Na objednanie" tab.
+
+    A row whose link comes from a review decision used to be read-only there, so the
+    only way to fix a wrong link was to find the product in the review tab and pair it
+    again. Writing the correction into `order_pairings` instead would have been a
+    silent no-op: the decision outranks it both in the row render and in the eshop
+    write-back (`order_pairing_rows(..., exclude_codes=…)`). So this rewrites THE
+    DECISION — the value the row shows and the import actually ships.
+
+    'manual' (not 'good'): the review card renders a 'good' decision from
+    `ai_chosen_url`, so keeping 'good' would show the OLD link straight back.
+    Guards mirror /api/order-pair — the value becomes an href AND an eshop
+    internalNote cell."""
+    body = request.get_json(force=True, silent=True) or {}
+    key = str(body.get("key") or "").strip()
+    url = str(body.get("url") or "").strip()
+    if not key:
+        return jsonify({"ok": False, "error": "missing key"}), 400
+    # Clearing a pairing is a review-tab decision ('↩ Vrátiť'), not a side effect of an
+    # empty save here — an empty url would drop the product out of the import silently.
+    if not url:
+        return jsonify({"ok": False, "error": "url is required"}), 400
+    if not re.match(r"^https?://", url):
+        return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+    if not any(p.get("key") == key for p in PRODUCTS):
+        # a decision whose key is not a live review product is pruned away at the next
+        # start — accepting it would throw the manager's correction away later
+        return jsonify({"ok": False, "error": "unknown review key"}), 404
+    with _lock:
+        d = _load_decisions()
+        if (d.get(key) or {}).get("status") == "split":
+            # a split product carries a DIFFERENT URL per size (#174); one product-wide
+            # link would discard every per-size link it holds
+            return jsonify({"ok": False,
+                            "error": "produkt je rozdelený na veľkosti — oprav link "
+                                     "pri konkrétnej veľkosti v párovacom tabe"}), 409
+        d[key] = {"status": "manual", "url": url}
+        _save_decisions(d)
+    log.info("order-decision-url key=%s url=%s", key, url)
     return jsonify({"ok": True})
 
 

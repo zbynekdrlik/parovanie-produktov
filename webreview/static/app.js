@@ -1194,13 +1194,42 @@ function initNdModal() {
   if (send) send.onclick = ndSendNow;
 }
 
+// The pairing URL this row is actually SHOWING. A reviewed decision outranks an inline
+// pairing BOTH on the row and in the eshop write-back (`order_pairing_rows` skips codes
+// already covered by `link_rows`), so the editor must prefill, compare and save against
+// the very same value — otherwise a correction is accepted and silently discarded (#242).
+const rowPairUrl = (o) => (o.reviewKey ? o.supplierUrl : o.pairUrl) || '';
+
 // Inline pairing: paste the supplier reorder URL straight onto an order line.
-// Persists per forestshop code (covers items outside the review dataset too).
+// Persists per forestshop code (covers items outside the review dataset too), or — when
+// the link came from a reviewed decision — rewrites THAT decision (#242).
 async function savePairUrl(o, url) {
   if (url && !/^https?:\/\//.test(url)) {
     // #214 — the guard used to drop a typo'd URL on the floor with no explanation
     alert('⚠️ Zadaj platnú adresu začínajúcu http:// alebo https:// — takto sa uložiť nedá.');
     return false;
+  }
+  if (o.reviewKey) {
+    if (!url) {
+      // clearing a reviewed pairing is a review-tab decision ('↩ Vrátiť'); an empty save
+      // here would look like it un-paired the product while nothing actually changed
+      alert('⚠️ Tento produkt je napárovaný v revízii — prázdnou hodnotou sa párovanie '
+            + 'nezruší. Zadaj opravenú adresu, alebo zruš párovanie v tabe „Kontrola párovania".');
+      return false;
+    }
+    const derr = await postToOrder('/api/order-decision-url', { key: o.reviewKey, url });
+    if (derr) {
+      toOrderSaveFailed('Párovacia URL', derr, toOrderPartLabel('kód', o.itemCode), url);
+      return false;
+    }
+    // ONE decision covers EVERY variant code of the product, so every row it feeds must
+    // follow — same reason as the per-product mirror below (#204): without it a sibling
+    // size keeps showing the old link until the next reload.
+    for (const x of ORDERS) {
+      if (x.reviewKey === o.reviewKey) { x.supplierUrl = url; x.reviewStatus = 'manual'; }
+    }
+    renderToOrder();
+    return true;
   }
   const err = await postToOrder('/api/order-pair', { code: o.itemCode, url });
   if (err) { toOrderSaveFailed('Párovacia URL', err, toOrderPartLabel('kód', o.itemCode), url); return false; }
@@ -1219,8 +1248,9 @@ function pairEditor(o, focus) {
   pair.dataset.editor = 'pair';        // so a repaint can carry unsaved typing over
   pair.appendChild(el('span', 'to-pcode', escapeHtml(o.itemCode || '')));
   const inp = el('input', 'to-pairurl'); inp.type = 'url';
-  inp.placeholder = o.pairUrl ? 'upraviť párovaciu URL…' : 'vlož párovaciu URL dodávateľa…';
-  inp.value = o.pairUrl || '';
+  const cur = rowPairUrl(o);
+  inp.placeholder = cur ? 'upraviť párovaciu URL…' : 'vlož párovaciu URL dodávateľa…';
+  inp.value = cur;
   const save = el('button', 'to-pairsave', '💾 Spárovať');
   save.title = 'Uložiť párovaciu URL — objaví sa ako odkaz a pôjde do importu';
   const doSave = () => commitEditor(pair, () => savePairUrl(o, inp.value.trim()));
@@ -1596,26 +1626,36 @@ function renderOrderRow(o, totals) {
   // editor — and the half-typed work in it — with it. The value is never echoed back
   // into a tooltip either.
   const supHref = safeHttpUrl(o.supplierUrl), pairHref = safeHttpUrl(o.pairUrl);
+  // #242 — EVERY pairing this row can show gets the same ✏️. A reviewed link used to
+  // be read-only here, so a wrong link ('mám to tam zle') meant hunting the product
+  // down in the review tab and pairing it from scratch; the save routes itself to
+  // whichever store owns the value (savePairUrl), so the fix cannot be a no-op.
+  const pairPencil = (node) => {
+    const edit = el('button', 'to-pairedit', '✏️');
+    edit.title = 'Zmeniť / opraviť párovaciu URL';
+    edit.onclick = () => openRowEditor(node, pairEditor(o, true), edit);
+    return edit;
+  };
   if (supHref) {
-    // reviewed decision link — authoritative, read-only (mení sa v párovacom tabe)
+    // reviewed decision link — correcting it here rewrites that decision itself
     const a = el('a', 'to-link'); a.href = supHref; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
+    row.appendChild(pairPencil(a));
   } else if (o.supplierUrl) {
-    // read-only slot with an unusable value — say so instead of faking a link
+    // slot with an unusable value — say so instead of faking a link, and let it be
+    // repaired right here (this is the row that most needs fixing)
     const bad = el('span', 'to-badlink', '🔗 ' + escapeHtml(o.itemCode || 'link'));
-    bad.title = 'Uložená adresa nie je platný http(s) odkaz — oprav ju v párovacom tabe';
+    bad.title = 'Uložená adresa nie je platný http(s) odkaz — oprav ju cez ✏️';
     row.appendChild(bad);
+    row.appendChild(pairPencil(bad));
   } else if (pairHref) {
     // inline-napárované → svieti rovnako ako ostatné napárované (🔗 odkaz) +
     // malá ✏️ na opravu, ak dal zlú URL
     const a = el('a', 'to-link'); a.href = pairHref; a.target = '_blank'; a.rel = 'noopener';
     a.textContent = '🔗 ' + (o.itemCode || 'link');
     row.appendChild(a);
-    const edit = el('button', 'to-pairedit', '✏️');
-    edit.title = 'Zmeniť / opraviť párovaciu URL';
-    edit.onclick = () => openRowEditor(a, pairEditor(o, true), edit);
-    row.appendChild(edit);
+    row.appendChild(pairPencil(a));
   } else {
     // an unusable inline pairing falls through to the paste box (its value pre-filled,
     // inert in an input) so the manager can repair it right where he sees it
@@ -1948,10 +1988,13 @@ function renderOrderFilters(idx) {
 const _EDITORS = Object.assign(Object.create(null), {
   pair: {
     input: '.to-pairurl',
-    stored: (o) => o.pairUrl || '',
+    stored: rowPairUrl,          // reviewed decision or inline pairing — whichever shows
     same: (a, b) => a.trim() === b.trim(),
     open: (o, row) => {
-      const a = row.querySelector('a.to-link'), edit = row.querySelector('.to-pairedit');
+      // a reviewed link that is not usable renders as an inert .to-badlink, and that
+      // row is exactly the one the manager needs to repair — take it too (#242)
+      const a = row.querySelector('a.to-link, .to-badlink');
+      const edit = row.querySelector('.to-pairedit');
       if (!a || !edit) return null;
       const ed = pairEditor(o, false); a.replaceWith(ed); edit.remove(); return ed;
     },
