@@ -1644,6 +1644,9 @@ def api_images():
         log.warning("image fetch failed url=%s: %r", url, e)
         title, imgs, price, avail = "", [], "", ""
     data = {"title": title, "images": imgs, "price": price, "availability": avail}
+    # the dir is created at boot, but OUT can be repointed afterwards (#261 lazy
+    # paths) — a missing imgcache must degrade to "no cache", never 500 the request
+    os.makedirs(IMGCACHE, exist_ok=True)
     with open(cache, "w", encoding="utf-8") as f:
         json.dump(data, f)
     return jsonify(data)
