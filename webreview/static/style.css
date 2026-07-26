@@ -298,9 +298,9 @@ body[data-theme=dark] .toorder-row .to-link{color:#60a5fa}
 .toorder-row .to-pairsave{flex:0 0 auto;background:#713AC7;color:#fff;border:0;border-radius:7px;
   padding:6px 11px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}
 .toorder-row .to-pairsave:hover{background:#6234AB}
-.toorder-row .to-pairedit,.toorder-row .to-supedit{background:transparent;border:0;cursor:pointer;
+.toorder-row .to-pairedit,.toorder-row .to-splitedit,.toorder-row .to-supedit{background:transparent;border:0;cursor:pointer;
   font-size:13px;padding:2px 4px;flex:0 0 auto;opacity:.55}
-.toorder-row .to-pairedit:hover,.toorder-row .to-supedit:hover{opacity:1}
+.toorder-row .to-pairedit:hover,.toorder-row .to-splitedit:hover,.toorder-row .to-supedit:hover{opacity:1}
 .toorder-row .to-supplier{display:flex;align-items:center;gap:6px;flex:0 0 auto}
 .toorder-row .to-supinput{width:140px;padding:6px 8px;border:1px solid var(--border);
   border-radius:7px;font-size:12px;background:var(--input-bg);color:var(--text)}

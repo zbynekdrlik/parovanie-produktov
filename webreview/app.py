@@ -1229,7 +1229,7 @@ def _cred(key: str):
     return None
 
 
-def build_to_order_rows(orders_csv, products, decisions, code2pair):
+def build_to_order_rows(orders_csv, products, decisions, code2pair, variant_links=None):
     """Forestshop orders.csv (cp1250 bytes or str) → to-order rows.
 
     Keeps statusName=='Vybavuje sa', drops SHIPPING*/BILLING* pseudo-items, and joins
@@ -1242,9 +1242,17 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
     # able to say WHICH reviewed decision owns its link, so the tab can correct that
     # decision in place instead of writing to a parallel store the eshop write-back
     # would discard (#242 — `order_pairing_rows` excludes codes already covered here).
-    specs = list(import_builder.link_row_specs(products, decisions, code2pair))
+    # `variant_links` is NOT optional in practice: without it the `split` branch (#174)
+    # yields nothing, so a product paired PER SIZE renders as unpaired — an empty paste
+    # box whose save goes to order_pairings, which the zip discards and the nightly
+    # ships, permanently clobbering an already-uploaded per-size link.
+    specs = list(import_builder.link_row_specs(products, decisions, code2pair,
+                                               variant_links or {}))
     code2url = {s[0]: s[2] for s in specs}
-    code2owner = {s[0]: (s[3], s[4]) for s in specs}
+    # A spec whose review key is EMPTY owns nothing the tab can edit: `savePairUrl`
+    # routes on `reviewKey`, so advertising a status without a key would send the
+    # correction to order_pairings — the silent no-op #242 exists to remove.
+    code2owner = {s[0]: (s[3], s[4]) for s in specs if s[3]}
     rows = []
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
         if (r.get("statusName") or "").strip() != "Vybavuje sa":
@@ -1253,7 +1261,7 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
         if not code or re.match(r"^(SHIPPING|BILLING)", code, re.I):
             continue
         order = (r.get("code") or "").strip()
-        owner_key, owner_status = code2owner.get(code, ("", ""))
+        owner_key, owner_status = code2owner[code] if code in code2owner else ("", "")
         rows.append({
             "key": f"{order}|{code}",
             "orderCode": order,
@@ -1267,8 +1275,8 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair):
             # #242 — the reviewed decision behind `supplierUrl` (empty for a code with
             # no decision, which keeps the inline-pairing path exactly as it was). The
             # tab uses it to route a correction at the value it is actually showing.
-            "reviewKey": owner_key or "",
-            "reviewStatus": owner_status or "",
+            "reviewKey": owner_key,
+            "reviewStatus": owner_status,
             # #101 — the shop's own internal note about this order ("Poznámka e-shopu"
             # in the admin). Per-ORDER value (same on every line of the order); shown
             # read-only on the row as context next to our editable comment.
@@ -1487,6 +1495,11 @@ def api_decision():
     body = request.get_json(force=True)
     key = str(body.get("key"))
     status = body.get("status")
+    # same cap as /api/order-pair and /api/order-decision-url — this value is re-read
+    # on every /api/orders and ends up in a Shoptet internalNote cell
+    if len(str(body.get("url") or "")) > URL_MAX:
+        return jsonify({"ok": False,
+                        "error": f"adresa je príliš dlhá (max {URL_MAX} znakov)"}), 400
     with _lock:
         d = _load_decisions()
         if status in (None, "", "undo"):          # undo / un-decide
@@ -1508,6 +1521,19 @@ _FORMULA_LEAD = ("=", "+", "-", "@", "\t", "\r")
 def _csv_safe(value):
     s = str(value)
     return "'" + s if s[:1] in _FORMULA_LEAD else s
+
+
+# A supplier product page is a few hundred characters at worst. Every store that keeps
+# one is re-read on every /api/orders AND its value ends up in a Shoptet internalNote
+# cell, so an unbounded URL is both a store-bloat and an import hazard: 300 kB of 'a'
+# was accepted and written straight into decisions.json.
+URL_MAX = 2000
+
+
+def _log_safe(value) -> str:
+    """CR/LF out of any free-form value before it reaches a log line — otherwise a URL
+    carrying `\\r\\nSet-Cookie: x` forges a log record of its own (log-line injection)."""
+    return str(value).replace("\r", "\\r").replace("\n", "\\n")
 
 
 def _csv_response(header, rows, filename):
@@ -2723,7 +2749,10 @@ def _do_edit_issue(number: int, title: str, text: str, author: str = ""):
     vykašlal"). `gh issue edit` cannot do this on this repo (it goes through the
     deprecated classic-Projects GraphQL and fails), so this is a plain REST PATCH.
     A closed issue is refused — reopening work by editing it would be invisible to
-    whoever already acted on it; a comment is the right tool there."""
+    whoever already acted on it; a comment is the right tool there. So is a PULL
+    REQUEST: GitHub's /issues/{n} also serves PRs, so without this check any logged-in
+    user could rewrite a PR's title and body just by typing its number (the list
+    endpoint already filters PRs out — this one has to as well)."""
     token, repo = _gh_config()
     if not token:
         return {"ok": False, "available": False,
@@ -2735,7 +2764,11 @@ def _do_edit_issue(number: int, title: str, text: str, author: str = ""):
             log.warning("gh edit issue (read): HTTP %s for %s#%s",
                         rg.status_code, repo, number)
             return {"ok": False, "error": f"GitHub API vrátil {rg.status_code}"}, 200
-        cur = rg.json() if isinstance(rg.json(), dict) else {}
+        body_json = rg.json()                       # parse ONCE
+        cur = body_json if isinstance(body_json, dict) else {}
+        if cur.get("pull_request"):
+            log.warning("gh edit issue: %s#%s is a pull request — refused", repo, number)
+            return {"ok": False, "error": "toto číslo nepatrí úlohe"}, 200
         if (cur.get("state") or "open") != "open":
             return {"ok": False,
                     "error": "úloha je už uzavretá — doplň ju radšej detailom"}, 200
@@ -2968,6 +3001,9 @@ def api_order_pair():
     # the import's internalNote; blocks javascript:/data: and malformed 'httpfoo'.
     if url and not re.match(r"^https?://", url):
         return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+    if len(url) > URL_MAX:
+        return jsonify({"ok": False,
+                        "error": f"adresa je príliš dlhá (max {URL_MAX} znakov)"}), 400
     with _lock:
         d = _load_order_pairings()
         if url:
@@ -2975,7 +3011,7 @@ def api_order_pair():
         else:
             d.pop(code, None)
         _save_order_pairings(d)
-    log.info("order-pair code=%s url=%s", code, url)
+    log.info("order-pair code=%s url=%s", _log_safe(code), _log_safe(url))
     return jsonify({"ok": True})
 
 
@@ -2994,33 +3030,70 @@ def api_order_decision_url():
     'manual' (not 'good'): the review card renders a 'good' decision from
     `ai_chosen_url`, so keeping 'good' would show the OLD link straight back.
     Guards mirror /api/order-pair — the value becomes an href AND an eshop
-    internalNote cell."""
+    internalNote cell.
+
+    Every refusal is worded in SLOVAK: `postToOrder` surfaces `error` verbatim into
+    the manager's alert, and the reachable one (a stale tab whose product a resync has
+    pruned) used to reach him as 'unknown review key'."""
     body = request.get_json(force=True, silent=True) or {}
     key = str(body.get("key") or "").strip()
     url = str(body.get("url") or "").strip()
     if not key:
-        return jsonify({"ok": False, "error": "missing key"}), 400
+        return jsonify({"ok": False, "error": "chýba kľúč produktu"}), 400
     # Clearing a pairing is a review-tab decision ('↩ Vrátiť'), not a side effect of an
     # empty save here — an empty url would drop the product out of the import silently.
     if not url:
-        return jsonify({"ok": False, "error": "url is required"}), 400
+        return jsonify({"ok": False, "error": "zadaj párovaciu adresu"}), 400
     if not re.match(r"^https?://", url):
-        return jsonify({"ok": False, "error": "url must start with http(s)://"}), 400
+        return jsonify({"ok": False,
+                        "error": "adresa musí začínať http:// alebo https://"}), 400
+    if len(url) > URL_MAX:
+        return jsonify({"ok": False,
+                        "error": f"adresa je príliš dlhá (max {URL_MAX} znakov)"}), 400
     if not any(p.get("key") == key for p in PRODUCTS):
         # a decision whose key is not a live review product is pruned away at the next
         # start — accepting it would throw the manager's correction away later
-        return jsonify({"ok": False, "error": "unknown review key"}), 404
+        return jsonify({"ok": False,
+                        "error": "tento produkt už nie je v revízii — obnov stránku"}), 404
     with _lock:
         d = _load_decisions()
-        if (d.get(key) or {}).get("status") == "split":
+        cur = d.get(key) or {}
+        st = cur.get("status")
+        # `reviewKey` is frozen in the client's ORDERS snapshot, so by the time this
+        # arrives the decision may be something else entirely — anything the manager
+        # changed in the review tab meanwhile (another window, a tab left open).
+        # Only a real product-wide PAIRING may be rewritten from here; every other
+        # status was silently overwritten with 'manual', which threw away exactly the
+        # assertion the eshop needs (Vypredané+stock 0 for 'unavailable', „Predaj
+        # skončil" for 'discontinued') — and a MISSING decision was CREATED, marking
+        # an unreviewed product reviewed behind his back.
+        if st == "split":
             # a split product carries a DIFFERENT URL per size (#174); one product-wide
             # link would discard every per-size link it holds
             return jsonify({"ok": False,
                             "error": "produkt je rozdelený na veľkosti — oprav link "
                                      "pri konkrétnej veľkosti v párovacom tabe"}), 409
+        if st not in ("good", "manual"):
+            return jsonify({"ok": False,
+                            "error": "stav produktu sa medzitým zmenil v revízii — "
+                                     "obnov stránku a pozri sa naň tam"}), 409
         d[key] = {"status": "manual", "url": url}
         _save_decisions(d)
-    log.info("order-decision-url key=%s url=%s", key, url)
+        # The decision now provably outranks any inline pairing for the SAME codes
+        # (link_rows covers them, so order_pairing_rows excludes them for good). Left
+        # behind, that stale value just sits in the store waiting for a night when the
+        # exclusion slips — drop it at the one moment it is certainly superseded.
+        codes = [c for p in PRODUCTS if p.get("key") == key
+                 for c in (p.get("variant_codes") or [])]
+        pairings = _load_order_pairings()
+        dropped = [c for c in codes if c in pairings]
+        if dropped:
+            for c in dropped:
+                pairings.pop(c, None)
+            _save_order_pairings(pairings)
+            log.info("order-decision-url dropped superseded inline pairings: %s",
+                     _log_safe(dropped))
+    log.info("order-decision-url key=%s url=%s", _log_safe(key), _log_safe(url))
     return jsonify({"ok": True})
 
 
@@ -3149,7 +3222,8 @@ def api_orders():
     except Exception as e:  # noqa: BLE001 — degrade to empty list, log the cause
         log.warning("orders fetch failed: %r", e)
         return jsonify({"orders": [], "error": str(e)})
-    rows = build_to_order_rows(csv_bytes, PRODUCTS, _load_decisions(), CODE2PAIR)
+    rows = build_to_order_rows(csv_bytes, PRODUCTS, _load_decisions(), CODE2PAIR,
+                               _load_variant_links())
     ordered = _load_ordered()
     waiting = _load_waiting()
     instock = _load_instock()
@@ -3486,20 +3560,28 @@ def _do_upload_pairings(dry):
                 **_pairing_summary(uploaded)}, 200
 
     rows = import_builder.link_rows(PRODUCTS, {k: dec[k] for k in new_keys}, CODE2PAIR)
+    # The exclusion is about OWNERSHIP, not about what this run happens to ship: a
+    # reviewed decision outranks an inline pairing permanently, so it must be built
+    # from ALL decisions exactly as the manual zip does (app.py /api/import), not from
+    # THIS run's new keys. Built from `rows` it went EMPTY the night after a correction
+    # shipped (the decision is no longer "new"), the stale `order_pairings[code]` was
+    # emitted, and the eshop's internalNote was reverted — permanently, because the
+    # code is then recorded uploaded and never retried, while the tab, /api/orders and
+    # /api/import all kept showing the corrected link.
+    owned_codes = {r[0] for r in import_builder.link_rows(
+        PRODUCTS, dec, CODE2PAIR, _load_variant_links())}
     order_rows = import_builder.order_pairing_rows(
         {c: order_pairings[c] for c in new_order_codes}, CODE2PAIR,
-        exclude_codes={r[0] for r in rows})
+        exclude_codes=owned_codes)
     all_rows = rows + order_rows
     if not all_rows:
         log.warning("n8n pairings: %d new keys + %d new order codes but 0 import rows",
                     len(new_keys), len(new_order_codes))
         # paired but un-uploadable — every decision key has 0 variant codes (blocked
-        # below the fold). order_pairings can never contribute to this branch on its
-        # own: order_pairing_rows only excludes a code via THIS run's decision rows
-        # (`rows`), and `rows` is empty here (exclude_codes=set()), so any non-empty
-        # new_order_codes would always have produced order_rows. order_blocked is
-        # therefore always 0 here — kept explicit (not hardcoded) so this stays
-        # correct if that invariant ever changes.
+        # below the fold). order_pairings CAN reach this branch on its own: a code
+        # already owned by a reviewed decision (uploaded on an earlier night, so not
+        # in `rows`) is excluded here too, which is precisely the point — it stays
+        # "new" and blocked forever rather than reverting the eshop.
         return {"ok": True, "count": 0, "products": products,
                 "order_count": 0, "order_blocked": len(new_order_codes),
                 "message": "no import rows", "blocked": len(new_keys),
@@ -3532,8 +3614,9 @@ def _do_upload_pairings(dry):
                     len(blocked_keys), len(new_keys), blocked_keys[:10])
 
     # An order_pairings code gets no row only when order_pairing_rows excluded it —
-    # i.e. its code is already covered by a reviewed decision this run. It stays
-    # "new" (never marked order:<code>) so it's retried while that stays true.
+    # i.e. its code is owned by a reviewed decision (from ANY night, not just this
+    # one). It stays "new" (never marked order:<code>) so it's retried if the
+    # decision ever goes away.
     order_written_codes = {r[0] for r in order_rows}
     blocked_order_codes = [c for c in new_order_codes if c not in order_written_codes]
     if blocked_order_codes:

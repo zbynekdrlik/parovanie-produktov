@@ -263,15 +263,17 @@ def link_rows(products, decisions, code2pair, variant_links=None):
 
 
 def link_row_specs(products, decisions, code2pair, variant_links=None):
-    """The ONE loop behind link_rows() and link_owners(): yields
+    """The ONE loop behind link_rows() and the to-order tab's owner map: yields
     `(code, pairCode, url, review_key, decision_status)` per emitted variant.
 
     Kept as a single generator on purpose — the "each code appears ONCE, first
     pairing wins" dedup decides BOTH what the eshop receives and which decision owns
     a given code, and a second copy of those rules would eventually disagree with
-    this one. `link_owners` is what lets the „Na objednanie" tab edit the decision
+    this one. Naming the owner is what lets the „Na objednanie" tab edit the decision
     that actually produced the link it shows (#242) instead of a parallel store the
-    write-back would discard."""
+    write-back would discard — `build_to_order_rows` consumes this generator directly
+    (a separate `link_owners` wrapper existed and was never called by production
+    code, so it is gone: dead code cannot guard anything)."""
     variant_links = variant_links or {}
     seen = set()
     for p in products:
@@ -300,14 +302,6 @@ def link_row_specs(products, decisions, code2pair, variant_links=None):
                     continue
                 seen.add(c)
                 yield [c, code2pair.get(c, ""), url, p.get("key"), st]
-
-
-def link_owners(products, decisions, code2pair, variant_links=None):
-    """{variant code: (review key, decision status)} — WHICH reviewed decision owns
-    the reorder link written for this code. Same loop (and therefore the same
-    dedup) as link_rows, so the two can never drift apart."""
-    return {c: (key, st) for c, _pc, _url, key, st
-            in link_row_specs(products, decisions, code2pair, variant_links)}
 
 
 def order_pairing_rows(order_pairings, code2pair, exclude_codes=None):

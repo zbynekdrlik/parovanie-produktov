@@ -346,6 +346,7 @@ function renderCard(p) {
   const s = statusOf(p);
   const exp = expanded.has(p.key);
   const card = el('div', 'card' + (s ? ' ' + s : '') + (p.current && p.current.off ? ' curoff' : ''));
+  card.dataset.key = p.key;      // so another tab can scroll straight to this product
 
   // LEFT — our product
   const left = el('div', 'side left');
@@ -1203,7 +1204,36 @@ const rowPairUrl = (o) => (o.reviewKey ? o.supplierUrl : o.pairUrl) || '';
 // Inline pairing: paste the supplier reorder URL straight onto an order line.
 // Persists per forestshop code (covers items outside the review dataset too), or — when
 // the link came from a reviewed decision — rewrites THAT decision (#242).
+// #174/#242 — a `split` product's reorder link belongs to ONE SIZE, so there is nothing
+// product-wide to save on this row: /api/order-decision-url refuses it (409, it would
+// discard every per-size link), and the inline path is worse — order_pairings would win
+// the write-back for that code and PERMANENTLY clobber an already-uploaded per-size link
+// (`split_links` keeps its own uploaded_variant_links.json idempotency, so it never
+// re-pushes). The ✂️ therefore takes him to the per-size panel instead of offering a save
+// that can only fail or corrupt.
+async function openSplitSizes(o) {
+  const p = (PRODUCTS || []).find(x => x.key === o.reviewKey);
+  if (!p) {
+    alert('⚠️ Tento produkt je rozdelený na veľkosti, ale nenašiel sa v revízii — '
+          + 'otvor tab „Kontrola párovania" a oprav odkaz pri konkrétnej veľkosti.');
+    return;
+  }
+  splitOpen.add(p.key);
+  FILTER = 'good';                       // 'split' sits under the „Dobré / Vybrané" filter
+  localStorage.setItem('filter', FILTER);
+  await switchTab('review');
+  const card = [...document.querySelectorAll('#list .card')]
+    .find(c => c.dataset.key === p.key);
+  if (card) card.scrollIntoView({ block: 'center' });
+}
+
 async function savePairUrl(o, url) {
+  if (o.reviewStatus === 'split') {
+    // unreachable from the row (a split row shows ✂️, not ✏️) — but a stale captured
+    // editor must never turn into a product-wide write on a per-size product
+    await openSplitSizes(o);
+    return false;
+  }
   if (url && !/^https?:\/\//.test(url)) {
     // #214 — the guard used to drop a typo'd URL on the floor with no explanation
     alert('⚠️ Zadaj platnú adresu začínajúcu http:// alebo https:// — takto sa uložiť nedá.');
@@ -1630,7 +1660,17 @@ function renderOrderRow(o, totals) {
   // be read-only here, so a wrong link ('mám to tam zle') meant hunting the product
   // down in the review tab and pairing it from scratch; the save routes itself to
   // whichever store owns the value (savePairUrl), so the fix cannot be a no-op.
+  // …unless the product is split per size (#174): then the value belongs to ONE size and
+  // the only honest affordance is the per-size panel. A DIFFERENT class matters — the
+  // `.to-pairedit` selector is what `_EDITORS.pair.open` reopens after a repaint, and a
+  // split row must never get a product-wide paste box back that way either.
   const pairPencil = (node) => {
+    if (o.reviewStatus === 'split') {
+      const sp = el('button', 'to-splitedit', '✂️');
+      sp.title = 'Tento produkt má vlastný odkaz pre každú veľkosť — otvoriť veľkosti';
+      sp.onclick = () => openSplitSizes(o);
+      return sp;
+    }
     const edit = el('button', 'to-pairedit', '✏️');
     edit.title = 'Zmeniť / opraviť párovaciu URL';
     edit.onclick = () => openRowEditor(node, pairEditor(o, true), edit);
@@ -2998,11 +3038,15 @@ async function _devToggleDetail(row, number, canAdd) {
 // Render (or re-render) an issue's detail into `box`: zadanie + comments + editor.
 function _renderDetail(box, number, data, canAdd) {
   box.innerHTML = '';
-  if (data.body && data.body.trim()) {
+  const hasBody = !!(data.body && data.body.trim());
+  // #243 — an already-sent request must stay CORRECTABLE. Without this the boss could
+  // only append a comment, so a request that came out wrong was abandoned instead
+  // („chcel som mu ešte niečo dopísať – nedá sa, tak som sa na to vykašlal").
+  // The header (and with it the ✏️) is rendered even when the body is EMPTY: an issue
+  // created straight on GitHub with no description could otherwise never have its
+  // TITLE corrected in the app at all — and the title is the whole request there.
+  if (hasBody || canAdd) {
     const h = el('div', 'dev-detail-h', 'Zadanie');
-    // #243 — an already-sent request must stay CORRECTABLE. Without this the boss could
-    // only append a comment, so a request that came out wrong was abandoned instead
-    // („chcel som mu ešte niečo dopísať – nedá sa, tak som sa na to vykašlal").
     if (canAdd) {
       const ed = el('button', 'dev-edit-btn', '✏️ Upraviť zadanie');
       ed.title = 'Opraviť alebo doplniť text tejto požiadavky';
@@ -3011,7 +3055,9 @@ function _renderDetail(box, number, data, canAdd) {
     }
     box.appendChild(h);
     const b = el('div', 'dev-detail-body');
-    b.textContent = data.body;                 // textContent → no XSS, no HTML render
+    // an empty request has no text to show — say so instead of an unexplained blank
+    if (hasBody) b.textContent = data.body;    // textContent → no XSS, no HTML render
+    else { b.className = 'dev-detail-body dev-detail-empty'; b.textContent = 'Bez textu — zatiaľ len názov.'; }
     box.appendChild(b);
   }
   const comments = data.comments || [];
@@ -3143,6 +3189,10 @@ function _ideaOpen() {
   // back to the form — the previous open may have ended on the confirmation panel
   const form = document.getElementById('ideaForm'), done = document.getElementById('ideaDone');
   if (form && done) { form.hidden = false; done.hidden = true; }
+  // the submit button stays disabled from the moment a submission is accepted until the
+  // dialog is opened again — this is the one place it comes back
+  const sb = document.getElementById('ideaSubmit');
+  if (sb) sb.disabled = false;
   _ideaMsg('');
   m.hidden = false;
   document.getElementById('ideaTitleInput').focus();
@@ -3168,14 +3218,20 @@ async function _ideaSubmit() {
     number = (j.issue && j.issue.number) || 0;
     if (!ok) err = j.error || ('chyba ' + r.status);
   } catch (_) { err = 'sieťová chyba'; }
-  btn.disabled = false;
-  if (!ok) { _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
-  await loadDevIssues();                       // new issue appears + nav badge updates
-  if (ACTIVE_TAB === 'dev') render(); else renderTabs();
+  if (!ok) { btn.disabled = false; _ideaMsg('Nepodarilo sa: ' + err, 'err'); return; }
   // #243 — the dialog used to just vanish. The lightbulb is on EVERY tab, so unless he
   // happened to be standing in „Vývoj" he got no number, no confirmation and no way
   // back to what he had just sent. Say it landed, and offer to open it right away.
+  //
+  // Confirm FIRST, refresh the list AFTER — and never re-enable the button here. It used
+  // to be re-enabled and the form left standing across `await loadDevIssues()`, so a
+  // second click inside that window (6 s with a slow /api/dev/issues) sent a SECOND POST
+  // and created a SECOND GitHub issue. It also made the new E2E flaky: 2 of 3 full runs
+  // failed waiting for #ideaDone, because the confirmation only appeared after the list
+  // round-trip. The button comes back when the dialog is opened again (_ideaOpen).
   _ideaDone(number);
+  await loadDevIssues();                       // new issue appears + nav badge updates
+  if (ACTIVE_TAB === 'dev') render(); else renderTabs();
 }
 
 // Success state of the idea dialog: confirmation + a way straight into the request.

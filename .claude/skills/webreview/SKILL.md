@@ -186,6 +186,8 @@ Manažér si priamo na webe značí stav. Tieto súbory držia jeho ŽIVÚ prác
 
 Vstupy endpointov, čo píšu do CSV (kód/dodávateľ), MUSIA odmietnuť formula-injection: kód aj meno dodávateľa začínajúce `= + - @ \t \r` → 400; URL `^https?://`. **CSV sink prefixuje `'` cez `_csv_safe` — aj manuálny `/api/import` zip AJ nočný `upload-*` sink** (nočný píše naživo do eshopu, takže NESMIE byť slabšie chránený než zip).
 
+**Každý endpoint, čo ukladá URL, potrebuje EŠTE TRI veci (revízia PR #255):** (1) **dĺžkový strop `URL_MAX` (2000)** — 300 000-znaková URL sa prijala a nafúkla `decisions.json` na 300 kB, pričom ten store sa re-číta pri KAŽDOM `/api/orders` a hodnota končí v Shoptet `internalNote` bunke; zdieľajú ho `/api/decision`, `/api/order-pair` aj `/api/order-decision-url`. (2) **`_log_safe()` pred zápisom do logu** — `^https?://` regex prepustí `https://x.test/a\r\nSet-Cookie: x`, takže surové `log.info(... url=%s)` vyrobí vlastný falošný log riadok (log-line forging). (3) **hlášky po SLOVENSKY** — `postToOrder` vypisuje `j.error` doslova do manažérovho alertu, takže „unknown review key" (dosiahnuteľné: zastaraný tab po resynci, ktorý produkt vypustil) mu prišlo v angličtine.
+
 **XSS — escapuj voľný text v KAŽDOM render-sinku, nie len v jednom.** `el(tag,cls,html)` používa `innerHTML`. Meno dodávateľa (voľný text manažéra) ide do 3 miest: 🏷️ menovka, **filter-button label** AJ **hlavička skupiny** — všetky 3 cez `escapeHtml(...)`. Escapnúť len menovku a zabudnúť na label/hlavičku = stored-XSS (našla to adversariálna revízia).
 
 **Zápis do eshopu (write-back):** doplnený dodávateľ → 3. import súbor `import_suppliers.csv` (`code;pairCode;supplier`, vlastný stĺpec) v `/api/import` zipe + nočný `/api/n8n/upload-suppliers` (inkrementálny `uploaded_suppliers.json`, mirror `upload-pairings`). **`supplier` JE importovateľný stĺpec Shoptetu** — overené naživo 2026-06-29 (set `40256/L`=PAROVANIE-TEST → export read-back potvrdil → revert na ''), NIE textProperty-style tichý no-op. Pri akomkoľvek NOVOM zápisovom poli ale ZNOVA over import-settability naživo (export presence ≠ importable).
@@ -944,6 +946,26 @@ viď classic-Project gotcha nižšie; `requests.patch`, nie post).
 - **Po uložení sa zoznam prekresľuje (`renderDev`), takže pôvodný `.dev-detail-box` je
   odpojený** — riadky nesú `data-num`, aby sa detail dal znova otvoriť na NOVOM riadku;
   bez toho vyzerá úprava ako zavretie vlastného detailu.
+- **Číslo z `/issues/<n>` NIE JE dôkaz, že ide o úlohu — GitHub tým istým endpointom
+  vracia AJ PULL REQUESTY (revízia PR #255).** Zoznam PR-ká filtruje (`pull_request`
+  kľúč), takže každý ĎALŠÍ endpoint, čo podľa čísla ZAPISUJE (`/edit`, a rovnako každý
+  budúci), ich musí odmietnuť tiež — inak si ktorýkoľvek prihlásený užívateľ prepíše
+  názov a telo PR-ka len tým, že napíše jeho číslo. Odpoveď „toto číslo nepatrí úlohe".
+- **Potvrdenie ukáž PRED refreshom zoznamu a tlačidlo NEODOMYKAJ (revízia PR #255).**
+  `_ideaSubmit` odomkol `#ideaSubmit` a AŽ POTOM `await loadDevIssues()` — v tom okne
+  (namerané 6 s pri pomalom `/api/dev/issues`) druhý klik poslal DRUHÝ POST a vytvoril
+  DRUHÚ GitHub úlohu; navyše sa `#ideaDone` objavil až po round-tripe, čo robilo e2e
+  flaky (2 z 3 plných behov padli). Poradie je `_ideaDone(number)` → `await
+  loadDevIssues()`; tlačidlo sa odomyká JEDINE v `_ideaOpen`. Pravidlo pre každý ďalší
+  „odošli a obnov zoznam" dialóg: potvrď hneď, obnovuj potom, odomkni pri otvorení.
+- **E2E na dvojité odoslanie drž PODRŽANÍM route** (`page.route(..., lambda r:
+  held.append(r))` a `r.continue_()` až na konci) — stub odpovie príliš rýchlo na to,
+  aby sa to okno vôbec otvorilo. Druhý klik posielaj cez `page.evaluate(... .click())`,
+  nie Playwright klikom: ten kontroluje actionability a na disabled/skrytom tlačidle
+  padne skôr, než čokoľvek zmeria.
+- **✏️ „Upraviť zadanie" NEVIAŽ na neprázdne telo.** Úloha založená priamo na GitHube
+  môže mať telo prázdne a NÁZOV je vtedy celá požiadavka — hlavička s ✏️ sa preto
+  renderuje aj bez tela (telo vypíše „Bez textu — zatiaľ len názov.").
 
 ## Admin premenovanie záložiek + popis automatizácií (#173, v0.70.0)
 
@@ -1035,17 +1057,56 @@ je TICHÝ NO-OP** — uloží sa, endpoint vráti 200, a riadok aj eshop ďalej 
 rozhodnutú URL („som to naparoval, ale tie linky vobec nefungujú"). Na živých dátach malo
 8 kódov obe hodnoty naraz, aspoň jedna rozdielna. **Pravidlo pre KAŽDÝ nový editor na tomto
 tabe: edituj to úložisko, ktoré riadok naozaj ZOBRAZUJE a ktoré sa naozaj EXPEDUJE** —
-riadok preto nesie `reviewKey`/`reviewStatus` (z `import_builder.link_owners`) a
+riadok preto nesie `reviewKey`/`reviewStatus` (z `import_builder.link_row_specs`) a
 `savePairUrl` podľa nich smeruje zápis: `POST /api/order-decision-url` (prepíše rozhodnutie,
 `status:'manual'`, 409 na `split`) vs. `POST /api/order-pair` (inline). Pomocník
 `rowPairUrl(o)` je JEDINÁ definícia „ktorá URL na tomto riadku platí" — používa ju prefill
 editora, `_EDITORS.pair.stored` aj porovnanie „zhodné s uloženým".
 
-**`import_builder.link_row_specs` je JEDNA slučka za `link_rows` aj `link_owners`.** Pravidlo
-„každý kód raz, prvé párovanie vyhráva" rozhoduje AJ o tom, ktorý kód komu patrí, takže
-druhá kópia tej dedup logiky by sa časom rozišla s tým, čo sa naozaj zapisuje. Nový
-konzument „ktoré rozhodnutie vlastní tento kód" berie `link_owners`, NEpíše si vlastný
-prechod; pinnuté testom, že množina kódov oboch výstupov je identická.
+**Vylúčenie je o VLASTNÍCTVE, nie o tom, čo daný beh práve posiela (revízia PR #255).**
+`_do_upload_pairings` staval `exclude_codes` z **tohtobehových NOVÝCH** decision riadkov.
+Len čo sa rozhodnutie zapíše ako uploaded, prestane byť „nové", množina sa vyprázdni a
+nočná dávka pošle do eshopu **starú inline URL** — oprava prežila presne JEDNU noc a
+`internalNote` ostal natrvalo zlý (kód sa zapíše ako uploaded a už sa NIKDY neskúsi),
+zatiaľ čo tab, `/api/orders` aj `/api/import` ďalej ukazovali tú správnu. A tá URL kŕmi
+automatické doobjednávanie, takže zlý odkaz objedná zlý tovar. Vylúčenie preto počítaj zo
+**VŠETKÝCH** rozhodnutí presne ako ručný zip (`link_rows(PRODUCTS, dec, CODE2PAIR,
+_load_variant_links())`) — a keď v tejto appke uvidíš dve cesty do TOHO ISTÉHO eshop poľa,
+over, či majú **rovnaké vstupy** (zip ich mal, nočná nie: `variant_links` chýbali).
+Druhá polovica: `/api/order-decision-url` po zápise **zmaže `order_pairings` pre variantné
+kódy** toho produktu — v tom momente je inline hodnota preukázateľne prebitá, takže tam
+nemá čo čakať na noc, keď vylúčenie zlyhá.
+
+**Endpoint, ktorý mení rozhodnutie podľa kľúča zo SNAPSHOTU klienta, musí prečítať ČERSTVÝ
+stav a odmietnuť všetko, čo nie je párovanie (revízia PR #255).** `reviewKey` je zamrznuté
+v `ORDERS`, takže čokoľvek, čo manažér medzitým zmenil v revízii (druhé okno, otvorený tab),
+sa ✏️ zápisom prepísalo: `unavailable` → `manual` (eshop prestal dostávať Vypredané+stock 0),
+`discontinued` → `manual` (zmizol riadok „Predaj skončil"), a **chýbajúce rozhodnutie sa
+VYTVORILO** — nerecenzovaný produkt sa označil ako recenzovaný. Guard je „prijmi len
+`good`/`manual`", inak 409 (split má vlastnú hlášku). Pravidlo pre KAŽDÝ ďalší taký
+endpoint: kľúč zo snapshotu je len ADRESA, stav sa vždy re-číta pod zámkom.
+
+**`import_builder.link_row_specs` je JEDNA slučka za `link_rows` aj za mapu vlastníkov.**
+Pravidlo „každý kód raz, prvé párovanie vyhráva" rozhoduje AJ o tom, ktorý kód komu patrí,
+takže druhá kópia tej dedup logiky by sa časom rozišla s tým, čo sa naozaj zapisuje. Nový
+konzument „ktoré rozhodnutie vlastní tento kód" konzumuje `link_row_specs` PRIAMO
+(`build_to_order_rows` to tak robí — jeden prechod dá aj URL aj vlastníka). Obálka
+`link_owners` existovala, ale ju **nevolal žiadny produkčný kód** — len anti-drift test,
+takže test strážil mŕtvy kód; zmazaná, test prepísaný na `link_row_specs`. Keď píšeš
+anti-drift test, over, že mieri na cestu, ktorou appka naozaj ide.
+
+**Split produkt (#174) je na tabe „Na objednanie" SLEPÉ MIESTO, ak `variant_links` nedáš
+až do `build_to_order_rows`.** Bez nich `split` vetva `link_row_specs` nevydá nič → riadok
+má `supplierUrl=''`/`reviewKey=''` a vykreslí prázdne vkladacie pole pre produkt, ktorý JE
+napárovaný per veľkosť; `savePairUrl` to pošle do `order_pairings`, ručný zip to zahodí,
+nočná to pošle — a keďže `split_links` má vlastnú `uploaded_variant_links.json`
+idempotenciu (nikdy nepushne znova), inline zápis **natrvalo prepíše** už nahraný
+veľkostný odkaz. Riadok split produktu preto dostane **✂️ tlačidlo s VLASTNOU triedou
+`to-splitedit`** (nie `to-pairedit` — na ten sa viaže `_EDITORS.pair.open`, takže po
+prekreslení by sa produktovo-široké pole vrátilo zadnými dvierkami) a to otvorí per-veľkosť
+panel v revízii (`openSplitSizes`: `splitOpen.add`, `FILTER='good'`, `switchTab('review')`,
+scroll na `.card[data-key]`). Produktovo-široký save tam nemá zmysel: endpoint ho odmietne
+409, inline cesta ho skazí.
 
 `order_pairings` kód pokrytý reviewed decisiou v TOM ISTOM behu sa **vynechá** (Shoptet
 padá na duplicitný `code` v jednom importe — decision vyhráva). Dedup nočného stavu pre
