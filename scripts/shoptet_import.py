@@ -139,7 +139,11 @@ def _run_browser(args, creds, plan):
                 page.screenshot(path=str(AUDIT_DIR / f"shoptet_import_{ts}_dryrun.png"))
                 print("DRY-RUN OK: prihlásený, viem dôjsť na import. Nič sa nenahralo.")
                 return 0
-            result_text = _do_import(page, args.file, baseline=baseline)
+            # #257: baseline ALONE cannot tell our Log entry from a foreign one written
+            # seconds later — the number of rows we submit (Shoptet echoes it back as
+            # 'Spracované: N') is what identifies this run's own result row.
+            result_text = _do_import(page, args.file, baseline=baseline,
+                                     expected_rows=plan["total"])
         except Exception as e:  # noqa: BLE001 — surface any UI failure loudly
             shot = AUDIT_DIR / f"shoptet_import_{ts}_FAIL.png"
             try:
@@ -163,8 +167,11 @@ def _run_browser(args, creds, plan):
             # Spracované/Zlyhanie summary at all, only this hard error line
             print(f"POZOR: Shoptet hlási chybu: {log['error_detail']}", file=sys.stderr)
         elif log["processed"] is None:
-            # výsledok sa nedal prečítať (zmena Logu / nenačítaná stránka) — NEhlás úspech
-            print("POZOR: výsledok importu sa nepodarilo prečítať — over Log ručne.",
+            # Výsledok sa nedal PRIRADIŤ tomuto behu (#257): buď sa náš riadok Logu
+            # neobjavil, alebo tam bežal ešte jeden import s rovnakým počtom riadkov.
+            # NIKDY nehlás cudzí riadok ako svoj — radšej "neprečítané" (exit 2).
+            print("POZOR: výsledok tohto importu sa nepodarilo priradiť "
+                  "(náš riadok Logu sa neobjavil alebo je nejednoznačný) — over Log ručne.",
                   file=sys.stderr)
         else:
             print("POZOR: Shoptet hlási zlyhania — skontroluj log.", file=sys.stderr)
@@ -253,26 +260,29 @@ def _row_texts(page):
     )
 
 
-def _read_result(page, baseline=None, retries=6, wait_s=2.0):
+def _read_result(page, baseline=None, expected_rows=None, retries=6, wait_s=2.0):
     """Read back THIS run's result row from /admin/import-produktov/log/ (#23).
 
     `baseline` is the topmost log-entry text captured BEFORE the import was
-    submitted (see _capture_baseline). A large/async import may not have
-    written its own row yet on the first read — poll (wait + reload) until
-    the picked row differs from baseline, up to `retries` times. Never falls
-    back to an OLDER row further down the table: that was the exact issue
-    #23 bug — an import that aborted with only a 'Chyba | Číslo riadku: N -
+    submitted (see _capture_baseline) and `expected_rows` is how many rows the
+    submitted CSV carries — together they identify THIS run's entry (see
+    pick_result_row). A large/async import may not have written its own row yet
+    on the first read, and a foreign import may write ITS row first (#257) —
+    poll (wait + reload) until our own entry appears, up to `retries` times.
+    Never falls back to an OLDER row further down the table: that was the exact
+    issue #23 bug — an import that aborted with only a 'Chyba | Číslo riadku: N -
     …' entry (no Spracované/Zlyhanie line) made the OLD keyword-only picker
     skip past it to a PREVIOUS run's 'Spracované' row and report a stale
     success.
 
-    Returns the picked row text, or None if it never changed from baseline /
-    no log entry is found at all. parse_import_log(None) then yields
-    processed=None, which result_exit_code() treats as an UNREADABLE result
-    (exit 2) — never a silent success."""
+    Returns the picked row text, or None if our own entry never appeared / no
+    log entry is found at all / two same-sized imports made it ambiguous.
+    parse_import_log(None) then yields processed=None, which result_exit_code()
+    treats as an UNREADABLE result (exit 2) — never a silent success."""
     row = None
     for attempt in range(retries):
-        row = pick_result_row(_row_texts(page), baseline=baseline)
+        row = pick_result_row(_row_texts(page), baseline=baseline,
+                              expected_rows=expected_rows)
         if row is not None:
             return row
         if attempt < retries - 1:
@@ -281,10 +291,10 @@ def _read_result(page, baseline=None, retries=6, wait_s=2.0):
     return None
 
 
-def _do_import(page, csv_path, baseline=None):
+def _do_import(page, csv_path, baseline=None, expected_rows=None):
     """Nahraj CSV (cez file-chooser — Shoptet widget inak súbor nezaregistruje),
     over bezpečné parametre, spusti import (Importovať → Log), vráť text výsledku
-    (viď _read_result — nikdy nevráti riadok totožný s `baseline`)."""
+    (viď _read_result — vráti LEN riadok Logu patriaci tomuto behu, inak None)."""
     print(f"[import] nahrávam súbor {csv_path}")
     with page.expect_file_chooser() as fc:
         page.locator('button:has-text("Vyberte súbor")').first.click()
@@ -295,7 +305,7 @@ def _do_import(page, csv_path, baseline=None):
     page.get_by_test_id("buttonImport").click()
     page.wait_for_url(re.compile(r"import-produktov/log"), timeout=120000)
     page.wait_for_load_state("networkidle")
-    return _read_result(page, baseline=baseline)
+    return _read_result(page, baseline=baseline, expected_rows=expected_rows)
 
 
 if __name__ == "__main__":
