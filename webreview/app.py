@@ -838,6 +838,14 @@ def _load_users() -> dict:
     if os.path.exists(USERS):
         with open(USERS, encoding="utf-8") as f:
             d = json.load(f)
+        if not isinstance(d, dict):
+            # Parses, but is not an account map — the one corruption shape this loader
+            # missed while every other loader in #265 checks it. `[]` used to reach
+            # `_bootstrap_admin` as a TypeError (import dies) and `_current_user` as an
+            # AttributeError (500 per request); both are outside the except tuples that
+            # turn a bad store into a 503 with repair instructions. A wrong hand-repair
+            # or restore lands here — exactly what that message invites (third review).
+            raise ValueError(f"{USERS} nie je zoznam účtov (je to {type(d).__name__})")
         _note_store_read(USERS, d)   # #261 — the receipt a later save is checked against
         return d
     return {}
@@ -890,15 +898,18 @@ def _bootstrap_admin() -> None:
 
 try:
     _bootstrap_admin()
-except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
+except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError, TypeError) as e:  # noqa: BLE001
     # This runs at IMPORT. Anything raising here does not degrade a feature — it stops the
     # service from STARTING at all (systemd restart loop, no web UI, nothing to look at).
-    # All four are real: another instance holding the store lock for 30 s, a refused
+    # All five are real: another instance holding the store lock for 30 s, a refused
     # write, the OSError `_load_users` deliberately re-raises on a users.json that is
     # there but unreadable, and — the most likely one of the lot — the ValueError a write
     # cut mid-JSON or mid-UTF-8 raises, which is exactly the corruption the fsync work
     # exists to make less likely and was the one shape NOT caught (PR #265 second review,
-    # C2). Existing accounts are unaffected; only the first-run bootstrap is skipped.
+    # C2). TypeError is the belt to `_load_users`' isinstance brace: a store that PARSES
+    # but is not a map (`[]` from a wrong hand-repair) used to reach `users[email] = …`
+    # and take the whole import down (PR #265 third review, I2).
+    # Existing accounts are unaffected; only the first-run bootstrap is skipped.
     log.error("auth: admin bootstrap skipped (%r) — the app keeps serving, existing "
               "accounts are unaffected; fix data/out/users.json and restart", e)
 
@@ -928,7 +939,7 @@ def _require_login():
     try:
         if _current_user():
             return None
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, TypeError) as e:
         # `_load_users` fails CLOSED on purpose (nobody gets in over a store we cannot
         # read) — but „fails closed" must still SAY what to fix. A bare 500 reads as a
         # transient glitch and invites another click (PR #265 second review, C2).
