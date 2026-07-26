@@ -128,32 +128,76 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
 - **Nový store deklaruj VŽDY `X = _store("meno.json")`**, nikdy `os.path.join(OUT, ...)` na
   module-leveli. `_StorePath` sa správa ako string (`open`, `os.path.*`, `+ ".tmp"`, `%s`),
   takže volajúci nič nevie a `monkeypatch.setattr(webapp, "X", str(tmp))` funguje ďalej.
-  Drift stráži `test_no_store_path_is_frozen_at_import`.
+  Drift stráži `test_no_store_path_is_frozen_at_import` — **cez AST** (`OUT` čítaný mimo tela
+  funkcie), nie hľadaním reťazcov: predošlá verzia videla len module-level `str` globaly,
+  takže `Path(OUT)/"x"`, f-string či cesta v dicte/class-atribúte/defaulte jej unikli.
+  Rovnaká lekcia platí pre každý drift guard: **guard, ktorý počíta výskyty reťazca, prejde
+  aj keď nič nestráži** (ten e2e počítal literál `'"WEBREVIEW_OUT": str(out)'`, takže fixture
+  s inak pomenovaným adresárom sa rátal ako nula serverov). Píš ich nad AST.
 - **Čítaj `_read_json_store(X, {})`, píš `_atomic_write_json(X, d, ...)`** — nekopíruj
   try/open/json.load ani tmp+replace (bolo ich 17 + 29). Reader degraduje LEN
   `FileNotFoundError` (prvý beh) a `ValueError` (useknutý zápis, vrátane
   UnicodeDecodeError); **každá iná `OSError` musí prebublať** — „súbor sa nedá prečítať"
   nie je dôkaz, že manažér nič neurobil, a tiché `{}` je presne tá strata (nález revízie).
-- **`protect=True` = neopakovateľná práca.** Writer odmietne KAŽDÉ ZMENŠENIE storu, ak ho
-  tento proces predtým naozaj nečítal (`_store_reads`; zapisuje sa LEN pri úspešnom čítaní,
-  ktoré vrátilo obsah). Nie je to prah na počte a nie je to „prázdna mapa": fixtúra z
-  incidentu bola malá, nie prázdna. Rast nikdy nevyžaduje čítanie. Legitímne zmenšenia
-  (undo posledného rozhodnutia, hromadné odznačenie skupiny `/api/ordered/bulk`, prune)
-  čítajú pod `_lock` chvíľu predtým, takže prejdú — **prvá verzia pravidla znela „prázdne
-  cez neprázdne = zamietni" a HNEĎ rozbila hromadné tlačidlo**, over každú takú ochranu
-  proti bulk cestám. Odmietnutie letí ako `StoreWipeRefused` → 503 so slovenskou hláškou
-  (nie 500 — na 500 manažér klikne znova).
+- **`protect=True` = neopakovateľná práca; POTVRDENKOU je samotné ČÍTANIE, nie počet.**
+  `_store_reads[cesta] = (objekt, ktorý reader vrátil, počty v čase čítania)`. Writer
+  povolí ZMENŠENIE len vtedy, keď zapisovaná mapa JE ten objekt (alebo ho volajúci pomenuje
+  cez `prev=`). **Prvá verzia si pamätala len POČET a bola tým trvalo odzbrojená** — appka
+  číta `decisions.json` pri každom načítaní stránky, takže „naposledy sme čítali N a na disku
+  je N" platilo vždy a incidentný zápis by prešiel (nález revízie PR #265). Rast nikdy
+  nevyžaduje potvrdenku. Po úspešnom zápise sa potvrdenka prepíše na zapísaný objekt, inak
+  druhé undo za sebou spadne na 503.
+  - **Kto prestavia mapu NANOVO, musí poslať `prev=`** (`_save_decisions(d1, prev=d0)`,
+    `_save_vystavy(kept, prev=vystavy)`). Kto mutuje načítaný objekt (drvivá väčšina ciest)
+    nepotrebuje nič. Pri novom store-zápise sa vždy spýtaj: *je toto ten istý objekt, ktorý
+    som čítal?*
+  - **NEČITATEĽNÝ súbor ≠ 0 záznamov.** Useknutý/nerozparsovateľný store sa zazálohuje
+    (`<store>.corrupt-<ts>`) a zápis sa ODMIETNE — aj rast (nad neparsovateľným súborom
+    nevieme, z čoho rastieme). Predtým sa počítal ako 0 a jeden klik prepísal ~1400
+    zachrániteľných záznamov. Prázdny (0 B) súbor korupcia NIE JE.
+  - **`protect=("orders",)` / `("escalation",)` pre dedup story.** `orders_reminder.json` a
+    `posta_uncollected.json` majú mapu „komu sme už písali" ZANORENÚ a vonkajšie kľúče sa
+    nikdy nemenia — `protect=True` bol pre ne úplne nečinný. Guarduj tú úroveň, kde dáta
+    naozaj sú.
+  - Legitímne zmenšenia (undo, hromadné odznačenie `/api/ordered/bulk`, retention prune
+    dedup mapy) čítajú pod `_lock` chvíľu predtým, takže prejdú — **prvá verzia pravidla
+    znela „prázdne cez neprázdne = zamietni" a HNEĎ rozbila hromadné tlačidlo**, over každú
+    takú ochranu proti bulk cestám. Odmietnutie letí ako `StoreWipeRefused` → 503 so
+    slovenskou hláškou (nie 500 — na 500 manažér klikne znova), a hláška musí dávať zmysel
+    aj CRONU, nie len prehliadaču.
+  - **Každý `protect=` store patrí do `scripts/backup_data.sh`** — pokrytie deriveruje test
+    z AST `protect=` volaní v `app.py`; ručne udržiavaný zoznam si tri story nevšimol.
 - **`_lock` = RLock + `fcntl.flock` na `OUT/.store.lock`.** Existujúce `with _lock:` bloky
   sú tým atomické aj MEDZI PROCESMI (lost update). Dôsledky: sieťové/SMTP volanie ostáva
   MIMO `_lock` (teraz by blokovalo aj druhý proces), `_lock` je reentrantný zámerne (writer
-  si ho berie sám) a čakanie je ohraničené (30 s → `StoreLockTimeout` → 503).
+  si ho berie sám) a čakanie je ohraničené (30 s → `StoreLockTimeout` → 503; env
+  `WEBREVIEW_STORE_LOCK_TIMEOUT` na skrátenie v testoch). `acquire(blocking=False)` vracia
+  `False` ako `threading.Lock`, nevyhadzuje.
+- **`_lock` VIE VYHODIŤ — každé miesto, kde predtým stál `threading.Lock`, preto prever.**
+  Dva reálne nálezy: `AutomationRunner._execute` čistil príznak „už beží" ako prvý riadok
+  VNÚTRI zámku, ktorý si berie na zápis výsledku — jeden timeout a automatizácia ostala
+  „bežiaca" navždy (plánovač ju preskakuje, „⚡ Spustiť teraz" hlási „už beží"), hoci maily
+  už odišli; a `_bootstrap_admin()` beží pri IMPORTE, takže výnimka tam neznamená degradáciu
+  ale to, že sa služba VÔBEC nenaštartuje. Pravidlo: príznaky čisti v `finally` MIMO zámku,
+  zápis výsledku obaľ, a všetko, čo beží pri importe, obaľ
+  `(StoreLockTimeout, StoreWipeRefused, OSError)`.
+- **`PRODUCTS` (review_data.json) sa mení POD bežiacou appkou** —
+  `scripts/add_supplier_review_data.py` pridá dodávateľa za behu. `run_shoptet_sync` preto
+  súbor pred resyncom ZNOVA načíta pod `_lock`: bez toho by zapisoval boot-time zoznam,
+  writer to (správne) odmietne a automatizácia padá KAŽDÚ hodinu až do reštartu.
 - **Dlhý beh NESMIE uložiť mapu, ktorú prečítal na začiatku.** Nočné write-backy sedia
   minúty v import subprocese; `_record_uploaded(load_fn, save_fn, entries)` znovu načíta
   a MERGNE pod zámkom (a vráti post-run mapu pre súhrny). Inak sa stratí kľúč, ktorý
   medzitým zapísal niekto iný — a stratený review kľúč znamená, že sa nabudúce nahrá
   odkaz, ktorý manažér už opravil.
-- **Tmp súbor je per-proces** (`<store>.<pid>.tmp`); pri zlyhaní `json.dump` sa maže.
-  Dve inštancie si predtým kolidovali na spoločnom `.tmp`.
+- **`fsync` PRED `os.replace`** v oboch writeroch. `os.replace` je atomický voči ČITATEĽOM,
+  nie voči pádu prúdu: premenovanie môže byť trvanlivé skôr než dáta — presne tak vznikne
+  useknutý store z predošlého bodu.
+- **Tmp meno: JSON writer per-proces (`<store>.<pid>.tmp`, beží pod `_lock`), ale
+  `_atomic_write_bytes` MUSÍ `tempfile.mkstemp`** — `orders_cache.csv` má DVOCH pisateľov v
+  jednom procese (request thread pri starej 30-min cache + hodinový sync), takže pid-ové meno
+  bolo pre oboch to isté: jeden premenoval inode, do ktorého druhý ešte písal, a ten potom
+  dopisoval rovno do ŽIVEJ cache. Per-proces meno nestačí, keď sú pisatelia dva THREADY.
 - **Testy: `tests/conftest.py` prepne `WEBREVIEW_OUT` + `WEBREVIEW_PRODUCTS` do tmp** pri
   IMPORTE conftestu (pred kolekciou), takže sa žiadny test nedostane na `data/out` ani keď
   nič nepatchne. Dev box sa tým správa ako CI. **Nový e2e fixture server** dedí pinned env
