@@ -110,6 +110,50 @@ zabudnutý pidfile).
 
 Dva taby: **Kontrola párovania** (review kariet) a **Na objednanie** (doobjednanie u dodávateľa).
 
+## Úložiská: LENIVÉ cesty, JEDEN reader/writer, medziprocesový `_lock` (#261/#264)
+
+Kontext, prečo to takto je: 2026-07-26 testovací beh vymazal všetkých 2831 rozhodnutí
+manažéra. `DECISIONS` bola konštanta počítaná pri IMPORTE, takže `monkeypatch OUT`
+nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
+
+- **Nový store deklaruj VŽDY `X = _store("meno.json")`**, nikdy `os.path.join(OUT, ...)` na
+  module-leveli. `_StorePath` sa správa ako string (`open`, `os.path.*`, `+ ".tmp"`, `%s`),
+  takže volajúci nič nevie a `monkeypatch.setattr(webapp, "X", str(tmp))` funguje ďalej.
+  Drift stráži `test_no_store_path_is_frozen_at_import`.
+- **Čítaj `_read_json_store(X, {})`, píš `_atomic_write_json(X, d, ...)`** — nekopíruj
+  try/open/json.load ani tmp+replace (bolo ich 17 + 29). Reader degraduje LEN
+  `FileNotFoundError` (prvý beh) a `ValueError` (useknutý zápis, vrátane
+  UnicodeDecodeError); **každá iná `OSError` musí prebublať** — „súbor sa nedá prečítať"
+  nie je dôkaz, že manažér nič neurobil, a tiché `{}` je presne tá strata (nález revízie).
+- **`protect=True` = neopakovateľná práca.** Writer odmietne KAŽDÉ ZMENŠENIE storu, ak ho
+  tento proces predtým naozaj nečítal (`_store_reads`; zapisuje sa LEN pri úspešnom čítaní,
+  ktoré vrátilo obsah). Nie je to prah na počte a nie je to „prázdna mapa": fixtúra z
+  incidentu bola malá, nie prázdna. Rast nikdy nevyžaduje čítanie. Legitímne zmenšenia
+  (undo posledného rozhodnutia, hromadné odznačenie skupiny `/api/ordered/bulk`, prune)
+  čítajú pod `_lock` chvíľu predtým, takže prejdú — **prvá verzia pravidla znela „prázdne
+  cez neprázdne = zamietni" a HNEĎ rozbila hromadné tlačidlo**, over každú takú ochranu
+  proti bulk cestám. Odmietnutie letí ako `StoreWipeRefused` → 503 so slovenskou hláškou
+  (nie 500 — na 500 manažér klikne znova).
+- **`_lock` = RLock + `fcntl.flock` na `OUT/.store.lock`.** Existujúce `with _lock:` bloky
+  sú tým atomické aj MEDZI PROCESMI (lost update). Dôsledky: sieťové/SMTP volanie ostáva
+  MIMO `_lock` (teraz by blokovalo aj druhý proces), `_lock` je reentrantný zámerne (writer
+  si ho berie sám) a čakanie je ohraničené (30 s → `StoreLockTimeout` → 503).
+- **Dlhý beh NESMIE uložiť mapu, ktorú prečítal na začiatku.** Nočné write-backy sedia
+  minúty v import subprocese; `_record_uploaded(load_fn, save_fn, entries)` znovu načíta
+  a MERGNE pod zámkom (a vráti post-run mapu pre súhrny). Inak sa stratí kľúč, ktorý
+  medzitým zapísal niekto iný — a stratený review kľúč znamená, že sa nabudúce nahrá
+  odkaz, ktorý manažér už opravil.
+- **Tmp súbor je per-proces** (`<store>.<pid>.tmp`); pri zlyhaní `json.dump` sa maže.
+  Dve inštancie si predtým kolidovali na spoločnom `.tmp`.
+- **Testy: `tests/conftest.py` prepne `WEBREVIEW_OUT` + `WEBREVIEW_PRODUCTS` do tmp** pri
+  IMPORTE conftestu (pred kolekciou), takže sa žiadny test nedostane na `data/out` ani keď
+  nič nepatchne. Dev box sa tým správa ako CI. **Nový e2e fixture server** dedí pinned env
+  cez `**_AUTH_ENV` — tam žije aj `WEBREVIEW_NO_SCHEDULER=1` (bez neho každý z 13 fixture
+  serverov štartoval OSTRÝ plánovač; neškodilo to len preto, že žiadna fixtúra neseeduje
+  `enabled: true`).
+- **Nový `protect=True` store pridaj aj do `scripts/backup_data.sh`** — zoznam stráži
+  `test_the_backup_script_covers_every_irreplaceable_store`.
+
 ## Per-riadkové stavy = 5 gitignored stores v `data/out/` (DÁTA MANAŽÉRA, ŽIVÉ)
 
 Manažér si priamo na webe značí stav. Tieto súbory držia jeho ŽIVÚ prácu a **MUSIA prežiť každý deploy**:
