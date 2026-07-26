@@ -822,6 +822,49 @@ def test_an_orphaned_temp_file_is_swept_at_startup(monkeypatch, tmp_path):
     assert keep.exists(), "the sweep deleted a real store"
 
 
+def test_the_startup_sweep_never_unlinks_inside_the_live_data_dir_under_pytest(
+        monkeypatch, tmp_path):
+    """`_sweep_stale_tmp` is the ONLY destructive operation in this codebase that did
+    not consult `_refuse_live_data_under_pytest` — it `os.unlink`s at IMPORT, over OUT
+    and `dirname(SRC)`. Under a pytest run with an un-pinned WEBREVIEW_OUT (the exact
+    configuration that wiped 2831 decisions, and the one this PR exists to make
+    impossible) it deleted live `data/out/*.tmp` and `data/*.tmp`. The blast radius is
+    small today, but the SHAPE is the incident's and it was exempt from the PR's own
+    brace (third review, I4). `_LIVE_OUT` is repointed at a throwaway dir so a
+    REGRESSION here cannot reach the manager's data."""
+    real = tmp_path / "pretend-live-out"
+    real.mkdir()
+    monkeypatch.setattr(webapp, "_LIVE_OUT", str(real))
+    old = real / "products.csv.abc123.tmp"
+    old.write_bytes(b"x" * 10)
+    os.utime(old, (time.time() - 36 * 3600, time.time() - 36 * 3600))
+
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._sweep_stale_tmp(str(real))
+    assert old.exists(), "the sweep deleted inside the live data dir from a test run"
+
+
+def test_the_boot_survives_a_sweep_the_pytest_net_refuses():
+    """…and refusing must not become a NEW way to stop the service from starting: the
+    startup call site catches only OSError, and StoreWipeRefused is not one."""
+    with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    guarded = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        called = {n.func.id for n in ast.walk(node)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if "_sweep_stale_tmp_at_startup" not in called:
+            continue
+        for h in node.handlers:
+            names = h.type.elts if isinstance(h.type, ast.Tuple) else [h.type]
+            guarded = [n.id for n in names if isinstance(n, ast.Name)]
+    assert guarded, "the startup sweep is not wrapped at all"
+    assert "StoreWipeRefused" in guarded, \
+        f"a refused sweep would abort the import: {guarded}"
+
+
 def test_the_pytest_live_dir_net_resolves_symlinks(monkeypatch, tmp_path):
     """`os.path.abspath` does not resolve symlinks, so a helper pointing WEBREVIEW_OUT
     at a link to data/out walked straight past the net. `_LIVE_OUT` is repointed at a
