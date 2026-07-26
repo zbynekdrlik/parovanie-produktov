@@ -14,8 +14,10 @@ Three layers are pinned here, each on its own:
 import ast
 import json
 import os
+import stat
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -657,3 +659,119 @@ def test_a_rebuilt_list_that_smuggles_in_a_foreign_entry_is_refused(monkeypatch,
     with pytest.raises(webapp.StoreWipeRefused):
         webapp._save_vystavy([{"id": "smuggled"}], prev=v0)
     assert len(webapp._load_vystavy()) == 3
+
+
+# --------------------------------------------------------------------------- #
+# The write path itself — durability, perms, and the tmp files it leaves behind
+# (PR #265 second review, the MINOR set)
+# --------------------------------------------------------------------------- #
+def _write_spy(monkeypatch):
+    """Records fsync/replace order, and whether each fsync was of a DIRECTORY."""
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def _fsync(fd):
+        calls.append(("fsync", stat.S_ISDIR(os.fstat(fd).st_mode)))
+        return real_fsync(fd)
+
+    def _replace(a, b):
+        calls.append(("replace", False))
+        return real_replace(a, b)
+
+    monkeypatch.setattr(os, "fsync", _fsync)
+    monkeypatch.setattr(os, "replace", _replace)
+    return calls
+
+
+def test_a_store_is_fsynced_before_the_rename_that_publishes_it(monkeypatch, tmp_path):
+    """Deleting both fsync lines left the whole suite green — the one claimed fix of
+    the previous wave with no regression test. os.replace is atomic against concurrent
+    READERS, not against a crash: the rename can be durable while the bytes are not,
+    which is exactly how a truncated store appears after a power loss."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._save_decisions(_two_decisions())
+    assert ("fsync", False) in calls, "the store was renamed into place without an fsync"
+    assert calls.index(("fsync", False)) < calls.index(("replace", False)), calls
+
+
+def test_the_directory_is_fsynced_after_the_rename(monkeypatch, tmp_path):
+    """Without it the RENAME itself can be lost on power loss and the old bytes
+    reappear — durable content published by a non-durable directory entry."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._save_decisions(_two_decisions())
+    after = calls[calls.index(("replace", False)):]
+    assert ("fsync", True) in after, f"no directory fsync after the rename: {calls}"
+
+
+def test_the_raw_cache_writer_fsyncs_too(monkeypatch, tmp_path):
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._atomic_write_bytes(str(tmp_path / "orders_cache.csv"), b"kod;nazov\r\n")
+    assert calls.index(("fsync", False)) < calls.index(("replace", False)), calls
+
+
+def test_the_customer_caches_are_written_private(monkeypatch, tmp_path):
+    """`orders_cache.csv` and `customers_cache.csv` hold customer names, e-mails and
+    phones — the same data `posta_uncollected.json` / `orders_reminder.json` keep at
+    0600. mkstemp creates the temp file 0600; the writer used to widen it to 0644 for
+    every cache. Only the app (one systemd --user service, one owner) reads them."""
+    p = tmp_path / "orders_cache.csv"
+    webapp._atomic_write_bytes(str(p), b"x", mode=0o600)
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    q = tmp_path / "products.csv"                      # the export is not PII
+    webapp._atomic_write_bytes(str(q), b"x")
+    assert stat.S_IMODE(os.stat(q).st_mode) == 0o644
+
+
+def test_every_customer_cache_write_asks_for_private_permissions():
+    """Structural, so a NEW writer of these two files cannot quietly go back to 0644."""
+    with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    loose = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_atomic_write_bytes" and node.args):
+            continue
+        target = node.args[0]
+        if not (isinstance(target, ast.Name)
+                and target.id in {"ORDERS_CACHE", "CUSTOMERS_CACHE"}):
+            continue
+        mode = next((k.value for k in node.keywords if k.arg == "mode"), None)
+        if not (isinstance(mode, ast.Constant) and mode.value == 0o600):
+            loose.append(f"{target.id} at line {node.lineno}")
+    assert loose == [], f"customer PII written world-readable: {loose}"
+
+
+def test_an_orphaned_temp_file_is_swept_at_startup(monkeypatch, tmp_path):
+    """`mkstemp` names are random, so a SIGKILL/OOM during the ~55 MB export write
+    leaves one orphan per event and nothing ever removes them (the old pid-derived
+    name was self-limiting at one per process lifetime)."""
+    old = tmp_path / "products.csv.abc123.tmp"
+    old.write_bytes(b"x" * 10)
+    os.utime(old, (time.time() - 36 * 3600, time.time() - 36 * 3600))
+    fresh = tmp_path / "orders_cache.csv.def456.tmp"       # another instance, right now
+    fresh.write_bytes(b"y")
+    keep = tmp_path / "decisions.json"
+    keep.write_text("{}", encoding="utf-8")
+
+    webapp._sweep_stale_tmp(str(tmp_path))
+
+    assert not old.exists(), "the orphaned temp file was never swept"
+    assert fresh.exists(), "a temp file a live write may still be using was deleted"
+    assert keep.exists(), "the sweep deleted a real store"
+
+
+def test_the_pytest_live_dir_net_resolves_symlinks(monkeypatch, tmp_path):
+    """`os.path.abspath` does not resolve symlinks, so a helper pointing WEBREVIEW_OUT
+    at a link to data/out walked straight past the net. `_LIVE_OUT` is repointed at a
+    throwaway dir here so that a REGRESSION cannot write into the manager's data."""
+    real = tmp_path / "pretend-live-out"
+    real.mkdir()
+    monkeypatch.setattr(webapp, "_LIVE_OUT", str(real))
+    link = tmp_path / "link-to-live"
+    link.symlink_to(real)
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._atomic_write_json(str(link / "decisions.json"), {"S|1": {"status": "x"}})
+    assert not (real / "decisions.json").exists()
