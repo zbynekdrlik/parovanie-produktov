@@ -147,9 +147,12 @@ class _StoreLock:
     The lock file is resolved from the CURRENT OUT, so each data dir (live service,
     fixture server, test tmp dir) has its own lock and they never contend."""
 
-    def __init__(self, name: str = ".store.lock", timeout: float = 30.0) -> None:
+    def __init__(self, name: str = ".store.lock", timeout: float = None) -> None:
         self.path = _store(name)
-        self.timeout = timeout
+        # env-tunable so a test (or an operator debugging a stuck instance) does not have
+        # to sit through the full 30 s; the default is unchanged.
+        self.timeout = float(os.environ.get("WEBREVIEW_STORE_LOCK_TIMEOUT") or 30.0) \
+            if timeout is None else timeout
         self._rlock = threading.RLock()
         self._depth = 0
         self._fd = None
@@ -188,6 +191,14 @@ class _StoreLock:
                 budget = max(0.0, timeout - (time.monotonic() - started))
             try:
                 self._fd = self._flock(budget)
+            except StoreLockTimeout:
+                # `threading.Lock` semantics for a BOUNDED acquire: answer False, never
+                # raise. `with _lock:` (unbounded) still raises loudly — that one really
+                # is „another process has held the data dir for 30 s", not a poll.
+                self._rlock.release()
+                if budget is not None:
+                    return False
+                raise
             except BaseException:
                 self._rlock.release()
                 raise
@@ -222,20 +233,81 @@ log = logging.getLogger("webreview")
 log.info("starting webreview v%s", __version__)
 
 
-def _stored_entry_count(path) -> int:
-    """How many entries the store on disk currently holds (0 for missing/corrupt —
-    an unreadable file is not evidence of work, and must not block the self-heal)."""
+def _measure_store(d) -> dict:
+    """Entry counts of one store: `""` = the top-level map, plus one entry per
+    top-level key whose value is ITSELF a map/list.
+
+    The nested counts are what makes `protect` real for the two fail-closed dedup
+    stores (PR #265 review): `orders_reminder.json` is
+    `{"orders": {...}, "red": [...], "stats": {...}, …}` and `posta_uncollected.json`
+    is `{"escalation": {...}, "terminal": {...}, …}` — the record of who was already
+    e-mailed is the NESTED map, and every real writer keeps the same top-level key
+    set, so an outer-dict count can never notice its loss."""
+    m = {"": len(d) if isinstance(d, (dict, list)) else 0}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            if isinstance(v, (dict, list)):
+                m[k] = len(v)
+    return m
+
+
+def _stored_measures(p) -> tuple:
+    """`(measures, corrupt)` for the store as it is on disk RIGHT NOW.
+
+    A MISSING or zero-byte file is a legitimate fresh store: `({}, False)` — nothing
+    to lose. Anything present that we cannot parse (a write cut mid-JSON or
+    mid-UTF-8, an I/O error) is `corrupt=True`, NOT „0 entries": counting it as zero
+    is what let a truncated decisions.json — ~1400 recoverable entries — be replaced
+    by a single click, silently and without a backup copy (PR #265 review)."""
     try:
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-    except (OSError, ValueError):
-        return 0
-    return len(d) if isinstance(d, (dict, list)) else 0
+        with open(p, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {}, False
+    except OSError:
+        return {}, True          # present but unreadable — we cannot know what is at stake
+    if not raw.strip():
+        return {}, False
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except ValueError:           # incl. UnicodeDecodeError — a write cut mid-character
+        return {}, True
+    return _measure_store(d), False
 
 
-# path → how many entries THIS process last read from that store. It is what makes
-# the #261 wipe guard exact instead of a guess (see _atomic_write_json).
+# path → `(the object a read of that store handed back, its counts AT READ TIME)`.
+#
+# The OBJECT is the receipt (#265 review). The first cut stored only a count, which
+# made this a stale-read detector rather than a provenance check: `_load_decisions()`
+# runs at import and on every /api/products + /api/orders, so „this process last read
+# N and the disk holds N" was permanently true and the guard never fired — the wipe
+# that started all this would have been allowed. Identity cannot be faked by an
+# unrelated read, and the strong reference kept here also stops `id()` from being
+# recycled onto a different object. One entry per store, so the cost is bounded.
 _store_reads: dict = {}
+
+# The manager's REAL data dir — never derived from OUT (which tests repoint), so it
+# still names the live files when OUT points at a tmp dir.
+_LIVE_OUT = os.path.abspath(os.path.join(ROOT, "data", "out"))
+_LIVE_PRODUCTS = os.path.abspath(os.path.join(ROOT, "data", "products.csv"))
+
+
+def _refuse_live_data_under_pytest(p) -> None:
+    """Belt and braces: while pytest runs, nothing may write into the manager's live
+    data dir — whatever OUT resolved to.
+
+    tests/conftest.py pinning WEBREVIEW_OUT is the real defence; this is the net under
+    it, for a helper that repoints paths by hand (or a child process that inherits the
+    env). It costs two string compares per write and would have stopped the 2026-07-26
+    incident on its own."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    a = os.path.abspath(os.fspath(p))
+    if a == _LIVE_PRODUCTS or a == _LIVE_OUT or a.startswith(_LIVE_OUT + os.sep):
+        log.error("REFUSED a write to the live data dir from a pytest run: %s", a)
+        raise StoreWipeRefused(
+            f"Test sa pokúsil zapísať do živých dát ({a}) — zamietnuté. "
+            "Testy musia bežať proti dočasnému WEBREVIEW_OUT.")
 
 
 def _read_json_store(path, default):
@@ -261,7 +333,13 @@ def _read_json_store(path, default):
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError:
+        return default
+    except ValueError:
+        # Degrading keeps the tab alive, but it must not be SILENT: a protected write
+        # over this file is about to be refused, and this line is what explains why.
+        log.error("úložisko %s sa nedá prečítať (poškodený/neúplný zápis) — zobrazujem "
+                  "prázdno, ale zápis doň bude zamietnutý, kým sa neopraví", path)
         return default
     if not isinstance(d, type(default)):
         return default
@@ -270,11 +348,33 @@ def _read_json_store(path, default):
 
 
 def _note_store_read(path, data) -> None:
-    """Remember what this process last saw on disk for `path` (#261 wipe guard)."""
-    _store_reads[os.fspath(path)] = len(data)
+    """Record the READ ITSELF as the receipt for `path` (#261/#265 wipe guard): the
+    object handed back plus the counts it held at that moment."""
+    _store_reads[os.fspath(path)] = (data, _measure_store(data))
 
 
-def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> None:
+def _guarded_measures(p, protect) -> tuple:
+    """`(keys, disk)` — which maps this write must not silently shrink, and what the
+    store on disk holds. Raises when the file is there but unreadable."""
+    disk, corrupt = _stored_measures(p)
+    if corrupt:
+        backup = _quarantine_corrupt_store(p)
+        log.error("REFUSED to write over %s: the file is there but unparseable, so we "
+                  "cannot know how much work it holds — a copy is preserved as %s and "
+                  "the original is left untouched for repair",
+                  p, backup or "-")
+        raise StoreWipeRefused(
+            f"Zápis do {os.path.basename(p)} zamietnutý: súbor sa nedá prečítať "
+            "(neúplný/poškodený zápis), takže nevieme, koľko práce v ňom je. Nič sa "
+            + (f"neprepísalo, kópia je v {os.path.basename(backup)}. " if backup
+               else "neprepísalo. ")
+            + "Súbor NEMAŽ — obnov ho zo zálohy (data/backups/state).")
+    keys = ("",) if protect is True else ("",) + tuple(protect)
+    return keys, disk
+
+
+def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False,
+                       prev=None) -> None:
     """The ONE json-store writer: refuse-wipe check → temp file → atomic os.replace.
 
     Every `_save_*` in this module goes through here (it used to be 29 copies of the
@@ -282,8 +382,10 @@ def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> Non
     written, so a store holding secrets is never briefly world-readable.
 
     `protect=True` marks a store holding IRREPLACEABLE work — the manager's
-    decisions / flags / pairings. There the writer refuses any write that SHRINKS the
-    store *unless this process actually read that exact store first*: losing entries
+    decisions / flags / pairings; `protect=("orders",)` additionally guards the NESTED
+    map(s) that carry the real content (the dedup stores keep theirs one level down).
+    There the writer refuses any write that SHRINKS the store *unless it is the tail of
+    a read-modify-write THIS caller performed on THAT store*: losing entries
     is legitimate only as the tail of a read-modify-write the manager just performed
     (undo the last decision, un-mark a whole supplier group via /api/ordered/bulk),
     and those all load the live store under `_lock` moments earlier. The 2026-07-26
@@ -294,27 +396,47 @@ def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False) -> Non
     incremental upload state only ever adds), and a stale count (another process wrote
     in between) refuses too: that write is a lost update, the #264 half of this story.
 
+    The receipt is the READ, not a count (PR #265 review): `_read_json_store` remembers
+    the OBJECT it handed back, and a shrink is allowed only when the map being written
+    IS that object (or names it via `prev=`, for the few callers that rebuild a new map
+    from the one they read). A count alone made this a stale-read detector: the app
+    reads decisions on every page load, so the count always matched the disk and the
+    guard was disarmed for every caller in the process — including one that had never
+    touched the store.
+
     Nothing is written when it refuses — not even a stray .tmp — and it raises rather
     than logging quietly, so the failure is visible in the response and in tests."""
     p = os.fspath(path)
     with _lock:
-        _write_json_locked(p, data, indent, mode, protect)
+        _write_json_locked(p, data, indent, mode, protect, prev)
 
 
-def _write_json_locked(p, data, indent, mode, protect) -> None:
+def _write_json_locked(p, data, indent, mode, protect, prev=None) -> None:
     """The body of `_atomic_write_json`, always under the store lock."""
+    _refuse_live_data_under_pytest(p)
     if protect:
-        n = _stored_entry_count(p)
-        if n and len(data) < n and _store_reads.get(p) != n:
-            log.error("REFUSED to shrink %s from %d to %d entries (#261): this process "
-                      "last read %s of them, so the smaller map is not something the "
-                      "manager just did — nothing was written",
-                      p, n, len(data), _store_reads.get(p))
+        keys, disk = _guarded_measures(p, protect)
+        new = _measure_store(data)
+        rec = _store_reads.get(p)
+        prev = data if prev is None else prev
+        for k in keys:
+            was = disk.get(k, 0)
+            if not was or new.get(k, 0) >= was:
+                continue                      # nothing to lose, or the map is growing
+            if rec is not None and rec[0] is prev and rec[1].get(k, 0) == was:
+                continue                      # the tail of a read-modify-write on THIS store
+            what = "záznamov" if k == "" else f"položiek v „{k}“"
+            log.error("REFUSED to shrink %s%s from %d to %d entries (#261/#265): this "
+                      "write did not come from a read of that store (read receipt: %s), "
+                      "so the smaller map is not something the manager just did — "
+                      "nothing was written", p, f" [{k}]" if k else "",
+                      was, new.get(k, 0), "none" if rec is None else "a different map")
             raise StoreWipeRefused(
-                f"Zápis do {os.path.basename(p)} zamietnutý: {n} záznamov by sa "
-                f"zmenšilo na {len(data)}, ale tento proces ich predtým nenačítal. "
-                "Dáta ostali nedotknuté — načítaj stránku znova a skús to ešte raz; "
-                "ak to nepomôže, súbor NEMAŽ a ozvi sa.")
+                f"Zápis do {os.path.basename(p)} zamietnutý: {was} {what} by sa "
+                f"zmenšilo na {new.get(k, 0)}, ale zapisovaný obsah nepochádza z "
+                "načítania tohto úložiska (na disku je novšia verzia, alebo ju zapísal "
+                "iný proces/skript). Dáta ostali nedotknuté. V prehliadači načítaj "
+                "stránku znova; ak to hlási automatizácia, spusti ju znova. Súbor NEMAŽ.")
     tmp = f"{p}.{os.getpid()}.tmp"   # per-process: two instances never share a temp
     if mode is None:
         f = open(tmp, "w", encoding="utf-8")
@@ -324,9 +446,17 @@ def _write_json_locked(p, data, indent, mode, protect) -> None:
     try:
         with f:
             json.dump(data, f, ensure_ascii=False, indent=indent)
+            # os.replace is atomic against concurrent READERS, not against a crash: the
+            # rename can be durable while the bytes are not, which is precisely how a
+            # truncated store appears after a power loss (PR #265 review).
+            f.flush()
+            os.fsync(f.fileno())
         if mode is not None:
             os.chmod(tmp, mode)   # exact perms regardless of the process umask
         os.replace(tmp, p)
+        # what is on disk now IS this object — so the manager's NEXT undo in a row is
+        # still a legitimate read-modify-write and does not 503 on a stale receipt
+        _note_store_read(p, data)
     except BaseException:
         # temp files are per-process now, so a failed dump would otherwise leave one
         # orphan per process lifetime; the store itself is untouched either way
@@ -360,20 +490,40 @@ def _record_uploaded(load_fn, save_fn, entries: dict) -> dict:
 
 def _atomic_write_bytes(path, data: bytes) -> None:
     """Same temp-file + atomic replace for the raw cp1250 CSV caches (export,
-    orders, customers) — a half-written cache would poison every reader."""
+    orders, customers) — a half-written cache would poison every reader.
+
+    The temp name comes from `tempfile.mkstemp`, NOT from the pid: `orders_cache.csv`
+    has TWO writers in one process — `_orders_csv_cached()` on any request thread when
+    the 30-min cache is stale, and `run_shoptet_sync()` on the scheduler thread every
+    hour. A pid-derived name is the SAME string for both, so the one that finishes
+    first renames the inode the other is still writing into place, and the loser then
+    keeps appending into the LIVE cache before its own replace fails (PR #265 review).
+
+    Still no store lock on purpose: with distinct temp files tmp+replace is enough, and
+    the export dump is ~55 MB — holding the cross-process lock across it would queue
+    every other instance's writes behind a multi-second write."""
     p = os.fspath(path)
-    tmp = f"{p}.{os.getpid()}.tmp"
-    # No store lock here on purpose: these caches have a single writer, tmp+replace is
-    # already atomic, and the export dump is ~55 MB — holding the cross-process lock
-    # across it would queue every other instance's writes behind a multi-second write.
-    with open(tmp, "wb") as f:
-        f.write(data)
-    os.replace(tmp, p)
+    _refuse_live_data_under_pytest(p)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(p) or ".",
+                               prefix=os.path.basename(p) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())          # durable bytes before the rename (see above)
+        os.chmod(tmp, 0o644)              # mkstemp is 0600; keep the caches as they were
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError as e:  # noqa: BLE001 — cleanup only, the real failure re-raises
+            log.warning("temp file %s sa nepodarilo odstrániť (%r)", tmp, e)
+        raise
 
 try:
     with open(DATA, encoding="utf-8") as f:
         PRODUCTS = json.load(f)
-    _store_reads[os.fspath(DATA)] = len(PRODUCTS)   # #261 — what a later save replaces
+    _note_store_read(DATA, PRODUCTS)   # #261 — the receipt a later save is checked against
     log.info("loaded %d products from %s", len(PRODUCTS), DATA)
 except FileNotFoundError:
     PRODUCTS = []
@@ -443,8 +593,11 @@ def _load_decisions() -> dict:
     return _read_json_store(DECISIONS, {})
 
 
-def _save_decisions(d: dict) -> None:
-    _atomic_write_json(DECISIONS, d, protect=True)
+def _save_decisions(d: dict, *, prev: dict = None) -> None:
+    """`prev` = the map this one was BUILT FROM, for a caller that rebuilds a new dict
+    instead of mutating the one it read (the startup prune). It is the read receipt the
+    shrink guard checks; a mutate-in-place caller needs nothing."""
+    _atomic_write_json(DECISIONS, d, protect=True, prev=prev)
 
 
 # --------------------------------------------------------------------------- #
@@ -535,7 +688,7 @@ def _load_users() -> dict:
     if os.path.exists(USERS):
         with open(USERS, encoding="utf-8") as f:
             d = json.load(f)
-        _store_reads[os.fspath(USERS)] = len(d)   # #261 — what a later save replaces
+        _note_store_read(USERS, d)   # #261 — the receipt a later save is checked against
         return d
     return {}
 
@@ -1360,7 +1513,7 @@ def _prune_orphan_decisions(products) -> None:
         d1 = {k: v for k, v in d0.items() if k in valid}
         if len(d1) != len(d0):
             log.info("pruned %d orphan decisions at startup", len(d0) - len(d1))
-            _save_decisions(d1)
+            _save_decisions(d1, prev=d0)   # a REBUILT map — name the read it came from
 
 
 try:
@@ -2524,8 +2677,9 @@ def _load_vystavy() -> list:
     return _read_json_store(VYSTAVY, [])
 
 
-def _save_vystavy(d: list) -> None:
-    _atomic_write_json(VYSTAVY, d, protect=True)
+def _save_vystavy(d: list, *, prev: list = None) -> None:
+    # `prev` — see _save_decisions: the delete path REBUILDS the list it read.
+    _atomic_write_json(VYSTAVY, d, protect=True, prev=prev)
 
 
 def _now_iso() -> str:
@@ -2631,8 +2785,8 @@ def api_vystava():
         if not v:
             return jsonify({"ok": False, "error": "výstava neexistuje"}), 404
         if body.get("delete"):
-            vystavy = [x for x in vystavy if x.get("id") != vid]
-            _save_vystavy(vystavy)
+            kept = [x for x in vystavy if x.get("id") != vid]
+            _save_vystavy(kept, prev=vystavy)   # a REBUILT list — name the read it came from
             log.info("vystavy: deleted %s user=%s", vid, session.get("user"))
             return jsonify({"ok": True})
         if "status" in body:
@@ -4423,6 +4577,10 @@ def _quarantine_corrupt_store(path: str) -> str:
     Backups are de-duplicated by CONTENT, so a daily automation hitting the same corrupt file does
     not leave one copy per run; a DIFFERENT corruption later still gets its own copy.
     """
+    # Resolve FIRST: the memo below is keyed by path, and a `_StorePath` hashes from the CURRENT
+    # OUT — keyed by the object, every repointed data dir would leave an entry nobody can look
+    # up again (PR #265 review). Callers pass either form.
+    path = os.fspath(path)
     try:
         with open(path, "rb") as f:
             raw = f.read()
@@ -4545,7 +4703,9 @@ def _load_posta_state_display() -> tuple:
 
 
 def _save_posta_state(d: dict) -> None:
-    _atomic_write_json(POSTA_STATE, d, mode=0o600, protect=True)
+    # ("escalation",) — the record of who was already e-mailed is that NESTED map; the
+    # outer dict keeps the same key set on every write, so guarding only it is inert.
+    _atomic_write_json(POSTA_STATE, d, mode=0o600, protect=("escalation",))
 
 
 def _fetch_tracking(pkg: str) -> dict:
@@ -4725,13 +4885,24 @@ def run_posta_uncollected() -> dict:
              # instead of a healthy-looking run that quietly mailed nobody (ERROR log only).
              "bcc_missing": _mail_bcc() is None}
     with _lock:
-        _save_posta_state({
+        # Re-read under the lock and update that map, rather than writing a brand-new dict:
+        # `esc`/`term_cache` were read before minutes of Pošta SK round-trips, so this both
+        # keeps whatever another writer added to the untouched keys AND makes the save a
+        # genuine read-modify-write — which is what the shrink guard checks (PR #265 review:
+        # a rebuilt dict carries no read receipt, and `escalation` really does shrink here).
+        st = _load_posta_state()
+        st.update({
+            # `esc` is the start-of-run map MINUS the orders that left the source window
+            # (pruned above) PLUS this run's bumps — so it deliberately CAN shrink. That is
+            # legitimate only because `st` is the map we just read under this lock, which is
+            # exactly what the shrink guard checks.
             "escalation": esc,
             "terminal": term_cache,
             "last_check": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "uncollected": uncollected, "invalid": invalid, "errors": errors,
             "stats": stats,
         })
+        _save_posta_state(st)
     log.info("posta: run done %s", stats)
     return stats
 
@@ -5415,7 +5586,8 @@ def _load_orders_reminder_display() -> tuple:
 
 
 def _save_orders_reminder(d: dict) -> None:
-    _atomic_write_json(ORDERS_REMINDER_STATE, d, mode=0o600, protect=True)
+    # ("orders",) — see _save_posta_state: the dedup map is one level down.
+    _atomic_write_json(ORDERS_REMINDER_STATE, d, mode=0o600, protect=("orders",))
 
 
 def _classify_contacted(shop_remark: str) -> bool:
