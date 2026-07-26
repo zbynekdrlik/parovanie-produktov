@@ -914,3 +914,14 @@ def test_the_pytest_live_dir_net_resolves_symlinks(monkeypatch, tmp_path):
     with pytest.raises(webapp.StoreWipeRefused):
         webapp._atomic_write_json(str(link / "decisions.json"), {"S|1": {"status": "x"}})
     assert not (real / "decisions.json").exists()
+
+
+def test_the_raw_cache_writer_fsyncs_the_directory_too(monkeypatch, tmp_path):
+    """The directory fsync landed in the JSON writer only — the 55 MB export and the
+    two customer caches got the durable BYTES and a rename that a power loss can still
+    lose (PR #265 third review)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    calls = _write_spy(monkeypatch)
+    webapp._atomic_write_bytes(str(tmp_path / "orders_cache.csv"), b"kod;nazov\r\n")
+    after = calls[calls.index(("replace", False)):]
+    assert ("fsync", True) in after, f"no directory fsync after the rename: {calls}"

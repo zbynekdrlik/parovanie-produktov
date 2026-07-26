@@ -220,3 +220,36 @@ def test_enabled_without_next_run_gets_rescheduled_not_run(tmp_path):
     r.tick_once()
     assert ran == []                          # no surprise run
     assert r.status()[0]["next_run"] != ""    # scheduled forward instead
+
+
+# ── durability: the state file decides what is ENABLED, so it must survive a crash ──
+def _write_spy(monkeypatch):
+    """Records fsync/replace order, and whether each fsync was of a DIRECTORY."""
+    calls = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def _fsync(fd):
+        calls.append(("fsync", stat.S_ISDIR(os.fstat(fd).st_mode)))
+        return real_fsync(fd)
+
+    def _replace(a, b):
+        calls.append(("replace", False))
+        return real_replace(a, b)
+
+    monkeypatch.setattr(os, "fsync", _fsync)
+    monkeypatch.setattr(os, "replace", _replace)
+    return calls
+
+
+def test_the_state_write_fsyncs_the_directory_after_the_rename(tmp_path, monkeypatch):
+    """The directory fsync landed in app.py's JSON writer only — and `automations.json`
+    is written by THIS module, which the app deliberately does not import from. Without
+    it a power loss can lose the RENAME while the bytes are durable, bringing the old
+    state back; and a truncated `automations.json` is precisely the corruption the
+    fail-closed loader now refuses to read (PR #265 third review)."""
+    calls = _write_spy(monkeypatch)
+    _runner(tmp_path)._save({"demo": {"enabled": True}})
+    assert ("fsync", False) in calls, "the state was renamed into place without an fsync"
+    assert calls.index(("fsync", False)) < calls.index(("replace", False)), calls
+    after = calls[calls.index(("replace", False)):]
+    assert ("fsync", True) in after, f"no directory fsync after the rename: {calls}"
