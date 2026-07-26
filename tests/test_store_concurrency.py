@@ -8,6 +8,7 @@ was not theoretical — a second app instance ran for four days over the same da
 (#262). And the stores that record which customer already got a reminder had no
 backup history at all, so nobody could even check afterwards.
 """
+import ast
 import os
 import subprocess
 import sys
@@ -22,16 +23,49 @@ import app as webapp  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKUP_SCRIPT = os.path.join(ROOT, "scripts", "backup_data.sh")
 
-# Stores whose loss means a customer gets a second e-mail, or the manager loses work
-# that exists nowhere else. Every one of them must be in the backup rotation.
-MUST_BE_BACKED_UP = [
-    "decisions.json", "review_data.json", "ordered_items.json", "uploaded_pairings.json",
-    "orders_reminder.json", "posta_uncollected.json", "automations.json",
-    "order_pairings.json", "supplier_assignments.json", "variant_links.json",
-    "waiting_items.json", "instock_items.json", "unavailable_items.json",
-    "order_comments.json", "nedostupne.json", "vystavy.json", "users.json",
-    "notes.json", "ui_labels.json",
-]
+# Stores that are irreplaceable for a reason the backup script cannot derive: the
+# automation history (what ran and when). Everything else is DERIVED from app.py's
+# `protect=` call sites by _protected_stores() below — a hand-kept list is exactly how
+# three stores ended up guarded in code and absent from the rotation.
+EXTRA_MUST_BE_BACKED_UP = ["automations.json"]
+
+
+def _protected_stores():
+    """Every store app.py marks as irreplaceable (`protect=True` / `protect=(...)`),
+    resolved to its file name.
+
+    Derived from the source, not restated: the rule added with #264 is „protect=True
+    implies a backup", and a test that hardcodes the same list as the script it checks
+    can never notice the rule being broken (it did not — uploaded_suppliers.json,
+    uploaded_externalcodes.json and uploaded_variant_links.json were all guarded and all
+    missing from the rotation)."""
+    with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    # NAME = _store("file.json")
+    stores = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name) and node.value.func.id == "_store"
+                and node.value.args and isinstance(node.value.args[0], ast.Constant)):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    stores[t.id] = node.value.args[0].value
+    writers = {"_atomic_write_json", "_save_json_0600"}
+    found = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in writers and node.args):
+            continue
+        protect = next((k.value for k in node.keywords if k.arg == "protect"), None)
+        if isinstance(protect, ast.Constant) and protect.value is True:
+            guarded = True
+        elif isinstance(protect, (ast.Tuple, ast.List)):
+            guarded = True
+        else:
+            continue                       # protect absent/False, or forwarded (a wrapper)
+        if guarded and isinstance(node.args[0], ast.Name) and node.args[0].id in stores:
+            found.add(stores[node.args[0].id])
+    return found
 
 
 def test_a_long_upload_records_its_keys_onto_the_CURRENT_state(tmp_path, monkeypatch):
@@ -52,8 +86,10 @@ def test_a_long_upload_records_its_keys_onto_the_CURRENT_state(tmp_path, monkeyp
 def test_the_backup_script_covers_every_irreplaceable_store():
     with open(BACKUP_SCRIPT, encoding="utf-8") as f:
         script = f.read()
-    missing = [f for f in MUST_BE_BACKED_UP if f not in script]
-    assert missing == [], f"no backup history for: {missing}"
+    expected = _protected_stores() | set(EXTRA_MUST_BE_BACKED_UP)
+    assert len(expected) > 15, f"the protect= scan found suspiciously little: {expected}"
+    missing = sorted(f for f in expected if f not in script)
+    assert missing == [], f"guarded in app.py but no backup history for: {missing}"
 
 
 def test_the_store_lock_is_exclusive_across_processes(tmp_path, monkeypatch):

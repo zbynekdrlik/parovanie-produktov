@@ -11,9 +11,11 @@ Three layers are pinned here, each on its own:
      helper that forgets to patch anything cannot reach data/out;
   3. a write that would drop a populated store to empty is refused, loudly.
 """
+import ast
 import json
 import os
 import sys
+import types
 
 import pytest
 
@@ -47,14 +49,76 @@ def test_patching_out_redirects_every_store_path(monkeypatch, tmp_path):
     assert frozen == [], f"still frozen at import time: {frozen}"
 
 
+def _import_time_out_uses():
+    """Every place app.py reads `OUT` in an expression that is EVALUATED AT IMPORT
+    (i.e. not inside a function body). Those are the frozen ones — the shape that
+    caused the wipe. Inside a function `OUT` is read per call, which is the point."""
+    with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    frozen = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Name) and node.id == "OUT"
+                and isinstance(node.ctx, ast.Load)):
+            continue
+        cur, lazy = node, False
+        while cur in parents:
+            cur = parents[cur]
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                lazy = True
+                break
+        if not lazy:
+            frozen.append(node.lineno)
+    return frozen
+
+
 def test_no_store_path_is_frozen_at_import():
-    """Drift guard: a NEW `X = os.path.join(OUT, ...)` constant would be a plain
-    absolute str under OUT — exactly the shape that caused the wipe."""
+    """Drift guard, structural. The string-shaped version it replaces only saw
+    module-level `str` globals, so a `pathlib.Path(OUT) / "x.json"`, an f-string, or a
+    path frozen into a dict / class attribute / default argument was invisible to it —
+    and every one of those re-introduces the #261 freeze. Reading the AST catches the
+    CAUSE (OUT evaluated once, at import) instead of one of its shapes."""
+    frozen = _import_time_out_uses()
+    assert frozen == [], (
+        f"app.py:{frozen} builds a path from OUT at import time — use `_store(name)`, "
+        "which resolves against the CURRENT OUT on every use")
+
+
+def test_no_module_level_value_hides_a_path_under_out():
+    """The runtime half of the same guard: a path frozen INSIDE a container, a class
+    attribute or a function default is still a frozen path, and none of those are a
+    module-level `str`."""
     out = os.fspath(webapp.OUT)
-    frozen = sorted(n for n, v in vars(webapp).items()
-                    if isinstance(v, str) and not n.startswith("__")
-                    and os.path.isabs(v) and v.startswith(out + os.sep))
-    assert frozen == [], f"store paths frozen as plain strings: {frozen}"
+
+    def _under_out(v):
+        return isinstance(v, str) and os.path.isabs(v) and v.startswith(out + os.sep)
+
+    # Runtime registries KEYED by a resolved path, by design — they hold whatever OUT
+    # was when the app last touched a store, which is the opposite of frozen.
+    runtime_caches = {"_store_reads", "_quarantined"}
+
+    frozen = []
+    for name, value in list(vars(webapp).items()):
+        if name.startswith("__") or name in runtime_caches:
+            continue
+        # `type(...) is` on purpose: app.py holds Flask/werkzeug proxies whose attributes
+        # explode outside a request context, so nothing here may probe an unknown object.
+        if type(value) in (list, tuple, set, frozenset):
+            seen = list(value)
+        elif type(value) is dict:
+            seen = list(value.keys()) + list(value.values())
+        elif type(value) is type:
+            seen = list(vars(value).values())
+        elif type(value) is types.FunctionType:
+            seen = (list(value.__defaults__ or ())
+                    + list((value.__kwdefaults__ or {}).values()))
+        else:
+            seen = [value]
+        frozen += [name for v in seen if _under_out(v)]
+    assert sorted(set(frozen)) == [], f"frozen paths under OUT: {sorted(set(frozen))}"
 
 
 # --------------------------------------------------------------------------- #

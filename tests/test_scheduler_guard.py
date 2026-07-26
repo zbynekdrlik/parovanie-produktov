@@ -12,6 +12,7 @@ carries no scheduler at all — nothing in it ever fires on a timer, however lon
 forgotten. (A manual „Spustiť teraz" click by a logged-in human still runs; the flag
 removes the unattended schedule, which is what the orphan was doing.)
 """
+import ast
 import fcntl
 import os
 import sys
@@ -96,20 +97,62 @@ def test_the_off_switch_is_opt_in(scheduler_out, monkeypatch):
     assert started == [1]
 
 
-def test_every_e2e_fixture_server_boots_without_a_scheduler():
-    """Each e2e fixture launches a real `python webreview/app.py`, so each one starts
-    a real scheduler over its own data dir. They are inert only because no fixture
-    happens to seed `enabled: true` today — one seeded automation and a CI run would
-    scrape a paid API or mail a customer. Same category as the forgotten preview."""
-    conftest = os.path.join(ROOT, "tests", "e2e", "conftest.py")
-    with open(conftest, encoding="utf-8") as f:
+def _e2e_server_envs():
+    """Every `subprocess.Popen` in the e2e conftest, paired with the env dict literal it
+    is handed. Structural on purpose: the string-counting version this replaces compared
+    occurrences of the literal `'"WEBREVIEW_OUT": str(out)'`, so a fixture that named its
+    dir anything but `out` counted as ZERO servers and the assertion held vacuously."""
+    path = os.path.join(ROOT, "tests", "e2e", "conftest.py")
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+
+    def dotted(node):
+        if isinstance(node, ast.Attribute):
+            return f"{dotted(node.value)}.{node.attr}"
+        return node.id if isinstance(node, ast.Name) else ""
+
+    out = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # name -> the dict literal assigned to it inside this fixture
+        envs = {t.id: n.value for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                for t in n.targets
+                if isinstance(t, ast.Name) and isinstance(n.value, ast.Dict)}
+        for call in ast.walk(fn):
+            if not (isinstance(call, ast.Call) and dotted(call.func) == "subprocess.Popen"):
+                continue
+            kw = next((k.value for k in call.keywords if k.arg == "env"), None)
+            if isinstance(kw, ast.Name):
+                kw = envs.get(kw.id)
+            out.append((fn.name, call.lineno, kw))
+    return out
+
+
+def test_every_e2e_fixture_server_boots_with_the_shared_pins():
+    """Each e2e fixture launches a real `python webreview/app.py`, so each one starts a
+    real scheduler over its own data dir AND resolves OUT itself. They are inert only
+    because no fixture happens to seed `enabled: true` today — one seeded automation and
+    a CI run would scrape a paid API or mail a customer. Same category as the forgotten
+    preview instance (#262). Every one of them must unpack the shared pins (which carry
+    WEBREVIEW_NO_SCHEDULER) and set its own WEBREVIEW_OUT."""
+    servers = _e2e_server_envs()
+    assert len(servers) >= 13, f"only {len(servers)} fixture servers found — parser drift?"
+    for name, lineno, env in servers:
+        where = f"tests/e2e/conftest.py:{lineno} ({name})"
+        assert isinstance(env, ast.Dict), f"{where}: Popen without an inspectable env dict"
+        unpacked = [ast.unparse(v) for k, v in zip(env.keys, env.values) if k is None]
+        keys = [k.value for k in env.keys if isinstance(k, ast.Constant)]
+        assert "_AUTH_ENV" in unpacked, f"{where}: env does not unpack **_AUTH_ENV"
+        assert "WEBREVIEW_OUT" in keys, f"{where}: env does not pin WEBREVIEW_OUT"
+
+
+def test_the_shared_e2e_pins_switch_the_scheduler_off():
+    path = os.path.join(ROOT, "tests", "e2e", "conftest.py")
+    with open(path, encoding="utf-8") as f:
         text = f.read()
     assert '"WEBREVIEW_NO_SCHEDULER": "1"' in text, \
         "the shared fixture-server env must pin the scheduler off"
-    servers = text.count('"WEBREVIEW_OUT": str(out)')
-    pinned = text.count("**_AUTH_ENV")
-    assert pinned >= servers, \
-        f"{servers - pinned} fixture server(s) build an env without the shared pins"
 
 
 def test_a_manual_run_still_works_without_a_scheduler(monkeypatch):
@@ -135,3 +178,55 @@ def test_the_playbook_preview_recipe_disables_the_scheduler():
     assert recipe, "the throwaway-preview recipe disappeared from the playbook"
     assert all("WEBREVIEW_NO_SCHEDULER=1" in ln for ln in recipe), \
         "the throwaway preview must be booted with WEBREVIEW_NO_SCHEDULER=1"
+
+
+# --------------------------------------------------------------------------- #
+# The state of the scheduler must be VISIBLE, not just logged once at boot
+# --------------------------------------------------------------------------- #
+def _automations_json():
+    from tests.conftest import authed_client
+    r = authed_client().get("/api/automations")
+    assert r.status_code == 200, r.data
+    return r.get_json()
+
+
+def test_a_running_scheduler_reports_itself_as_running(scheduler_out, monkeypatch):
+    monkeypatch.setattr(webapp.RUNNER, "start", lambda: None)
+    assert webapp._start_scheduler() is True
+    assert _automations_json()["scheduler"] == "running"
+
+
+def test_a_blocked_scheduler_is_visible_in_the_api(scheduler_out, monkeypatch):
+    """The boot ERROR line is the ONLY signal today, and `next_run` comes straight from
+    the persisted state file — so the tab renders every enabled automation with a healthy
+    future „Ďalší beh" while nothing will ever fire. That is the same silent business
+    failure the store guard exists to prevent, one level up (PR #265 review)."""
+    monkeypatch.setattr(webapp.RUNNER, "start", lambda: None)
+    holder_fd = os.open(str(scheduler_out / ".scheduler.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(holder_fd, fcntl.LOCK_EX)
+    try:
+        assert webapp._start_scheduler() is False
+        assert _automations_json()["scheduler"] == "blocked"
+    finally:
+        fcntl.flock(holder_fd, fcntl.LOCK_UN)
+        os.close(holder_fd)
+
+
+def test_a_preview_instance_reports_its_scheduler_as_off(scheduler_out, monkeypatch):
+    monkeypatch.setenv("WEBREVIEW_NO_SCHEDULER", "1")
+    monkeypatch.setattr(webapp.RUNNER, "start", lambda: None)
+    assert webapp._start_scheduler() is False
+    assert _automations_json()["scheduler"] == "off"
+
+
+def test_the_frontend_renders_the_scheduler_warning():
+    """The API field is only half the fix — the manager must SEE it. Pinned structurally
+    so the banner cannot be dropped while the endpoint keeps reporting."""
+    with open(os.path.join(ROOT, "webreview", "static", "app.js"), encoding="utf-8") as f:
+        js = f.read()
+    with open(os.path.join(ROOT, "webreview", "templates", "index.html"),
+              encoding="utf-8") as f:
+        html = f.read()
+    assert 'id="schedWarn"' in html, "no banner element on the page"
+    assert "schedWarn" in js and "SCHEDULER" in js, "app.js never fills the banner in"
+    assert "sa nespustia" in js, "the banner must say plainly that nothing will run"
