@@ -15,6 +15,7 @@ import ast
 import json
 import os
 import sys
+import threading
 import types
 
 import pytest
@@ -517,3 +518,103 @@ def test_the_startup_prune_still_drops_a_genuine_orphan(monkeypatch, tmp_path):
     webapp._save_decisions(_two_decisions())
     webapp._prune_orphan_decisions([{"key": "S|1"}])
     assert list(webapp._load_decisions()) == ["S|1"]
+
+
+# --------------------------------------------------------------------------- #
+# Layer 3, hardened again — the receipt must survive a CONCURRENT READ
+#
+# The first cut of the receipt kept ONE slot per store and overwrote it on every
+# read. Flask runs threaded, every GET re-reads these stores (/api/orders alone
+# loads eight of them, and the tab polls), so a display read landing between the
+# writer's load and its guard check replaced the receipt — and the manager's own
+# un-toggle was refused with a 503. Measured before this section existed: 11 of
+# 400 un-toggles refused with three pollers, 317 of 400 with no sleep between
+# reads. The receipt must be provenance, not „the last read wins" (PR #265
+# second review, C1).
+# --------------------------------------------------------------------------- #
+def test_a_display_read_between_the_load_and_the_write_never_refuses_it(
+        monkeypatch, tmp_path):
+    """Deterministic form: the read lands INSIDE the writer's guarded window (the
+    re-read of the store that `_write_json_locked` does while holding the lock)."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_ordered({"O1|A": True, "O1|B": True})
+    d = webapp._load_ordered()
+    d.pop("O1|A")
+
+    orig = webapp._stored_measures
+
+    def _read_from_another_request(p):
+        webapp._load_ordered()          # what /api/orders does, on another thread
+        return orig(p)
+
+    monkeypatch.setattr(webapp, "_stored_measures", _read_from_another_request)
+    webapp._save_ordered(d)             # the manager's un-toggle — must NOT 503
+    assert webapp._load_ordered() == {"O1|B": True}
+
+
+def test_the_managers_undos_are_never_refused_while_the_tab_polls(monkeypatch, tmp_path):
+    """The reviewer's shape, with real threads: a writer doing legitimate shrinking
+    writes while another thread reads the same store in a loop. Zero refusals."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    n = 200
+    webapp._save_ordered({f"O|{i}": True for i in range(n + 1)})
+
+    stop = threading.Event()
+    reads = []
+
+    def _poller():
+        while not stop.is_set():
+            reads.append(len(webapp._load_ordered()))
+
+    t = threading.Thread(target=_poller, daemon=True, name="tab-poller")
+    t.start()
+    refused = []
+    try:
+        for i in range(n):
+            d = webapp._load_ordered()
+            d.pop(f"O|{i}")
+            try:
+                webapp._save_ordered(d)
+            except webapp.StoreWipeRefused as e:
+                refused.append(f"{i}: {e}")
+    finally:
+        stop.set()
+        t.join(timeout=10)
+
+    assert reads, "the poller never ran — the test proves nothing"
+    assert refused == [], f"{len(refused)}/{n} legitimate un-toggles refused"
+    assert len(webapp._load_ordered()) == 1
+
+
+def test_a_concurrent_read_still_does_not_legitimise_a_foreign_wipe(
+        monkeypatch, tmp_path):
+    """The B1 exploit, re-run against the widened receipt: however many reads are in
+    flight, a map that came from NO read of this store is still refused."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    for _ in range(50):                      # fill whatever the receipt remembers
+        webapp._load_decisions()
+    with pytest.raises(webapp.StoreWipeRefused):
+        webapp._save_decisions({})
+    assert webapp._load_decisions() == _two_decisions()
+
+
+def test_the_receipt_of_one_thread_is_not_a_receipt_for_another(monkeypatch, tmp_path):
+    """Widening the receipt must not turn „some thread read it once" into a licence
+    for a thread that never did — that is the incident's own shape, threaded."""
+    monkeypatch.setattr(webapp, "OUT", str(tmp_path))
+    webapp._save_decisions(_two_decisions())
+    read = webapp._load_decisions()          # this thread reads…
+    boom = []
+
+    def _foreign_writer():
+        try:
+            webapp._save_decisions({})       # …a DIFFERENT thread wipes, having read nothing
+        except webapp.StoreWipeRefused:
+            boom.append("refused")
+
+    t = threading.Thread(target=_foreign_writer, name="foreign")
+    t.start()
+    t.join(timeout=10)
+    assert boom == ["refused"], "a foreign thread wiped the store"
+    assert webapp._load_decisions() == _two_decisions() and read
