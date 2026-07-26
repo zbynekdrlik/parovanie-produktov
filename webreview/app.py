@@ -310,9 +310,11 @@ _store_reads: dict = {}            # path -> deque[(object, measures)], any thre
 _thread_reads = threading.local()  # path -> deque[(object, measures)], this thread only
 
 # The manager's REAL data dir — never derived from OUT (which tests repoint), so it
-# still names the live files when OUT points at a tmp dir.
-_LIVE_OUT = os.path.abspath(os.path.join(ROOT, "data", "out"))
-_LIVE_PRODUCTS = os.path.abspath(os.path.join(ROOT, "data", "products.csv"))
+# still names the live files when OUT points at a tmp dir. `realpath`, not `abspath`:
+# abspath does not resolve symlinks, so a helper pointing WEBREVIEW_OUT at a LINK to
+# data/out walked straight past the net (PR #265 second review).
+_LIVE_OUT = os.path.realpath(os.path.join(ROOT, "data", "out"))
+_LIVE_PRODUCTS = os.path.realpath(os.path.join(ROOT, "data", "products.csv"))
 
 
 def _refuse_live_data_under_pytest(p) -> None:
@@ -325,8 +327,11 @@ def _refuse_live_data_under_pytest(p) -> None:
     incident on its own."""
     if not os.environ.get("PYTEST_CURRENT_TEST"):
         return
-    a = os.path.abspath(os.fspath(p))
-    if a == _LIVE_PRODUCTS or a == _LIVE_OUT or a.startswith(_LIVE_OUT + os.sep):
+    # realpath both sides: a symlinked tmp dir must not be a way around this
+    a = os.path.realpath(os.fspath(p))
+    live_out = os.path.realpath(_LIVE_OUT)
+    if (a == os.path.realpath(_LIVE_PRODUCTS) or a == live_out
+            or a.startswith(live_out + os.sep)):
         log.error("REFUSED a write to the live data dir from a pytest run: %s", a)
         raise StoreWipeRefused(
             f"Test sa pokúsil zapísať do živých dát ({a}) — zamietnuté. "
@@ -451,6 +456,56 @@ def _guarded_measures(p, protect) -> tuple:
     return keys, disk
 
 
+def _fsync_dir(d: str) -> None:
+    """Make a rename durable. Best effort: some filesystems refuse a directory fsync,
+    and losing THIS is far less bad than failing a write the manager just made — so it
+    warns instead of raising (ext4, which the box runs, supports it)."""
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError as e:  # noqa: BLE001 — durability hint only, the data is already written
+        log.warning("adresár %s sa nedá otvoriť na fsync (%r)", d, e)
+        return
+    try:
+        os.fsync(fd)
+    except OSError as e:  # noqa: BLE001 — see above
+        log.warning("fsync adresára %s zlyhal (%r)", d, e)
+    finally:
+        os.close(fd)
+
+
+def _sweep_stale_tmp(*dirs: str, max_age_h: float = 12.0) -> int:
+    """Remove `*.tmp` leftovers older than `max_age_h` from the data dirs.
+
+    `_atomic_write_bytes` names its temp file with `tempfile.mkstemp`, so a SIGKILL/OOM
+    during the ~55 MB export write leaves one ~55 MB orphan PER EVENT and nothing ever
+    reuses that name (the old pid-derived name was self-limiting at one per process
+    lifetime — PR #265 second review). The age bound is what makes this safe: a live
+    write of any store takes seconds, so nothing another instance is still using can be
+    12 hours old."""
+    cutoff = time.time() - max_age_h * 3600
+    removed = 0
+    for d in dirs:
+        try:
+            names = os.listdir(d)
+        except OSError as e:  # noqa: BLE001 — housekeeping, never a reason to fail the boot
+            log.warning("nedá sa prehľadať %s na zvyškové .tmp súbory (%r)", d, e)
+            continue
+        for name in names:
+            if not name.endswith(".tmp"):
+                continue
+            f = os.path.join(d, name)
+            try:
+                if os.stat(f).st_mtime >= cutoff:
+                    continue
+                os.unlink(f)
+            except OSError as e:  # noqa: BLE001 — someone else may have won the race
+                log.warning("zvyškový %s sa nepodarilo odstrániť (%r)", f, e)
+                continue
+            removed += 1
+            log.info("odstránený zvyškový dočasný súbor %s (staršī ako %g h)", f, max_age_h)
+    return removed
+
+
 def _atomic_write_json(path, data, *, indent=2, mode=None, protect=False,
                        prev=None) -> None:
     """The ONE json-store writer: refuse-wipe check → temp file → atomic os.replace.
@@ -534,6 +589,10 @@ def _write_json_locked(p, data, indent, mode, protect, prev=None) -> None:
         if mode is not None:
             os.chmod(tmp, mode)   # exact perms regardless of the process umask
         os.replace(tmp, p)
+        # …and the RENAME itself must be durable too: fsyncing the bytes but not the
+        # directory entry lets a power loss bring the OLD file back (PR #265 second
+        # review). One call, in the one place every json store is written.
+        _fsync_dir(os.path.dirname(p) or ".")
         # what is on disk now IS this object — so the manager's NEXT undo in a row is
         # still a legitimate read-modify-write and does not 503 on a stale receipt
         _note_store_write(p, data)
@@ -568,7 +627,7 @@ def _record_uploaded(load_fn, save_fn, entries: dict) -> dict:
     return fresh
 
 
-def _atomic_write_bytes(path, data: bytes) -> None:
+def _atomic_write_bytes(path, data: bytes, *, mode: int = 0o644) -> None:
     """Same temp-file + atomic replace for the raw cp1250 CSV caches (export,
     orders, customers) — a half-written cache would poison every reader.
 
@@ -591,7 +650,12 @@ def _atomic_write_bytes(path, data: bytes) -> None:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())          # durable bytes before the rename (see above)
-        os.chmod(tmp, 0o644)              # mkstemp is 0600; keep the caches as they were
+        # mkstemp creates the temp file 0600. The export is public-ish data and stays
+        # 0644 as it always was; the ORDER and CUSTOMER caches hold customer names,
+        # e-mails and phones and keep mkstemp's 0600 — the same class of data
+        # posta_uncollected.json / orders_reminder.json already keep private, and only
+        # this one systemd --user service ever reads them (PR #265 second review).
+        os.chmod(tmp, mode)               # exact perms regardless of the process umask
         os.replace(tmp, p)
     except BaseException:
         try:
@@ -1625,12 +1689,24 @@ def _prune_orphan_decisions(products) -> None:
 
 try:
     _prune_orphan_decisions(PRODUCTS)
-except (StoreLockTimeout, StoreWipeRefused, OSError) as e:  # noqa: BLE001
+except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
     # Tidying orphans is housekeeping — never a reason for the service to fail to boot.
     # Widened past the lock timeout (PR #265 review): a refused write, or the OSError
     # `_read_json_store` now re-raises on an unreadable decisions.json, would abort the
-    # import just as effectively and leave no UI to diagnose it from.
+    # import just as effectively and leave no UI to diagnose it from. ValueError joins
+    # them for the same reason it joined the admin bootstrap (PR #265 second review).
     log.error("startup decision prune skipped (%r) — the app keeps serving", e)
+
+def _sweep_stale_tmp_at_startup() -> int:
+    """The startup sweep, reading OUT/SRC at CALL time — never frozen at import
+    (`test_no_store_path_is_frozen_at_import`, which caught this very line)."""
+    return _sweep_stale_tmp(os.fspath(OUT), os.path.dirname(os.fspath(SRC)) or ".")
+
+
+try:
+    _sweep_stale_tmp_at_startup()
+except OSError as e:  # noqa: BLE001 — housekeeping; never a reason for the service not to start
+    log.error("startup temp-file sweep skipped (%r) — the app keeps serving", e)
 
 
 _IMG_NOISE = ("logo", "/producer/", ".svg", "/svg/", "placeholder", "no-image",
@@ -1818,7 +1894,7 @@ def _orders_csv_cached() -> bytes:
         with open(ORDERS_CACHE, "rb") as f:
             return f.read()
     data = _fetch_orders_csv()
-    _atomic_write_bytes(ORDERS_CACHE, data)
+    _atomic_write_bytes(ORDERS_CACHE, data, mode=0o600)
     return data
 
 
@@ -5045,7 +5121,7 @@ def run_shoptet_sync() -> dict:
     global PRODUCTS, CODE2PAIR, CODE2VARIANT, CATALOG, _NEDOSTUPNE_CAT, _CODE2URL
 
     orders_bytes = _fetch_orders_csv()
-    _atomic_write_bytes(ORDERS_CACHE, orders_bytes)
+    _atomic_write_bytes(ORDERS_CACHE, orders_bytes, mode=0o600)
 
     export_bytes = _fetch_export_csv()
     _atomic_write_bytes(SRC, export_bytes)
@@ -5090,7 +5166,7 @@ def run_shoptet_sync() -> dict:
     customers_bytes, customers_error = b"", None
     try:
         customers_bytes = _fetch_customers_csv()
-        _atomic_write_bytes(CUSTOMERS_CACHE, customers_bytes)
+        _atomic_write_bytes(CUSTOMERS_CACHE, customers_bytes, mode=0o600)
     except Exception as e:  # noqa: BLE001 — auxiliary source; never fail the whole sync
         customers_error = str(e)   # already secret-sanitized by _fetch_customers_csv
         log.warning("shoptet_sync: customer export refresh failed (non-fatal): %s",
