@@ -474,6 +474,68 @@ def _export(pairs):
     return head + "".join(f"{c};P1;{note};\r\n" for c, note in pairs.items())
 
 
+def test_partial_stdout_is_read_from_the_scripts_own_result_line(iso, monkeypatch):
+    """The import script's stdout STARTS with an echo of the baseline Log entry, which
+    carries its own 'Spracované: N'. Parsing the whole stdout read THAT as the result
+    (#196's processed=1/failed=1 while 260 rows really went through) — and it silently
+    disabled the whole partial-chunk fix, because the baseline counts never match the
+    number of rows we sent, so every partial chunk was classified as a hard failure."""
+    _seed_pairing()
+    real_stdout = (
+        "Súbor:   data/out/import_links_x.csv\nRiadkov: 1\n"
+        "[import] baseline (posledný riadok Logu pred behom): #12688 26.07.2026 20:12 "
+        "Info Import dobehol úspešne. Spracované: 4. Upravené: 1.\n"
+        "[import] spúšťam import …\n"
+        "\nVÝSLEDOK: spracované=1 upravené=0 zlyhania=1\n")
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (2, real_stdout, ""))
+
+    result = webapp.run_parovania_eshop()
+
+    p = result["pairings"]
+    assert p["partial"] is True           # 1 row sent, 1 processed, 1 rejected
+    assert p["rejected"] == 1
+    # nothing credited: the log cannot say WHICH row failed and here it was the only one
+    assert (not (iso["tmp"] / "uploaded_pairings.json").exists()
+            or json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) == {})
+
+
+def test_export_confirmation_ignores_a_code_the_export_lists_twice(iso, monkeypatch):
+    # the catalog holds duplicate products sharing variant codes (see link_rows) — if
+    # two export rows disagree about a code's internalNote, neither proves anything,
+    # so the code must stay unconfirmed and be sent.
+    _seed_pairing()
+    monkeypatch.setattr(webapp, "_read_export_for_links",
+                        lambda: ("code;pairCode;internalNote;supplier\r\n"
+                                 "1/M;P1;https://supplier/OTHER;\r\n"
+                                 "1/M;P1;https://supplier/x;\r\n"))
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["pairings"]["confirmed_in_export"] == 0
+    links = [c for c in calls if c["header"][2] == "internalNote"]
+    assert links and ["1/M", "P1", "https://supplier/x"] in links[0]["rows"]
+
+
+def test_partial_message_promises_export_confirmation_only_where_it_happens(iso, monkeypatch):
+    # only the pairings push reconciles against the export; the supplier write-back
+    # writes a different column and never confirms anything, so its message must not
+    # tell the manager the rows will be confirmed from the export.
+    _seed_pairing()
+    _seed_supplier()
+    partial = "VÝSLEDOK: spracované=1 upravené=0 zlyhania=1"
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda p, dry_run=False, timeout=300: (2, partial, ""))
+
+    result = webapp.run_parovania_eshop()
+
+    assert "z exportu" in result["pairings"]["error"]
+    assert "odmietol 1 z" in result["suppliers"]["error"]
+    assert "z exportu" not in result["suppliers"]["error"]
+
+
 def test_partial_chunk_keeps_importing_the_rest_of_the_batch(iso, monkeypatch):
     n = 650                                     # 3 chunks of <=300
     products = [{"key": f"K{i}", "idx": i, "supplier": "BETALOV", "name": f"P{i}",
@@ -500,7 +562,8 @@ def test_partial_chunk_keeps_importing_the_rest_of_the_batch(iso, monkeypatch):
     # …and the rejection is SURFACED, not hidden behind a bare 'ok'
     assert p["ok"] is False
     assert p["partial"] is True
-    assert "odmietol" in p["error"] and "2" in p["error"]
+    assert p["rejected"] == 2
+    assert "odmietol 2 z 650 riadkov" in p["error"]
 
 
 def test_rows_already_correct_in_the_eshop_are_credited_from_the_export(iso, monkeypatch):

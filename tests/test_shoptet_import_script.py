@@ -67,6 +67,45 @@ def test_read_result_polls_past_a_foreign_row_until_our_own_appears():
     assert page.reloads >= 1          # it really waited instead of taking the top row
 
 
+def test_read_result_does_not_credit_a_lone_foreign_row_that_matches_the_count():
+    # The residual hole of count-only matching: a CONCURRENT import of the same size
+    # writes its row first, ours has not appeared yet — on a single read it is the
+    # only match and would be taken as ours (and its 300 codes recorded uploaded
+    # although nothing landed). The read must settle: a pick is only accepted when
+    # two consecutive reads agree, so our own row appearing in between turns the
+    # false match into an unattributable result instead of a false success.
+    foreign = "#12701 26.07.2026 21:00 Info Import dobehol úspešne. Spracované: 300. Upravené: 12."
+    ours = "#12702 26.07.2026 21:00 Info Import dobehol úspešne. Spracované: 300. Upravené: 298."
+    page = FakePage([[foreign, BASELINE],
+                     [ours, foreign, BASELINE],
+                     [ours, foreign, BASELINE]])
+    assert script._read_result(page, baseline=BASELINE, expected_rows=300,
+                               retries=4, wait_s=0) is None
+
+
+def test_capture_baseline_never_echoes_the_previous_runs_counts(capsys):
+    """The stdout of this script is parsed by webreview/app.py to learn what the
+    import did. Echoing the baseline ROW there put a foreign 'Spracované: N' AHEAD of
+    our own result line, and parse_import_log takes the first match — so the app read
+    the PREVIOUS entry's numbers as this run's result (#196's 'processed=1/failed=1'
+    while 260 rows were really processed). Print the entry id, never the counts."""
+
+    class P:
+        def goto(self, *a, **kw):
+            pass
+
+        def wait_for_load_state(self, *a, **kw):
+            pass
+
+        def evaluate(self, _js):
+            return [BASELINE]
+
+    assert script._capture_baseline(P(), {"SHOPTET_ADMIN_URL": "https://x/admin"}) == BASELINE
+    printed = capsys.readouterr().out
+    assert "12688" in printed                      # still identifies the baseline
+    assert "Spracované" not in printed and "Upravené" not in printed
+
+
 def test_read_result_gives_up_instead_of_reporting_a_foreign_row():
     # Our row never shows up → None → parse_import_log(None) → processed=None →
     # exit code 2 ("výsledok sa nepodarilo prečítať"), never a foreign success.
