@@ -179,6 +179,11 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
     kľúče pri mape — **vrátane VNORENÝCH máp, ktoré `protect=("orders",)` stráži**, lebo
     vonkajšiu sadu kľúčov nechá rovnakú každý reálny writer, takže kontrola len na
     najvyššej úrovni dovolila `prev=` zápisu podstrčiť cudziu mapu „komu sme už písali";
+    **a porovnávaj až PO kontrole typu (`type(a) is not type(b)` → zamietni)** — obe
+    vetvy porovnávajú rovnaké s rovnakým (`isinstance(a, dict) and isinstance(b, dict)`,
+    to isté pre list), takže zápis, ktorý tú vnorenú mapu NAHRADÍ niečím iným (`None`,
+    list, string, `0`) alebo jej kľúč rovno vypustí, netrafil ani jednu vetvu a prešiel
+    ako „odvodený" — všetky štyri tvary namerané ako POVOLENÉ (finálna revízia PR #265);
     a pri liste identita prvkov **alebo hodnotová zhoda** — samotná identita zamietala
     poctivú prestavbu `[dict(x) for x in prev if …]`, a to hláškou „nepochádza z načítania
     tohto úložiska", čo je nepravda a pozvánka nájsť si obchádzku (tretia revízia).
@@ -246,6 +251,13 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
   ktorého useknutie fail-closed loader hlási ako korupciu (tretia revízia PR #265).
   **A oba fsync-y otestuj** (spy na poradie `os.fsync`/`os.replace`) — pôvodná oprava
   fsyncu bola jediná v celej vlne BEZ testu: zmazanie oboch riadkov nechalo suite zelenú.
+  - **Trvanlivosť je BONUS — nikdy nesmie zhodiť už HOTOVÝ zápis.** `_fsync_dir` prehĺtal
+    chyby z `os.open`/`os.fsync`, ale nie `os.close` vo svojom `finally` — a volá sa AŽ ZA
+    `os.replace`, vnútri `except BaseException: unlink(tmp); raise`. Jedna chyba pri
+    zatváraní adresára by tak ohlásila 55 MB export, ktorý JE na disku, ako zlyhaný (plus
+    nezmyselné „temp file sa nepodarilo odstrániť" — v tej chvíli už neexistuje). Pravidlo:
+    v takom helperi obaľ KAŽDÉ volanie vrátane `close`, a jeho volanie daj **za** `try/except`,
+    ktorý upratuje po neúspechu (finálna revízia PR #265).
 - **Tmp meno: JSON writer per-proces (`<store>.<pid>.tmp`, beží pod `_lock`), ale
   `_atomic_write_bytes` MUSÍ `tempfile.mkstemp`** — `orders_cache.csv` má DVOCH pisateľov v
   jednom procese (request thread pri starej 30-min cache + hodinový sync), takže pid-ové meno
@@ -261,7 +273,11 @@ nepresmeroval nič a fixtúra sa zapísala do ŽIVÝCH dát.
     deštruktívnej operácii, nielen k zápisom.** Metla bola jediné `os.unlink` v strome
     mimo tej siete, a beží pri IMPORTE nad `OUT` + `dirname(SRC)`: pri nepripnutom
     `WEBREVIEW_OUT` (presne konfigurácia incidentu) mazala živé `data/out/*.tmp`
-    (tretia revízia PR #265). Volajúci pri štarte musí zamietnutie prežiť
+    (tretia revízia PR #265). **A sieť musí kryť OBA tie adresáre**: pôvodne poznala
+    `data/out` (aj čokoľvek pod ním) a SÚBOR `products.csv`, ale nie `data/` samotné —
+    čiže presne ten druhý argument metly (`dirname(SRC)`), takže helper, ktorý prestaví
+    `WEBREVIEW_PRODUCTS` na živý export, ju pustil mazať živé `data/*.tmp` (finálna
+    revízia PR #265). Volajúci pri štarte musí zamietnutie prežiť
     (`except (OSError, StoreWipeRefused)`), inak z ochrany spravíš mŕtvy import.
   - **`mode` sa dedí z `mkstemp` (0600) — nešir ho naslepo na 0644.** `orders_cache.csv` a
     `customers_cache.csv` držia mená, e-maily a telefóny zákazníkov (tá istá trieda dát ako
