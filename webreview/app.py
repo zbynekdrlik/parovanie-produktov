@@ -412,9 +412,15 @@ def _note_store_write(path, data) -> None:
 
 
 def _store_receipts(p: str):
-    """Every receipt this process may honour for `p` — this thread's first."""
-    yield from _thread_ring(p)
-    yield from _store_reads.get(p, ())
+    """Every receipt this process may honour for `p` — this thread's first.
+
+    SNAPSHOTS both rings (PR #265 third review): the guard consumes this generator
+    while every GET is appending to the very same deques WITHOUT the store lock, and
+    CPython raises `RuntimeError: deque mutated during iteration` for exactly that.
+    It surfaced as a raw 500 on the manager's click — a RuntimeError is not
+    `StoreWipeRefused`, so not even the 503 with something to fix."""
+    yield from tuple(_thread_ring(p))
+    yield from tuple(_store_reads.get(p, ()))
 
 
 def _is_derived_from(data, prev) -> bool:
