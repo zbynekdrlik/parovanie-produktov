@@ -3311,12 +3311,18 @@ function renderSchedulerWarning(onAutomationTab) {
   const box = document.getElementById('schedWarn');
   if (!box) return;
   if (!onAutomationTab || SCHEDULER === 'running') { box.hidden = true; box.textContent = ''; return; }
-  box.textContent = SCHEDULER === 'blocked'
-    ? '⚠ Plánovač v tejto inštancii nebeží — drží ho iná spustená inštancia aplikácie. '
+  const SCHED_MSG = {
+    'blocked': '⚠ Plánovač v tejto inštancii nebeží — drží ho iná spustená inštancia aplikácie. '
       + 'Automatizácie sa tu samy nespustia (ručné „⚡ Spustiť teraz" funguje). '
-      + 'Časy „Ďalší beh" nižšie sú z uloženého stavu, nie prísľub.'
-    : '⚠ Plánovač je v tejto inštancii vypnutý — automatizácie sa nespustia samé '
-      + '(ručné „⚡ Spustiť teraz" funguje). Toto je náhľadová/testovacia inštancia.';
+      + 'Časy „Ďalší beh" nižšie sú z uloženého stavu, nie prísľub.',
+    // spadol počas behu — naštartoval sa, ale vlákno plánovača už nebeží
+    'dead': '⚠ Plánovač spadol — naštartoval sa, ale už nebeží, takže automatizácie sa '
+      + 'samy nespustia (ručné „⚡ Spustiť teraz" funguje). Časy „Ďalší beh" nižšie sú '
+      + 'z uloženého stavu, nie prísľub. Reštartuj službu parovanie-web.',
+    'off': '⚠ Plánovač je v tejto inštancii vypnutý — automatizácie sa nespustia samé '
+      + '(ručné „⚡ Spustiť teraz" funguje). Toto je náhľadová/testovacia inštancia.',
+  };
+  box.textContent = SCHED_MSG[SCHEDULER] || SCHED_MSG['off'];
   box.hidden = false;
 }
 

@@ -334,6 +334,11 @@ class AutomationRunner:
         log.info("automation runner started (%d registered: %s, tick=%ss)",
                  len(self.automations), ", ".join(self.automations), self.tick)
 
+    def is_alive(self) -> bool:
+        """Is the scheduling loop REALLY running? The app reports its scheduler state
+        from this rather than from what boot intended (PR #265 second review)."""
+        return bool(self._thread and self._thread.is_alive())
+
     def stop(self) -> None:
         self._stop.set()
         if self._thread:

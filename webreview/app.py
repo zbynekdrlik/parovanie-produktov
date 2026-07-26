@@ -6702,28 +6702,41 @@ def _claim_scheduler() -> bool:
     return True
 
 
-# "running" | "blocked" (another instance holds the claim) | "off" (WEBREVIEW_NO_SCHEDULER).
-# Reported by /api/automations and rendered as a banner: the boot log line used to be the
-# ONLY trace, while the tab kept showing every enabled automation with a healthy future
+# What this instance INTENDED: "running" | "blocked" (another instance holds the claim)
+# | "off" (WEBREVIEW_NO_SCHEDULER). Reported (derived, see `_scheduler_state`) by
+# /api/automations and rendered as a banner: the boot log line used to be the ONLY
+# trace, while the tab kept showing every enabled automation with a healthy future
 # „Ďalší beh" (it comes from the persisted state file) although nothing would ever fire —
 # a silent business failure of exactly the kind the store guard exists to prevent, one
 # level up (PR #265 review). Starts "off": until _start_scheduler() runs, nothing schedules.
-SCHEDULER_STATE = "off"
+SCHEDULER_INTENT = "off"
+
+
+def _scheduler_state() -> str:
+    """What is REALLY the case, not what boot intended (PR #265 second review).
+
+    An intent assigned once at boot cannot notice the loop thread dying, so a runner
+    that is gone kept reporting „running" forever — the same healthy-looking tab over
+    an idle scheduler that the banner exists to prevent. "dead" is the honest answer
+    and the banner says so."""
+    if SCHEDULER_INTENT != "running":
+        return SCHEDULER_INTENT
+    return "running" if RUNNER.is_alive() else "dead"
 
 
 def _start_scheduler() -> bool:
     """Start the automation runner iff this instance may and can own it."""
-    global SCHEDULER_STATE
+    global SCHEDULER_INTENT
     if not _scheduler_enabled():
         log.warning("automation scheduler DISABLED (WEBREVIEW_NO_SCHEDULER) — nothing "
                     "will run on a timer in this instance (manual runs still work)")
-        SCHEDULER_STATE = "off"
+        SCHEDULER_INTENT = "off"
         return False
     if not _claim_scheduler():
-        SCHEDULER_STATE = "blocked"
+        SCHEDULER_INTENT = "blocked"
         return False
     RUNNER.start()
-    SCHEDULER_STATE = "running"
+    SCHEDULER_INTENT = "running"
     return True
 
 # Valid /api/ui-label rename keys (#173): every NAV key the frontend actually
@@ -6754,9 +6767,9 @@ def api_automations():
     for a in RUNNER.status():
         a["description"] = AUTOMATION_DESCRIPTIONS.get(a["key"], "")
         out.append(a)
-    # `scheduler` — see SCHEDULER_STATE: without it a blocked/switched-off instance is
-    # indistinguishable from a healthy one in the UI.
-    return jsonify({"automations": out, "scheduler": SCHEDULER_STATE})
+    # `scheduler` — see `_scheduler_state`: without it a blocked / switched-off / dead
+    # instance is indistinguishable from a healthy one in the UI.
+    return jsonify({"automations": out, "scheduler": _scheduler_state()})
 
 
 @app.route("/api/ui-labels")
