@@ -52,20 +52,42 @@ def test_patching_out_redirects_every_store_path(monkeypatch, tmp_path):
     assert frozen == [], f"still frozen at import time: {frozen}"
 
 
-def _import_time_out_uses():
-    """Every place app.py reads `OUT` in an expression that is EVALUATED AT IMPORT
-    (i.e. not inside a function body). Those are the frozen ones — the shape that
-    caused the wipe. Inside a function `OUT` is read per call, which is the point."""
-    with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
-        tree = ast.parse(f.read())
+def _names_the_data_dir(node) -> bool:
+    """Does this expression name the data dir? Three shapes, not one (PR #265 second
+    review): the module global `OUT`, an ATTRIBUTE `something.OUT` (how a helper reads
+    it — `webapp.OUT`), and the raw environment key a path could be built from without
+    mentioning `OUT` at all. Matching only a bare `ast.Name` made the guard blind to
+    the last two, so a path frozen from either was invisible to it."""
+    if isinstance(node, ast.Name) and node.id == "OUT" and isinstance(node.ctx, ast.Load):
+        return True
+    if isinstance(node, ast.Attribute) and node.attr == "OUT" and isinstance(node.ctx, ast.Load):
+        return True
+    return isinstance(node, ast.Constant) and node.value == "WEBREVIEW_OUT"
+
+
+def _import_time_out_uses(src=None):
+    """Every place the module names the data dir in an expression that is EVALUATED AT
+    IMPORT (i.e. not inside a function body). Those are the frozen ones — the shape that
+    caused the wipe. Inside a function it is read per call, which is the point.
+
+    The one module-level use that is NOT frozen-by-mistake is the definition of `OUT`
+    itself, so its right-hand side is excluded."""
+    if src is None:
+        with open(os.path.join(ROOT, "webreview", "app.py"), encoding="utf-8") as f:
+            src = f.read()
+    tree = ast.parse(src)
     parents = {}
     for node in ast.walk(tree):
         for child in ast.iter_child_nodes(node):
             parents[child] = node
+    definition = set()
+    for node in tree.body:                       # module level only
+        if (isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "OUT" for t in node.targets)):
+            definition.update(ast.walk(node.value))
     frozen = []
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Name) and node.id == "OUT"
-                and isinstance(node.ctx, ast.Load)):
+        if not _names_the_data_dir(node) or node in definition:
             continue
         cur, lazy = node, False
         while cur in parents:
@@ -76,6 +98,20 @@ def _import_time_out_uses():
         if not lazy:
             frozen.append(node.lineno)
     return frozen
+
+
+def test_the_drift_guard_sees_every_shape_a_path_can_be_frozen_from():
+    """The guard itself, tested — it used to match a bare `OUT` only, so the two other
+    ways to freeze the very same path walked straight past it."""
+    for src in ('import os\nDECISIONS = os.path.join(OUT, "decisions.json")\n',
+                'import webapp\nDECISIONS = webapp.OUT + "/decisions.json"\n',
+                'import os\nDECISIONS = os.environ["WEBREVIEW_OUT"] + "/decisions.json"\n',
+                'import os\nDECISIONS = os.environ.get("WEBREVIEW_OUT")\n'):
+        assert _import_time_out_uses(src) == [2], f"drift guard blind to:\n{src}"
+    # …and the definition of OUT itself is not a frozen path
+    assert _import_time_out_uses(
+        'import os\nOUT = os.environ.get("WEBREVIEW_OUT") or "/data/out"\n'
+        'def _store(n):\n    return os.path.join(OUT, n)\n') == []
 
 
 def test_no_store_path_is_frozen_at_import():
