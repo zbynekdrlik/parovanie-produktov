@@ -625,6 +625,28 @@ def test_the_managers_undos_are_never_refused_while_the_tab_polls(monkeypatch, t
     assert len(webapp._load_ordered()) == 1
 
 
+def test_a_read_arriving_mid_guard_does_not_crash_the_write(monkeypatch, tmp_path):
+    """The guard walks the receipts with `any(...)` while every GET appends to the
+    same rings WITHOUT the store lock — and `_store_receipts` used to `yield from`
+    the live deques, so CPython raised `RuntimeError: deque mutated during
+    iteration` INSIDE the guarded window. That is not the 503 with something to fix:
+    a bare RuntimeError is not `StoreWipeRefused`, so the manager's click came back
+    as a raw 500 (measured 93/4000 at a 1 µs switch interval). Snapshot both rings.
+
+    `skip` walks the generator into EACH ring in turn: 0-2 are this thread's, 3+ the
+    shared one — both are appended to by the same concurrent read."""
+    p = str(tmp_path / "decisions.json")
+    for i in range(3):
+        webapp._note_store_read(p, {"a": i})
+    for skip in (1, 4):
+        gen = webapp._store_receipts(p)
+        for _ in range(skip):
+            next(gen)
+        webapp._note_store_read(p, {"mid": skip})   # a GET on another thread
+        rest = list(gen)                            # must not RuntimeError
+        assert isinstance(rest, list)
+
+
 def test_a_concurrent_read_still_does_not_legitimise_a_foreign_wipe(
         monkeypatch, tmp_path):
     """The B1 exploit, re-run against the widened receipt: however many reads are in
