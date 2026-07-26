@@ -20,7 +20,11 @@ let AUTOMATIONS = [];       // /api/automations — in-app runner statuses (#93)
 // 'running' | 'blocked' (iná inštancia drží plánovač) | 'off' (WEBREVIEW_NO_SCHEDULER).
 // Bez tohto vyzerá zablokovaná inštancia úplne zdravo: „Ďalší beh" sa číta z uloženého
 // stavu, takže tab ukazuje budúci čas aj keď sa nikdy nič nespustí (review PR #265).
+// …a 'corrupt' = /api/automations sa nepodarilo prečítať (server fail-closed 503 nad
+// poškodeným automations.json, alebo request zlyhal). Bez toho sa 503 s návodom na
+// opravu vykreslil ako čistý prvý štart (revízia PR #265, I3).
 let SCHEDULER = 'running';
+let SCHED_ERROR = '';       // serverová hláška k stavu 'corrupt' (čo presne opraviť)
 let POSTA = null;           // /api/posta-uncollected — last run's display data
 let SUPPLIER_STOCK = null;  // /api/supplier-stock — last scraper run's rows (#106)
 let STOCK_FILTER = 'all';   // dodávateľský sklad filter: all | errors | llm | <supplier>
@@ -3300,10 +3304,26 @@ function initIdea() {
 // ---- + „Sync zo Shoptetu" (#119, plain status-only tab, no per-item table) - //
 async function loadAutomations() {
   try {
-    const j = await (await fetch('/api/automations')).json();
+    const r = await fetch('/api/automations');
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // The server FAILS CLOSED over an unreadable automations.json (503 + a repair
+      // message). Reading that answer with `j.automations || []` / `j.scheduler ||
+      // 'running'` rendered the clean first-run state the guard exists to prevent —
+      // „nič nie je nastavené, plánovač je zdravý" while every pripomienka, pošta a
+      // hodinová synchronizácia bola vypnutá (revízia PR #265, I3). The global fetch
+      // wrapper only handles 401, so nothing else was going to catch this.
+      AUTOMATIONS = []; SCHEDULER = 'corrupt'; SCHED_ERROR = j.error || '';
+      return;
+    }
     AUTOMATIONS = j.automations || [];
     SCHEDULER = j.scheduler || 'running';
-  } catch (_) { AUTOMATIONS = []; }
+    SCHED_ERROR = '';
+  } catch (_) {
+    // Same reasoning: a failed request means we do NOT know the state, and pretending
+    // „running" is the silent switch-off. No server text to show here.
+    AUTOMATIONS = []; SCHEDULER = 'corrupt'; SCHED_ERROR = '';
+  }
 }
 
 // Banner nad obsahom: automatizácie v tejto inštancii nebežia na časovač.
@@ -3312,6 +3332,10 @@ function renderSchedulerWarning(onAutomationTab) {
   if (!box) return;
   if (!onAutomationTab || SCHEDULER === 'running') { box.hidden = true; box.textContent = ''; return; }
   const SCHED_MSG = {
+    // fail-closed: nevieme, čo je nastavené, tak to NEHRÁME na zdravý prvý štart
+    'corrupt': '⚠ ' + (SCHED_ERROR || 'Stav automatizácií sa nedá načítať zo servera — '
+      + 'nevieme, ktoré automatizácie sú zapnuté, takže sa možno nespustia. Obnov '
+      + 'stránku; ak to trvá, pozri log služby parovanie-web.'),
     'blocked': '⚠ Plánovač v tejto inštancii nebeží — drží ho iná spustená inštancia aplikácie. '
       + 'Automatizácie sa tu samy nespustia (ručné „⚡ Spustiť teraz" funguje). '
       + 'Časy „Ďalší beh" nižšie sú z uloženého stavu, nie prísľub.',
