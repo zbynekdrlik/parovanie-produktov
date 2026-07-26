@@ -186,3 +186,103 @@ def test_a_corrupt_user_store_answers_503_with_something_to_fix(tmp_path, monkey
     r = c.get("/api/orders")
     assert r.status_code == 503, r.status_code
     assert r.get_json()["ok"] is False and r.get_json()["error"]
+
+
+# --------------------------------------------------------------------------- #
+# …and clearing the claim BEFORE the outcome write opened a duplicate-run window
+#
+# The fix above moved `self._running[key] = False` into a `finally` that runs before a
+# SECOND `with self._lock:` persists the outcome — and that acquisition is the
+# cross-process store lock, blockable for up to 30 s by another instance. In that
+# window the claim is clear while `automations.json` still holds the old, already-past
+# `next_run`: the scheduler ticks (every 30 s), sees neither, and runs the automation a
+# second time — duplicate customer mails, with only the dedup store between them and
+# the customer (PR #265 second review, C3).
+# --------------------------------------------------------------------------- #
+class _GateLock:
+    """A store lock whose FIRST armed acquisition blocks until the test releases it."""
+
+    def __init__(self):
+        self._l = threading.Lock()
+        self.arm = False
+        self.gate = threading.Event()
+        self.blocked = threading.Event()
+
+    def __enter__(self):
+        if self.arm:
+            self.arm = False          # only the outcome write waits, not the retry
+            self.blocked.set()
+            self.gate.wait(15)
+        self._l.acquire()
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        self._l.release()
+        return False
+
+
+def _due_runner(tmp_path, run_fn, lock):
+    a = Automation(key="orders_reminder", name="Pripomienka objednávok",
+                   schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
+                   run_fn=run_fn)
+    r = AutomationRunner(str(tmp_path / "automations.json"), [a], tick=999.0, lock=lock)
+    r.set_enabled("orders_reminder", True)
+    st = r._load()
+    st["orders_reminder"]["next_run"] = "2020-01-01T00:00:00"      # long overdue
+    r._save(st)
+    return r
+
+
+def test_a_blocked_outcome_write_cannot_let_the_scheduler_run_it_twice(tmp_path):
+    runs = []
+    lock = _GateLock()
+
+    def run_fn():
+        runs.append(1)
+        lock.arm = True               # the NEXT acquisition is the outcome write
+        return {"sent": 1}
+
+    r = _due_runner(tmp_path, run_fn, lock)
+    first = threading.Thread(target=r._execute, args=("orders_reminder",),
+                             name="first-run", daemon=True)
+    first.start()
+    assert lock.blocked.wait(15), "the outcome write never blocked — test is not testing"
+
+    # the scheduler's own tick, while the first run is still recording its outcome
+    tick = threading.Thread(target=r.tick_once, name="scheduler-tick", daemon=True)
+    tick.start()
+    tick.join(5)
+    try:
+        assert runs == [1], (f"the automation ran {len(runs)}× — the scheduler started a "
+                             "second run while the first was still persisting its outcome")
+        assert r.status()[0]["running"] is True, "the claim was dropped before the write"
+    finally:
+        lock.gate.set()
+        first.join(15)
+        tick.join(15)
+    assert r.status()[0]["running"] is False, "the claim was never cleared"
+    assert r._load()["orders_reminder"]["last_status"] == "ok"
+
+
+def test_the_claim_still_clears_when_the_outcome_write_raises(tmp_path):
+    """The property the previous fix bought must survive: a StoreLockTimeout while
+    persisting the outcome may not leave the automation claimed forever."""
+    class _RaisingLock:
+        def __init__(self):
+            self.calls = 0
+
+        def __enter__(self):
+            self.calls += 1
+            if self.calls > 1:          # let the claim be taken, fail the outcome write
+                raise webapp.StoreLockTimeout("iná inštancia drží dáta")
+            return self
+
+        def __exit__(self, *exc) -> bool:
+            return False
+
+    lock = _RaisingLock()
+    a = Automation(key="demo", name="Demo", schedule={"interval_minutes": 60},
+                   run_fn=lambda: {"n": 1})
+    r = AutomationRunner(str(tmp_path / "automations.json"), [a], tick=999.0, lock=lock)
+    assert r._execute("demo") is True
+    assert r._running["demo"] is False, "the automation stayed claimed forever"
