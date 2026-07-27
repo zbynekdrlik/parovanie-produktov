@@ -290,10 +290,18 @@ def classify_tracking(api_json, today: date | None = None) -> dict:
         if raw_till:
             # Normalised to a bare YYYY-MM-DD: we have one live sample of the result-level shape,
             # so a timestamped value („2026-08-03T00:00:00") is entirely possible and would
-            # otherwise land verbatim in a customer's e-mail. Anything unparsable is kept as-is
-            # rather than dropped — a display string we do not recognise still beats none.
+            # otherwise land verbatim in a customer's e-mail.
+            #
+            # Anything we cannot read as a date is DROPPED, not kept for display. This field is a
+            # DATE, and the mail template hard-codes the „…vyzdvihnite si ju do <hodnota>" prefix
+            # around it, so an unrecognised string reads as nonsense at a real customer („do do
+            # odvolania", „do True"). It is not merely cosmetic either: build_email's „deadline
+            # already passed" guard runs the SAME parser, so a value the parser rejects is
+            # silently EXEMPT from it — a garbled and long-expired date would be presented as if
+            # it were still ahead. Fail-soft for a date field is the dateless „čo najskôr"
+            # wording, which is always true; a string we do not understand is not.
             d = _parse_date(raw_till)
-            out["retained_till"] = d.isoformat() if d else str(raw_till)
+            out["retained_till"] = d.isoformat() if d else ""
     return out
 
 
@@ -377,15 +385,27 @@ def build_email(count: int, name: str, track_num: str, office_name: str,
     templates. Free-text fields (customer name, office) are HTML-escaped here
     (the one hardening added over n8n).
 
-    A retention date that has already PASSED is treated as no date at all. Until #283 the field
-    was never populated at all, so every mail used the dateless wording; now that it is read
-    correctly, a parcel first seen late in its retention (or chased through the day 0 → +3 → +3 →
-    +7 cadence) could otherwise be told „ak si ju nevyzdvihnete do <a date last week>". The
-    dateless „čo najskôr" wording is the honest thing to send once the deadline is behind us."""
-    if retained_till:
-        d = _parse_date(retained_till)
-        if d is not None and d < (today or date.today()):
-            retained_till = ""
+    A retention date that has already PASSED — or that cannot be read as a date at all — is
+    treated as no date. Until #283 the field was never populated, so every mail used the dateless
+    wording; now that it is read correctly, a parcel first seen late in its retention (or chased
+    through the day 0 → +3 → +3 → +7 cadence) could otherwise be told „ak si ju nevyzdvihnete do
+    <a date last week>". The dateless „čo najskôr" wording is the honest thing to send once the
+    deadline is behind us — or whenever we do not actually know it.
+
+    The unparsable case is checked HERE and not only in classify_tracking because this builder has
+    a second caller: the preview endpoint hands it `retained_till` straight out of the JSON store,
+    so a garbled value written by an older run would still reach a customer. And because the
+    expiry check below is the same parser, an unreadable value would be silently exempt from it —
+    i.e. a garbled AND long-expired deadline would be presented as if it were still ahead.
+
+    A named deadline is rendered the way a Slovak reader writes a date („3. 8. 2026"), never the
+    ISO form the API, the JSON store and the web table use internally."""
+    today = today or date.today()
+    # Unconditional, so `retained_till` is ALWAYS a str from here on: the preview endpoint reads
+    # this argument out of the JSON store, where a corrupt entry could be any type at all, and a
+    # TypeError in escape() below would take the whole daily run (and the customer's mail) with it.
+    d = _parse_date(retained_till) if retained_till else None
+    retained_till = f"{d.day}. {d.month}. {d.year}" if d is not None and d >= today else ""
     link = TRACKING_LINK.format(q=track_num)
     name_h = escape(name)
     num_h = f"<strong>{escape(track_num)}</strong>"
