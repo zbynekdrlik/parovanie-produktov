@@ -197,7 +197,13 @@ def source_coverage(orders_csv, today: date | None = None) -> dict:
     dispatched = [(od, pkg) for r, od, pkg in eligible
                   if (r.get("statusName") or "").strip().lower() == DISPATCHED_STATUS]
     with_pkg = sum(1 for _, pkg in dispatched if pkg)
-    pkg_dates = [od for _, od, pkg in eligible if pkg]
+    # Only orders dated TODAY OR EARLIER count as „a number arrived". A future-dated row (a
+    # mistyped order date, a clock jump on the export side) would otherwise make `gap` NEGATIVE,
+    # which both renders as nonsense („pred -3 dňami") and — far worse — reads as fresher than
+    # any threshold, silently switching the staleness rule off for as long as that row stays in
+    # the window. Same fail-safe the terminal cache uses for its `at` stamp: a date we cannot
+    # believe degrades to „no evidence of freshness", never to „everything is fine".
+    pkg_dates = [od for _, od, pkg in eligible if pkg and od <= today]
     gap = (today - max(pkg_dates)).days if pkg_dates else None
     out = {
         "dispatched_orders": len(dispatched),

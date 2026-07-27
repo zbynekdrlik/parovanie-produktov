@@ -433,7 +433,15 @@ def test_source_coverage_pending_orders_never_degrade():
     assert c["degraded"] is False
 
 
-def test_source_coverage_needs_enough_evidence_to_accuse_the_source():
+def test_source_coverage_ignores_a_future_dated_package_number():
+    """A single mistyped/clock-skewed order date must not be able to switch the staleness rule
+    off. Counted naively it would give a NEGATIVE gap — which reads as fresher than any threshold
+    and would silence the alarm for as long as that row sits in the window."""
+    rows = ([(-5, "Vybavená", "EF40000001SK", "Kuriér")]          # dated 5 days in the FUTURE
+            + [(20, "Vybavená", "", "Kuriér") for _ in range(10)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["days_since_last_package"] is None       # not -5, and not treated as fresh
+    assert c["degraded"] is True
     """~27 % of dispatched orders legitimately carry no number even in a healthy month, so on a
     near-empty window „no numbers at all" is a coincidence (odds 0.27 at one order, 0.02 at three),
     not proof of a dead source. Four dispatched orders without one stay quiet; the real failure
