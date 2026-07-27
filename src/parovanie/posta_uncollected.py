@@ -218,6 +218,13 @@ def source_coverage(orders_csv, today: date | None = None) -> dict:
     disp_dates = [od for od, _ in dispatched if od <= today]
     last_dispatch = max(disp_dates) if disp_dates else None
     out = {
+        # Every order the automation is responsible for in this window. This is the number
+        # `dispatched_status_unknown` below actually triggers on, so it has to be published:
+        # without it the blind-spot ERROR could only approximate the window size, and in the one
+        # branch that fires (nothing dispatched) every other count here is 0 or numberless-only —
+        # which is how it came to report „v okne je 0 objednávok, ale ANI JEDNA nemá stav
+        # Vybavená" over six orders that all carried a number.
+        "eligible_orders": len(eligible),
         "dispatched_orders": len(dispatched),
         "dispatched_with_package": with_pkg,
         "dispatched_without_package": len(dispatched) - with_pkg,

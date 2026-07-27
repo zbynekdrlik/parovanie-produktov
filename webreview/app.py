@@ -5616,10 +5616,14 @@ def run_posta_uncollected() -> dict:
         # one hard-coded status string. Orders in the window of which NOT ONE is recognised as
         # dispatched means that vocabulary moved — and this alarm would then sit green forever,
         # exactly like the automation it was built to watch.
+        # `eligible_orders` and not `missing_package + dispatched_orders`: this branch fires only
+        # when dispatched_orders is 0, so that sum degenerates to „orders WITHOUT a number", and a
+        # window whose orders all carry one reported „v okne je 0 objednávok, ale ANI JEDNA…" —
+        # self-contradictory, and wrong about the only number the reader can act on.
         log.error("posta: v okne je %d objednávok, ale ANI JEDNA nemá stav Vybavená — stavy sa v "
                   "Shoptete zrejme premenovali; kontrola pokrytia podacích čísel je odteraz "
                   "slepá, kým sa nový názov stavu nedoplní do DISPATCHED_STATUS",
-                  coverage["missing_package"] + coverage["dispatched_orders"])
+                  coverage["eligible_orders"])
     if coverage["degraded"]:
         log.error("posta: ZDROJ ZÁSIELOK JE DEGRADOVANÝ — %d z %d odoslaných objednávok v okne "
                   "nemá podacie číslo, posledné pribudlo pred %s dňami; automatizácia z nich "
