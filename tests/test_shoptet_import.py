@@ -443,3 +443,36 @@ def test_chunk_outcome_ok_and_hard_failures():
                          rows_sent=35) == "failed"
     # a timeout (rc=1, no output at all)
     assert chunk_outcome(1, parse_import_log(""), rows_sent=35) == "failed"
+
+
+def test_result_slice_survives_a_mojibaked_marker():
+    """PR #271 review, IMPORTANT 2 — the whole nightly push hung on ONE non-ASCII
+    character. `encoding='utf-8'` on Popen only fixes the PARENT's decoding; the child
+    encodes with ITS locale, and nothing pinned PYTHONIOENCODING. On a box whose locale
+    is not UTF-8 the child prints 'V?SLEDOK: spracovan?=35 …', the exact-substring
+    rfind('VÝSLEDOK:') misses, the slice is '' → processed=None → EVERY chunk is booked
+    failed/unreadable and the push silently stops. (The old parse_import_log matched the
+    ASCII substrings 'pracov'/'zlyhan' and survived mojibake — this PR made it fragile.)
+
+    The env pin is the fix (test_run_import_pins_the_child_stdout_encoding); the marker
+    match must be byte-tolerant too, so ONE mangled character can never again cost the
+    whole push."""
+    out = ("[import] baseline …: #12688 Spracovan?: 4. Upraven?: 1.\n"
+           "\nV?SLEDOK: spracovan?=35 upraven?=31 zlyhania=2\n")
+    parsed = parse_import_log(result_stdout_slice(out))
+    assert parsed["processed"] == 35 and parsed["failed"] == 2   # ours, not the baseline's 4
+    assert chunk_outcome(2, parsed, rows_sent=35) == "partial"
+
+
+def test_chunk_outcome_never_credits_rc0_whose_counts_disagree():
+    """PR #271 review, IMPORTANT 4 — rc == 0 was trusted unconditionally, so an rc-0
+    result whose 'Spracované' disagrees with the rows we sent would book the WHOLE chunk
+    as landed (its codes go to success_codes → uploaded_pairings.json → never re-sent).
+    The invariant that makes rc 0 mean "all rows landed" is enforced in a DIFFERENT file
+    (result_exit_code); assert it here instead of trusting it across the module boundary."""
+    assert chunk_outcome(0, parse_import_log("VÝSLEDOK: spracované=5 upravené=5"),
+                         rows_sent=300) == "failed"
+    # unchanged: an rc-0 run that printed no counts (the --dry-run path) is still ok
+    assert chunk_outcome(0, parse_import_log(""), rows_sent=300) == "ok"
+    assert chunk_outcome(0, parse_import_log("VÝSLEDOK: spracované=300 upravené=298"),
+                         rows_sent=300) == "ok"

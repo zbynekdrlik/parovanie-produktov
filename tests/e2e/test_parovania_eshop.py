@@ -82,6 +82,13 @@ def test_run_now_zero_new_reports_ok_without_touching_eshop(page, automations_se
     result_text = page.locator(".autoresult").inner_text()
     assert "Inline páry" in result_text and "+0 nových" in result_text
 
+    # PR #271 review: the two facts a partially-accepted push turns on — how many rows
+    # the eshop already had (credited from its export, never re-sent) and how many
+    # Shoptet REJECTED — are in the API result but were invisible on the card, so the
+    # manager could not see "Shoptet odmietol N z M riadkov" at all.
+    assert "potvrdené z exportu" in result_text
+    assert "Shoptet odmietol" in result_text
+
     # the app itself survived (no crash) — other tabs stay usable
     page.get_by_role("button", name="Nevyzdvihnuté zásielky").click()
     page.wait_for_selector('[data-testid="posta-status"]')

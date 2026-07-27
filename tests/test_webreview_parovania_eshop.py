@@ -13,7 +13,9 @@ green (one place for the logic, NEkopíruj logiku).
 import csv as _csv
 import json
 import os
+import subprocess
 import sys
+import time
 
 import pytest
 
@@ -676,3 +678,91 @@ def test_export_confirmation_needs_an_exact_url_match(iso, monkeypatch):
     assert result["pairings"]["confirmed_in_export"] == 0
     links = [c for c in calls if c["header"][2] == "internalNote"]
     assert links and ["1/M", "P1", "https://supplier/x"] in links[0]["rows"]
+
+
+# ── PR #271 review — the four ways this push could still lie about what landed ──
+def test_run_import_pins_the_child_stdout_encoding(monkeypatch):
+    """IMPORTANT 2 — `encoding='utf-8'` on Popen only decodes what the CHILD produced;
+    the child encodes with ITS OWN locale. On a box whose locale is not UTF-8 the
+    result marker comes back mojibake'd ('V?SLEDOK:'), the slice is empty, processed is
+    None and EVERY chunk is booked failed/unreadable — the whole nightly push dies on
+    one character. Pin the child's stdout encoding explicitly."""
+    seen = {}
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+
+        def communicate(self, timeout=None):
+            return "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""
+
+    monkeypatch.setattr(webapp.subprocess, "Popen", FakePopen)
+    rc, out, _err = webapp.run_import("/tmp/does-not-matter.csv")
+
+    assert rc == 0 and "VÝSLEDOK" in out
+    assert seen["kw"]["env"]["PYTHONIOENCODING"] == "utf-8"
+    assert seen["kw"]["env"]["PYTHONPATH"].endswith(os.path.join("", "src"))
+
+
+def _write_export(path, pairs, age_s=0):
+    """A real on-disk catalog export (cp1250, as „Sync zo Shoptetu" writes it), aged
+    `age_s` seconds — the freshness of THIS file is what may credit rows as uploaded."""
+    path.write_bytes(_export(pairs).encode("cp1250"))
+    if age_s:
+        old = time.time() - age_s
+        os.utime(path, (old, old))
+    return str(path)
+
+
+def test_export_confirmation_refuses_a_stale_export(tmp_path, monkeypatch):
+    """IMPORTANT 3 — confirmed rows are NOT sent at all and ARE recorded uploaded, on
+    the strength of data/products.csv, which a SEPARATE hourly automation refreshes. If
+    that sync is off/broken, a code cleared or changed in the eshop after the last sync
+    is silently never re-written. The sibling supplier write-back already fails closed
+    on an unusable export; this path trusted it at any age."""
+    p = tmp_path / "products.csv"
+    _write_export(p, {"1/M": "https://supplier/x"}, age_s=webapp.EXPORT_MAX_AGE_S + 60)
+    monkeypatch.setattr(webapp, "SRC", str(p))
+
+    assert webapp._codes_confirmed_in_export([["1/M", "P1", "https://supplier/x"]]) == set()
+
+
+def test_export_confirmation_still_credits_a_fresh_export(tmp_path, monkeypatch):
+    # the guard must not block the normal case — an export the hourly sync just wrote
+    p = tmp_path / "products.csv"
+    _write_export(p, {"1/M": "https://supplier/x"})
+    monkeypatch.setattr(webapp, "SRC", str(p))
+
+    assert (webapp._codes_confirmed_in_export([["1/M", "P1", "https://supplier/x"]])
+            == {"1/M"})
+
+
+def test_timed_out_chunk_is_reported_as_uncertain_not_as_zero_imported(iso, monkeypatch):
+    """MINOR — a chunk that TIMED OUT had its rows submitted and very probably landed,
+    yet it was reported with the flat 'import zlyhal … naimportované 0 z N riadkov' —
+    the exact misleading wording this PR fixes for the unreadable case."""
+    _seed_pairing()
+
+    def timeout_run(csv_path, dry_run=False, timeout=300):
+        raise subprocess.TimeoutExpired(cmd="shoptet_import.py", timeout=timeout)
+    monkeypatch.setattr(webapp, "run_import", timeout_run)
+
+    p, _st = webapp._do_upload_pairings(dry=False)
+
+    assert p["ok"] is False
+    assert "nepodarilo prečítať" in p["error"] and "mohli prejsť" in p["error"]
+    assert "naimportované 0" not in p["error"]
+    assert "timeout" in p["error"]           # the reason still reaches the manager
+
+
+def test_partially_accepted_row_count_never_goes_negative():
+    """MINOR — 'Zlyhanie variantov: N' is an aggregate Shoptet count; if it ever counts
+    VARIANTS rather than rows it can exceed the rows we sent, and the message told the
+    manager a negative number of rows was accepted."""
+    res = {"chunks_ok": 0, "chunks_partial": 1, "chunks_total": 3, "rows_ok": 0,
+           "rows_partial": 300, "partial_failed": 400, "unreadable": False,
+           "error_detail": None}
+    msg = webapp._chunk_error_msg(res, 900)
+    assert "-100" not in msg and "+0 čiastočne prijatých" in msg

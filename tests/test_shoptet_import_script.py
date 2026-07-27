@@ -146,6 +146,45 @@ def test_read_result_gives_up_instead_of_reporting_a_foreign_row():
                                retries=3, wait_s=0) is None
 
 
+def test_read_result_waits_out_the_WHOLE_window_before_crediting_a_same_sized_row():
+    """PR #271 review, CRITICAL 1 — the settle check returned on the FIRST two
+    consecutive agreeing reads, so the "give our own entry time to appear" guarantee
+    covered ~ONE wait_s interval (~2 s), not the 6×2 s poll window the docstring
+    promises.
+
+    The realistic collision: a foreign import writes its own 300-row entry between our
+    baseline and our first read, and Shoptet writes OUR entry a few seconds later
+    (every large batch is chunked to exactly IMPORT_CHUNK_ROWS = 300 rows, so
+    "same size" is the normal case). Reads 0+1 both see only the foreign row → the old
+    code returned it, chunk_outcome booked `ok`, 300 codes went into success_codes and
+    into uploaded_pairings.json, and new_pairing_keys skipped them FOREVER — a
+    permanent, silent loss of 300 pairings.
+
+    The window must be exhausted first: our entry then shows up, TWO distinct entries
+    matched the count, the read is genuinely ambiguous → None → exit 2 (fail closed),
+    the rows are simply re-sent next run."""
+    foreign = "#12701 26.07.2026 21:00 Info Import dobehol úspešne. Spracované: 300. Upravené: 12."
+    ours = "#12702 26.07.2026 21:00 Info Import dobehol úspešne. Spracované: 300. Upravené: 298."
+    page = FakePage([[foreign, BASELINE],
+                     [foreign, BASELINE],
+                     [foreign, BASELINE],
+                     [ours, foreign, BASELINE]])
+    assert script._read_result(page, baseline=BASELINE, expected_rows=300,
+                               retries=6, wait_s=0) is None
+
+
+def test_read_result_polls_the_whole_window_even_when_early_reads_agree():
+    """Same defect from the other side: with our own row already present the old code
+    returned after the SECOND read (one reload), so a foreign entry appearing later in
+    the promised window was never seen. The read must use every retry it was given."""
+    ours = OURS_35
+    page = FakePage([[ours, BASELINE]])          # stable from the very first read
+    row = script._read_result(page, baseline=BASELINE, expected_rows=35,
+                              retries=4, wait_s=0)
+    assert row == ours                            # still attributed — no false negative
+    assert page.reloads == 3                      # …but the FULL window was observed
+
+
 def test_do_import_passes_the_submitted_row_count_to_the_read_back(monkeypatch):
     seen = {}
 
