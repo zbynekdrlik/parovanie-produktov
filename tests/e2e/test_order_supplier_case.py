@@ -64,7 +64,9 @@ def test_case_variants_share_one_group_and_one_filter(page, toorder_server):
     heads = [t.strip() for t in page.locator(".toorder-supplier .tosup-label").all_inner_texts()]
     citrade_heads = [h for h in heads if "citrade" in h.lower()]
     assert len(citrade_heads) == 1, f"one group per supplier, got {heads}"
-    assert citrade_heads[0].startswith("CITRADE — 4 položiek"), citrade_heads[0]
+    # the count is declined (#238/#240 — „4 položky", not „4 položiek"); the LABEL-first
+    # contract this line guards is unchanged
+    assert citrade_heads[0].startswith("CITRADE — 4 položky"), citrade_heads[0]
 
     # selecting the chip must filter to ALL 4 lines, whatever spelling they carry
     _chips(page).filter(has_text="CITRADE").first.click()
