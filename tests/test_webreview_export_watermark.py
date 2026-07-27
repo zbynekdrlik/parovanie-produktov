@@ -241,3 +241,41 @@ def test_an_empty_download_is_still_refused_first(iso, tmp_path, monkeypatch):
     _arm_download(monkeypatch, b"")
     with pytest.raises(RuntimeError, match="prázdny"):
         webapp._fetch_export_csv()
+
+
+# ── #280 review, item 4: the watermark had no UPPER bound ─────────────────────
+def test_one_absurd_reading_cannot_block_the_healthy_export(iso, monkeypatch):
+    """Measured before the fix:
+
+        after ONE observation 50000: watermark=50000 floor=25000
+        → a real 14066-code export is REFUSED for a full 7 days, with no escape
+
+    A single implausible reading (a duplicated feed, a parse anomaly) must not raise the
+    floor above reality. The observation is therefore CLAMPED to a bounded multiple of
+    what we already believe: a genuine catalogue growth is still absorbed — it just takes
+    a few hourly syncs instead of one — while one spike cannot outrun it."""
+    webapp._export_watermark_observe(14066)
+    assert webapp._export_watermark() == 14066
+
+    webapp._export_watermark_observe(50000)
+
+    wm = webapp._export_watermark()
+    assert wm < 50000, "an absurd single reading was adopted whole"
+    # the real catalogue still clears the floor it produces — the whole point
+    assert webapp._export_min_codes() <= 14066
+
+
+def test_the_clamp_still_lets_a_genuine_catalogue_growth_through(iso):
+    """Bounded, not blocked: repeated honest readings converge on the new size, so a shop
+    that really doubles is fully reflected within a few hourly syncs — no human action."""
+    webapp._export_watermark_observe(14066)
+    for _ in range(6):                       # six hourly syncs
+        webapp._export_watermark_observe(28000)
+    assert webapp._export_watermark() == 28000
+
+
+def test_the_first_ever_reading_is_never_clamped(iso):
+    """A fresh deploy (or a window that aged out entirely) has nothing to clamp against —
+    it must adopt what it sees, or the very first sync would understate the catalogue."""
+    webapp._export_watermark_observe(14066)
+    assert webapp._export_watermark() == 14066
