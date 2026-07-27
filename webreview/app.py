@@ -2040,6 +2040,17 @@ def _fetch_export_csv() -> bytes:
     return r.content
 
 
+class ExportDownloadRefused(RuntimeError):
+    """The catalogue-export download looked truncated, so we kept what is on disk.
+
+    Its OWN type because `run_shoptet_sync` treats it very differently from a network
+    failure (PR #280 review, MUST FIX 2): this refusal is self-inflicted and, by
+    construction, only ever raised while the on-disk export is BOTH fresh and plausible
+    — i.e. exactly when carrying on with those bytes is safe. A network failure proves
+    nothing about the on-disk copy, so it stays fatal. Still a RuntimeError, so every
+    existing caller and `except` keeps behaving as before."""
+
+
 def _refuse_implausible_export_download(size: int) -> None:
     """#277 — a truncated download must not silently replace a good export.
 
@@ -2065,7 +2076,7 @@ def _refuse_implausible_export_download(size: int) -> None:
     floor = int(EXPORT_FETCH_MIN_RATIO * have)
     if size < floor:
         # NEvkladaj URL ani `e` do hlášky (partner hash) — same rule as above.
-        raise RuntimeError(
+        raise ExportDownloadRefused(
             f"stiahnutý export katalógu je nepravdepodobne malý ({size} B oproti "
             f"{have} B na disku, limit {floor} B) — vyzerá useknuto, nechávam na disku "
             "ten predošlý")
@@ -5734,8 +5745,25 @@ def run_shoptet_sync() -> dict:
     orders_bytes = _fetch_orders_csv()
     _atomic_write_bytes(ORDERS_CACHE, orders_bytes, mode=0o600)
 
-    export_bytes = _fetch_export_csv()
-    _atomic_write_bytes(SRC, export_bytes)
+    # A REFUSED download is NON-FATAL (PR #280 review, MUST FIX 2). The refusal fires
+    # only while the copy already on disk is fresh AND plausible — it exists to protect
+    # exactly those bytes — so the right response is to keep using them, not to abandon
+    # the whole refresh. Unguarded, it took the review-card price/stock resync and the
+    # customer export down every hour until the on-disk export aged past
+    # EXPORT_MAX_AGE_S, which was precisely the staleness that disarmed the supplier
+    # hold: the two gates created each other's blind spot.
+    #
+    # Deliberately narrow: only ExportDownloadRefused. A network failure says nothing
+    # about the on-disk copy, and a sync quietly running for a week on an old export
+    # while reporting OK is worse than a red row — so that stays fatal.
+    export_bytes, export_error = b"", None
+    try:
+        export_bytes = _fetch_export_csv()
+        _atomic_write_bytes(SRC, export_bytes)
+    except ExportDownloadRefused as e:
+        export_error = str(e)              # already secret-sanitized by the guard
+        log.warning("shoptet_sync: catalogue export download refused (non-fatal, "
+                    "keeping the copy on disk): %s", export_error)
 
     # rebuild the in-memory search index from the fresh export — same single
     # cp1250-pass helper the app uses at startup, no restart needed.
@@ -5763,7 +5791,13 @@ def run_shoptet_sync() -> dict:
         # have just rebuilt from freshly downloaded bytes. Feeding a persistent
         # max-over-7-days store is NOT the „compare against len(CODE2PAIR)" the ticket
         # rules out: a broken feed can only fail to raise the watermark, never lower it.
-        _export_watermark_observe(len(CODE2PAIR))
+        #
+        # SKIPPED when the download was refused: the index then comes from the OLD copy
+        # on disk, and re-observing that would let a stale export keep re-asserting the
+        # old size for ever — which is exactly what disables the ratio floor's
+        # time-based self-healing (playbook: measure only from freshly downloaded bytes).
+        if export_error is None:
+            _export_watermark_observe(len(CODE2PAIR))
 
     rows = []
     # newline="" — see _load_catalog (#279). resync_current joins the export to
@@ -5799,6 +5833,8 @@ def run_shoptet_sync() -> dict:
         "review_stale": counts["stale"],
         "customers_bytes": len(customers_bytes),
     }
+    if export_error:
+        result["export_error"] = export_error
     if customers_error:
         result["customers_error"] = customers_error
     log.info("shoptet_sync: run OK %s", result)
