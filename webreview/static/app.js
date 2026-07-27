@@ -932,46 +932,121 @@ function _reconcileFlag(st, map, key) {
   renderToOrder();
 }
 
-async function saveOrderFlag(path, field, map, key, on, what) {
-  const st = _flagEntry(field, key, map);
-  const seq = ++st.seq;
-  st.inflight += 1;
+// One POST can move MORE than one flag on a row: turning an axis-B status on makes the
+// server clear the other two in the same atomic write (#211), and the tab must mirror the
+// whole of that write — optimistically at click time, and back again if it is refused.
+// Every flag it touches claims its sequence number through the SAME `_flagWrites`
+// bookkeeping, taken when the write is ISSUED (exactly like markGroupOrdered): a refusal
+// then rolls each flag back to what the SERVER confirmed, never to a snapshot of the map.
+// There is deliberately no second, unsequenced rollback path — that is the bug this
+// bookkeeping exists to prevent, and a clear-side flag would be just as exposed to it.
+// `writes` = [{field, map, value}], the first entry being the flag the manager clicked.
+async function saveOrderWrite(path, payload, writes, key, what) {
+  const sts = writes.map(w => _flagEntry(w.field, key, w.map));
+  const seqs = sts.map(st => ++st.seq);
+  sts.forEach(st => { st.inflight += 1; });
   let err;
   // the decrement must be unskippable: postToOrder swallows every throw today, but a
-  // leaked counter would permanently disable reconciliation for this (flag, row) —
-  // the entry is never deleted, so it would never reach 0 again for the page's lifetime
+  // leaked counter would permanently disable reconciliation for those (flag, row)
+  // entries — they are never deleted, so they would never reach 0 again for this page
   try {
-    if (on) map[key] = true; else delete map[key];
-    err = await postToOrder(path, { key, [field]: on });
-  } finally { st.inflight -= 1; }
-  // `loadOrders()` drops the whole map when it re-reads the server, so an entry that is
-  // no longer the live one for its key must not roll anything back over fresh data
-  const live = _flagWrites[st.wk] === st;
-  if (!err && live && seq >= st.confirmedSeq) { st.confirmed = on; st.confirmedSeq = seq; }
-  if (!live || seq !== st.seq) {              // superseded: the newest write owns the row
-    if (live && st.inflight === 0) _reconcileFlag(st, map, key);
+    writes.forEach(w => { if (w.value) w.map[key] = true; else delete w.map[key]; });
+    err = await postToOrder(path, payload);
+  } finally { sts.forEach(st => { st.inflight -= 1; }); }
+  // `loadOrders()` drops the maps when it re-reads the server, so an entry that is no
+  // longer the live one for its key must not roll anything back over fresh data. The
+  // wipe clears every entry at once, so this verdict is the same for the whole write.
+  const live = _flagWrites[sts[0].wk] === sts[0];
+  let owner = false, repaint = false;
+  writes.forEach((w, i) => {
+    const st = sts[i], seq = seqs[i];
+    if (_flagWrites[st.wk] !== st) return;
+    if (!err && seq >= st.confirmedSeq) { st.confirmed = w.value; st.confirmedSeq = seq; }
+    if (seq !== st.seq) {                     // a later write owns this (flag, row) now
+      // …and once nothing else is out for it, the map owes the server's own last word
+      if (st.inflight === 0 && !!w.map[key] !== st.confirmed) {
+        if (st.confirmed) w.map[key] = true; else delete w.map[key];
+        repaint = true;
+      }
+      return;
+    }
+    owner = true;
+    if (err && !!w.map[key] !== st.confirmed) {
+      if (st.confirmed) w.map[key] = true; else delete w.map[key];
+    }
+  });
+  if (!live || !owner) {          // superseded by a newer write, or disowned by a reload
+    if (repaint) renderToOrder();
     // A write the reload DISOWNED has no map left to roll back — but it still failed, and
     // returning `false` in silence is the very silent-lost-write #214 exists to kill. A
     // write superseded by a NEWER one on the same row stays quiet on purpose: that newer
     // write owns the row and does the reporting.
-    if (!live && err) toOrderSaveFailed(what, err, toOrderRowLabel(key), on);
+    if (!live && err) toOrderSaveFailed(what, err, toOrderRowLabel(key), writes[0].value);
     return !err;
   }
   if (!err) return true;
-  if (st.confirmed) map[key] = true; else delete map[key];
-  renderToOrder();              // roll the tab back BEFORE the message, never after
-  toOrderSaveFailed(what, err, toOrderRowLabel(key), on);
+  // Always repaint on the owner's failure, even when the map happens to already agree
+  // with the server: the CLICK HANDLER painted the row (and its buttons) by hand before
+  // this write was issued, so only a repaint puts the screen back in step with the maps.
+  renderToOrder();                // roll the tab back BEFORE the message, never after
+  toOrderSaveFailed(what, err, toOrderRowLabel(key), writes[0].value);
   return false;
 }
 
+const saveOrderFlag = (path, field, map, key, on, what) =>
+  saveOrderWrite(path, { key, [field]: on }, [{ field, map, value: on }], key, what);
+
 const saveOrdered = (key, on) =>
   saveOrderFlag('/api/ordered', 'ordered', ORDERED, key, on, 'Označenie „objednané“');
-const saveWaiting = (key, on) =>
-  saveOrderFlag('/api/waiting', 'waiting', WAITING, key, on, 'Označenie „čaká sa“');
-const saveInstock = (key, on) =>
-  saveOrderFlag('/api/instock', 'instock', INSTOCK, key, on, 'Označenie „skladom“');
-const saveUnavailable = (key, on) =>
-  saveOrderFlag('/api/unavailable', 'unavailable', UNAVAIL, key, on, 'Označenie „nedostupné“');
+
+// #211 — axis B: the line's STATUS, and a line has one at a time. Built fresh on every
+// call on purpose: `loadOrders()` REPLACES these map objects, so a module-level array
+// holding them would go on writing into the map the reload threw away.
+function statusFlagSpecs() {
+  return [
+    { field: 'waiting', path: '/api/waiting', map: WAITING, sel: '.to-wait',
+      cls: 'waiting', what: 'Označenie „čaká sa“' },
+    { field: 'instock', path: '/api/instock', map: INSTOCK, sel: '.to-instock',
+      cls: 'instock', what: 'Označenie „skladom“' },
+    { field: 'unavailable', path: '/api/unavailable', map: UNAVAIL, sel: '.to-unavail',
+      cls: 'unavail', what: 'Označenie „nedostupné“' },
+  ];
+}
+
+// Paint the row's three status affordances FROM the flag maps — the maps are the one
+// truth the rest of the tab already reads (isHandled, the chips, the summary), so the
+// row can never drift from them. Cheap and in place: a per-row toggle deliberately does
+// NOT repaint the list (#208/#233), and all three buttons live in this one row anyway.
+function paintRowStatus(row, key) {
+  if (!row) return;
+  for (const s of statusFlagSpecs()) {
+    const on = !!s.map[key];
+    row.classList.toggle(s.cls, on);
+    const btn = row.querySelector(s.sel);
+    if (!btn) continue;
+    btn.classList.toggle('on', on);
+    if (s.field === 'waiting') btn.textContent = on ? '⏳ Čaká sa' : '⏳ Počkať';
+  }
+}
+
+// Turning a status ON says the other two are NOT the case, so the server clears them in
+// one atomic write and the row shows that AT CLICK TIME — a row painted „čaká sa +
+// skladom" for the length of a round-trip is the contradiction #211 is about, and on a
+// slow link that is not a blink. Turning one OFF is no statement about the others.
+function toggleStatusFlag(key, row, field) {
+  const specs = statusFlagSpecs();
+  const me = specs.find(s => s.field === field);
+  const on = !me.map[key];
+  const writes = [{ field: me.field, map: me.map, value: on }];
+  if (on) {
+    for (const s of specs) {
+      if (s.field !== field && s.map[key]) writes.push({ field: s.field, map: s.map, value: false });
+    }
+  }
+  saveOrderWrite(me.path, { key, [field]: on }, writes, key, me.what);
+  paintRowStatus(row, key);     // the maps are already written — mirror them now
+  renderOrderFilters();
+}
 
 // Označiť celú skupinu dodávateľa objednané naraz (manažér objedná od dodávateľa
 // všetko naraz). Pošle všetky per-riadkové kľúče cez bulk endpoint, updatne ORDERED
@@ -1867,36 +1942,18 @@ function renderOrderRow(o, totals) {
   w.textContent = WAITING[o.key] ? '⏳ Čaká sa' : '⏳ Počkať';
   w.title = 'Aktívna objednávka, ktorá sa zatiaľ nenaskladňuje — čaká sa na dodávateľa, '
     + 'zbierame viac položiek, alebo dohoda so zákazníkom (napr. september)';
-  w.onclick = () => {
-    const on = !WAITING[o.key];
-    saveWaiting(o.key, on);
-    w.textContent = on ? '⏳ Čaká sa' : '⏳ Počkať';
-    w.classList.toggle('on', on);
-    row.classList.toggle('waiting', on);
-    renderOrderFilters();
-  };
+  w.onclick = () => toggleStatusFlag(o.key, row, 'waiting');
   row.appendChild(w);
   // 'skladom' — už máme / naskladnené, a 'nedostupné' — u dodávateľa nedostupné.
-  // Independent toggles, same shape as 'čaká sa' (synchronous DOM update + async POST).
+  // The three are ONE axis (#211): switching one on switches the conflicting one off, on
+  // the server and — through the same click — on the row.
   const inStk = el('button', 'to-instock' + (INSTOCK[o.key] ? ' on' : ''), '✓ Skladom');
-  inStk.title = 'Máme skladom / naskladnené';
-  inStk.onclick = () => {
-    const on = !INSTOCK[o.key];
-    saveInstock(o.key, on);
-    inStk.classList.toggle('on', on);
-    row.classList.toggle('instock', on);
-    renderOrderFilters();
-  };
+  inStk.title = 'Máme skladom / naskladnené (zhasne „čaká sa" aj „nedostupné")';
+  inStk.onclick = () => toggleStatusFlag(o.key, row, 'instock');
   row.appendChild(inStk);
   const unavailBtn = el('button', 'to-unavail' + (UNAVAIL[o.key] ? ' on' : ''), '✗ Nedostupné');
-  unavailBtn.title = 'U dodávateľa nedostupné';
-  unavailBtn.onclick = () => {
-    const on = !UNAVAIL[o.key];
-    saveUnavailable(o.key, on);
-    unavailBtn.classList.toggle('on', on);
-    row.classList.toggle('unavail', on);
-    renderOrderFilters();
-  };
+  unavailBtn.title = 'U dodávateľa nedostupné (zhasne „čaká sa" aj „skladom")';
+  unavailBtn.onclick = () => toggleStatusFlag(o.key, row, 'unavailable');
   row.appendChild(unavailBtn);
   return row;
 }
