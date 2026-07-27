@@ -4,6 +4,7 @@ Against the seeded automations_server (see conftest): no network, no SMTP —
 the manual run finds 0 shipments (orders fixture has no packageNumber), so
 clicking ⚡ Spustiť teraz is a hermetic green run.
 """
+from playwright.sync_api import expect
 
 
 def _console(page):
@@ -205,8 +206,11 @@ def test_degraded_source_run_is_not_shown_as_a_healthy_ok_run(page, posta_degrad
     assert "DEGRADOVANÝ" in meta                     # …not the „✅ OK" that hid the outage
     assert "✅ OK" not in meta
 
-    # the banner names the real numbers and what to go and check — no adjectives
-    banner = page.locator(".autoerr").first.inner_text()
+    # the banner names the real numbers and what to go and check — no adjectives. Matched by its
+    # own text, not by position: `.autoerr` is the shared class for every warning banner on these
+    # cards (bcc_missing, corrupt store, a run's error), so `.first` would silently start testing
+    # a different banner the day one of those also renders here.
+    banner = page.locator(".autoerr", has_text="podacie číslo").inner_text()
     assert "87 z 91" in banner
     assert "podacie číslo" in banner
     assert "spred 26 dní" in banner                  # „pred" + instrumental would be ungrammatical
@@ -220,9 +224,11 @@ def test_degraded_source_lights_the_nav_badge_from_any_page(page, posta_degraded
     — and this automation has no other push channel at all (#285)."""
     console = _console(page)
     page.goto(posta_degraded_server)
-    page.wait_for_selector('[data-testid="version"]')
-
+    # `[data-testid="version"]` is in the server-rendered template, so waiting on it proves
+    # nothing about init() — which paints the sidebar only AFTER awaiting /api/automations. A bare
+    # count() right after it therefore raced init and failed on the slower CI runner while passing
+    # locally. expect() retries, so it waits for the state instead of sampling it once.
     posta_btn = page.get_by_role("button", name="Nevyzdvihnuté zásielky")
-    assert posta_btn.locator(".navwarn").count() == 1
+    expect(posta_btn.locator(".navwarn")).to_have_count(1, timeout=15000)  # as the polls above
 
     assert console == [], f"console not clean: {console}"
