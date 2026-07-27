@@ -1240,6 +1240,26 @@ const rowPairUrl = (o) => (o.reviewKey ? o.supplierUrl : o.pairUrl) || '';
 // (`split_links` keeps its own uploaded_variant_links.json idempotency, so it never
 // re-pushes). The ✂️ therefore takes him to the per-size panel instead of offering a save
 // that can only fail or corrupt.
+// #260 — `editorSnapHasWork` deliberately merges two states into ONE „carry this over"
+// answer (see the note there): text the manager typed and has not saved, and a box he
+// OPENED with ✏️/💬 and left empty. Both are kept across a repaint and both are closed by
+// the trip to the sizes panel, so both are worth warning about — but only the first can
+// be LOST, and calling an empty open box „rozpísaný neuložený text" warns him about work
+// that does not exist. The counting is NOT narrowed (a second, narrower predicate beside
+// the shared one is exactly what that note forbids); only the wording separates them.
+// The count keeps the established `(N×)` shape after a singular noun, so no second
+// declension rule is introduced beside `itemsWord`.
+function leaveEditorsWarning(typed, opened) {
+  if (!typed && !opened) return '';
+  const parts = [];
+  if (typed) parts.push(`rozpísaný neuložený text (${typed}×)`);
+  if (opened) parts.push(`otvorené prázdne políčko (${opened}×)`);
+  // nothing is thrown away when there is no text — an empty box is merely closed
+  const fate = typed ? 'zahodí' : 'zavrie';
+  return `⚠️ Máš ${parts.join(' a ')} v objednávkach. `
+    + `Prechodom na veľkosti sa ${fate}. Pokračovať?`;
+}
+
 async function openSplitSizes(o) {
   const p = (PRODUCTS || []).find(x => x.key === o.reviewKey);
   if (!p) {
@@ -1253,9 +1273,12 @@ async function openSplitSizes(o) {
   // read as navigation: warn first rather than lose the work silently (#205/#233). Same
   // predicate the repaint machinery uses, so „would be lost" cannot drift from „is lost".
   const busy = captureOpenEditors().filter(
-    s => editorSnapHasWork(s, ORDERS.find(x => x.key === s.key))).length;
-  if (busy && !confirm('⚠️ Máš rozpísaný neuložený text (' + busy + '×) v objednávkach. '
-                       + 'Prechodom na veľkosti sa zahodí. Pokračovať?')) return;
+    s => editorSnapHasWork(s, ORDERS.find(x => x.key === s.key)));
+  // #260 — WHAT is at stake stays the one predicate above; only the sentence tells the
+  // two states it merges apart (typed text vs a box he only opened and left empty).
+  const typed = busy.filter(s => s.value.trim()).length;
+  const warn = leaveEditorsWarning(typed, busy.length - typed);
+  if (warn && !confirm(warn)) return;
   splitOpen.add(p.key);
   // in memory ONLY — 'split' sits under the „Dobré / Vybrané" filter, so the review tab
   // has to be on it to show the card. Persisting it replaced whichever filter the
@@ -2249,7 +2272,12 @@ function renderToOrder() {
     // header = escapovaná menovka (label FIRST → startsWith(sup) kontrakt) + hromadné
     // tlačidlo „označiť skupinu objednané". Ak je UŽ všetko objednané, tlačidlo prepína späť.
     const head = el('div', 'toorder-supplier');
-    head.appendChild(el('span', 'tosup-label', `${escapeHtml(lbl(sup))} — ${items.length} položiek`));
+    // #238/#240 — the count is declined like every other counter on the tab, through the
+    // ONE `itemsWord` helper (nominative here: „CITRADE — 1 položka"; the accusative
+    // „položku" belongs to the toolbar's „ostáva vybaviť"). This header was the last
+    // place with the genitive baked into the template.
+    head.appendChild(el('span', 'tosup-label',
+                        `${escapeHtml(lbl(sup))} — ${items.length} ${itemsWord(items.length)}`));
     const allOrdered = items.every(o => ORDERED[o.key]);
     const bulk = el('button', 'tosup-bulk', allOrdered ? '↺ Zrušiť objednané' : '✔ Označiť skupinu objednané');
     bulk.title = allOrdered ? 'Odznačiť „objednané" pre celú skupinu'
