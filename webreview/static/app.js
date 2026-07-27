@@ -511,6 +511,14 @@ const NAV_ICONS = {
     + '<path d="M21 3v6h-6M3 21v-6h6"/>',
   parovania_eshop: '<path d="M12 3v12"/><path d="M8 7l4-4 4 4"/>'
     + '<path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
+  // #274 — these two were MISSING, so `${NAV_ICONS[key]}` interpolated the string
+  // "undefined" into the <svg> and the browser painted it as text next to the
+  // label („undefinedGRUBE kódy → eshop"). Every nav key needs an entry — pinned
+  // by test_every_nav_key_has_an_icon.
+  grube_externalcode: '<rect x="3" y="6" width="18" height="12" rx="2"/>'
+    + '<path d="M7 9v6M11 9v6M15 9v6M18 9v6"/>',
+  split_links: '<path d="M7 4v6a4 4 0 004 4h6"/><path d="M7 14v7"/>'
+    + '<path d="M17 11l3 3-3 3"/>',
   dodavatelsky_sklad: '<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M3 7l9 4 9-4"/>'
     + '<path d="M12 11v10"/>',
   riziko_vypadku: '<path d="M12 3L2 20h20L12 3z"/><path d="M12 9.5v4"/><path d="M12 17v.01"/>',
@@ -571,7 +579,10 @@ function _navButton(key, defaultLbl) {
   const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
   const n = navCount(key);
   const err = navError(key);
-  bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
+  // `|| ''` — a key with no icon must render an EMPTY svg, never the literal
+  // "undefined" as text beside the label (#274); the drift test above keeps the
+  // table complete, this keeps the fallback harmless if one ever slips through.
+  bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key] || ''}</svg>`
     + `<span class="tlabel">${escapeHtml(lbl)}</span>`
     + (err ? '<span class="navwarn" title="posledný beh zlyhal">⚠</span>' : '')
     + (n > 0 ? `<span class="navcount">${n}</span>` : '');
