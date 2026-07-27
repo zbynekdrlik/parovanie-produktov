@@ -1076,23 +1076,26 @@ def test_a_held_supplier_code_goes_up_once_the_catalogue_carries_it(iso, monkeyp
     assert {r[0] for r in calls[0]["rows"]} == {"9/Z"}
 
 
-def test_an_untrusted_export_holds_nothing_on_the_supplier_side(iso, monkeypatch):
-    """The hold is a WRITE condition, so it may only stand on bytes we believe. A stale
-    export must not withhold a code the eshop has had for days — the same gate that
-    already suppressed the mere REPORT now also suppresses the hold, so behaviour falls
-    back to sending (idempotent, the same name written again)."""
-    webapp._save_supplier_assign({"9/Z": "BETALOV"})
-    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
-    monkeypatch.setattr(webapp, "_iter_export_lines",
-                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
-    monkeypatch.setattr(webapp, "_export_age_s", lambda: webapp.EXPORT_MAX_AGE_S + 60)
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
-    s, _st = webapp._do_upload_suppliers(dry=False)
-
-    assert {r[0] for r in calls[0]["rows"]} == {"9/Z"}     # sent, not held
-    assert s["missing_count"] == 0
+# RETIRED (PR #280 review) — `test_an_untrusted_export_holds_nothing_on_the_supplier_side`
+# stood here and asserted that a STALE export makes the write-back SEND the very code the
+# catalogue does not carry (`{r[0] for r in calls[0]["rows"]} == {"9/Z"}  # sent, not held`).
+#
+# Its premise was that suppressing the hold is the safe fallback, because the hold is a
+# WRITE condition and may only stand on bytes we believe. Half of that is right — the hold
+# does need trusted bytes. The conclusion does not follow: with no trustworthy export the
+# answer is to write NOTHING, not to write EVERYTHING. Suppressing only the hold left the
+# dangerous half (the eshop write) running on bytes we had just declared untrustworthy,
+# so it fail-OPENED — and #275's whole fix evaporated during any window in which the
+# hourly sync had been down for 6 h before the 21:00 push. Worse, the BUG 1 clobber guard
+# then ran on the same stale `own_supplier` bytes, so an assignment could overwrite a
+# supplier a colleague had set in Shoptet meanwhile.
+#
+# It is replaced (not weakened) by
+# `test_a_stale_export_blocks_the_whole_supplier_write_back` below: a stale export now
+# blocks the upload and HOLDS every assignment, which is safe and self-healing — the same
+# shape the size gate beside it has always had. Retired in its own commit, per the rule
+# that a test codifying a defect is replaced with a stated justification, never quietly
+# edited into agreement.
 
 
 def test_a_run_whose_only_fault_is_a_missing_code_is_orange_not_red(iso, monkeypatch):
