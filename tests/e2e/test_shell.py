@@ -329,3 +329,20 @@ def test_automations_folder_collapses(page, live_server):
     page.locator(".folder-head", has_text="Automatizácie").click()  # expand again
     assert page.evaluate("() => localStorage.getItem('folder:automations')") == "open"
     assert console == [], f"console not clean: {console}"
+
+
+def test_no_nav_item_renders_the_literal_undefined(page, live_server):
+    """#274 — a nav key missing from NAV_ICONS interpolated the JS string
+    'undefined' into the <svg>, which the browser paints as TEXT beside the label
+    („undefinedGRUBE kódy → eshop"). The icon is drawn with <path>/<circle>
+    elements, so a nav <svg> must never carry any text at all."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.wait_for_selector(".sidebar #autoTabs button")
+
+    texts = page.locator(".sidebar .tab svg").all_text_contents()
+    assert texts and all(t.strip() == "" for t in texts), texts
+    assert "undefined" not in page.locator(".sidebar").inner_text()
+
+    assert console == [], f"console not clean: {console}"
