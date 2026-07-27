@@ -4288,7 +4288,7 @@ def _missing_report(codes, values) -> dict:
 def _export_age_s():
     """Age of the on-disk catalog export in seconds, or None when it cannot be stat'd
     (missing file / a test that patches the reader). Unknown age never BLOCKS: with no
-    file at all `_read_export_for_links` already yields '' → nothing is confirmed."""
+    file at all `_iter_export_lines` already yields nothing → nothing is confirmed."""
     try:
         return max(0.0, time.time() - os.path.getmtime(SRC))
     except OSError:
@@ -4717,10 +4717,11 @@ def _export_supplier_index() -> tuple[set, set, bool]:
     → (codes whose product ALREADY carries its own `supplier`, EVERY code the export
     lists, whether the export had any content at all).
 
-    The third value is what the write-back's fail-closed gate needs: a genuinely
-    missing/empty export means "we cannot tell which suppliers are protected", which
-    must BLOCK the write — and it is deliberately "any bytes at all", exactly as the
-    old `export_text.strip()` check was, so a header-only export still passes."""
+    The second and third values are what the write-back's fail-closed gate needs: an
+    export that is missing/empty (no bytes at all) OR implausibly small (fewer than
+    EXPORT_MIN_CODES codes — a broken feed) means "we cannot tell which suppliers are
+    protected", which must BLOCK the write. The caller applies both, so a header-only
+    export no longer passes on "it had bytes" alone (PR #276 review)."""
     csv.field_size_limit(10**9)
     own, codes, seen_content = set(), set(), False
     lines = _iter_export_lines()
@@ -4762,17 +4763,28 @@ def _do_upload_suppliers(dry):
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
-    # BUG 1 safety — FAIL CLOSED on a missing/empty export. The exclusion guard below
-    # needs the catalog export to know which codes already carry their own eshop
-    # supplier. With NO export it cannot tell, so it would fall open (exclude nothing)
-    # and a stale assignment could clobber a real supplier in the LIVE eshop. Refuse to
-    # write anything: hold all new assignments (blocked), touch nothing. A present-but-
-    # partial export that merely lacks a given code is fine — that code is simply not
-    # excluded and gets written (unchanged behaviour); only a genuinely empty export blocks.
+    # BUG 1 safety — FAIL CLOSED on an UNUSABLE export. The exclusion guard below needs
+    # the catalog export to know which codes already carry their own eshop supplier.
+    # With no usable export it cannot tell, so it would fall open (exclude nothing) and
+    # a stale assignment could clobber a real supplier in the LIVE eshop. Refuse to
+    # write anything: hold all new assignments (blocked), touch nothing. Holding is safe
+    # and self-healing — the next run with a good export sends them; falling open is an
+    # irreversible overwrite of live catalog data.
+    #
+    # „Unusable" is the SAME bar the (merely reporting) missing-code verdict below uses,
+    # deliberately: an export with a handful of codes out of a ~14 000-code catalogue is
+    # a broken feed (truncated download, a filter left on, a Shoptet-side subset), and it
+    # yields a nearly empty `own_supplier` — i.e. it silently claims that almost NO code
+    # is protected. Trusting the weaker "any bytes at all" signal for the DANGEROUS half
+    # while demanding EXPORT_MIN_CODES for the cosmetic one was the PR #276 review's
+    # IMPORTANT 1 (pinned: test_an_implausibly_small_export_blocks_the_supplier_write_back).
+    # A PLAUSIBLE-but-partial export that merely lacks a given code is still fine — that
+    # code is simply not excluded and gets written (unchanged behaviour, PR #213).
     own_supplier, export_codes, export_present = _export_supplier_index()
-    if not export_present:
-        log.warning("n8n suppliers: export missing/empty — supplier upload BLOCKED "
-                    "(%d new assignments held, no eshop write)", len(new_codes))
+    if not export_present or len(export_codes) < EXPORT_MIN_CODES:
+        log.warning("n8n suppliers: export missing/empty/implausibly small (%d codes < %d) "
+                    "— supplier upload BLOCKED (%d new assignments held, no eshop write)",
+                    len(export_codes), EXPORT_MIN_CODES, len(new_codes))
         return {"ok": True, "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
@@ -4785,9 +4797,10 @@ def _do_upload_suppliers(dry):
     # ADD a name where the eshop has none, and PR #213 decided a present-but-partial
     # export must never drop a legitimate fill-in assignment. So the manager sees the
     # bad code from both sides of the push, and the write behaviour is untouched.
-    # The report carries the same weight as the pairings verdict (it turns the whole
-    # nightly row orange), so it needs the same gate: stale bytes must not accuse a code
-    # the eshop has had for days, and an implausibly small export is a broken feed.
+    # The report carries the same weight as the pairings verdict (it turns the pairings
+    # half of the nightly row orange), so it needs the same gates: stale bytes must not
+    # accuse a code the eshop has had for days. The SIZE gate already ran above — an
+    # implausibly small export never gets this far — so only freshness is left here.
     export_age = _export_age_s()
     export_trusted = (len(export_codes) >= EXPORT_MIN_CODES
                       and (export_age is None or export_age <= EXPORT_MAX_AGE_S))

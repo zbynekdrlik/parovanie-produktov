@@ -57,6 +57,18 @@ def _export_lines(text):
     return lambda: iter(lines)
 
 
+def _stub_catalog_export(monkeypatch, codes, notes=None):
+    """Give the fixture export the codes THIS test pushes (no own supplier, no note).
+    Production's export lists all ~14 000 catalogue codes, so a code the export does not
+    list is — since #270 — a code the eshop genuinely does not have: its row is HELD and
+    reported. That is never what a chunking / partial-failure test means, so those tests
+    declare their catalogue here instead of relying on the fixture's three codes."""
+    notes = notes or {}
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;internalNote;supplier\r\n"
+        + "".join(f"{c};P;{notes.get(c, '')};\r\n" for c in codes)))
+
+
 @pytest.fixture
 def iso(tmp_path, monkeypatch):
     """Isolate every store the automation reads/writes + the import subprocess."""
@@ -72,17 +84,21 @@ def iso(tmp_path, monkeypatch):
     products = [_product()]
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {"1/M": "P1", "9/Z": "777"})
-    # BUG 1 fail-closed: the supplier write-back refuses to run without a catalog export.
-    # Default to a minimal non-empty export so the normal push path proceeds (no code is
-    # excluded); tests that assert the exclusion / blocked-on-empty behaviour override
-    # the export seam themselves. Without this the CI box (no data/products.csv)
-    # reads an empty export and the supplier upload is blocked.
-    monkeypatch.setattr(webapp, "_iter_export_lines",
-                        _export_lines("code;pairCode;supplier\r\n"))
+    # BUG 1 fail-closed: the supplier write-back refuses to run without a USABLE catalog
+    # export (missing/empty OR fewer than EXPORT_MIN_CODES codes → blocked). Default to a
+    # small but usable export that LISTS every code these tests push (none of them carries
+    # its own supplier and none carries our note → nothing is excluded, nothing is credited
+    # or held, the normal push path proceeds); tests that assert the exclusion /
+    # blocked-on-unusable / missing-code behaviour override the export seam themselves.
+    # Without this the CI box (no data/products.csv) reads an empty export and blocks.
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;internalNote;supplier\r\n"
+        "1/M;P1;;\r\n9/Z;777;;\r\n7/Y;P1;;\r\n"))
     # #270: production refuses to trust an export carrying fewer than EXPORT_MIN_CODES
     # (1000) codes — a fake export here has a handful, so the floor is lowered for the
     # fixtures and pinned SEPARATELY at its real value by
-    # test_an_implausibly_small_export_is_not_trusted.
+    # test_an_implausibly_small_export_is_not_trusted (verdicts) and
+    # test_an_implausibly_small_export_blocks_the_supplier_write_back (the write gate).
     monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 1)
     return {"tmp": tmp_path, "products": products}
 
@@ -339,6 +355,7 @@ def test_large_pairing_batch_split_into_chunks(iso, monkeypatch):
     codes = [f"{i}/M" for i in range(n)]
     monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
     monkeypatch.setattr(webapp, "CODE2PAIR", {c: "P1" for c in codes})
+    _stub_catalog_export(monkeypatch, codes)
     _seed_pairing()
     fake_run, calls = _recording_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
@@ -385,6 +402,7 @@ def test_mid_batch_chunk_failure_records_partial_and_releases_lock(iso, monkeypa
                  "candidates": [], "current": {}} for i in range(n)]
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
+    _stub_catalog_export(monkeypatch, [f"{i}/M" for i in range(n)])
     webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"} for i in range(n)})
     fake_run, calls = _recording_import(fail_on_call=2)     # 1st chunk ok, 2nd fails
     monkeypatch.setattr(webapp, "run_import", fake_run)
@@ -520,6 +538,7 @@ def test_partial_stdout_is_read_from_the_scripts_own_result_line(iso, monkeypatc
     codes = ("1/M", "1/L", "1/XL")
     monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
     monkeypatch.setattr(webapp, "CODE2PAIR", {c: "P1" for c in codes})
+    _stub_catalog_export(monkeypatch, codes)
     _seed_pairing()
     real_stdout = (
         "Súbor:   data/out/import_links_x.csv\nRiadkov: 3\n"
@@ -567,6 +586,7 @@ def test_partial_message_promises_export_confirmation_only_where_it_happens(iso,
     monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
     monkeypatch.setattr(webapp, "CODE2PAIR", {**{c: "P1" for c in codes},
                                               "9/Z": "777", "8/Z": "778"})
+    _stub_catalog_export(monkeypatch, [*codes, "9/Z", "8/Z"])
     _seed_pairing()
     webapp._save_supplier_assign({"9/Z": "BETALOV", "8/Z": "CITRADE"})
 
@@ -593,6 +613,7 @@ def test_partial_chunk_keeps_importing_the_rest_of_the_batch(iso, monkeypatch):
                  "candidates": [], "current": {}} for i in range(n)]
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
+    _stub_catalog_export(monkeypatch, [f"{i}/M" for i in range(n)])
     webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"}
                             for i in range(n)})
     fake_run, calls = _partial_import(partial_on_call=1)
@@ -678,6 +699,7 @@ def test_partial_chunk_then_hard_failure_reports_what_really_landed(iso, monkeyp
                  "candidates": [], "current": {}} for i in range(n)]
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
+    _stub_catalog_export(monkeypatch, [f"{i}/M" for i in range(n)])
     webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"}
                             for i in range(n)})
     calls = []
