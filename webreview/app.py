@@ -4337,6 +4337,22 @@ EXPORT_MIN_CODES = 1000
 EXPORT_WATERMARK = _store("export_watermark.json")
 EXPORT_WATERMARK_WINDOW_DAYS = 7
 EXPORT_WATERMARK_RATIO = 0.5
+# …and an UPPER bound on a single reading (PR #280 review). The window bounds the
+# watermark in TIME but nothing bounded it in SIZE, so ONE implausible observation
+# (a duplicated feed, a parse anomaly) raised the floor above reality and refused the
+# HEALTHY export for a full 7 days: measured, one reading of 50 000 gave floor 25 000
+# and locked out the real 14 066-code catalogue.
+#
+# 1.5 is chosen against EXPORT_WATERMARK_RATIO (0.5): a clamped reading yields a floor
+# of 0.75 × the previous watermark, so an export at (or slightly below) the size we
+# already believe still clears it — a growth cap of 2.0 would put the floor exactly AT
+# the old watermark and refuse a catalogue that merely lost a few products.
+#
+# It bounds one reading, not a trend: honest repeated readings compound 1.5× per sync,
+# so a genuine doubling is fully absorbed within a few hourly syncs with no human
+# action. That is deliberate — it is the same „recovery is by TIME" property the window
+# has, and for the same reason (repetition must not be able to shortcut a gate).
+EXPORT_WATERMARK_MAX_GROWTH = 1.5
 # How much smaller than what we already hold a DOWNLOAD may be before we refuse to
 # swap it in (bytes vs bytes — never lines vs codes: multi-line HTML descriptions make
 # a line count far exceed the code count, so a ratio calibrated for codes would reject
@@ -4395,7 +4411,21 @@ def _export_watermark_observe(codes: int, today=None) -> int:
         days = _watermark_days(_read_json_store(EXPORT_WATERMARK, {}))
         days = {k: v for k, v in days.items() if lo <= k <= hi}
         if codes > 0:
-            days[hi] = max(days.get(hi, 0), int(codes))
+            # CLAMP a single reading to a bounded multiple of what we already believe
+            # (#280 review): one implausible observation must not raise the floor above
+            # reality and refuse the healthy export for the whole window. Nothing to
+            # clamp against on a fresh deploy (or an aged-out window) → adopt as seen,
+            # or the very first sync would understate the catalogue.
+            current = max(days.values()) if days else 0
+            capped = int(codes)
+            if current > 0:
+                capped = min(capped, int(current * EXPORT_WATERMARK_MAX_GROWTH))
+                if capped < int(codes):
+                    log.warning("export watermark: reading %d clamped to %d (max %.1f× "
+                                "the %d we already believe) — one implausible reading "
+                                "must not lock out the healthy export",
+                                int(codes), capped, EXPORT_WATERMARK_MAX_GROWTH, current)
+            days[hi] = max(days.get(hi, 0), capped)
         _atomic_write_json(EXPORT_WATERMARK, {"days": days}, indent=None)
     return max(days.values()) if days else 0
 
