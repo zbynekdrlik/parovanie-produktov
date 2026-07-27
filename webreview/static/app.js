@@ -2187,14 +2187,39 @@ function editorSnapHasWork(s, o) {
   return true;
 }
 
+// #235 — a snapshot whose row is NOT in the rebuilt list (the manager switched the
+// supplier chip, or the row jumped to another group) used to be dropped on the floor,
+// which is the same silent loss the carry-over was built to remove — just narrower.
+// Park it here instead, keyed per (editor, row), and hand it back on the first repaint
+// that shows that row again. Bounded by rows x 3 editors, and self-clearing: a parked
+// snapshot dies the moment its row is on screen and `editorSnapHasWork` says it is no
+// longer unsaved work (saved meanwhile, or an empty box he never opened himself). No
+// wipe on `loadOrders()` is needed for the same reason — the predicate is re-evaluated
+// against the FRESH stored value on the next repaint.
+// null-prototype: the key is built from a `data-editor` attribute + a store key, so this
+// map must not inherit `constructor` / `toString` (same reason as `_EDITORS`).
+const _pendingEditors = Object.create(null);
+const _editorSnapKey = (s) => s.kind + ' ' + s.key;
+
 function restoreOpenEditors(snaps) {
-  if (!snaps.length) return;
+  // parked snapshots ride along with every restore pass. A LIVE snapshot for the same
+  // (editor, row) WINS — it is the newer state of that very box, and re-adding the
+  // parked one would put stale text back over what he is typing right now.
+  const live = new Set(snaps.map(_editorSnapKey));
+  const all = snaps.concat(Object.keys(_pendingEditors)
+    .filter(k => !live.has(k))
+    .map(k => _pendingEditors[k]));
+  if (!all.length) return;
   const rows = [...document.querySelectorAll('#list .toorder-row')];
-  for (const s of snaps) {
+  for (const s of all) {
+    const pk = _editorSnapKey(s);
     const spec = _EDITORS[s.kind];
-    const row = rows.find(r => r.dataset.key === s.key);   // filtered out / gone → drop it
+    const row = rows.find(r => r.dataset.key === s.key);
     const o = row && ORDERS.find(x => x.key === s.key);
-    if (!spec || !o) continue;
+    if (!spec) { delete _pendingEditors[pk]; continue; }
+    // the row is not on screen right now → PARK, never drop (#235)
+    if (!o) { _pendingEditors[pk] = s; continue; }
+    delete _pendingEditors[pk];
     // only UNSAVED TYPING is carried over — the whole rule (and why the two conditions
     // are in that order) lives in editorSnapHasWork above
     if (!editorSnapHasWork(s, o)) continue;
