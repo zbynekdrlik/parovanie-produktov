@@ -192,3 +192,37 @@ def test_nav_keys_match_appjs():
     assert appjs_keys == webapp.NAV_KEYS, (
         f"app.js nav keys vs server NAV_KEYS drift — only in app.js: "
         f"{appjs_keys - webapp.NAV_KEYS}; only in server: {webapp.NAV_KEYS - appjs_keys}")
+
+
+# --------------------------------------------------------------------------- #
+# Drift guard (#274): a nav key WITHOUT a NAV_ICONS entry interpolates the
+# JavaScript string "undefined" straight into the <svg>, and the browser paints
+# it as text next to the label — the manager literally read
+# „undefinedGRUBE kódy → eshop" in the sidebar. Every key that gets a nav button
+# (TABS + SYSTEM_TABS + AUTOMATION_TABS + the two standalone items) must own an
+# icon, so the next automation cannot repeat it.
+# --------------------------------------------------------------------------- #
+def test_every_nav_key_has_an_icon():
+    import re
+    appjs_path = os.path.join(os.path.dirname(__file__), "..", "webreview", "static", "app.js")
+    appjs = open(appjs_path, encoding="utf-8").read()
+
+    def _keys(var):
+        m = re.search(var + r"\s*=\s*\[(.*?)\];", appjs, re.S)
+        assert m, f"{var} not found in app.js"
+        return set(re.findall(r"\[\s*'(\w+)'\s*,", m.group(1)))
+
+    m = re.search(r"const NAV_ICONS\s*=\s*\{(.*?)\n\};", appjs, re.S)
+    assert m, "NAV_ICONS not found in app.js"
+    icons = set(re.findall(r"^\s*(\w+)\s*:", m.group(1), re.M))
+
+    # the standalone items (Užívatelia, Vývoj) are not in any TABS array — take them
+    # from the CALL SITES instead of hard-coding a list that silently goes stale when a
+    # third standalone nav button appears
+    standalone = set(re.findall(r"_navButton\(\s*'(\w+)'", appjs))
+    nav_keys = (_keys("const TABS") | _keys("const AUTOMATION_TABS")
+                | _keys("const SYSTEM_TABS") | standalone)
+    assert {"users", "dev"} <= nav_keys, f"standalone nav keys not found: {sorted(nav_keys)}"
+    assert nav_keys <= icons, (
+        "nav keys without a NAV_ICONS entry (they render the literal 'undefined' "
+        f"inside the <svg>): {sorted(nav_keys - icons)}")

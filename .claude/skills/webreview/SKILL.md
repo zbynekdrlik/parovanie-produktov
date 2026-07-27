@@ -354,7 +354,9 @@ Manažér si priamo na webe značí stav. Tieto súbory držia jeho ŽIVÚ prác
 
 **Kľúč per-PRODUKT (`itemCode`) vs per-RIADOK (`<orderCode>\|<itemCode>`):** `order_pairings` aj `supplier_assignments` sú per-PRODUKT (URL/dodávateľ je vlastnosť produktu) → platia pre VŠETKY riadky toho kódu. Preto JS save MUSÍ propagovať zmenu na všetky `ORDERS` s tým istým `itemCode` (`for (const x of ORDERS) if (x.itemCode===o.itemCode) x.assignedSupplier=…`) PRED re-renderom, inak sa preskupí len kliknutý riadok a súrodenci ostanú v starej skupine do reloadu. `ordered`/`waiting` sú per-RIADOK.
 
-**GOTCHA — dodávateľ objednávky (`o.supplier`) VYHRÁVA nad ručným priradením (`o.assignedSupplier`); priradenie je len FILL-IN pre riadok BEZ vlastného dodávateľa (BUG 1).** Priradenie je per-PRODUKT, ale realita objednávky je per-RIADOK — ten istý kód môže mať jednu objednávku bez dodávateľa (dostane priradenie) a inú už s vlastným zo Shoptetu. Preto `effSup = o.supplier || o.assignedSupplier || '—'` (NIE naopak — obrátené poradie prebíjalo reálneho dodávateľa v zoskupení). A nočná `_do_upload_suppliers` (na prode ENABLED, píše `supplier` NAŽIVO) MUSÍ vylúčiť kódy, ktorých produkt UŽ má vlastného `supplier` v aktuálnom exporte — `_codes_with_own_supplier(text=None)` (číta `supplier` stĺpec z `_read_export_for_links()`) → `supplier_rows(..., exclude_codes=...)`. Bez toho stará priradenie natrvalo prepíše reálneho dodávateľa v eshope. `uploaded_suppliers.json` idempotencia sama nestačí (priradenie sa nemení → stále „nové"). Riadok BEZ `o.supplier` naďalej zobrazuje inline supplier-assign pole (`if (!o.supplier)`) — nič sa tu nemení. **FAIL-CLOSED na chýbajúci export (PR #213 review):** samotný `_codes_with_own_supplier` stále vracia prázdnu množinu pri prázdnom exporte, ALE zápisový volajúci NESMIE fail-openovať — `_do_upload_suppliers` na PRÁZDNY/nečitateľný `_read_export_for_links()` (`if not export_text.strip()`) preskočí CELÝ supplier upload (`count=0`, `blocked=len(new_codes)`, `uploaded_suppliers.json` netknuté, log.warning), lebo bez exportu nevie ktoré kódy sú chránené → prázdna množina by povolila prepis reálneho dodávateľa. Prítomný-ale-partial export (nemá daný kód) blokádu NEspustí — kód sa len nevyloči a zapíše sa (pred-PR správanie). **TEST-PASCA:** každý test, čo vezme `_do_upload_suppliers`/`run_parovania_eshop`/`/api/n8n/upload-suppliers` cez reálny zápis, MUSÍ `monkeypatch _read_export_for_links` na NEPRÁZDNY export (kódy s prázdnym `supplier`) — inak prejde na dev boxe (reálny `data/products.csv` existuje) a padne na CI (žiadny `data/` → prázdny export → blocked). Zdieľané fixtúry `_arm_suppliers` (test_webreview) + `iso` (test_webreview_parovania_eshop) to stubujú; over cez `WEBREVIEW_PRODUCTS=/nonexistent`.
+**GOTCHA — dodávateľ objednávky (`o.supplier`) VYHRÁVA nad ručným priradením (`o.assignedSupplier`); priradenie je len FILL-IN pre riadok BEZ vlastného dodávateľa (BUG 1).** Priradenie je per-PRODUKT, ale realita objednávky je per-RIADOK — ten istý kód môže mať jednu objednávku bez dodávateľa (dostane priradenie) a inú už s vlastným zo Shoptetu. Preto `effSup = o.supplier || o.assignedSupplier || '—'` (NIE naopak — obrátené poradie prebíjalo reálneho dodávateľa v zoskupení). A nočná `_do_upload_suppliers` (na prode ENABLED, píše `supplier` NAŽIVO) MUSÍ vylúčiť kódy, ktorých produkt UŽ má vlastného `supplier` v aktuálnom exporte — `_export_supplier_index()` (streamovane číta `supplier` stĺpec, #272) → `supplier_rows(..., exclude_codes=...)`. Bez toho stará priradenie natrvalo prepíše reálneho dodávateľa v eshope. `uploaded_suppliers.json` idempotencia sama nestačí (priradenie sa nemení → stále „nové"). Riadok BEZ `o.supplier` naďalej zobrazuje inline supplier-assign pole (`if (!o.supplier)`) — nič sa tu nemení. **FAIL-CLOSED na NEPOUŽITEĽNÝ export (PR #213 review, sprísnené PR #276 review):** samotný `_export_supplier_index()` stále vracia prázdnu množinu vlastných dodávateľov pri prázdnom exporte, ALE zápisový volajúci NESMIE fail-openovať — `_do_upload_suppliers` preskočí CELÝ supplier upload (`count=0`, `blocked=len(new_codes)`, `uploaded_suppliers.json` netknuté, log.warning) na export, ktorý je (a) PRÁZDNY/nečitateľný (tretia návratová hodnota = mal súbor vôbec nejaký obsah) ALEBO (b) má menej ako `EXPORT_MIN_CODES` kódov. Bez použiteľného exportu nevie, ktoré kódy sú chránené → skoro prázdna množina by povolila prepis reálneho dodávateľa. **Slabšia brána nesmie strážiť nebezpečnejšiu akciu:** do PR #276 sa zápis pýtal len „mal súbor nejaké bajty", kým (len hlásiaci) verdikt vedľa už vyžadoval `EXPORT_MIN_CODES` — pokazený feed s hŕstkou riadkov teda prešiel a staré priradenie prepísalo živého dodávateľa. Zádrž je bezpečná a samoliečivá (ďalší beh s dobrým exportom ich pošle), fail-open je nevratný prepis. POUŽITEĽNÝ-ale-partial export (nemá daný kód) blokádu NEspustí — kód sa len nevyloči a zapíše sa (pred-PR správanie), pozri „zámerná asymetria" nižšie. **TEST-PASCA:** každý test, čo vezme `_do_upload_suppliers`/`run_parovania_eshop`/`/api/n8n/upload-suppliers` cez reálny zápis, MUSÍ `monkeypatch _iter_export_lines` (NIE `_read_export_for_links` — nočný push ho od #272 vôbec nevolá; helper `_export_lines(text)` v test_webreview_parovania_eshop) na POUŽITEĽNÝ export — teda (a) neprázdny, (b) aspoň `EXPORT_MIN_CODES` kódov (fixtúry si prah znižujú na 1) a (c) **vymenúvajúci kódy, ktoré ten test posiela** — inak prejde na dev boxe (reálny `data/products.csv` existuje) a padne na CI (žiadny `data/` → prázdny export → blocked). Zdieľané fixtúry `_arm_suppliers` (test_webreview) + `iso` (test_webreview_parovania_eshop) to stubujú; over cez `WEBREVIEW_PRODUCTS=/nonexistent`.
+
+**TEST-PASCA 2 (PR #276 review) — `EXPORT_MIN_CODES` je JEDEN prah pre DVE veci: dôveryhodnosť verdiktov aj právo zapisovať dodávateľov. Preto sa header-only fixture export už nedá použiť.** Len čo fixture export prejde zápisovou bránou (má aspoň znížený prah kódov), stane sa AJ dôveryhodným pre `_export_row_verdicts` — a každý kód, ktorý v ňom NIE JE, je odvtedy `absent` → jeho riadok sa ZADRŽÍ a neodíde do (stubnutého) importu. Presne na tom padlo 6 dávkových/chunkových testov, ktoré si generujú `{i}/M` kódy a export nestubovali. **Ak test generuje vlastnú sadu kódov, deklaruj mu katalóg cez `_stub_catalog_export(monkeypatch, codes)`** (helper v test_webreview_parovania_eshop) — nespoliehaj sa na tri kódy v `iso`. Produkčnú hodnotu prahu pinujú dva testy (`test_an_implausibly_small_export_is_not_trusted` pre verdikty, `test_an_implausibly_small_export_blocks_the_supplier_write_back` pre zápis) cez `PROD_EXPORT_MIN_CODES` odchytené pri importe modulu — fixture ich znížením prahu nevie odzbrojiť. **Bola aj SIEDMA obeť, ktorá nespadla** (`test_large_supplier_batch_split_into_chunks`, dodatočná revízia PR #276) — jej assercie kontrolujú len chunking/count, nie `missing_count`/`status`, takže bežala ĎALEJ proti 3-kódovému katalógu vs. 400 pushnutým kódom a TICHO PREŠLA (`status=blocked`, `missing_count=400`, no assert to catch it). Poučenie: hľadaj tento vzorec podľa toho, KTORÝ test generuje vlastnú sadu kódov bez `_stub_catalog_export` — nie podľa toho, ktoré testy práve zlyhávajú; nezlyhaný test proti nezmyselnému stavu je rovnaká past.
 
 **GOTCHA — SAFE loader platí pre DISPLAY/flag stores, NIE pre DEDUP stores (#225).** Než pridáš `try/except → {}` na nový loader, rozhodni, čo strata dát znamená: display flag = kozmetika (degraduj), evidencia „komu sme už poslali mail" = **duplicitný mail zákazníkovi** (nikdy nedegraduj). Detail nižšie v „Fail-closed dedup stores".
 
@@ -465,7 +467,9 @@ Appka má vlastný scheduler (`src/parovanie/automation_runner.py` — registry 
    `renderRestockSkladom` s globálom `RESTOCK`) treba LEN keď tab renderuje veľkú
    tabuľku riadkov, nie zopár čísel. Frontend ešte: `#tab-<key>` sekcia v `index.html`
    (pri ostatných), `render()` boolean + `auto` set + `hidden` toggle + dispatch riadok,
-   `PAGE_TITLES`, cache-bust `?v=` bump. Backend NAV_KEYS + `AUTOMATION_DESCRIPTIONS`
+   `PAGE_TITLES`, **`NAV_ICONS[key]`** (bez neho sa do `<svg>` interpoluje reťazec
+   `undefined` a prehliadač ho VYKRESLÍ ako text vedľa názvu — #274; stráži
+   `test_every_nav_key_has_an_icon`), cache-bust `?v=` bump. Backend NAV_KEYS + `AUTOMATION_DESCRIPTIONS`
    (drift-guard `test_nav_keys_match_appjs` + description test to vynúti).
    **Migrácia workflowu, ktorý VOLÁ EXISTUJÚCI endpoint appky** (napr. #109 nočný push
    párovaní/dodávateľov cez `/api/n8n/upload-pairings|upload-suppliers`) = **NEROB
@@ -1297,6 +1301,61 @@ viď classic-Project gotcha nižšie; `requests.patch`, nie post).
 ## Deploy = reštart služby (data/out PREŽIJE) — over počty pred/po
 
 `systemctl --user restart parovanie-web` (WorkingDirectory == repo, `.venv/bin/python webreview/app.py`, `:8801`, verejne `parovanie-forestshop.newlevel.media`). `data/out` je gitignored → checkout/restart sa ho NEDOTKNE. **Vždy over data-safety**: spočítaj entries v `ordered_items.json`/`order_pairings.json`/`waiting_items.json`/`supplier_assignments.json` PRED a PO deployi (musia sedieť) a `/api/version` == nasadená verzia. Tunel/systemd detaily → `.claude/skills/deploy`.
+
+## Čítanie katalógového exportu — DVA čitatelia, jeden seam (#272/#270)
+
+`data/products.csv` má ~57 MB, takže KTO ho číta rozhoduje o pamäti celého procesu:
+
+- **`_iter_export_lines()` = streamovaný čitateľ (nočný push).** `open(SRC,
+  encoding="cp1250", errors="replace", newline="")` + `yield from f`; `newline=""` drží
+  ukončovače riadkov nedotknuté, takže `csv.DictReader` nad ním parsuje IDENTICKY ako nad
+  `io.StringIO(celý_text)` — vrátane citovaného poľa cez viac riadkov aj osamoteného
+  návratu vozíka (pinuje `test_the_streamed_index_parses_exactly_like_a_whole_text_parse`).
+  Namerané na živom 57,4 MB exporte: špička 346,6 MB → 3,0 MB (max RSS 361 → 17,6 MB) pri
+  rovnakom čase (~1,4 s). **Binárne čítanie + `raw.decode()` na každý riadok je ~1,8×
+  POMALŠIE** (2,5 s) — textový režim má inkrementálny dekodér v C, použi ten.
+- **`_read_export_for_links()` = bulk (scrape/JOIN automatizácie #106/#107/#108).** Zámerne
+  NIE je postavený nad streamom: `"".join(riadky)` si najprv postaví zoznam všetkých
+  riadkov, takže by špičku ešte ZVÝŠIL. Dvaja čitatelia sú tu správne, nie duplicita.
+- **Seam pre testy je `_iter_export_lines`** (helper `_export_lines(text)`); patchnutie
+  `_read_export_for_links` nočný push UŽ NEOVPLYVNÍ.
+- **`_export_note_index()` / `_export_supplier_index()` = jeden prechod, viac faktov** —
+  `{code: internalNote}` + množina VŠETKÝCH kódov, resp. kódy s vlastným `supplier` + všetky
+  kódy + „mal súbor vôbec nejaký obsah". Keď potrebuješ ďalší fakt z exportu, PRIDAJ ho do
+  prechodu, ktorý v TEJ ISTEJ funkcii už beží — nerob druhý. (Dva prechody za nočný beh sú
+  v poriadku: párovania a dodávatelia sú dva nezávislé vstupné body, každý si číta sám.)
+
+**`_export_row_verdicts(rows)` (#270) = `{"confirmed", "absent"}` z toho jedného prechodu.**
+`absent` = kód, ktorý eshop v katalógu VÔBEC nemá → riadok sa NEPOŠLE (Shoptet by ho
+zakaždým odmietol — presne to bolo „Zlyhanie variantov: 2" každú noc) a vypíše sa na karte
+automatizácie ako „⛔ Eshop tieto kódy v katalógu nemá" spolu s hodnotou, ktorú sme chceli
+zapísať; PÁROVACIA polovica behu je tak oranžová (`blocked`), nie falošne zelená.
+**POZOR na formuláciu „beh je oranžový" — platí len o párovacej polovici.** Dodávateľská
+polovica ten istý kód zatiaľ NAĎALEJ posiela (zámerná asymetria nižšie), Shoptet ho odmietne
+→ `s_ok=False` → `run_parovania_eshop` vráti `status="failed"` (červená), nie oranžová. Na
+prode je to živý stav: `supplier_assignments.json = {"145/3XL": "FOREST"}` a `145/3XL` eshop
+v katalógu nemá. Celý beh sa prestane sfarbovať na červeno až keď dobehne #275. Tri veci,
+ktoré k tomu patria:
+
+- **Zadržanie NIE JE zápis do `uploaded_*.json`** — je ohraničené a samoliečivé: len čo sa
+  kód v katalógu objaví, najbližší beh ho pošle. Preto stačia dve brány — a **NEROB pomerovú
+  „vyzerá to na neúplný export" bránu**: sama sa vyradí vo chvíli, keď v dávke ostanú už LEN
+  tie doomed riadky (100 % „absent" → brána ich zase pustí), a nočné odmietanie sa vráti.
+- **Brány: čerstvosť (`EXPORT_MAX_AGE_S`) + `EXPORT_MIN_CODES` (1000).** Katalóg má
+  ~14 000 kódov, takže čerstvý neprázdny export s hŕstkou kódov je pokazený feed
+  (useknuté stiahnutie, zabudnutý filter), nie malý obchod — veril by mu a zadržal by
+  riadky kódov, ktoré eshop má. Absolútny prah sa (na rozdiel od pomerového) nevie sám
+  vyradiť. Testy si ho znižujú vo fixture; produkčnú hodnotu pinuje
+  `test_an_implausibly_small_export_is_not_trusted`. Rovnaké brány platia aj pre
+  hlásenie na dodávateľskej strane (oranžový beh je tvrdenie, nech stojí na overených
+  bajtoch) — a `EXPORT_MIN_CODES` je tam navyše aj ZÁPISOVÁ brána (PR #276 review,
+  `test_an_implausibly_small_export_blocks_the_supplier_write_back`). Chýbajúci/prázdny/
+  starý export nesmie ani potvrdiť, ani zadržať — `absent` je NOVÁ podmienka na zápis do
+  ostrého eshopu, takže nesie tú istú bránu ako potvrdzovanie z exportu.
+- **Dodávateľský write-back tie kódy LEN HLÁSI a ďalej ich zapisuje — zámerná asymetria.**
+  PR #213 rozhodlo, že prítomný-ale-partial export nesmie zahodiť doplneného dodávateľa (ten
+  zápis vie len DOPLNIŤ meno tam, kde eshop žiadne nemá). Pinuje
+  `test_supplier_codes_absent_from_the_catalogue_are_reported_but_still_written`.
 
 ## Discord notifikácie = n8n, NIE Flask (a draft/publish gotcha)
 

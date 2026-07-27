@@ -329,3 +329,54 @@ def test_automations_folder_collapses(page, live_server):
     page.locator(".folder-head", has_text="Automatizácie").click()  # expand again
     assert page.evaluate("() => localStorage.getItem('folder:automations')") == "open"
     assert console == [], f"console not clean: {console}"
+
+
+def test_no_nav_item_renders_the_literal_undefined(page, live_server):
+    """#274 — a nav key missing from NAV_ICONS interpolated the JS string
+    'undefined' into the <svg>, which the browser paints as TEXT beside the label
+    („undefinedGRUBE kódy → eshop"). The icon is drawn with <path>/<circle>
+    elements, so a nav <svg> must never carry any text at all."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector(".sidebar #tabs button")
+    page.wait_for_selector(".sidebar #autoTabs button")
+
+    texts = page.locator(".sidebar .tab svg").all_text_contents()
+    assert texts and all(t.strip() == "" for t in texts), texts
+    assert "undefined" not in page.locator(".sidebar").inner_text()
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_missing_eshop_codes_are_listed_with_what_we_wanted_to_write(page, live_server):
+    """#270 — the nightly push holds back rows whose variant code the eshop's
+    catalogue does not carry (Shoptet rejected them every single night) and names
+    them on the automation card. Unit-tests the pure builder in the browser realm:
+    both halves of the run are listed, the supplier half is marked as still being
+    written, the overflow is counted, and the manager's free text is never HTML."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector(".sidebar #tabs button")
+
+    out = page.evaluate("""() => {
+      const box = missingCodesBox(
+        {missing_count: 3, missing_in_eshop: [{code: '15813/110', value: 'https://x/<b>y</b>'}]},
+        {missing_count: 1, missing_in_eshop: [{code: '145/3XL', value: 'FOREST'}]});
+      return {quiet: missingCodesBox({}, {}),
+              text: box.textContent,
+              bolds: box.querySelectorAll('b').length,
+              cls: box.className,
+              items: box.querySelectorAll('.misscodes li').length};
+    }""")
+
+    assert out["quiet"] is None                      # a normal night renders nothing
+    assert "(4)" in out["text"]                      # exact total, both halves
+    assert "15813/110 → https://x/<b>y</b>" in out["text"]
+    assert "145/3XL → FOREST (dodávateľ — zapisuje sa ďalej)" in out["text"]
+    assert out["bolds"] == 0                         # free text, never markup
+    # its OWN class — `.autoerr` means „the last run failed" and every unscoped
+    # `.autoerr` locator in the e2e suite would break on a second, nested match
+    assert out["cls"] == "automiss"
+    assert out["items"] == 2 and "a ďalších 2" in out["text"]
+
+    assert console == [], f"console not clean: {console}"

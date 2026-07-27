@@ -336,7 +336,7 @@ def chunk_outcome(rc, parsed, rows_sent) -> str:
     NOTE: the Shoptet log reports AGGREGATE counts only — it never says WHICH rows
     failed. 'partial' therefore means "some of these rows landed, we cannot tell
     which"; proving a specific row landed needs the eshop's own catalog export (see
-    webreview/app.py::_export_internal_notes)."""
+    webreview/app.py::_export_row_verdicts)."""
     parsed = parsed or {}
     processed, failed = parsed.get("processed"), parsed.get("failed") or 0
     if rc == 0:

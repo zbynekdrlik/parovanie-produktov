@@ -61,7 +61,15 @@ def test_summary_shows_remaining_and_recomputes_live(page, toorder_server):
     # The manager's real action: flag one line IN-SESSION. The tally must follow at once
     # — a per-line toggle deliberately does NOT repaint the list, so a summary that only
     # rebuilt with the list would sit there lying until the next reload.
-    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    # The write must be OBSERVED before the reload below: `saveOrderFlag` mutates the
+    # map and repaints SYNCHRONOUSLY and only then awaits the POST, so waiting on the
+    # toolbar text proves the CLIENT updated — not that the server stored anything. A
+    # reload in that window re-reads the old server state and the „still 6 of 7 after a
+    # reload" assertion reads 7 of 7 (CI failure 2026-07-27: the POST /api/instock
+    # landed in the test's TEARDOWN log). Same rule as the /api/decision races.
+    with page.expect_response(lambda r: r.request.method == "POST"
+                              and "/api/instock" in r.url):
+        page.locator(".toorder-row[data-code='C1'] .to-instock").click()
     page.wait_for_function(
         "() => /Ostáva vybaviť 6 položiek z 7/.test("
         "document.getElementById('toToolbar').textContent)")

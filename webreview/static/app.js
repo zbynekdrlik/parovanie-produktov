@@ -511,6 +511,14 @@ const NAV_ICONS = {
     + '<path d="M21 3v6h-6M3 21v-6h6"/>',
   parovania_eshop: '<path d="M12 3v12"/><path d="M8 7l4-4 4 4"/>'
     + '<path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
+  // #274 — these two were MISSING, so `${NAV_ICONS[key]}` interpolated the string
+  // "undefined" into the <svg> and the browser painted it as text next to the
+  // label („undefinedGRUBE kódy → eshop"). Every nav key needs an entry — pinned
+  // by test_every_nav_key_has_an_icon.
+  grube_externalcode: '<rect x="3" y="6" width="18" height="12" rx="2"/>'
+    + '<path d="M7 9v6M11 9v6M15 9v6M18 9v6"/>',
+  split_links: '<path d="M7 4v6a4 4 0 004 4h6"/><path d="M7 14v7"/>'
+    + '<path d="M17 11l3 3-3 3"/>',
   dodavatelsky_sklad: '<path d="M3 7l9-4 9 4v10l-9 4-9-4z"/><path d="M3 7l9 4 9-4"/>'
     + '<path d="M12 11v10"/>',
   riziko_vypadku: '<path d="M12 3L2 20h20L12 3z"/><path d="M12 9.5v4"/><path d="M12 17v.01"/>',
@@ -571,7 +579,10 @@ function _navButton(key, defaultLbl) {
   const bt = el('button', 'tab' + (ACTIVE_TAB === key ? ' active' : ''));
   const n = navCount(key);
   const err = navError(key);
-  bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key]}</svg>`
+  // `|| ''` — a key with no icon must render an EMPTY svg, never the literal
+  // "undefined" as text beside the label (#274); the drift test above keeps the
+  // table complete, this keeps the fallback harmless if one ever slips through.
+  bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key] || ''}</svg>`
     + `<span class="tlabel">${escapeHtml(lbl)}</span>`
     + (err ? '<span class="navwarn" title="posledný beh zlyhal">⚠</span>' : '')
     + (n > 0 ? `<span class="navcount">${n}</span>` : '');
@@ -3802,6 +3813,42 @@ const _PAROVANIA_STATUS = {
   ok: ['✅ OK', 'ok'], blocked: ['⚠️ Časť zablokovaná', 'warn'],
   failed: ['❌ Zlyhalo', 'bad'],
 };
+// #270 — „eshop taký kód nemá". A variant code that is missing from the eshop's
+// own catalogue export can never be imported: Shoptet rejects that row on EVERY
+// run (the same „Zlyhanie variantov: 2" every night since 24. 7. 2026), and the
+// manager saw only a red count with no way to learn WHICH code or WHY. The push
+// now holds those rows back and names them here, with the value it wanted to
+// write, so the code can be fixed. `p`/`s` are the pairings/suppliers halves of
+// last_result; returns null when there is nothing to report (the normal night).
+// Pure enough to unit-test in the browser realm — see tests/e2e/test_shell.py.
+function missingCodesBox(p, s) {
+  const rows = [];
+  for (const m of (p.missing_in_eshop || [])) rows.push({ ...m, held: true });
+  for (const m of (s.missing_in_eshop || [])) rows.push({ ...m, held: false });
+  const total = (Number(p.missing_count) || 0) + (Number(s.missing_count) || 0);
+  if (!total) return null;
+  // own class (styled FROM .autoerr): `.autoerr` means „the last run failed" and sits
+  // as a direct child of the tab section — a second, NESTED match would break every
+  // unscoped `.autoerr` locator in the e2e suite.
+  const box = el('div', 'automiss');
+  box.appendChild(el('div', '',
+    `⛔ Eshop tieto kódy v katalógu nemá (${total}) — oprav kód v eshope alebo `
+    + 'párovanie na záložke „Na objednanie".'));
+  const ul = el('ul', 'misscodes');
+  for (const m of rows) {
+    const li = document.createElement('li');
+    // free text out of the manager's stores — textContent only, never innerHTML
+    li.textContent = m.code + (m.value ? ' → ' + m.value : '')
+      + (m.held ? '' : ' (dodávateľ — zapisuje sa ďalej)');
+    ul.appendChild(li);
+  }
+  box.appendChild(ul);
+  if (rows.length < total) {
+    box.appendChild(el('div', 'sub2', `… a ďalších ${total - rows.length}`));
+  }
+  return box;
+}
+
 function renderParovaniaEshop() {
   const wrap = document.getElementById('tab-parovania_eshop');
   if (!wrap) return;
@@ -3876,6 +3923,9 @@ function renderParovaniaEshop() {
       + ` · spolu ${s.total_uploaded ?? 0} / ${s.total_assigned ?? 0} doplnených`
       + ` · chýba ${s.remaining ?? 0}`));
     if (s.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(s.error)));
+    // #270 — the codes the eshop's catalogue does not have at all
+    const miss = missingCodesBox(p, s);
+    if (miss) box.appendChild(miss);
     st.appendChild(box);
   } else if (!a.last_run) {
     st.appendChild(el('div', 'muted',
