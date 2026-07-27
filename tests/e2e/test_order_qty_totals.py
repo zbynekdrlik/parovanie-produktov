@@ -76,7 +76,15 @@ def test_a_handled_line_leaves_the_chip_showing_what_is_left(page, toorder_serve
     page.wait_for_selector(".toorder-row")
 
     # the qty-1 line (newest order first) → 2 ks stay outstanding on the other line
-    page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
+    # A per-row toggle updates the DOM SYNCHRONOUSLY and POSTs asynchronously (see
+    # app.js saveInstock), so the toolbar text this waits on says nothing about the
+    # server having stored the flag. Reloading on the strength of it races the write:
+    # on a loaded runner the page came back BEFORE the POST landed and the chip still
+    # showed the unhandled 3 ks. Wait for the write itself, exactly like every other
+    # mutate-then-assert E2E here.
+    with page.expect_response(lambda r: "/api/instock" in r.url
+                              and r.request.method == "POST"):
+        page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
     page.wait_for_function(
         "() => /6 položiek z 7/.test(document.getElementById('toToolbar').textContent)")
     page.reload()
@@ -162,7 +170,15 @@ def test_the_screen_number_equals_the_copied_number(page, toorder_server):
 
     assert _copied_qty() == 3          # nothing handled: 1 ks + 2 ks
 
-    page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
+    # A per-row toggle updates the DOM SYNCHRONOUSLY and POSTs asynchronously (see
+    # app.js saveInstock), so the toolbar text this waits on says nothing about the
+    # server having stored the flag. Reloading on the strength of it races the write:
+    # on a loaded runner the page came back BEFORE the POST landed and the chip still
+    # showed the unhandled 3 ks. Wait for the write itself, exactly like every other
+    # mutate-then-assert E2E here.
+    with page.expect_response(lambda r: "/api/instock" in r.url
+                              and r.request.method == "POST"):
+        page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
     page.wait_for_function(
         "() => /6 položiek z 7/.test(document.getElementById('toToolbar').textContent)")
     page.reload()
