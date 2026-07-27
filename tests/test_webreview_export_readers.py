@@ -300,3 +300,61 @@ def test_the_readers_agree_with_a_whole_text_parse(tmp_path, monkeypatch, reader
         got = {c: n for c, n in code2name.items() if c in names_truth}
 
     assert got == names_truth
+
+
+# ── #280 review, item 7: what the \r does to the SEARCH INDEX ─────────────────
+# #279 changed 88% of the blobs (3862/4378 `search_blob_norm` entries now carry a raw
+# \r that the text layer used to rewrite). An unmentioned, untested change to the search
+# index does not ship unexamined — so the claim „inert" is PINNED here rather than
+# asserted in prose. It is inert for a structural reason, not a lucky one:
+#
+#   • `search_catalog` tokenizes the query with `_words` (`[^a-z0-9]+`), so a query term
+#     is ALWAYS alnum-only — it can never contain \r, \n or a space, and can therefore
+#     never span the boundary where the two variants differ;
+#   • `_words(name_norm)` splits on that same class, so \r and \n are BOTH separators →
+#     the tokens feeding the whole-word (5) and prefix (4) tiers are identical;
+#   • the whole-query bonuses (`qn == name_norm`, `qn in name_norm`) match under NEITHER
+#     variant, so they cannot differ either.
+#
+# Normalising the \r away was rejected: #279 exists precisely to keep the eshop's bytes
+# intact, and `normalize_text` is shared with other callers.
+def _catalog_with(name_sep):
+    from parovanie.catalog_index import build_catalog_index
+    rows = [{"code": "1/M", "pairCode": "P1", "name": f"Bunda{name_sep}Zelena Test",
+             "description": f"Popis{name_sep}dlhy text", "supplier": "BETALOV",
+             "externalCode": "", "shortDescription": "", "manufacturer": "", "ean": "",
+             "productNumber": "", "price": "10", "stock": "1",
+             "productVisibility": "visible", "availabilityInStock": "Skladom",
+             "availabilityOutOfStock": ""}]
+    return build_catalog_index(rows, set())
+
+
+@pytest.mark.parametrize("q", [
+    "bunda", "zelena", "bunda zelena", "test", "popis", "dlhy", "unda", "nda zel",
+    "bunda test", "popis dlhy", "betalov", "1/m",
+])
+def test_a_carriage_return_in_the_blob_changes_no_search_result(q):
+    """The CRLF-carrying index (post-#279) must answer every query exactly like the
+    LF-carrying one (pre-#279) — same hits, same order."""
+    from parovanie.catalog_index import search_catalog
+    crlf = search_catalog(_catalog_with("\r\n"), q)
+    lf = search_catalog(_catalog_with("\n"), q)
+    assert [e["key"] for e in crlf] == [e["key"] for e in lf], f"query {q!r} diverged"
+
+
+def test_the_blobs_really_do_differ_so_the_test_above_is_not_vacuous():
+    """Guard against the pin proving nothing: the two indexes must genuinely hold
+    different bytes, otherwise the equality above is trivially true."""
+    a = _catalog_with("\r\n")["P1"]["search_blob_norm"]
+    b = _catalog_with("\n")["P1"]["search_blob_norm"]
+    assert a != b and "\r" in a and "\r" not in b
+
+
+def test_a_query_term_can_never_contain_the_separator_that_differs():
+    """The structural reason the above holds for ALL queries, not just the sampled ones:
+    the tokenizer cannot emit a term carrying \\r, \\n or a space."""
+    from parovanie.catalog_index import _words, normalize_text
+    for raw in ["bunda\rzelena", "bunda\nzelena", "bunda zelena", "bunda\r\nzelena"]:
+        terms = _words(normalize_text(raw))
+        assert terms == ["bunda", "zelena"], f"{raw!r} tokenized as {terms}"
+        assert all(c.isalnum() for t in terms for c in t)
