@@ -3822,6 +3822,24 @@ const _PAROVANIA_STATUS = {
 // last_result; returns null when there is nothing to report (the normal night).
 // Since #275 BOTH halves hold, so a listed code means the same thing either way —
 // the per-row „(dodávateľ — zapisuje sa ďalej)" caveat is gone with the asymmetry.
+// Why the fail-closed gate blocked the supplier write-back (#280 review). Every block
+// used to render „(chýbajú kódy)", which is the one cause it never is: nothing is
+// missing, the export itself is not believable. `g` is suppliers.gate_blocked from the
+// run result, null on a healthy night AND on a block that really IS about missing codes
+// (#270) — that one keeps its original wording. Pure; unit-tested in the browser realm.
+function gateBlockedWhy(g) {
+  if (!g) return ' (chýbajú kódy)';
+  if (g.reason === 'stale') {
+    return ` (export je starý ${g.age_h} h, limit ${g.max_age_h} h`
+      + ' — čakám na čerstvý export)';
+  }
+  if (g.reason === 'small') {
+    return ` (export vyzerá neúplný — ${g.codes} kódov, limit ${g.min_codes}`
+      + ' — čakám na dobrý export)';
+  }
+  return ' (export chýba alebo je prázdny — čakám na dobrý export)';
+}
+
 // Pure enough to unit-test in the browser realm — see tests/e2e/test_shell.py.
 function missingCodesBox(p, s) {
   const rows = [...(p.missing_in_eshop || []), ...(s.missing_in_eshop || [])];
@@ -3918,7 +3936,7 @@ function renderParovaniaEshop() {
       + (p.order_blocked ? ` · ${p.order_blocked} prekrytých recenziou` : '')));
     box.appendChild(el('div', '',
       `🏷️ Dodávatelia: +${s.count ?? 0} nových`
-      + (s.blocked ? ` · ${s.blocked} zablokovaných (chýbajú kódy)` : '')
+      + (s.blocked ? ` · ${s.blocked} zablokovaných${gateBlockedWhy(s.gate_blocked)}` : '')
       + ` · spolu ${s.total_uploaded ?? 0} / ${s.total_assigned ?? 0} doplnených`
       + ` · chýba ${s.remaining ?? 0}`));
     if (s.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(s.error)));

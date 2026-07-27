@@ -5919,6 +5919,11 @@ def run_parovania_eshop() -> dict:
             # makes this term the one that (correctly) turns it orange instead.
             "missing_count": _missing(suppliers),
             "missing_in_eshop": suppliers.get("missing_in_eshop") or [],
+            # #280 review: WHY the fail-closed gate blocked the write, so the card can
+            # name the real cause. Every block used to render „chýbajú kódy", which is
+            # the one thing it never is — nothing is missing, the export is simply not
+            # believable (absent / too small / too old). None on a healthy run.
+            "gate_blocked": suppliers.get("gate_blocked"),
             "ok": s_ok,
             "error": suppliers.get("error", ""),
         },
