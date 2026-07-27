@@ -26,7 +26,6 @@ import sys
 from datetime import timedelta, timezone, datetime
 
 import pytest
-import requests
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
