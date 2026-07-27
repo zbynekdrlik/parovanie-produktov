@@ -433,9 +433,12 @@ def test_toorder_assigned_supplier_name_is_html_escaped(page, live_server):
 
 
 def test_toorder_instock_and_unavailable_flags_toggle_and_persist(page, live_server):
-    """#84 — the two independent 'skladom' / 'nedostupné' per-line flags, cloned from
-    the 'čaká sa' toggle pattern. Toggled on the 2/M row (already used by the waiting
-    test above, which cleans up after itself — independent stores, no interference)."""
+    """#84 — the 'skladom' / 'nedostupné' per-line flags toggle and survive a reload.
+    Toggled on the 2/M row (already used by the waiting test above, which cleans up after
+    itself — no interference).
+
+    They are NO LONGER independent of each other (#211): both name the LINE'S STATUS, so
+    the row holds one at a time and turning one on turns the conflicting one off."""
     console = []
     page.on("console", lambda m: console.append(f"[{m.type}] {m.text}")
             if m.type in ("error", "warning") else None)
@@ -467,17 +470,19 @@ def test_toorder_instock_and_unavailable_flags_toggle_and_persist(page, live_ser
     assert "instock" in (row.get_attribute("class") or "")
     assert "on" in (row.locator(".to-instock").get_attribute("class") or "")
 
-    # Toggle 'nedostupné' on too — independent of 'skladom', both stay active together.
+    # Now 'nedostupné' — a CONTRADICTING status, so it replaces 'skladom' rather than
+    # standing beside it: „máme to" and „dodávateľ to nemá" cannot both be true of one
+    # line. The server is the authority; the row mirrors it, buttons and all.
     with page.expect_response(
             lambda r: "/api/unavailable" in r.url and r.request.method == "POST"):
         row.locator(".to-unavail").click()
     assert "unavail" in (row.get_attribute("class") or "")
-    assert "instock" in (row.get_attribute("class") or "")   # still on
+    assert "instock" not in (row.get_attribute("class") or "")
+    assert "on" not in (row.locator(".to-instock").get_attribute("class") or "")
+    assert page.evaluate(
+        "() => fetch('/api/instock').then(r => r.json()).then(j => Object.keys(j.instock))") == []
 
-    # Toggle both off — leaves the shared fixture server pristine.
-    with page.expect_response(
-            lambda r: "/api/instock" in r.url and r.request.method == "POST"):
-        row.locator(".to-instock").click()
+    # Toggle the one remaining flag off — leaves the shared fixture server pristine.
     with page.expect_response(
             lambda r: "/api/unavailable" in r.url and r.request.method == "POST"):
         row.locator(".to-unavail").click()
