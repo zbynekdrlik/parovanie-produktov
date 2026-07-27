@@ -3747,6 +3747,20 @@ function renderShoptetSync() {
       + ` · katalóg: ${lr.catalog_products ?? 0} produktov (${lr.catalog_codes ?? 0} kódov)`
       + ` · zosynchronizované review karty: ${lr.review_synced ?? 0}`
       + (lr.review_stale ? ` (nenájdených v exporte: ${lr.review_stale})` : '')));
+    // #280 review — a NON-FATAL degradation has to be VISIBLE. Both of these leave
+    // last_status = ok on purpose (the critical refresh did land), so without a line
+    // here a degraded hour reads exactly like a healthy one: the „quietly dead
+    // automation" the playbook warns about. Own class, not `.autoerr` — the run did
+    // not fail, one source of it did.
+    if (lr.export_error) {
+      st.appendChild(el('div', 'autowarn',
+        '⚠️ Katalógový export sa neobnovil — pracujem s predošlým súborom na disku: '
+        + escapeHtml(lr.export_error)));
+    }
+    if (lr.customers_error) {
+      st.appendChild(el('div', 'autowarn',
+        '⚠️ Export zákazníkov sa neobnovil: ' + escapeHtml(lr.customers_error)));
+    }
   }
   wrap.appendChild(st);
 }
