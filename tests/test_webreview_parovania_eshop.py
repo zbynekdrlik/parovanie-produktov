@@ -255,28 +255,22 @@ def test_do_upload_suppliers_blocks_when_export_empty(iso, monkeypatch):
     assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
 
 
-# ── BUG 1 (case c): a code that IS in supplier_assignments but is NOT present in the
-#    current export has no "own supplier" there → it is NOT excluded, and the nightly
-#    write-back STILL emits it (unchanged pre-PR behaviour). A present-but-partial
-#    export must not silently drop a legitimate fill-in assignment — only a genuinely
-#    empty export blocks (test above), a non-empty one that merely lacks the code writes. ─
-def test_do_upload_suppliers_emits_code_absent_from_export(iso, monkeypatch):
+# ── BUG 1 (case c): a code that IS in supplier_assignments but has no "own supplier"
+#    in the current export is NOT excluded by the clobber guard. Whether it is then
+#    SENT depends on the #270 catalogue verdict, which lives in its own tests below —
+#    this one pins only that the BUG 1 exclusion helper leaves it alone. ─────────────
+def test_the_clobber_guard_does_not_flag_a_code_absent_from_the_export(iso, monkeypatch):
     webapp._save_supplier_assign({"9/Z": "BETALOV"})
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
     # a NON-empty export listing OTHER products (5/A carries its own supplier) but NOT 9/Z
     export = ("code;pairCode;supplier\r\n"
               "5/A;555;REAL_SUPPLIER\r\n")
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(export))
-    # the exclusion helper does NOT flag 9/Z (it is absent from the export)
-    assert "9/Z" not in webapp._export_supplier_index()[0]
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
 
-    result, status = webapp._do_upload_suppliers(dry=False)
-    assert status == 200
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert {r[0] for r in sup["rows"]} == {"9/Z"}      # still written (not excluded)
-    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {"9/Z": "BETALOV"}
+    own, codes, present = webapp._export_supplier_index()
+
+    assert "9/Z" not in own            # nothing to clobber — the eshop has no supplier there
+    assert codes == {"5/A"} and present is True
 
 
 def test_run_is_idempotent_second_run_pushes_nothing(iso, monkeypatch):
@@ -1030,28 +1024,6 @@ def test_a_missing_code_turns_the_run_orange_and_reaches_the_tab(iso, monkeypatc
     assert result["status"] == "blocked"
     assert result["pairings"]["missing_count"] == 1
     assert result["pairings"]["missing_in_eshop"][0]["code"] == "1/M"
-
-
-def test_supplier_codes_absent_from_the_catalogue_are_reported_but_still_written(iso, monkeypatch):
-    """DELIBERATE ASYMMETRY. The supplier write-back keeps writing a code the export
-    does not list (PR #213 decided a present-but-partial export must never drop a
-    fill-in assignment — that path can only ADD a supplier where the eshop has
-    none). It only REPORTS them, so the manager sees the same bad code from both
-    sides of the nightly push."""
-    webapp._save_supplier_assign({"9/Z": "BETALOV"})
-    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
-    monkeypatch.setattr(webapp, "_iter_export_lines",
-                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
-    s, status = webapp._do_upload_suppliers(dry=False)
-
-    assert status == 200
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert {r[0] for r in sup["rows"]} == {"9/Z"}          # still written
-    assert s["missing_in_eshop"] == [{"code": "9/Z", "value": "BETALOV"}]
-    assert s["missing_count"] == 1
 
 
 def test_an_implausibly_small_export_is_not_trusted(tmp_path, monkeypatch):
