@@ -66,11 +66,68 @@ def _truth():
 # passes even when it guards nothing (playbook, „Drift guard nad AST"). cp1250 is the
 # Shoptet export's encoding and is used for NOTHING else in this tree, so „opened as
 # cp1250" is exactly „reads the catalogue export".
-def test_every_catalogue_export_reader_opens_the_file_with_newline_disabled():
-    source = open(APP_PY, encoding="utf-8").read()
+def _module_level_str_consts(tree) -> dict:
+    """{NAME: "value"} for every module-level `NAME = "literal"`.
+
+    Without this the guard was blind to `open(p, encoding=_EXPORT_ENCODING)` (PR #280
+    review): the AST walk matched only `ast.Constant`, and the raw-text cross-check
+    counted only the literal `encoding="cp1250"` — so a reader written that way was
+    invisible to BOTH halves at once, and the guard reported `1 passed` with an
+    unguarded reader present."""
+    consts = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    consts[t.id] = node.value.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str) and isinstance(node.target, ast.Name):
+            consts[node.target.id] = node.value.value
+    return consts
+
+
+def _is_cp1250(node, consts) -> bool:
+    """Resolve the `encoding=` argument SYMBOLICALLY, not just as a literal."""
+    if isinstance(node, ast.Constant):
+        return node.value == "cp1250"
+    if isinstance(node, ast.Name):
+        return consts.get(node.id) == "cp1250"
+    if isinstance(node, ast.Attribute):          # e.g. webapp._EXPORT_ENCODING
+        return consts.get(node.attr) == "cp1250"
+    return False
+
+
+def _names_the_export_path(node) -> bool:
+    """Second net, independent of the encoding: does this expression name the catalogue
+    export file? Catches a reader that reaches the export while spelling its encoding in
+    some shape the resolution above still cannot see."""
+    if isinstance(node, ast.Name):
+        return node.id in ("SRC", "src")
+    if isinstance(node, ast.Attribute):
+        return node.attr in ("SRC", "src")
+    return False
+
+
+def _is_binary(call) -> bool:
+    """A binary open does NO newline translation at all, so it is never an offender —
+    and app.py has one (the export is also read as bytes)."""
+    mode = call.args[1] if len(call.args) > 1 else None
+    for k in call.keywords:
+        if k.arg == "mode":
+            mode = k.value
+    return isinstance(mode, ast.Constant) and isinstance(mode.value, str) \
+        and "b" in mode.value
+
+
+def unguarded_export_readers(source: str) -> tuple:
+    """(offending line numbers, how many export readers were seen).
+
+    Split out of the test so the GUARD ITSELF can be tested against every bypass shape
+    — the playbook's rule for drift guards: „Vždy si guard otestuj tým, že mu podhodíš
+    každý tvar"."""
     tree = ast.parse(source)
-    offenders = []
-    seen = 0
+    offenders, seen = [], 0
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "open"):
@@ -83,18 +140,69 @@ def test_every_catalogue_export_reader_opens_the_file_with_newline_disabled():
         nl = kw.get("newline")
         if not (isinstance(nl, ast.Constant) and nl.value == ""):
             offenders.append(node.lineno)
+    return offenders, seen
+
+
+def test_every_catalogue_export_reader_opens_the_file_with_newline_disabled():
+    source = open(APP_PY, encoding="utf-8").read()
+    offenders, seen = unguarded_export_readers(source)
     # Cross-check the AST walk against the raw text, so the guard cannot pass by
     # silently matching NOTHING (a helper wrapping `open`, a renamed kwarg, an ast
     # shape this walk does not cover). Deliberately not a hard-coded count: routing a
     # reader away is a legitimate refactor and must not fail this test spuriously —
-    # what must never happen is the walk MISSING one that is still there.
-    assert seen == source.count('encoding="cp1250"'), (
-        f"the AST walk found {seen} cp1250 open() calls but the file text has "
-        f"{source.count('encoding=\"cp1250\"')} — the guard is no longer seeing them all")
+    # what must never happen is the walk MISSING one that is still there. `>=` because
+    # the walk now ALSO catches readers the literal text search cannot see.
+    assert seen >= source.count('encoding="cp1250"'), (
+        f"the AST walk found {seen} export readers but the file text has "
+        f"{source.count('encoding=\"cp1250\"')} literal cp1250 opens — the guard is no "
+        "longer seeing them all")
     assert offenders == [], (
         "webreview/app.py opens the catalogue export without newline=\"\" at line(s) "
         f"{offenders} — csv then silently rewrites \\r\\n and \\r inside quoted "
         "fields to \\n, so the value read is not the value the eshop holds")
+
+
+# ── the guard's OWN test: every bypass shape must be caught ────────────────────
+@pytest.mark.parametrize("label,src", [
+    ("literal encoding",
+     '_ = open(p, encoding="cp1250")'),
+    ("module constant encoding",
+     '_EXPORT_ENCODING = "cp1250"\n_ = open(p, encoding=_EXPORT_ENCODING)'),
+    ("attribute constant encoding",
+     '_EXPORT_ENCODING = "cp1250"\n_ = open(p, encoding=webapp._EXPORT_ENCODING)'),
+    ("export path, encoding elsewhere",
+     'SRC = "x"\n_ = open(SRC, encoding=enc())'),
+    ("export path via attribute",
+     '_ = open(webapp.SRC, encoding=enc())'),
+    ("keyword file= argument",
+     'SRC = "x"\n_ = open(file=SRC, encoding=enc())'),
+])
+def test_the_drift_guard_catches_every_bypass_shape(label, src):
+    offenders, seen = unguarded_export_readers(src)
+    assert seen == 1, f"{label}: the guard did not even SEE this reader"
+    assert offenders, f"{label}: the guard saw it but did not flag the missing newline"
+
+
+@pytest.mark.parametrize("label,src", [
+    ("literal encoding", '_ = open(p, encoding="cp1250", newline="")'),
+    ("module constant", '_E = "cp1250"\n_ = open(p, encoding=_E, newline="")'),
+    ("export path", 'SRC = "x"\n_ = open(SRC, encoding=enc(), newline="")'),
+])
+def test_the_drift_guard_accepts_a_correctly_opened_reader(label, src):
+    offenders, seen = unguarded_export_readers(src)
+    assert seen == 1 and offenders == [], f"{label}: false positive"
+
+
+def test_the_drift_guard_ignores_a_binary_read_of_the_export():
+    """A binary open does no newline translation at all — app.py has one and it is not
+    an offender. Without this exemption the new path-based net would flag it."""
+    offenders, seen = unguarded_export_readers('SRC = "x"\n_ = open(SRC, "rb")')
+    assert (offenders, seen) == ([], 0)
+
+
+def test_the_drift_guard_ignores_unrelated_files():
+    offenders, seen = unguarded_export_readers('_ = open("notes.json", encoding="utf-8")')
+    assert (offenders, seen) == ([], 0)
 
 
 # ── behaviour, per call site ───────────────────────────────────────────────────
