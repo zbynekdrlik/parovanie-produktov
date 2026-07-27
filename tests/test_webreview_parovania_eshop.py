@@ -866,3 +866,136 @@ def test_a_missing_export_yields_an_empty_index_and_never_raises(tmp_path, monke
     monkeypatch.setattr(webapp, "SRC", str(tmp_path / "nope.csv"))
     assert webapp._export_note_index() == ({}, set())
     assert webapp._read_export_for_links() == ""
+
+
+# --------------------------------------------------------------------------- #
+# #270 — a code the eshop's CATALOGUE does not carry at all can never be
+# imported: Shoptet rejects that row on every single run („Zlyhanie variantov:
+# 2", the same two rows every night since 24. 7.), and the manager saw only a red
+# „Shoptet odmietol 2 riadkov" with no way to learn WHICH code or WHY. Such rows
+# are now held back and LISTED with the code + the URL we tried to write.
+# --------------------------------------------------------------------------- #
+def test_a_code_the_catalogue_does_not_have_is_held_back_and_listed(iso, monkeypatch):
+    _seed_pairing()                                    # BETALOV|P1 → 1/M
+    # a fresh, perfectly normal export of OTHER products — 1/M is not in the eshop
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines(_export({"9/Z": "", "8/Z": ""})))
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    p, status = webapp._do_upload_pairings(dry=False)
+
+    assert status == 200
+    assert calls == []                                 # the doomed row is NOT sent
+    assert p["missing_count"] == 1
+    assert p["missing_in_eshop"] == [{"code": "1/M", "url": "https://supplier/x"}]
+    # NOT recorded uploaded — the moment the code appears in the catalogue it is sent
+    assert (not (iso["tmp"] / "uploaded_pairings.json").exists()
+            or json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) == {})
+
+
+def test_a_code_that_reappears_in_the_catalogue_is_sent_on_the_next_run(iso, monkeypatch):
+    """Holding a row back is never permanent: it is not credited, so once the
+    manager fixes the code in the eshop the very next run writes it."""
+    _seed_pairing()
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines(_export({"9/Z": ""})))
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    webapp._do_upload_pairings(dry=False)
+    assert calls == []
+
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines(_export({"9/Z": "", "1/M": ""})))
+    p, _st = webapp._do_upload_pairings(dry=False)
+
+    assert p["missing_count"] == 0
+    assert calls and ["1/M", "P1", "https://supplier/x"] in calls[0]["rows"]
+    assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) \
+        == {"BETALOV|P1": "https://supplier/x"}
+
+
+def test_an_empty_export_never_holds_a_row_back(iso, monkeypatch):
+    """FAIL-SAFE: no export = we know NOTHING about the catalogue, so nothing may be
+    called missing. Everything is sent, exactly as before (an idempotent re-write)."""
+    _seed_pairing()
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(""))
+    fake_run, calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    p, _st = webapp._do_upload_pairings(dry=False)
+
+    assert p["missing_count"] == 0
+    assert calls and ["1/M", "P1", "https://supplier/x"] in calls[0]["rows"]
+
+
+def test_a_stale_export_never_holds_a_row_back(tmp_path, monkeypatch):
+    """Same guard as the export CREDIT (#271): an export older than EXPORT_MAX_AGE_S
+    describes a catalogue that may have changed since, so it may neither confirm a
+    row nor declare one missing."""
+    p = tmp_path / "products.csv"
+    _write_export(p, {"9/Z": ""}, age_s=webapp.EXPORT_MAX_AGE_S + 60)
+    monkeypatch.setattr(webapp, "SRC", str(p))
+
+    v = webapp._export_row_verdicts([["1/M", "P1", "https://supplier/x"]])
+    assert v["absent"] == set() and v["confirmed"] == set()
+
+
+def test_a_fresh_export_reports_both_verdicts_in_one_pass(tmp_path, monkeypatch):
+    p = tmp_path / "products.csv"
+    _write_export(p, {"1/M": "https://supplier/x", "2/M": ""})
+    monkeypatch.setattr(webapp, "SRC", str(p))
+
+    v = webapp._export_row_verdicts([["1/M", "P1", "https://supplier/x"],
+                                     ["2/M", "P1", "https://supplier/y"],
+                                     ["3/M", "P1", "https://supplier/z"]])
+
+    assert v["confirmed"] == {"1/M"}          # already exactly as we would write it
+    assert v["absent"] == {"3/M"}             # the eshop has no such code at all
+    # 2/M exists but carries a different note → still sent (unchanged behaviour)
+
+
+def test_the_verdicts_cannot_be_handed_notes_that_skip_the_freshness_check():
+    """#271's guard, kept through the #270 rename: the credit (and now the
+    missing-code verdict) may only ever be computed from an export whose AGE was
+    checked, so there must be no parameter through which pre-read bytes can enter."""
+    params = inspect.signature(webapp._export_row_verdicts).parameters
+    assert "notes" not in params and "text" not in params and "codes" not in params
+
+
+def test_a_missing_code_turns_the_run_orange_and_reaches_the_tab(iso, monkeypatch):
+    """The manager's only window into the nightly push is the automation card, so
+    the codes must reach `last_result` — and the run must not look plain green."""
+    _seed_pairing()
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines(_export({"9/Z": ""})))
+    fake_run, _calls = _recording_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["status"] == "blocked"
+    assert result["pairings"]["missing_count"] == 1
+    assert result["pairings"]["missing_in_eshop"][0]["code"] == "1/M"
+
+
+def test_supplier_codes_absent_from_the_catalogue_are_reported_but_still_written(iso, monkeypatch):
+    """DELIBERATE ASYMMETRY. The supplier write-back keeps writing a code the export
+    does not list (PR #213 decided a present-but-partial export must never drop a
+    fill-in assignment — that path can only ADD a supplier where the eshop has
+    none). It only REPORTS them, so the manager sees the same bad code from both
+    sides of the nightly push."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    s, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200
+    sup = next(c for c in calls if c["header"][2] == "supplier")
+    assert {r[0] for r in sup["rows"]} == {"9/Z"}          # still written
+    assert s["missing_in_eshop"] == [{"code": "9/Z", "url": "BETALOV"}]
+    assert s["missing_count"] == 1
