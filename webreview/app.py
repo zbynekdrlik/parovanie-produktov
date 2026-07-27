@@ -5604,6 +5604,17 @@ def run_posta_uncollected() -> dict:
     sent = failed = api_skipped = 0
     today = datetime.now().date()
     today_iso = today.isoformat()
+    # Is the SOURCE still alive (#282)? `checked` above only ever counts orders that DID carry a
+    # package number, so an export that stops carrying them reads as a calm day. This is the one
+    # stat that can tell those two apart. Pure counting over the same export — no send, no API.
+    coverage = posta_uncollected.source_coverage(csv_bytes, today)
+    if coverage["degraded"]:
+        log.error("posta: ZDROJ ZÁSIELOK JE DEGRADOVANÝ — %d z %d odoslaných objednávok v okne "
+                  "nemá podacie číslo, posledné pribudlo pred %s dňami; automatizácia z nich "
+                  "nevidí takmer nič a nikoho neupozorní",
+                  coverage["dispatched_without_package"], coverage["dispatched_orders"],
+                  coverage["days_since_last_package"]
+                  if coverage["days_since_last_package"] is not None else "30+")
     # A cached terminal verdict is trusted for this long, then re-verified once. Cheap insurance:
     # it still removes ~6 of every 7 calls for a delivered parcel, while bounding ANY wrong or
     # freak reading to a week instead of the full 30-day source window.
@@ -5735,7 +5746,16 @@ def run_posta_uncollected() -> dict:
              # „BCC vždy" is BINDING for these customer mails (require_bcc): with no MAIL_BCC not
              # one escalation goes out. Surfaced so the tab shows a dead automation as dead
              # instead of a healthy-looking run that quietly mailed nobody (ERROR log only).
-             "bcc_missing": _mail_bcc() is None}
+             "bcc_missing": _mail_bcc() is None,
+             # #282 — the same idea one step upstream: with no package numbers in the export there
+             # is nothing to check at all, and `checked` shrinking towards zero looks exactly like
+             # a quiet week. These four make the difference visible; `source_degraded` is what
+             # turns the card red instead of leaving a green „✅ OK" over a blind automation.
+             "source_degraded": coverage["degraded"],
+             "dispatched_orders": coverage["dispatched_orders"],
+             "dispatched_without_package": coverage["dispatched_without_package"],
+             "missing_package": coverage["missing_package"],
+             "days_since_last_package": coverage["days_since_last_package"]}
     with _lock:
         # Re-read under the lock and update that map, rather than writing a brand-new dict:
         # `esc`/`term_cache` were read before minutes of Pošta SK round-trips, so this both

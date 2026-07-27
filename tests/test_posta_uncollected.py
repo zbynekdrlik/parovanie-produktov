@@ -426,11 +426,24 @@ def test_source_coverage_low_coverage_alone_degrades():
 def test_source_coverage_pending_orders_never_degrade():
     """An order still being picked („Vybavuje sa") has no package number yet and that is entirely
     normal — counting those into the rule would light the alarm up every single day."""
-    rows = [(d, "Vybavuje sa", "", "Kuriér") for d in range(40)]
+    rows = [(d % 25, "Vybavuje sa", "", "Kuriér") for d in range(40)]
     c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
     assert c["dispatched_orders"] == 0
     assert c["missing_package"] == 40
     assert c["degraded"] is False
+
+
+def test_source_coverage_needs_enough_evidence_to_accuse_the_source():
+    """~27 % of dispatched orders legitimately carry no number even in a healthy month, so on a
+    near-empty window „no numbers at all" is a coincidence (odds 0.27 at one order, 0.02 at three),
+    not proof of a dead source. Four dispatched orders without one stay quiet; the real failure
+    runs 91 orders deep, so this floor costs nothing against it."""
+    rows = [(20, "Vybavená", "", "Kuriér") for _ in range(4)]
+    assert pu.source_coverage(_orders(rows), today=date(2026, 7, 27))["degraded"] is False
+    # …one more order and the same evidence is worth acting on
+    rows.append((20, "Vybavená", "", "Kuriér"))
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 5 and c["degraded"] is True
 
 
 def test_source_coverage_empty_window_never_degrades():

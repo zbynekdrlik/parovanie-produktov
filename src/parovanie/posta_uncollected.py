@@ -59,6 +59,43 @@ ADMIN_ORDER_LINK = ("https://www.forestshop.sk/admin/vyhladavanie/"
 SOURCE_WINDOW_DAYS = 30
 MAX_EMAILS = 4
 
+# The order status that means „už odoslaná" — the only orders that MUST already carry a package
+# number. An order still being picked („Vybavuje sa") legitimately has none yet, and counting
+# those would light the coverage alarm below every single day. Rare statuses are deliberately not
+# guessed at (same discipline as TERMINAL_STATE_CODES: only vocabulary we have actually seen).
+DISPATCHED_STATUS = "vybavená"
+
+# ── the coverage alarm (#282) ────────────────────────────────────────────────────────────────
+# The ONLY source of shipments is the export's `packageNumber` column. On 2026-07-02 it stopped
+# being filled and the daily run went on reporting `ok` with a quietly shrinking `checked`
+# (21 → 13 → 9 → 6 → 4 over five days) while a real parcel sat at the post office until its
+# pickup deadline: `checked` counts the orders that DID carry a number, so a source that stops
+# feeding them looks like a calm day, not a failure. Both thresholds below are calibrated on the
+# real history (read-only recount of the live orders export, 2026-07-27), not guessed:
+#
+#   coverage — dispatched orders carrying a number: 90.3 % in May, 72.2 % in June; the worst
+#     rolling 30-day window in that healthy period was 73.2 %. Tonight: 4.4 %. A 50 % floor
+#     therefore has ~23 points of headroom under the worst healthy reading. It is deliberately
+#     not tighter: even in a healthy June ~27 % of dispatched orders have no number, so a
+#     stricter floor would alarm on normal trading noise.
+#   staleness — the longest gap between two days bringing a new package number in 1.5.–1.7. was
+#     3 days (54 such days, gaps of 1/2/3). Tonight: 26 days. A 7-day limit is over twice the
+#     worst healthy gap, so a weekend or a holiday cannot trip it.
+#
+# Against the real outage (source died 1.7.) staleness would have gone red on 8.7. and coverage
+# around 10.7. — 17-19 days before the deadline of the shipment that was actually lost.
+#
+# The third constant is the evidence floor. Roughly 27 % of dispatched orders legitimately carry
+# no number even in a healthy month, so on a tiny window both rules above are noise: with a single
+# dispatched order the odds of „no numbers at all" happening innocently are 0.27, with two 0.073,
+# with three 0.02 — a card that cried wolf at those odds would be trained away within a week. At
+# five they are 0.0014 (~1 window in 700), which is where the verdict becomes worth acting on.
+# The real shop runs 91-157 dispatched orders per window, so this floor costs no detection power
+# whatsoever against the failure it exists for; it only keeps a near-empty window quiet.
+MIN_PACKAGE_COVERAGE = 0.5
+MAX_PACKAGE_GAP_DAYS = 7
+MIN_DISPATCHED_FOR_ALARM = 5
+
 
 def _parse_date(s) -> date | None:
     """Lenient 'YYYY-MM-DD...' prefix → date; None (never raises) on junk."""
@@ -89,17 +126,15 @@ def _is_non_posta_carrier(name: str) -> bool:
     return any(k in n for k in NON_POSTA_CARRIER_KEYWORDS)
 
 
-def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dict]:
-    """Shoptet orders.csv (cp1250 bytes or str) → one shipment per ORDER.
+def _eligible_orders(orders_csv, today: date | None = None) -> list[tuple[dict, date, str]]:
+    """Every order this automation is responsible for, WITHOUT the packageNumber filter →
+    [(row, order_date, packageNumber), …].
 
-    Port of the n8n 'Filter' + 'Remove Duplicates' nodes: packageNumber
-    non-empty AND order date within the last 30 days, first row per order code
-    wins (the export repeats order fields on every item line). One deliberate
-    deviation from n8n: a cancelled order (Stornovaná) is skipped — nagging a
-    customer who cancelled would be wrong (documented on #93). Second
-    deviation (#126): orders shipped via a non-Pošta courier (DPD etc., see
-    _is_non_posta_carrier) are excluded entirely — this automation is Pošta
-    SK only."""
+    The shared definition of „naša objednávka": first row per order code wins (the export repeats
+    order fields on every item line), the order is not cancelled, it did not ship with a non-Pošta
+    courier, and its date is inside the 30-day source window. Both the shipment source below and
+    the coverage alarm read it, so the alarm can never end up counting a different set of orders
+    than the automation actually chases."""
     text = (orders_csv.decode("cp1250", errors="replace")
             if isinstance(orders_csv, bytes) else orders_csv)
     today = today or date.today()
@@ -112,9 +147,6 @@ def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dic
         if not code or code in seen:
             continue
         seen.add(code)
-        pkg = (r.get("packageNumber") or "").strip()
-        if not pkg:
-            continue
         if (r.get("statusName") or "").strip().lower() == "stornovaná":
             continue
         if _is_non_posta_carrier(carriers.get(code, "")):
@@ -122,14 +154,65 @@ def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dic
         od = _parse_date(r.get("date"))
         if od is None or od < cutoff:
             continue
-        out.append({
-            "code": code,
-            "date": od.isoformat(),
-            "packageNumber": pkg,
-            "email": (r.get("email") or "").strip(),
-            "phone": (r.get("phone") or "").strip(),
-            "billFullName": (r.get("billFullName") or "").strip(),
-        })
+        out.append((r, od, (r.get("packageNumber") or "").strip()))
+    return out
+
+
+def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dict]:
+    """Shoptet orders.csv (cp1250 bytes or str) → one shipment per ORDER.
+
+    Port of the n8n 'Filter' + 'Remove Duplicates' nodes: packageNumber
+    non-empty AND order date within the last 30 days, first row per order code
+    wins (the export repeats order fields on every item line). One deliberate
+    deviation from n8n: a cancelled order (Stornovaná) is skipped — nagging a
+    customer who cancelled would be wrong (documented on #93). Second
+    deviation (#126): orders shipped via a non-Pošta courier (DPD etc., see
+    _is_non_posta_carrier) are excluded entirely — this automation is Pošta
+    SK only."""
+    return [{
+        "code": (r.get("code") or "").strip(),
+        "date": od.isoformat(),
+        "packageNumber": pkg,
+        "email": (r.get("email") or "").strip(),
+        "phone": (r.get("phone") or "").strip(),
+        "billFullName": (r.get("billFullName") or "").strip(),
+    } for r, od, pkg in _eligible_orders(orders_csv, today) if pkg]
+
+
+def source_coverage(orders_csv, today: date | None = None) -> dict:
+    """Is the shipment SOURCE still alive? → counts + a `degraded` verdict (#282).
+
+    Everything here is counted over the same eligible orders the automation chases
+    (_eligible_orders). `degraded` is True when the window holds dispatched orders AND either
+    fewer than MIN_PACKAGE_COVERAGE of them carry a package number, or no order has brought a new
+    one for MAX_PACKAGE_GAP_DAYS (see the calibration above each constant).
+
+    Three things it deliberately does NOT do. It never degrades on a window holding fewer than
+    MIN_DISPATCHED_FOR_ALARM dispatched orders — too little evidence to tell a dead source from a
+    quiet shop; it never counts orders that are still being picked, which have no number yet for
+    entirely normal reasons; and it never touches the escalation. This is a pure counter: it reads
+    the export, sends nothing, and never widens the set of shipments that get e-mailed."""
+    today = today or date.today()
+    eligible = _eligible_orders(orders_csv, today)
+    dispatched = [(od, pkg) for r, od, pkg in eligible
+                  if (r.get("statusName") or "").strip().lower() == DISPATCHED_STATUS]
+    with_pkg = sum(1 for _, pkg in dispatched if pkg)
+    pkg_dates = [od for _, od, pkg in eligible if pkg]
+    gap = (today - max(pkg_dates)).days if pkg_dates else None
+    out = {
+        "dispatched_orders": len(dispatched),
+        "dispatched_with_package": with_pkg,
+        "dispatched_without_package": len(dispatched) - with_pkg,
+        # every eligible order with no number, dispatched or not — reported for context, NOT used
+        # as the rule (the not-yet-shipped ones are a normal, permanent part of it)
+        "missing_package": sum(1 for _, _, pkg in eligible if not pkg),
+        "days_since_last_package": gap,
+        "degraded": False,
+    }
+    if len(dispatched) >= MIN_DISPATCHED_FOR_ALARM:
+        thin = with_pkg / len(dispatched) < MIN_PACKAGE_COVERAGE
+        stale = gap is None or gap >= MAX_PACKAGE_GAP_DAYS
+        out["degraded"] = thin or stale
     return out
 
 
