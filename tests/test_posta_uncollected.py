@@ -559,7 +559,16 @@ def test_classify_drops_an_unparsable_retained_till():
 # The shapes a foreign API can hand us for one date field: a nonsense calendar date, a Slovak
 # d.m.yyyy string, free text, and a raw JSON type. None of them is a date we can reason about,
 # so none of them may reach a customer — the mail must fall back to the dateless wording.
-UNPARSABLE_TILLS = ["2026-13-45", "20.07.2026", "do odvolania", True, 20260803, {"date": "x"}]
+UNPARSABLE_TILLS = ["2026-13-45", "20.07.2026", "do odvolania", True, {"date": "x"}, []]
+
+
+def test_classify_accepts_the_basic_iso_form():
+    """Counterpart to the hostile set: `20260803` is not junk — it is ISO-8601 BASIC form, which
+    date.fromisoformat reads unambiguously, so it must be accepted (and normalised), not dropped.
+    Pinned so the fail-soft above can never be widened into „anything I don't like is empty"."""
+    j = {"results": [{"status": "ok", "retainedTill": 20260803, "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-08-03"
 
 
 def test_classify_drops_every_unrecognised_retained_till_shape():
@@ -570,6 +579,12 @@ def test_classify_drops_every_unrecognised_retained_till_shape():
             {"stateCode": "notified", "detailCode": "ZNP1AN",
              "localDate": "2026-07-16T08:10:00"}]}]}
         assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "", repr(raw)
+    # whitespace too (checked only here — as a substring it would match the mail's own indentation)
+    j = {"results": [{"status": "ok", "retainedTill": "   ", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == ""
+    assert pu.build_email(1, "X", "EF1SK", "P", "", "   ", today=TODAY)[1].count(
+        "vyzdvihnite si ju čo najskôr") == 1
 
 
 def test_build_email_never_pastes_an_unrecognised_deadline():
