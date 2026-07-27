@@ -3,6 +3,14 @@
 Hermetic: tracking responses are saved fixtures (shapes verified against the
 LIVE api.posta.sk on 2026-07-22 — the delivered + invalid_format ones are real
 responses with anonymized numbers), no network, no SMTP.
+
+`tracking_notified_znp.json` was rebuilt for #283: the original was invented
+alongside the feature and put `retainedTill` on the notified EVENT, a shape the
+live API does not produce — it carries the field at RESULT level. That invented
+shape is exactly why the missing pickup deadline in the escalation mails went
+unnoticed, so the fixture now mirrors the real response (result-level
+`retainedTill`, real `detailCode` ZNP1AN as seen in the anonymized
+`tracking_collected_at_office.json`).
 """
 import json
 import os
@@ -108,6 +116,36 @@ def test_classify_notified_znp_is_uncollected():
     assert c["retained_till"] == "2026-08-03"
     assert c["notified_since"] == "2026-07-16"
     assert c["days_at_post"] == 6                       # 22.7. - 16.7.
+
+
+def test_classify_reads_retained_till_from_result_level():
+    """#283 — the live API returns `retainedTill` on the RESULT, never on an event. Reading it
+    only from the events left `retained_till` empty, so the escalation mail dropped its „vyzdvihnite
+    si ju do <dátum>" line and fell back to a vague „čo najskôr" — on the shipment that started
+    this issue the missing date was the actual deadline."""
+    j = {"results": [{"status": "ok", "retainedTill": "2026-07-27", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-07-27"
+
+
+def test_classify_retained_till_event_fallback_kept():
+    """The event-level shape is what the ported n8n workflow observed. We have exactly one live
+    sample of the result-level shape, so the old reading stays as a fallback rather than being
+    swapped for it — the field is display-only and never gates a send, so honouring both costs
+    nothing and cannot be wrong-footed by whichever shape the API answers with."""
+    j = {"results": [{"status": "ok", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00",
+         "retainedTill": "2026-08-03"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-08-03"
+
+
+def test_classify_result_level_retained_till_wins_over_event():
+    """Both shapes present: the result-level value is the shipment's current deadline, an event's
+    is whatever was true when that event was written — so the result wins."""
+    j = {"results": [{"status": "ok", "retainedTill": "2026-07-27", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00",
+         "retainedTill": "2026-08-03"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-07-27"
 
 
 def test_classify_delivered_not_uncollected():
