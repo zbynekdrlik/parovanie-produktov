@@ -6,12 +6,18 @@ import pytest
 from parovanie.shoptet_import import (
     EXPECTED_HEADER,
     ShoptetError,
+    chunk_outcome,
     classify_row,
+    hard_error_detail,
+    has_log_entries,
     load_credentials,
+    log_entry_id,
     parse_import_log,
+    parse_result_stdout,
     pick_result_row,
     preflight_csv,
     result_exit_code,
+    result_stdout_slice,
 )
 
 
@@ -252,3 +258,235 @@ def test_pick_result_row_returns_new_row_once_it_differs_from_baseline():
     rows = ["12.7.2026 10:05  Spracované: 3776. Upravené: 784.", baseline]
     row = pick_result_row(rows, baseline=baseline)
     assert row == rows[0]
+
+
+# --------------------------------------------------------------------------- #
+# #257 / #196 — the read-back must identify THIS run's row, not "the newest one"
+#
+# Real rows, copied verbatim from data/out/shoptet_import_*.log. Shoptet renders
+# its Log NEWEST FIRST and prefixes every entry with its own increasing id (#N).
+# --------------------------------------------------------------------------- #
+ROW_BASELINE = ("#12688 26.07.2026 20:12 Info Import dobehol úspešne. "
+                "Spracované: 4. Upravené: 1.")
+ROW_OURS_35 = ("#12689 26.07.2026 21:00 Upozornenie Import skončil s chybou. "
+               "Spracované: 35. Upravené: 31. Zlyhanie variantov: 2.")
+ROW_FOREIGN_1 = ("#12704 26.07.2026 21:01 Upozornenie Import skončil s chybou. "
+                 "Spracované: 1. Zlyhanie variantov: 1.")
+
+
+def test_pick_result_row_ignores_a_foreign_newer_row_and_picks_our_own(): #257
+    # #257: two imports write to the same Shoptet Log within ~90 s (two automations
+    # in one app instance, or two instances). Taking the NEWEST row read the FOREIGN
+    # 1-row supplier import as the result of OUR 35-row pairings import → the run was
+    # booked as a failure and uploaded_pairings.json froze. With the row count of the
+    # file we actually submitted, our own row is identifiable.
+    rows = [ROW_FOREIGN_1, ROW_OURS_35, ROW_BASELINE]
+    assert pick_result_row(rows, baseline=ROW_BASELINE, expected_rows=35) == ROW_OURS_35
+
+
+def test_pick_result_row_never_reports_a_stale_row_as_our_result(): #196
+    # #196 verbatim: the read-back reported processed=1/failed=1 while the import had
+    # really processed 260. Without a baseline (the Log page rendered no entry at
+    # capture time) EVERY visible entry — including days-old ones — would be a
+    # candidate, so nothing may be attributed at all: fail closed, poll, exit 2.
+    stale = ("#12542 23.07.2026 21:00 Upozornenie Import skončil s chybou. "
+             "Spracované: 1. Zlyhanie variantov: 1.")
+    ours = ("#12584 23.07.2026 22:13 Info Import dobehol úspešne. "
+            "Spracované: 260. Upravené: 74.")
+    assert pick_result_row([stale], baseline=None, expected_rows=260) is None
+    # even a row with the RIGHT count is unattributable without a baseline — it could
+    # be any older run of the same size
+    assert pick_result_row([ours, stale], baseline=None, expected_rows=260) is None
+    # with the baseline known, our own row is picked
+    assert pick_result_row([ours, stale], baseline=stale, expected_rows=260) == ours
+
+
+def test_pick_result_row_fails_closed_when_two_new_rows_match_the_count():
+    # Two concurrent imports of the SAME size are genuinely indistinguishable —
+    # report "unattributable" (None → exit 2), never guess one of them.
+    a = "#12691 26.07.2026 21:00 Info Import dobehol úspešne. Spracované: 35. Upravené: 5."
+    b = "#12690 26.07.2026 21:00 Info Import dobehol úspešne. Spracované: 35. Upravené: 31."
+    assert pick_result_row([a, b, ROW_BASELINE], baseline=ROW_BASELINE,
+                           expected_rows=35) is None
+
+
+def test_pick_result_row_older_id_is_never_a_candidate():
+    # A row whose entry id is OLDER than the baseline predates this run, whatever
+    # the table order claims.
+    old = "#12500 20.07.2026 21:00 Info Import dobehol úspešne. Spracované: 35. Upravené: 35."
+    assert pick_result_row([old, ROW_BASELINE], baseline=ROW_BASELINE,
+                           expected_rows=35) is None
+
+
+def test_pick_result_row_accepts_our_hard_error_row_when_it_is_the_only_new_one():
+    # A hard abort writes NO Spracované summary at all (#23) — so it can never match
+    # the expected count. It is still ours when it is the single new entry.
+    hard = "#12692 Chyba | Číslo riadku: 42 - Data in column code are not unique"
+    assert pick_result_row([hard, ROW_BASELINE], baseline=ROW_BASELINE,
+                           expected_rows=35) == hard
+
+
+def test_pick_result_row_without_expected_rows_keeps_the_legacy_top_row():
+    # The baseline capture itself reads the Log with no expectation — unchanged.
+    rows = [ROW_FOREIGN_1, ROW_OURS_35, ROW_BASELINE]
+    assert pick_result_row(rows) == ROW_FOREIGN_1
+
+
+def test_log_entry_id_reads_the_shoptet_entry_number():
+    assert log_entry_id(ROW_OURS_35) == 12689
+    assert log_entry_id("Spracované: 5. Upravené: 5.") is None
+    assert log_entry_id(None) is None
+    # anchored at the START of the row: a '#42' further inside the text (an order
+    # number, a row reference) is NOT the entry id — mistaking it for one would cut
+    # the candidate list short and lose our own entry
+    assert log_entry_id("#12689 26.07.2026 Objednávka #42 Spracované: 1.") == 12689
+    assert log_entry_id("Chyba | Číslo riadku: 42 - kód #999 nie je unikátny") is None
+
+
+# --------------------------------------------------------------------------- #
+# #257 cause 2 — a partially-failed chunk is NOT a batch that imported nothing
+# --------------------------------------------------------------------------- #
+# The REAL stdout of scripts/shoptet_import.py, not just its last line: the plan, the
+# backup, the login and — the trap — the echo of the baseline Log entry, which carries
+# its OWN 'Spracované: N'. parse_import_log takes the FIRST match in the text, so
+# parsing the whole stdout reads the PREVIOUS entry's counts as this run's result.
+STDOUT_PARTIAL = (
+    "Súbor:   data/out/import_links_iu65p2zl.csv\n"
+    "Riadkov: 35\n"
+    "  • napárované (link):        35\n"
+    "[záloha] 57354090 B → data/backups/export_20260726-210026.csv\n"
+    "[login] OK → https://forestshop.myshoptet.com/admin/\n"
+    "[import] baseline (posledný riadok Logu pred behom): #12688 26.07.2026 20:12 "
+    "Info Import dobehol úspešne. Spracované: 4. Upravené: 1.\n"
+    "[import] spúšťam import …\n"
+    "\nVÝSLEDOK: spracované=35 upravené=31 zlyhania=2\n")
+
+
+def test_chunk_outcome_partial_when_shoptet_took_every_row_but_rejected_some():
+    # The 2026-07-26 21:00 run: Shoptet really updated 31 of the 35 rows we sent,
+    # yet the whole chunk was booked as 0 imported rows and the queue froze.
+    parsed = parse_import_log(result_stdout_slice(STDOUT_PARTIAL))
+    assert parsed["processed"] == 35 and parsed["updated"] == 31 and parsed["failed"] == 2
+    assert chunk_outcome(2, parsed, rows_sent=35) == "partial"
+
+
+def test_result_slice_ignores_the_baseline_echo_in_the_scripts_stdout():
+    # THE trap (#196's reported symptom, verbatim): parsing the WHOLE stdout returns
+    # the BASELINE row's numbers — 'processed=4/updated=1' here, 'processed=1,failed=1'
+    # on 2026-07-23 while the import had really processed 260 rows. Only the text from
+    # the script's own VÝSLEDOK marker on describes THIS run.
+    whole = parse_import_log(STDOUT_PARTIAL)
+    assert whole["processed"] == 4                      # the baseline entry, not ours
+    ours = parse_import_log(result_stdout_slice(STDOUT_PARTIAL))
+    assert ours["processed"] == 35
+    # …and the misread turns a partially accepted chunk into a hard failure
+    assert chunk_outcome(2, whole, rows_sent=35) == "failed"
+    assert chunk_outcome(2, ours, rows_sent=35) == "partial"
+
+
+def test_hard_error_detail_is_the_shoptet_line_alone():
+    sl = ("VÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+          "CHYBA LOGU: Chyba | Číslo riadku: 42 - Data in column code are not unique\n")
+    # what reaches n8n / the automation card is the reason, not the block around it
+    assert hard_error_detail(sl) == "Chyba | Číslo riadku: 42 - Data in column code are not unique"
+    # no marker → fall back to whatever parse_import_log could tell
+    plain = "Chyba | Číslo riadku: 7 - duplicitný kód"
+    assert hard_error_detail(plain, parse_import_log(plain)) == plain
+    assert hard_error_detail("", {}) is None
+
+
+def test_counts_are_never_read_from_the_hard_error_line():
+    # 'Zlyhanie …: N' may not reach across into the Shoptet error line that follows —
+    # there it would return the ROW NUMBER ('Číslo riadku: 42') or the entry id as the
+    # failure count, and a hard abort would be mis-accounted as a partial one.
+    out = ("[import] baseline (posledný záznam Logu pred behom): #12688\n"
+           "VÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+           "CHYBA LOGU: #12689 Chyba | Číslo riadku: 42 - Data in column code are not unique\n")
+    # naive parsing of the whole result block reaches INTO the error line and returns
+    # the Shoptet entry id as the failure count
+    naive = parse_import_log(result_stdout_slice(out))
+    assert naive["failed"] == 12689
+    # the one entry point the app uses keeps counts and reason apart
+    r = parse_result_stdout(out)
+    assert r["processed"] is None and r["failed"] is None and r["updated"] is None
+    assert r["error_detail"] == ("#12689 Chyba | Číslo riadku: 42 - "
+                                 "Data in column code are not unique")
+    assert chunk_outcome(2, r, rows_sent=35) == "failed"
+
+
+def test_result_slice_keeps_a_hard_shoptet_error_and_survives_junk():
+    hard = ("[import] baseline (posledný riadok Logu pred behom): #12688 Spracované: 4.\n"
+            "\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+            "CHYBA LOGU: Chyba | Číslo riadku: 42 - Data in column code are not unique\n")
+    parsed = parse_import_log(result_stdout_slice(hard))
+    assert parsed["processed"] is None
+    assert "not unique" in (parsed["error_detail"] or "")
+    assert chunk_outcome(2, parsed, rows_sent=35) == "failed"
+    # no marker at all (script died before printing a result) → nothing to attribute
+    assert result_stdout_slice("STOP: záloha zlyhala") == ""
+    assert parse_import_log(result_stdout_slice(""))["processed"] is None
+
+
+def test_chunk_outcome_ok_and_hard_failures():
+    assert chunk_outcome(0, parse_import_log("VÝSLEDOK: spracované=35 upravené=31"),
+                         rows_sent=35) == "ok"
+    # unreadable result → hard failure (never partial)
+    assert chunk_outcome(2, parse_import_log(""), rows_sent=35) == "failed"
+    # a hard Shoptet abort (no summary at all) → hard failure
+    assert chunk_outcome(2, parse_import_log(
+        "Chyba | Číslo riadku: 42 - Data in column code are not unique"),
+        rows_sent=35) == "failed"
+    # Shoptet saw fewer rows than we sent → we cannot claim the rest landed
+    assert chunk_outcome(2, parse_import_log("spracované=3 zlyhania=1"),
+                         rows_sent=35) == "failed"
+    # every row failed → nothing landed
+    assert chunk_outcome(2, parse_import_log("spracované=35 zlyhania=35"),
+                         rows_sent=35) == "failed"
+    # a timeout (rc=1, no output at all)
+    assert chunk_outcome(1, parse_import_log(""), rows_sent=35) == "failed"
+
+
+def test_result_slice_survives_a_mojibaked_marker():
+    """PR #271 review, IMPORTANT 2 — the whole nightly push hung on ONE non-ASCII
+    character. `encoding='utf-8'` on Popen only fixes the PARENT's decoding; the child
+    encodes with ITS locale, and nothing pinned PYTHONIOENCODING. On a box whose locale
+    is not UTF-8 the child prints 'V?SLEDOK: spracovan?=35 …', the exact-substring
+    rfind('VÝSLEDOK:') misses, the slice is '' → processed=None → EVERY chunk is booked
+    failed/unreadable and the push silently stops. (The old parse_import_log matched the
+    ASCII substrings 'pracov'/'zlyhan' and survived mojibake — this PR made it fragile.)
+
+    The env pin is the fix (test_run_import_pins_the_child_stdout_encoding); the marker
+    match must be byte-tolerant too, so ONE mangled character can never again cost the
+    whole push."""
+    out = ("[import] baseline …: #12688 Spracovan?: 4. Upraven?: 1.\n"
+           "\nV?SLEDOK: spracovan?=35 upraven?=31 zlyhania=2\n")
+    parsed = parse_import_log(result_stdout_slice(out))
+    assert parsed["processed"] == 35 and parsed["failed"] == 2   # ours, not the baseline's 4
+    assert chunk_outcome(2, parsed, rows_sent=35) == "partial"
+
+
+def test_chunk_outcome_never_credits_rc0_whose_counts_disagree():
+    """PR #271 review, IMPORTANT 4 — rc == 0 was trusted unconditionally, so an rc-0
+    result whose 'Spracované' disagrees with the rows we sent would book the WHOLE chunk
+    as landed (its codes go to success_codes → uploaded_pairings.json → never re-sent).
+    The invariant that makes rc 0 mean "all rows landed" is enforced in a DIFFERENT file
+    (result_exit_code); assert it here instead of trusting it across the module boundary."""
+    assert chunk_outcome(0, parse_import_log("VÝSLEDOK: spracované=5 upravené=5"),
+                         rows_sent=300) == "failed"
+    # unchanged: an rc-0 run that printed no counts (the --dry-run path) is still ok
+    assert chunk_outcome(0, parse_import_log(""), rows_sent=300) == "ok"
+    assert chunk_outcome(0, parse_import_log("VÝSLEDOK: spracované=300 upravené=298"),
+                         rows_sent=300) == "ok"
+
+
+def test_has_log_entries_tells_an_unrendered_table_from_a_real_one():
+    """The read-back needs to know WHY a read produced nothing: a page that had not
+    rendered the Log yet (retry-able) vs. a rendered Log whose entries could not be
+    attributed (fatal). Only rows shaped like a real Shoptet log ENTRY count — the
+    header row and empty page chrome do not."""
+    assert has_log_entries([ROW_OURS_35, ROW_BASELINE]) is True
+    assert has_log_entries(["Dátum Výsledok", ROW_BASELINE]) is True
+    assert has_log_entries([]) is False
+    assert has_log_entries(None) is False
+    assert has_log_entries(["Dátum Výsledok"]) is False
+    assert has_log_entries(["", None]) is False

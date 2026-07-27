@@ -137,33 +137,167 @@ def parse_import_log(text):
 _RESULT_ROW_RE = re.compile(r"spracov|zpracov|uprav|zlyhan|chyba|riadku", re.IGNORECASE)
 
 
-def pick_result_row(row_texts, baseline=None):
-    """Pick the row that reflects the import just triggered, from a list of
-    table-row texts as Shoptet renders its Log — NEWEST FIRST.
+# Shoptet prefixes every Log entry with its own increasing id ('#12689 26.07.2026
+# 21:00 …') — the only stable handle on WHICH entry a row is. ANCHORED at the start
+# of the row: a '#42' further inside the text (an order number, a code) is not an
+# entry id, and mistaking one for it would cut the candidate list short.
+_ENTRY_ID_RE = re.compile(r"^\s*#(\d+)")
 
-    Returns None (never a stale row) when either:
-      * no row looks like a log entry at all (only a header / empty table), or
-      * the topmost log-entry row is IDENTICAL to `baseline` — the row
-        captured BEFORE this import was submitted. A large/async import may
-        not have written its own row yet on the first read; the caller must
-        treat None as "not ready yet", poll, and retry — never as success.
 
-    This is what makes issue #23 impossible: the OLD browser-side picker only
-    matched a NARROWER keyword set (no 'chyba'/'riadku'), so an import that
-    ABORTED with only a 'Chyba | Číslo riadku: N - …' entry (no Spracované/
-    Zlyhanie line at all) fell through to an OLDER row further down the
-    table — a PREVIOUS run's summary — and reported IT as this run's result.
-    """
-    top = None
-    for t in row_texts or []:
-        if _RESULT_ROW_RE.search(t or ""):
-            top = t
+def log_entry_id(text):
+    """Shoptet's own Log entry number ('#12689 …' → 12689), or None when the row
+    carries none (older/other renderings — callers must degrade, not crash)."""
+    m = _ENTRY_ID_RE.match(text or "")
+    return int(m.group(1)) if m else None
+
+
+# The import script prints its own result after the 'VÝSLEDOK:' marker. Everything
+# BEFORE it is progress chatter — including the echo of the baseline Log entry, whose
+# own 'Spracované: N' would otherwise be read as this run's result (#196/#257).
+# The marker is matched TOLERANTLY when read back: `encoding=` on the Popen fixes only
+# the PARENT's decoding; the child encodes with its own locale, so on a non-UTF-8 box the marker
+# arrives mojibake'd ('V?SLEDOK:', 'VÃSLEDOK:'). An exact-substring search then misses,
+# every slice is empty, processed=None and the WHOLE nightly push is booked failed on
+# one character. webreview/app.py::run_import pins PYTHONIOENCODING=utf-8 so this never
+# happens; the wildcard is the belt to that brace (the ASCII tail 'SLEDOK:' is what
+# actually identifies the marker — only 'Ý' can mangle).
+_RESULT_MARKER_RE = re.compile(r"V.{0,2}SLEDOK:")
+# …and the raw Shoptet line of a HARD error (an import aborted with no summary at
+# all) is printed after it, so the reason survives the slicing below.
+HARD_ERROR_MARKER = "CHYBA LOGU:"
+
+
+def hard_error_detail(slice_text, parsed=None):
+    """The Shoptet error line ALONE (no surrounding chatter) when the import aborted
+    hard, else the parsed `error_detail`. Keeps the reason that reaches n8n and the
+    automation card readable: 'Chyba | Číslo riadku: 42 - Data in column code are not
+    unique', not the whole result block it was printed in."""
+    text = slice_text or ""
+    if HARD_ERROR_MARKER in text:
+        return text.split(HARD_ERROR_MARKER, 1)[1].strip() or None
+    return (parsed or {}).get("error_detail")
+
+
+def parse_result_stdout(text):
+    """THE entry point for reading scripts/shoptet_import.py's stdout — use this, never
+    a bare parse_import_log(stdout).
+
+    Two traps it closes, both of which silently corrupted the reported result:
+      * the stdout opens with progress chatter (the baseline entry id, the plan), and
+        parse_import_log returns the FIRST count it finds → slice to this run's result
+        (result_stdout_slice);
+      * 'Zlyhanie …: N' reaches up to 40 characters ahead, so on a hard-error block it
+        happily returns the Shoptet ROW NUMBER or ENTRY ID as the failure count →
+        read the counts from the part BEFORE the error line, and keep the error line
+        itself as `error_detail`."""
+    sl = result_stdout_slice(text)
+    parsed = parse_import_log(sl.split(HARD_ERROR_MARKER, 1)[0])
+    parsed["error_detail"] = hard_error_detail(sl, parsed)
+    return parsed
+
+
+def result_stdout_slice(text):
+    """The part of scripts/shoptet_import.py's stdout that describes THIS run —
+    everything from its last 'VÝSLEDOK:' marker (`_RESULT_MARKER_RE`) on. ALWAYS parse
+    this slice, never the raw stdout: `parse_import_log` returns the FIRST count it
+    finds, and the stdout opens
+    with '[import] baseline …: #12688 … Spracované: 4. Upravené: 1.' — the PREVIOUS
+    entry. Reading that as the result is exactly the '#196' symptom (processed=1/
+    failed=1 while 260 rows were really processed) and it silently defeats the
+    partial-chunk accounting (the baseline counts never equal the rows we sent, so
+    every partially accepted chunk looks like a hard failure).
+
+    Returns '' when the marker is absent (the script died before printing a result),
+    which parses to processed=None → an unreadable, never-successful result."""
+    if not text:
+        return ""
+    hits = list(_RESULT_MARKER_RE.finditer(text))
+    return text[hits[-1].start():] if hits else ""
+
+
+def _new_entries(entries, baseline):
+    """The log entries written AFTER `baseline` (the topmost entry captured before
+    this import was submitted), newest first. Uses Shoptet's entry ids when both
+    sides carry one; otherwise falls back to table position (the Log is rendered
+    newest first, so everything from `baseline` down is older)."""
+    base_id = log_entry_id(baseline)
+    out = []
+    for t in entries:
+        if baseline is not None and t == baseline:
             break
-    if top is None:
+        tid = log_entry_id(t)
+        if base_id is not None and tid is not None and tid <= base_id:
+            break
+        out.append(t)
+    return out
+
+
+def has_log_entries(row_texts) -> bool:
+    """Did this read of the page see the Log TABLE at all — i.e. at least one row
+    shaped like a genuine import-log entry (a summary or a hard error)? The header
+    row and empty page chrome do not count.
+
+    This is what tells the read-back's two "nothing picked" cases apart, which look
+    identical from pick_result_row's None alone: a page that has not RENDERED the Log
+    yet (a reload returning before the table paints — retry-able, and the earlier
+    reads' verdict still stands) versus a rendered Log whose entries could not be
+    attributed (genuinely ambiguous — fatal)."""
+    return any(_RESULT_ROW_RE.search(t or "") for t in (row_texts or []))
+
+
+def pick_result_row(row_texts, baseline=None, expected_rows=None):
+    """Pick the row that reflects the import THIS run just triggered, from a list
+    of table-row texts as Shoptet renders its Log — NEWEST FIRST.
+
+    Two facts identify our own entry, and both are required to say "this is ours":
+      * `baseline` — the topmost log entry captured BEFORE this import was
+        submitted. Only entries NEWER than it (by Shoptet's own '#12689' entry
+        id, or by table position when ids are absent) can be ours.
+      * `expected_rows` — how many rows the CSV we submitted actually carries.
+        Shoptet reports it back as 'Spracované: N' (verified against every
+        archived run in data/out/shoptet_import_*.log), so among several new
+        entries ours is the one whose processed count matches.
+
+    Returns None — "not ours / not readable yet", never a guess — when no entry
+    looks like a log row, when nothing new appeared since the baseline, or when
+    the new entries cannot be attributed. The caller MUST treat None as "poll and
+    retry", and finally as an UNREADABLE result (exit 2), never as success.
+
+    #257: without `expected_rows` the picker took the NEWEST new row, so a foreign
+    import writing to the same Log within seconds (two automations in one app
+    instance, or two instances) was read as this run's result — its 'Spracované: 1'
+    booked our 35-row pairings import as a failure and froze uploaded_pairings.json.
+    #196 is the same defect seen from the other side (a stale 'processed=1/failed=1'
+    reported while the import had really processed 260 rows).
+    #23: the entry-shape regex below also matches a HARD error row ('Chyba | Číslo
+    riadku: N - …', no Spracované summary at all), so an aborted import can never
+    fall through to an OLDER run's summary row.
+    """
+    entries = [t for t in (row_texts or []) if _RESULT_ROW_RE.search(t or "")]
+    if not entries:
         return None
-    if baseline is not None and top == baseline:
+    if expected_rows is not None and baseline is None:
+        # The baseline capture found nothing (Log page unreadable / not rendered), so
+        # EVERY visible entry — including days-old ones — would be a candidate and a
+        # stale row with a matching count would be credited as ours. Nothing here can
+        # be attributed: fail closed (the caller polls, then reports "unreadable").
         return None
-    return top
+    candidates = _new_entries(entries, baseline)
+    if not candidates:
+        return None
+    if expected_rows is None:
+        return candidates[0]        # unattributed read (e.g. the baseline capture)
+    matches = [c for c in candidates
+               if parse_import_log(c).get("processed") == expected_rows]
+    if len(matches) == 1:
+        return matches[0]
+    if matches:
+        return None                 # two same-sized imports — genuinely ambiguous
+    if len(candidates) == 1 and parse_import_log(candidates[0]).get("error_detail"):
+        # a hard abort carries no 'Spracované' at all; it is ours only when it is
+        # the single new entry (nothing else could have written it)
+        return candidates[0]
+    return None
 
 
 def result_exit_code(parsed) -> int:
@@ -175,3 +309,39 @@ def result_exit_code(parsed) -> int:
     if parsed.get("failed"):
         return 2
     return 0
+
+
+def chunk_outcome(rc, parsed, rows_sent) -> str:
+    """Classify ONE imported chunk from the import script's exit code + the counts
+    it printed. Returns:
+
+      'ok'      — clean run (rc 0) whose reported 'Spracované' count really is every
+                  row we sent. rc 0 alone is NOT enough: the invariant that makes it
+                  mean "all rows landed" lives in result_exit_code, a different module,
+                  and a rc-0 result whose counts disagree would book the whole chunk as
+                  landed (success_codes → uploaded_pairings.json → never re-sent). A run
+                  that printed NO count at all stays ok — that is the --dry-run path.
+      'partial' — Shoptet PROCESSED every row we sent ('Spracované' == rows_sent)
+                  but rejected some of them ('Zlyhanie variantov: N', N < rows_sent).
+                  The rest genuinely landed in the eshop, so this must NOT abort the
+                  batch and must NOT be booked as "0 rows imported".
+      'failed'  — anything else: unreadable result, a hard Shoptet abort with no
+                  summary, a timeout, fewer rows processed than we sent, or every
+                  row failing. Nothing may be assumed to have landed.
+
+    #257: 'Spracované: 35. Upravené: 31. Zlyhanie variantov: 2.' was treated as a
+    hard failure, so 31 genuinely written rows were discarded, the remaining chunks
+    never ran, and uploaded_pairings.json froze on 2026-07-22.
+
+    NOTE: the Shoptet log reports AGGREGATE counts only — it never says WHICH rows
+    failed. 'partial' therefore means "some of these rows landed, we cannot tell
+    which"; proving a specific row landed needs the eshop's own catalog export (see
+    webreview/app.py::_export_internal_notes)."""
+    parsed = parsed or {}
+    processed, failed = parsed.get("processed"), parsed.get("failed") or 0
+    if rc == 0:
+        return "ok" if processed is None or processed == rows_sent else "failed"
+    if (rows_sent and processed == rows_sent and 0 < failed < rows_sent
+            and not parsed.get("error_detail")):
+        return "partial"
+    return "failed"

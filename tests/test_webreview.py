@@ -958,13 +958,24 @@ def test_pairings_failed_import_does_not_mark_uploaded(monkeypatch, tmp_path):
     assert r2.get_json()["count"] == 1 and calls["n"] == 1
 
 
+def _hard_error_stdout(err):
+    """scripts/shoptet_import.py's REAL stdout for a hard Shoptet abort: its own
+    result marker (the app parses only the slice from there on — the raw stdout opens
+    with the PREVIOUS Log entry's counts, #196/#257) and then the Shoptet error line."""
+    return ("\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
+            f"CHYBA LOGU: {err}\n")
+
+
 def test_pairings_hard_error_surfaces_error_detail_and_does_not_mark_uploaded(monkeypatch, tmp_path):
     # #23: a hard Shoptet error (aborted import, e.g. duplicate 'code') must be
     # surfaced as error_detail AND must not mark the pairing uploaded — ask #3.
     dec = {"k1": {"status": "good", "url": "https://supplier/z"}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec)
     err = "Chyba | Číslo riadku: 7 - Data in column code are not unique"
-    monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (2, err, "boom"))
+    # the real script always prints its own result marker first (the app parses only
+    # that slice — the raw stdout starts with the PREVIOUS Log entry, #196/#257)
+    out = _hard_error_stdout(err)
+    monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (2, out, "boom"))
     r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
     j = r.get_json()
     assert r.status_code == 502 and j["ok"] is False
@@ -1204,7 +1215,8 @@ def test_import_hard_error_surfaces_error_detail(monkeypatch, tmp_path):
     # swallowed into a bare "processed: null".
     tok = _arm_token(monkeypatch, tmp_path)
     err = "Chyba | Číslo riadku: 42 - Data in column code are not unique"
-    monkeypatch.setattr(webapp, "run_import", lambda *a, **k: (2, err, "boom"))
+    out = _hard_error_stdout(err)
+    monkeypatch.setattr(webapp, "run_import", lambda *a, **k: (2, out, "boom"))
     r = _client().post("/api/n8n/shoptet-import", data=_FEED,
                        headers={"Authorization": f"Bearer {tok}"})
     j = r.get_json()
@@ -1376,8 +1388,9 @@ def test_suppliers_hard_error_surfaces_error_detail(monkeypatch, tmp_path):
     # #23: same hard-error surfacing for the supplier write-back endpoint.
     tok = _arm_suppliers(monkeypatch, tmp_path, {"88/Z": "BETALOV"})
     err = "Chyba | Číslo riadku: 3 - Data in column code are not unique"
+    out = _hard_error_stdout(err)
     monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (2, err, "boom"))
+                        lambda p, dry_run=False, timeout=300: (2, out, "boom"))
     r = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
     j = r.get_json()
     assert r.status_code == 502 and j["ok"] is False
