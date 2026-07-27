@@ -63,6 +63,28 @@ def test_group_headers_decline_the_rendered_count(page, toorder_server):
     assert console == [], f"console not clean: {console}"
 
 
+def test_page_subtitle_declines_the_open_line_count(page, toorder_server):
+    """Review of this PR: the tab's OWN subtitle, a few pixels above the header, still
+    baked the genitive in — „1 otvorených položiek u dodávateľov" is the very defect #240
+    reported, and it also made #240's „jediné počítadlo" claim false. The ADJECTIVE has to
+    follow the noun's number too, so this one is a phrase, not a bare `itemsWord` call."""
+    console = _console_watch(page)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    # the fixture serves 7 open lines
+    assert page.locator("#pageSub").inner_text().strip() == \
+        "7 otvorených položiek u dodávateľov"
+
+    out = page.evaluate("""() =>
+      [0, 1, 2, 4, 5, 11, 21, 101].map(n => openItemsPhrase(n))""")
+    assert out == ["0 otvorených položiek", "1 otvorená položka", "2 otvorené položky",
+                   "4 otvorené položky", "5 otvorených položiek", "11 otvorených položiek",
+                   "21 otvorených položiek", "101 otvorených položiek"]
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_group_header_declines_the_plural_counts_too(page, toorder_server):
     """5+ / 11 / 21 / 101 through the real `renderToOrder`, by cloning a rendered order
     line into a group of the wanted size — the header must read whatever `itemsWord`

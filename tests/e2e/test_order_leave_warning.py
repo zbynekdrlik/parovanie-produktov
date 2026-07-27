@@ -79,9 +79,11 @@ def test_warning_text_is_built_from_the_two_counts(page, toorder_server):
                             "Prechodom na veľkosti sa zahodí. Pokračovať?")
     assert out["opened"] == ("⚠️ Máš otvorené prázdne políčko (3×) v objednávkach. "
                              "Prechodom na veľkosti sa zavrie. Pokračovať?")
+    # both states at once → BOTH fates, or the sentence still tells him the merely
+    # opened box is thrown away (review of this PR)
     assert out["both"] == ("⚠️ Máš rozpísaný neuložený text (2×) a otvorené prázdne "
                            "políčko (1×) v objednávkach. Prechodom na veľkosti sa "
-                           "zahodí. Pokračovať?")
+                           "zahodí a zavrie. Pokračovať?")
 
 
 def test_only_opened_editor_is_not_called_unsaved_text(page, toorder_server):
@@ -128,7 +130,7 @@ def test_both_states_are_named_separately(page, toorder_server):
 
     msgs = _leave(page)
     assert msgs == ["⚠️ Máš rozpísaný neuložený text (1×) a otvorené prázdne políčko "
-                    "(1×) v objednávkach. Prechodom na veľkosti sa zahodí. "
+                    "(1×) v objednávkach. Prechodom na veľkosti sa zahodí a zavrie. "
                     "Pokračovať?"], msgs
 
 
