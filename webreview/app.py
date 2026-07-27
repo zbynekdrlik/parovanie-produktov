@@ -2055,8 +2055,14 @@ def _refuse_implausible_export_download(size: int) -> None:
     """#277 — a truncated download must not silently replace a good export.
 
     Raising here happens BEFORE `run_shoptet_sync`'s atomic swap, so the bytes already
-    on disk survive (the fetch-then-swap contract that function documents) and the
-    hourly sync goes red instead of degrading quietly.
+    on disk survive (the fetch-then-swap contract that function documents).
+
+    That caller catches this ONE type and carries on with those protected bytes,
+    surfacing `export_error` (PR #280 review): raising it all the way up used to kill
+    the review-card price/stock resync and the customer export every hour, and the
+    export then aged past EXPORT_MAX_AGE_S — which is exactly the staleness that
+    disarmed the supplier hold. The refusal is NOT a reason to abandon the refresh; it
+    only ever fires while what we hold is fresh and plausible.
 
     Bounded by construction, so it can never deadlock a genuine catalogue shrink: it
     only defends an export that is still USABLE. Once the on-disk copy is older than
