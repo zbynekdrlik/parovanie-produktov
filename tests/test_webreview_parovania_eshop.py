@@ -27,6 +27,11 @@ import app as webapp  # noqa: E402
 
 from tests.conftest import authed_client  # noqa: E402
 
+# The PRODUCTION export-plausibility floor, captured at import time — the `iso` fixture
+# lowers the module global to 1 so the tiny fixture exports pass, so a test that wants to
+# pin the real threshold must restore THIS value (and cannot be disarmed by the fixture).
+PROD_EXPORT_MIN_CODES = webapp.EXPORT_MIN_CODES
+
 
 def _product(variant_codes=("1/M",)):
     return {"key": "BETALOV|P1", "idx": 0, "supplier": "BETALOV", "name": "Bunda Test",
@@ -1060,3 +1065,46 @@ def test_the_supplier_report_is_gated_on_the_same_export_trust(iso, monkeypatch)
     s, _st = webapp._do_upload_suppliers(dry=False)
 
     assert s["missing_count"] == 0 and s["missing_in_eshop"] == []
+
+
+def test_an_implausibly_small_export_blocks_the_supplier_write_back(iso, monkeypatch):
+    """PR #276 review, IMPORTANT 1. The DANGEROUS half of the export gate must not be
+    weaker than the cosmetic one: the write-back's fail-closed check used to ask only
+    „had the file any bytes at all", while the (merely reporting) missing-code verdict
+    next to it already demanded EXPORT_MIN_CODES. A broken feed yielding a handful of
+    rows therefore passed — `own_supplier` came back nearly empty, nothing was excluded,
+    and a stale assignment could overwrite a REAL eshop supplier: exactly the clobber
+    PR #213's gate exists to prevent. An implausibly small export must BLOCK the upload
+    (nothing sent to the live eshop) and HOLD the assignments (a hold is safe and
+    self-healing, a drop is loss). Pinned at the PRODUCTION threshold."""
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", PROD_EXPORT_MIN_CODES)
+    webapp._save_supplier_assign({"9/Z": "STALE_ASSIGNMENT"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    # fresh, non-empty, and carrying THREE codes out of a ~14 000-code catalogue
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n1/A;1;OWN\r\n2/A;2;OWN\r\n3/A;3;OWN\r\n"))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200
+    assert calls == []                       # NOTHING reached the live eshop
+    assert result["count"] == 0
+    assert result["blocked"] == 1            # held, not dropped
+    assert result["products"] == [{"code": "9/Z", "supplier": "STALE_ASSIGNMENT"}]
+    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+
+    # …and the very same assignment IS written once the export is plausible again —
+    # the gate blocks a broken feed, it does not freeze the write-back.
+    plausible = ("code;pairCode;supplier\r\n"
+                 + "".join(f"{i}/A;{i};\r\n" for i in range(PROD_EXPORT_MIN_CODES))
+                 + "9/Z;777;\r\n")
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(plausible))
+
+    result2, status2 = webapp._do_upload_suppliers(dry=False)
+
+    assert status2 == 200
+    sup = next(c for c in calls if c["header"][2] == "supplier")
+    assert {r[0] for r in sup["rows"]} == {"9/Z"}
+    assert result2["count"] == 1
