@@ -33,6 +33,15 @@ def _product(variant_codes=("1/M",)):
             "ai_chosen_url": "", "ai_reason": "", "candidates": [], "current": {}}
 
 
+def _export_lines(text):
+    """monkeypatch value for `webapp._iter_export_lines` — the nightly push STREAMS
+    the catalog export line by line (#272), so THIS is the seam a test feeds a fake
+    export through (patching the whole-text `_read_export_for_links` no longer
+    reaches the push: it is defined in terms of this one). Returns a fresh iterator
+    on every call, exactly like the real generator."""
+    return lambda: iter(text.splitlines(keepends=True))
+
+
 @pytest.fixture
 def iso(tmp_path, monkeypatch):
     """Isolate every store the automation reads/writes + the import subprocess."""
@@ -51,9 +60,10 @@ def iso(tmp_path, monkeypatch):
     # BUG 1 fail-closed: the supplier write-back refuses to run without a catalog export.
     # Default to a minimal non-empty export so the normal push path proceeds (no code is
     # excluded); tests that assert the exclusion / blocked-on-empty behaviour override
-    # _read_export_for_links themselves. Without this the CI box (no data/products.csv)
+    # the export seam themselves. Without this the CI box (no data/products.csv)
     # reads an empty export and the supplier upload is blocked.
-    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: "code;pairCode;supplier\r\n")
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n"))
     return {"tmp": tmp_path, "products": products}
 
 
@@ -171,7 +181,7 @@ def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkey
     export = ("code;pairCode;supplier\r\n"
               "9/Z;777;\r\n"
               "5/A;555;REAL_SUPPLIER\r\n")
-    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: export)
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(export))
     fake_run, calls = _ok_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
 
@@ -195,7 +205,7 @@ def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkey
 def test_do_upload_suppliers_blocks_when_export_empty(iso, monkeypatch):
     webapp._save_supplier_assign({"9/Z": "BETALOV", "5/A": "ORBIS"})
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
-    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: "")  # export missing/unreadable
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(""))  # missing/unreadable
     fake_run, calls = _ok_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
 
@@ -219,7 +229,7 @@ def test_do_upload_suppliers_emits_code_absent_from_export(iso, monkeypatch):
     # a NON-empty export listing OTHER products (5/A carries its own supplier) but NOT 9/Z
     export = ("code;pairCode;supplier\r\n"
               "5/A;555;REAL_SUPPLIER\r\n")
-    monkeypatch.setattr(webapp, "_read_export_for_links", lambda: export)
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(export))
     # the exclusion helper does NOT flag 9/Z (it is absent from the export)
     assert "9/Z" not in webapp._codes_with_own_supplier()
     fake_run, calls = _ok_import()
@@ -515,10 +525,10 @@ def test_export_confirmation_ignores_a_code_the_export_lists_twice(iso, monkeypa
     # two export rows disagree about a code's internalNote, neither proves anything,
     # so the code must stay unconfirmed and be sent.
     _seed_pairing()
-    monkeypatch.setattr(webapp, "_read_export_for_links",
-                        lambda: ("code;pairCode;internalNote;supplier\r\n"
-                                 "1/M;P1;https://supplier/OTHER;\r\n"
-                                 "1/M;P1;https://supplier/x;\r\n"))
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;internalNote;supplier\r\n"
+                                      "1/M;P1;https://supplier/OTHER;\r\n"
+                                      "1/M;P1;https://supplier/x;\r\n"))
     fake_run, calls = _recording_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
 
@@ -591,8 +601,8 @@ def test_rows_already_correct_in_the_eshop_are_credited_from_the_export(iso, mon
     a code whose internalNote already equals the URL we would send is proven to be on
     the eshop, so it is recorded uploaded and never re-sent."""
     _seed_pairing()                                   # BETALOV|P1 → https://supplier/x
-    monkeypatch.setattr(webapp, "_read_export_for_links",
-                        lambda: _export({"1/M": "https://supplier/x"}))
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines(_export({"1/M": "https://supplier/x"})))
     monkeypatch.setattr(webapp, "run_import",
                         lambda *a, **k: pytest.fail("nothing left to import"))
 
@@ -673,8 +683,8 @@ def test_partial_chunk_then_hard_failure_reports_what_really_landed(iso, monkeyp
 def test_export_confirmation_needs_an_exact_url_match(iso, monkeypatch):
     # a stale / different note on the eshop proves nothing — the row is still sent
     _seed_pairing()
-    monkeypatch.setattr(webapp, "_read_export_for_links",
-                        lambda: _export({"1/M": "https://supplier/OLD"}))
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines(_export({"1/M": "https://supplier/OLD"})))
     fake_run, calls = _recording_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
 
@@ -831,18 +841,23 @@ def test_the_streamed_index_parses_exactly_like_a_whole_text_parse(tmp_path, mon
             "2/M;P2;\"riadok\r\ns novým riadkom\";\r\n"
             "3/M;P3;;\r\n"
             "4/M;P4;https://s/A;\r\n"
-            "4/M;P4;https://s/B;\r\n")
+            "4/M;P4;https://s/B;\r\n"
+            "5/M;P5;\"samotný \r návrat vozíka\";\r\n")
     p = tmp_path / "products.csv"
     p.write_bytes(text.encode("cp1250"))
     monkeypatch.setattr(webapp, "SRC", str(p))
 
     notes, codes = webapp._export_note_index()
 
-    assert codes == {"1/M", "2/M", "3/M", "4/M"}
+    assert codes == {"1/M", "2/M", "3/M", "4/M", "5/M"}
     assert notes["1/M"] == "https://s/x"
     assert "novým riadkom" in notes["2/M"]
     assert notes["3/M"] == ""
     assert "4/M" not in notes                      # conflicting rows prove nothing
+    # a LONE \r inside a quoted field: line iteration with newline='' breaks there,
+    # csv reassembles it — the value must come back byte-for-byte, as a whole-text
+    # parse produced it
+    assert notes["5/M"] == "samotný \r návrat vozíka"
     # the whole-text reader (still used by the scraping automations) is unchanged
     assert webapp._read_export_for_links() == text
 

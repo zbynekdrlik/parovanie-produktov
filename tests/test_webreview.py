@@ -1313,8 +1313,9 @@ def _arm_suppliers(monkeypatch, tmp_path, assigns, token="secret-tok"):
     # minimal non-empty export where 88/Z has NO own supplier (empty column) → not excluded
     # → the assignment is written, exactly as in production. (Without this stub the CI box,
     # which has no data/products.csv, would read an empty export and block the upload.)
-    monkeypatch.setattr(webapp, "_read_export_for_links",
-                        lambda: "code;pairCode;supplier\r\n88/Z;777;\r\n")
+    monkeypatch.setattr(
+        webapp, "_iter_export_lines",
+        lambda: iter(["code;pairCode;supplier\r\n", "88/Z;777;\r\n"]))
     webapp._save_supplier_assign(assigns)
     return token
 

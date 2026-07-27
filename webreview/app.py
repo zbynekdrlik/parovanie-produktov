@@ -4215,26 +4215,35 @@ def _chunk_error_msg(res, total_rows, confirms_from_export=False):
             + tail)
 
 
-def _export_internal_notes(text: str | None = None) -> dict:
-    """{variant code: internalNote} as the LIVE eshop currently has it, from the
-    on-disk catalog export (data/products.csv, refreshed hourly by „Sync zo
-    Shoptetu"). This is the ONLY per-row proof that a reorder link really reached
-    the eshop: the Shoptet import log reports aggregate counts only ('Spracované:
-    35. Upravené: 31. Zlyhanie variantov: 2.') and never says WHICH rows failed.
-    A missing/empty export yields {} — nothing is then confirmed and every row is
-    (re-)sent, which is the safe direction for this write (unlike the supplier
-    write-back, which must fail CLOSED — there an empty export could CLOBBER a real
-    eshop value, here it only means a harmless idempotent re-upload)."""
-    if text is None:
-        text = _read_export_for_links()
-    if not text:
-        return {}
+def _export_note_index() -> tuple[dict, set]:
+    """ONE STREAMING pass over the on-disk catalog export (data/products.csv,
+    refreshed hourly by „Sync zo Shoptetu") → two facts about the LIVE eshop:
+
+      • notes = {variant code: internalNote} — the ONLY per-row proof that a reorder
+        link really reached the eshop: the Shoptet import log reports aggregate
+        counts only ('Spracované: 35. Upravené: 31. Zlyhanie variantov: 2.') and
+        never says WHICH rows failed;
+      • codes = EVERY variant code the catalog carries — a code that is NOT in here
+        does not exist in the eshop at all, so any row addressing it is rejected on
+        every import for ever (#270).
+
+    A missing/empty export yields ({}, set()) — nothing is then confirmed and
+    nothing is held back, i.e. every row is (re-)sent, which is the safe direction
+    for this write (unlike the supplier write-back, which must fail CLOSED — there
+    an empty export could CLOBBER a real eshop value, here it only means a harmless
+    idempotent re-upload).
+
+    Takes no pre-read text on purpose: the export is read HERE (by the caller that
+    has just checked its AGE), never handed in — #272
+    made this the streaming path precisely so nobody ever needs to pass ~57 MB
+    around."""
     csv.field_size_limit(10**9)
-    notes, conflicting = {}, set()
-    for r in csv.DictReader(io.StringIO(text), delimiter=";"):
+    notes, codes, conflicting = {}, set(), set()
+    for r in csv.DictReader(_iter_export_lines(), delimiter=";"):
         code = (r.get("code") or "").strip()
         if not code:
             continue
+        codes.add(code)
         val = (r.get("internalNote") or "").strip()
         if code in notes and notes[code] != val:
             # the catalog holds duplicate products sharing variant codes (see
@@ -4244,7 +4253,7 @@ def _export_internal_notes(text: str | None = None) -> dict:
         notes[code] = val
     for code in conflicting:
         notes.pop(code, None)
-    return notes
+    return notes, codes
 
 
 # How old the catalog export may be and still PROVE a row landed. „Sync zo Shoptetu"
@@ -4290,7 +4299,7 @@ def _codes_confirmed_in_export(rows, note_col=2) -> set:
                     "žiadne riadky, radšej ich pošlem znova",
                     age / 3600, EXPORT_MAX_AGE_S / 3600)
         return set()
-    notes = _export_internal_notes()
+    notes, _codes = _export_note_index()
     if not notes:
         return set()
     return {r[0] for r in rows
@@ -4635,28 +4644,47 @@ def _supplier_summary(uploaded, assigns):
             "remaining": max(0, total - up), "review_url": PUBLIC_URL}
 
 
-def _codes_with_own_supplier(text: str | None = None) -> set:
+def _export_supplier_index() -> tuple[set, set, bool]:
+    """ONE STREAMING pass over the catalog export for the supplier write-back (#272)
+    → (codes whose product ALREADY carries its own `supplier`, EVERY code the export
+    lists, whether the export had any content at all).
+
+    The third value is what the write-back's fail-closed gate needs: a genuinely
+    missing/empty export means "we cannot tell which suppliers are protected", which
+    must BLOCK the write — and it is deliberately "any bytes at all", exactly as the
+    old `export_text.strip()` check was, so a header-only export still passes."""
+    csv.field_size_limit(10**9)
+    own, codes, seen_content = set(), set(), False
+    lines = _iter_export_lines()
+
+    def _tap():
+        nonlocal seen_content
+        for line in lines:
+            if line.strip():
+                seen_content = True
+            yield line
+
+    for r in csv.DictReader(_tap(), delimiter=";"):
+        code = (r.get("code") or "").strip()
+        if not code:
+            continue
+        codes.add(code)
+        if (r.get("supplier") or "").strip():
+            own.add(code)
+    return own, codes, seen_content
+
+
+def _codes_with_own_supplier() -> set:
     """Forestshop variant codes whose product ALREADY carries its own `supplier`
     in the current catalog export (data/products.csv). A per-product manual
     assignment is meant to FILL IN a supplier for an order line that arrived
     WITHOUT one — it must NEVER overwrite a real eshop supplier. So the nightly
-    write-back excludes any code the export already shows a supplier for. Read from
-    the same on-disk cp1250 export as CODE2PAIR (_read_export_for_links; pass `text`
-    to reuse an already-read export). An empty set means "no code is protected",
-    which is only safe when the export is KNOWN to be present — so any WRITE caller
-    must fail CLOSED on an empty export BEFORE relying on this (see
-    _do_upload_suppliers); here a missing export still yields an empty set."""
-    if text is None:
-        text = _read_export_for_links()
-    if not text:
-        return set()
-    csv.field_size_limit(10**9)
-    codes = set()
-    for r in csv.DictReader(io.StringIO(text), delimiter=";"):
-        code = (r.get("code") or "").strip()
-        if code and (r.get("supplier") or "").strip():
-            codes.add(code)
-    return codes
+    write-back excludes any code the export already shows a supplier for. An empty
+    set means "no code is protected", which is only safe when the export is KNOWN
+    to be present — so any WRITE caller must fail CLOSED on an empty export BEFORE
+    relying on this (see _do_upload_suppliers); here a missing export still yields
+    an empty set."""
+    return _export_supplier_index()[0]
 
 
 def _do_upload_suppliers(dry):
@@ -4685,8 +4713,8 @@ def _do_upload_suppliers(dry):
     # write anything: hold all new assignments (blocked), touch nothing. A present-but-
     # partial export that merely lacks a given code is fine — that code is simply not
     # excluded and gets written (unchanged behaviour); only a genuinely empty export blocks.
-    export_text = _read_export_for_links()
-    if not export_text.strip():
+    own_supplier, export_codes, export_present = _export_supplier_index()
+    if not export_present:
         log.warning("n8n suppliers: export missing/empty — supplier upload BLOCKED "
                     "(%d new assignments held, no eshop write)", len(new_codes))
         return {"ok": True, "count": 0, "products": products,
@@ -4695,8 +4723,8 @@ def _do_upload_suppliers(dry):
                 **_supplier_summary(uploaded, assigns)}, 200
 
     # BUG 1: never overwrite a supplier the eshop already has — exclude codes whose
-    # product carries its own supplier in the current export.
-    own_supplier = _codes_with_own_supplier(export_text)
+    # product carries its own supplier in the current export (read in the single
+    # streaming pass above).
     rows = import_builder.supplier_rows(
         {c: assigns[c] for c in new_codes}, CODE2PAIR, exclude_codes=own_supplier)
     if not rows:
@@ -5700,10 +5728,37 @@ def _save_supplier_stock(d: dict) -> None:
     _atomic_write_json(SUPPLIER_STOCK_STATE, d, mode=0o600)
 
 
+def _iter_export_lines():
+    """The on-disk Shoptet catalog export (data/products.csv), cp1250-decoded,
+    yielded LINE BY LINE — the reader the NIGHTLY PUSH uses (#272), so it never
+    holds more than one line of the ~57 MB file.
+
+    `newline=""` keeps every line terminator intact (and turns off newline
+    translation), which is exactly what `csv.reader`/`csv.DictReader` need: a
+    quoted field spanning several lines is reassembled from the yielded lines
+    byte-for-byte, so parsing over this iterator gives the same values as parsing
+    over `io.StringIO(whole_text)` did. A missing file yields nothing and never
+    raises — same contract as `_read_export_for_links`.
+
+    Measured on the live 57.4 MB export: peak allocation 346.6 MB → 3.0 MB
+    (max RSS 361 MB → 17.6 MB) at the same wall time (~1.4 s)."""
+    try:
+        f = open(SRC, encoding="cp1250", errors="replace", newline="")
+    except FileNotFoundError:
+        return
+    with f:
+        yield from f
+
+
 def _read_export_for_links() -> str:
-    """The on-disk Shoptet catalog export (data/products.csv), cp1250-decoded — the
-    source of supplier links. Refreshed hourly by the „Sync zo Shoptetu" automation
-    and at startup; a missing file simply yields 0 links (never crashes)."""
+    """The WHOLE on-disk Shoptet catalog export as one cp1250-decoded string — the
+    source of supplier links for the scraping/JOIN automations (#106/#107/#108),
+    which genuinely need the full text. Refreshed hourly by the „Sync zo Shoptetu"
+    automation and at startup; a missing file simply yields 0 links (never crashes).
+
+    Deliberately NOT implemented on top of `_iter_export_lines`: `"".join(lines)`
+    builds the whole line list first and would peak HIGHER than this single read.
+    The nightly push must not call this at all — it streams (#272)."""
     try:
         with open(SRC, "rb") as f:
             return f.read().decode("cp1250", errors="replace")
