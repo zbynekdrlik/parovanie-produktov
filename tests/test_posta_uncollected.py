@@ -539,8 +539,14 @@ def test_classify_normalises_a_timestamped_retained_till():
     assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-08-03"
 
 
-def test_classify_keeps_an_unparsable_retained_till_for_display():
-    """Fail-soft: a shape we do not recognise is still better shown than silently dropped."""
+def test_classify_drops_an_unparsable_retained_till():
+    """Retires the defect this test used to PIN („a shape we do not recognise is still better
+    shown than silently dropped"). It is not: `retained_till` is a DATE field, and the mail
+    template hard-codes the „…vyzdvihnite si ju do <hodnota>" prefix around it, so anything that
+    is not a date reads as nonsense at a real customer („do do odvolania"). Worse, the expiry
+    guard in build_email is the SAME parser — a value it cannot read is silently exempt from the
+    „deadline already passed" check, so a garbled AND long-expired value would be presented as if
+    it were still ahead. Fail-soft for a date field is to DROP it and use the dateless wording."""
     j = {"results": [{"status": "ok", "retainedTill": "do odvolania", "events": [
         {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
-    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "do odvolania"
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == ""
