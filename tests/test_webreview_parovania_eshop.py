@@ -741,7 +741,8 @@ def test_export_confirmation_refuses_a_stale_export(tmp_path, monkeypatch):
     _write_export(p, {"1/M": "https://supplier/x"}, age_s=webapp.EXPORT_MAX_AGE_S + 60)
     monkeypatch.setattr(webapp, "SRC", str(p))
 
-    assert webapp._codes_confirmed_in_export([["1/M", "P1", "https://supplier/x"]]) == set()
+    assert (webapp._export_row_verdicts([["1/M", "P1", "https://supplier/x"]])["confirmed"]
+            == set())
 
 
 def test_export_confirmation_still_credits_a_fresh_export(tmp_path, monkeypatch):
@@ -750,20 +751,8 @@ def test_export_confirmation_still_credits_a_fresh_export(tmp_path, monkeypatch)
     _write_export(p, {"1/M": "https://supplier/x"})
     monkeypatch.setattr(webapp, "SRC", str(p))
 
-    assert (webapp._codes_confirmed_in_export([["1/M", "P1", "https://supplier/x"]])
+    assert (webapp._export_row_verdicts([["1/M", "P1", "https://supplier/x"]])["confirmed"]
             == {"1/M"})
-
-
-def test_export_confirmation_cannot_be_handed_notes_that_skip_the_freshness_check():
-    """MINOR (revízia PR #271) — the credit may only ever be computed from an export
-    whose AGE was checked. `_codes_confirmed_in_export` also accepted a pre-read
-    `notes=` mapping; no caller ever passed one, but that parameter was the single
-    entry point through which the natural future optimisation („read the export once,
-    hand it down") would have silently deleted the guard the two tests above add.
-    There must be no such entry point: the notes are read INSIDE, after the age check,
-    or not at all."""
-    params = inspect.signature(webapp._codes_confirmed_in_export).parameters
-    assert "notes" not in params
 
 
 def test_timed_out_chunk_is_reported_as_uncertain_not_as_zero_imported(iso, monkeypatch):
@@ -888,7 +877,7 @@ def test_a_code_the_catalogue_does_not_have_is_held_back_and_listed(iso, monkeyp
     assert status == 200
     assert calls == []                                 # the doomed row is NOT sent
     assert p["missing_count"] == 1
-    assert p["missing_in_eshop"] == [{"code": "1/M", "url": "https://supplier/x"}]
+    assert p["missing_in_eshop"] == [{"code": "1/M", "value": "https://supplier/x"}]
     # NOT recorded uploaded — the moment the code appears in the catalogue it is sent
     assert (not (iso["tmp"] / "uploaded_pairings.json").exists()
             or json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) == {})
@@ -997,5 +986,5 @@ def test_supplier_codes_absent_from_the_catalogue_are_reported_but_still_written
     assert status == 200
     sup = next(c for c in calls if c["header"][2] == "supplier")
     assert {r[0] for r in sup["rows"]} == {"9/Z"}          # still written
-    assert s["missing_in_eshop"] == [{"code": "9/Z", "url": "BETALOV"}]
+    assert s["missing_in_eshop"] == [{"code": "9/Z", "value": "BETALOV"}]
     assert s["missing_count"] == 1

@@ -4261,6 +4261,21 @@ def _export_note_index() -> tuple[dict, set]:
 # refuses an export from a sync that has been off/broken for half a day.
 EXPORT_MAX_AGE_S = 6 * 3600
 
+# How many „the eshop has no such code" rows the nightly result lists by name (#270).
+# The count is always exact; the list is what the tab renders, and the manager fixes
+# them one by one — a runaway list must not bloat automations.json.
+MISSING_CODES_SHOWN = 50
+
+
+def _missing_report(codes, values) -> dict:
+    """The „eshop taký kód nemá" block both halves of the nightly push return (#270):
+    an exact count plus the first MISSING_CODES_SHOWN codes with the value we wanted
+    to write (the reorder URL for pairings, the supplier name for the write-back), so
+    the manager can act on the code instead of guessing which rows Shoptet refused."""
+    return {"missing_count": len(codes),
+            "missing_in_eshop": [{"code": c, "value": (values.get(c) or "").strip()}
+                                 for c in codes[:MISSING_CODES_SHOWN]]}
+
 
 def _export_age_s():
     """Age of the on-disk catalog export in seconds, or None when it cannot be stat'd
@@ -4272,12 +4287,24 @@ def _export_age_s():
         return None
 
 
-def _codes_confirmed_in_export(rows, note_col=2) -> set:
-    """The subset of `rows` (code;pairCode;internalNote) the eshop ALREADY carries
-    exactly as we would write them — proven uploaded, so they need neither a
-    re-upload nor a guess. This is what un-freezes the nightly push (#257): rows
-    Shoptet accepted inside a partially-rejected batch are credited on the next run
-    from the eshop's own export instead of being re-sent forever.
+def _export_row_verdicts(rows, note_col=2) -> dict:
+    """What the eshop's own catalog export says about `rows` (code;pairCode;
+    internalNote) — BOTH verdicts from ONE streaming pass:
+
+      confirmed  the eshop ALREADY carries the row exactly as we would write it —
+                 proven uploaded, so it needs neither a re-upload nor a guess. This
+                 is what un-freezes the nightly push (#257): rows Shoptet accepted
+                 inside a partially-rejected batch are credited on the next run from
+                 the eshop's own export instead of being re-sent forever.
+      absent     the eshop's catalogue does not carry that variant code AT ALL, so
+                 the row can NEVER import — Shoptet rejects it on every single run
+                 („Zlyhanie variantov: 2", the same two rows every night since
+                 24. 7. 2026). Holding them back is what stops the endless nightly
+                 rejection; the caller LISTS them for the manager instead (#270).
+
+    Holding a row back is deliberately NOT recorded as uploaded and is bounded and
+    self-healing: a code that reappears in the catalogue (the manager fixes it, or a
+    freak export was wrong) is simply sent on the next run.
 
     A confirmed row is NOT sent at all and IS recorded uploaded, so this credit is only
     as trustworthy as the export it reads. data/products.csv is refreshed by a SEPARATE
@@ -4292,18 +4319,24 @@ def _codes_confirmed_in_export(rows, note_col=2) -> set:
     used one) would be the single entry point through which the natural future
     optimisation „read the export once, pass it down" could credit rows from bytes
     whose age was never checked — the guard below can only hold while the read and
-    the freshness check stay in the same place."""
+    the freshness check stay in the same place. The same guard now protects the
+    `absent` verdict, which is a WRITE condition too (it withholds a row)."""
+    none = {"confirmed": set(), "absent": set()}
     age = _export_age_s()
     if age is not None and age > EXPORT_MAX_AGE_S:
         log.warning("export je starý %.1f h (limit %.1f h) — nepotvrdzujem z neho "
-                    "žiadne riadky, radšej ich pošlem znova",
+                    "žiadne riadky ani nezadržiavam žiadne, radšej ich pošlem znova",
                     age / 3600, EXPORT_MAX_AGE_S / 3600)
-        return set()
-    notes, _codes = _export_note_index()
-    if not notes:
-        return set()
-    return {r[0] for r in rows
-            if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
+        return none
+    notes, codes = _export_note_index()
+    if not codes:
+        # no export / an export with no product rows: we know NOTHING about the
+        # catalogue, so nothing may be credited AND nothing may be called missing
+        return none
+    confirmed = {r[0] for r in rows
+                 if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
+    absent = {r[0] for r in rows if r[0] not in codes}
+    return {"confirmed": confirmed, "absent": absent}
 
 
 @app.route("/api/n8n/shoptet-import", methods=["POST"])
@@ -4454,6 +4487,7 @@ def _do_upload_pairings(dry):
     if not new_keys and not new_order_codes:
         log.info("n8n pairings: 0 new pairings")
         return {"ok": True, "count": 0, "products": [], "order_count": 0, "order_blocked": 0,
+                "missing_count": 0, "missing_in_eshop": [],
                 **_pairing_summary(uploaded)}, 200
 
     rows = import_builder.link_rows(PRODUCTS, {k: dec[k] for k in new_keys}, CODE2PAIR)
@@ -4482,6 +4516,7 @@ def _do_upload_pairings(dry):
         return {"ok": True, "count": 0, "products": products,
                 "order_count": 0, "order_blocked": len(new_order_codes),
                 "message": "no import rows", "blocked": len(new_keys),
+                "missing_count": 0, "missing_in_eshop": [],
                 **_pairing_summary(uploaded)}, 200
 
     # surface a real data inconsistency: the same variant code paired to two different
@@ -4526,12 +4561,24 @@ def _do_upload_pairings(dry):
     # rows Shoptet accepted inside a partially-rejected batch (whose identity the
     # import log never reveals) get credited on the next run instead of being
     # rebuilt and re-sent every night forever.
-    confirmed = _codes_confirmed_in_export(all_rows)
-    send_rows = [r for r in all_rows if r[0] not in confirmed]
+    # #270: the mirror image — a code the catalogue does NOT carry at all can never
+    # import (Shoptet rejects that row on every run, for ever). Hold it back and LIST
+    # it with the URL we tried to write, so the manager can fix the code instead of
+    # reading a bare „Shoptet odmietol 2 riadkov" every morning. Never credited, so
+    # the moment the code appears in the catalogue it is written.
+    verdicts = _export_row_verdicts(all_rows)
+    confirmed = verdicts["confirmed"]
+    absent = verdicts["absent"] - confirmed
+    send_rows = [r for r in all_rows if r[0] not in confirmed and r[0] not in absent]
+    missing = _missing_report(sorted(absent), {r[0]: r[2] for r in all_rows})
     if confirmed:
         log.info("n8n pairings: %d z %d riadkov už eshop má presne tak, ako by sme "
                  "ich poslali — potvrdené z exportu, neposielam znova",
                  len(confirmed), len(all_rows))
+    if absent:
+        log.warning("n8n pairings: %d kódov eshop v katalógu vôbec nemá — "
+                    "neposielam ich (Shoptet by ich zakaždým odmietol): %s",
+                    len(absent), sorted(absent)[:10])
 
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n pairings: another import already running")
@@ -4587,6 +4634,7 @@ def _do_upload_pairings(dry):
               "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
               "products": products, "stdout_tail": res["stdout_tail"],
               "blocked": len(blocked_keys),
+              **missing,
               "order_count": len(uploaded_order_codes),
               "order_blocked": len(blocked_order_codes),
               **_pairing_summary(uploaded)}
@@ -4704,6 +4752,7 @@ def _do_upload_suppliers(dry):
     if not new_codes:
         log.info("n8n suppliers: 0 new assignments")
         return {"ok": True, "count": 0, "products": [],
+                "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
     # BUG 1 safety — FAIL CLOSED on a missing/empty export. The exclusion guard below
@@ -4720,7 +4769,20 @@ def _do_upload_suppliers(dry):
         return {"ok": True, "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
+                "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
+
+    # #270: the same "the eshop has no such code" rows that doom the pairings push
+    # also sit here (145/3XL is both an inline pairing and a supplier assignment).
+    # This path only REPORTS them — deliberately asymmetric: a supplier row can only
+    # ADD a name where the eshop has none, and PR #213 decided a present-but-partial
+    # export must never drop a legitimate fill-in assignment. So the manager sees the
+    # bad code from both sides of the push, and the write behaviour is untouched.
+    missing_codes = sorted(c for c in new_codes if c not in export_codes) if export_codes else []
+    if missing_codes:
+        log.warning("n8n suppliers: %d kódov eshop v katalógu vôbec nemá "
+                    "(zapisujem ich ďalej, len ich hlásim): %s",
+                    len(missing_codes), missing_codes[:10])
 
     # BUG 1: never overwrite a supplier the eshop already has — exclude codes whose
     # product carries its own supplier in the current export (read in the single
@@ -4733,6 +4795,7 @@ def _do_upload_suppliers(dry):
                     len(new_codes), len(own_supplier & set(new_codes)))
         return {"ok": True, "count": 0, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
+                **_missing_report(missing_codes, assigns),
                 **_supplier_summary(uploaded, assigns)}, 200
 
     # supplier_rows is 1:1 with codes (no product→variant indirection), but codes with
@@ -4769,6 +4832,7 @@ def _do_upload_suppliers(dry):
               "error_detail": res["error_detail"], "error": err_msg,
               "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
               "products": products, "stdout_tail": res["stdout_tail"],
+              **_missing_report(missing_codes, assigns),
               **_supplier_summary(uploaded, assigns)}
     log.info("n8n suppliers: rc=%s chunks=%d/%d processed=%s codes=%d",
              res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
@@ -5553,11 +5617,15 @@ def run_parovania_eshop() -> dict:
     def _blocked(d):
         return int(d.get("blocked") or 0)
 
+    def _missing(d):
+        return int(d.get("missing_count") or 0)
+
     p_ok = bool(pairings.get("ok"))
     s_ok = bool(suppliers.get("ok"))
     if not (p_ok and s_ok):
         status = "failed"          # an import (or lock/timeout) failed → red row
-    elif _blocked(pairings) or _blocked(suppliers):
+    elif (_blocked(pairings) or _blocked(suppliers)
+            or _missing(pairings) or _missing(suppliers)):
         status = "blocked"         # paired but un-uploadable (missing codes) → orange row
     else:
         status = "ok"
@@ -5578,6 +5646,11 @@ def run_parovania_eshop() -> dict:
             # own counters — see _do_upload_pairings)
             "order_count": int(pairings.get("order_count") or 0),
             "order_blocked": int(pairings.get("order_blocked") or 0),
+            # #270: codes the eshop's CATALOGUE does not carry at all — held back
+            # instead of being rejected by Shoptet every night, and listed by name so
+            # the manager can fix them (this is what turns the row orange above).
+            "missing_count": _missing(pairings),
+            "missing_in_eshop": pairings.get("missing_in_eshop") or [],
             # #257: how many rows the eshop already had exactly as we would write
             # them (proven from its export → credited, not re-sent), and how many
             # Shoptet REJECTED out of the ones we did send. Both were invisible
@@ -5594,6 +5667,10 @@ def run_parovania_eshop() -> dict:
             "total_assigned": suppliers.get("total_assigned", 0),
             "remaining": suppliers.get("remaining", 0),
             "blocked": _blocked(suppliers),
+            # #270 report-only on this side — the row IS still written (see
+            # _do_upload_suppliers); the manager just sees the same bad code here too
+            "missing_count": _missing(suppliers),
+            "missing_in_eshop": suppliers.get("missing_in_eshop") or [],
             "ok": s_ok,
             "error": suppliers.get("error", ""),
         },

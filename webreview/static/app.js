@@ -3813,6 +3813,39 @@ const _PAROVANIA_STATUS = {
   ok: ['✅ OK', 'ok'], blocked: ['⚠️ Časť zablokovaná', 'warn'],
   failed: ['❌ Zlyhalo', 'bad'],
 };
+// #270 — „eshop taký kód nemá". A variant code that is missing from the eshop's
+// own catalogue export can never be imported: Shoptet rejects that row on EVERY
+// run (the same „Zlyhanie variantov: 2" every night since 24. 7. 2026), and the
+// manager saw only a red count with no way to learn WHICH code or WHY. The push
+// now holds those rows back and names them here, with the value it wanted to
+// write, so the code can be fixed. `p`/`s` are the pairings/suppliers halves of
+// last_result; returns null when there is nothing to report (the normal night).
+// Pure enough to unit-test in the browser realm — see tests/e2e/test_shell.py.
+function missingCodesBox(p, s) {
+  const rows = [];
+  for (const m of (p.missing_in_eshop || [])) rows.push({ ...m, held: true });
+  for (const m of (s.missing_in_eshop || [])) rows.push({ ...m, held: false });
+  const total = (p.missing_count || 0) + (s.missing_count || 0);
+  if (!total) return null;
+  const box = el('div', 'autoerr');
+  box.appendChild(el('div', '',
+    `⛔ Eshop tieto kódy v katalógu nemá (${total}) — oprav kód v eshope alebo `
+    + 'párovanie na záložke „Na objednanie".'));
+  const ul = el('ul', 'misscodes');
+  for (const m of rows) {
+    const li = document.createElement('li');
+    // free text out of the manager's stores — textContent only, never innerHTML
+    li.textContent = m.code + (m.value ? ' → ' + m.value : '')
+      + (m.held ? '' : ' (dodávateľ — zapisuje sa ďalej)');
+    ul.appendChild(li);
+  }
+  box.appendChild(ul);
+  if (rows.length < total) {
+    box.appendChild(el('div', 'sub2', `… a ďalších ${total - rows.length}`));
+  }
+  return box;
+}
+
 function renderParovaniaEshop() {
   const wrap = document.getElementById('tab-parovania_eshop');
   if (!wrap) return;
@@ -3887,6 +3920,9 @@ function renderParovaniaEshop() {
       + ` · spolu ${s.total_uploaded ?? 0} / ${s.total_assigned ?? 0} doplnených`
       + ` · chýba ${s.remaining ?? 0}`));
     if (s.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(s.error)));
+    // #270 — the codes the eshop's catalogue does not have at all
+    const miss = missingCodesBox(p, s);
+    if (miss) box.appendChild(miss);
     st.appendChild(box);
   } else if (!a.last_run) {
     st.appendChild(el('div', 'muted',

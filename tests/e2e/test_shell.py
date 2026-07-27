@@ -346,3 +346,33 @@ def test_no_nav_item_renders_the_literal_undefined(page, live_server):
     assert "undefined" not in page.locator(".sidebar").inner_text()
 
     assert console == [], f"console not clean: {console}"
+
+
+def test_missing_eshop_codes_are_listed_with_what_we_wanted_to_write(page, live_server):
+    """#270 — the nightly push holds back rows whose variant code the eshop's
+    catalogue does not carry (Shoptet rejected them every single night) and names
+    them on the automation card. Unit-tests the pure builder in the browser realm:
+    both halves of the run are listed, the supplier half is marked as still being
+    written, the overflow is counted, and the manager's free text is never HTML."""
+    console = _console(page)
+    page.goto(live_server)
+    page.wait_for_selector(".sidebar #tabs button")
+
+    out = page.evaluate("""() => {
+      const box = missingCodesBox(
+        {missing_count: 3, missing_in_eshop: [{code: '15813/110', value: 'https://x/<b>y</b>'}]},
+        {missing_count: 1, missing_in_eshop: [{code: '145/3XL', value: 'FOREST'}]});
+      return {quiet: missingCodesBox({}, {}),
+              text: box.textContent,
+              bolds: box.querySelectorAll('b').length,
+              items: box.querySelectorAll('.misscodes li').length};
+    }""")
+
+    assert out["quiet"] is None                      # a normal night renders nothing
+    assert "(4)" in out["text"]                      # exact total, both halves
+    assert "15813/110 → https://x/<b>y</b>" in out["text"]
+    assert "145/3XL → FOREST (dodávateľ — zapisuje sa ďalej)" in out["text"]
+    assert out["bolds"] == 0                         # free text, never markup
+    assert out["items"] == 2 and "a ďalších 2" in out["text"]
+
+    assert console == [], f"console not clean: {console}"
