@@ -57,3 +57,11 @@ poradie „menovka najprv", nie znenie počtu.
 
 Nový počet → napoj na `itemsWord` a otestuj tabuľkou (0/1/2/4/5/11/21/101 — 11/21/101 sú
 tie, ktoré naivné `n > 1 → množné číslo` pokazí). Vzor: `tests/e2e/test_order_group_header.py`.
+
+**A hľadaj VŠETKY počítadlá, nielen to nahlásené.** Revízia tejto PR našla druhé miesto s
+tým istým defektom — podtitul tabu (`pageSub`, `app.js` `openItemsPhrase`) — pár pixelov nad
+hlavičkou, ktorú ticket opravoval; ticket ju pritom nazval „jediné počítadlo, ktoré obchádza
+skloňovanie". Keď meníš skloňovanie, prejdi `grep -n "položiek\|položky\|položka\|položku"
+webreview/static/app.js` a posúď KAŽDÝ zásah. Pozor na prípady, kde sa skloňuje aj PRÍDAVNÉ
+meno („1 otvorená položka" / „5 otvorených položiek") — tam nestačí `itemsWord`, treba
+vlastnú frázovú funkciu, ktorá si podstatné meno stále vypýta od neho.
