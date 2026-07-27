@@ -5,7 +5,7 @@ Nástroj: páruje forestshop (Shoptet) produkty na produktové stránky dodávat
 ## Playbook router
 Load the matching skill BEFORE working on that area (don't re-derive):
 - automatizácie: tichá smrť behu (alarm/stats/banner), kalibrácia prahov, dôvera fixtúram cudzieho API → `.claude/rules/automation-health.md` (auto-loads on its `paths:`)
-- e2e „Na objednanie": zdieľané `#list`/`ACTIVE_TAB`, výroba ✂️ split riadku, skloňovanie počtov → `.claude/rules/toorder-e2e.md` (auto-loads on its `paths:`)
+- e2e „Na objednanie": zdieľané `#list`/`ACTIVE_TAB`, výroba ✂️ split riadku, skloňovanie počtov, spy na hlásenie + route podľa metódy, zmena sémantiky vs. cudzie testy → `.claude/rules/toorder-e2e.md` (auto-loads on its `paths:`)
 - shoptet eshop / export / import / polia produktov / textProperty / vypredané/vypnuté → load `.claude/skills/shoptet`
 - dodávatelia / recon webu / pridanie dodávateľa / parsovanie výsledkov → load `.claude/skills/suppliers`
 - deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`

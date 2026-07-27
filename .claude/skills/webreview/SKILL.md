@@ -364,7 +364,39 @@ Manažér si priamo na webe značí stav. Tieto súbory držia jeho ŽIVÚ prác
 
 **Hlavička skupiny `.toorder-supplier` je teraz FLEX kontajner: `.tosup-label` (menovka PRVÁ — E2E `startswith(sup)` kontrakt) + `.tosup-bulk` tlačidlo.** Pri zmene hlavičky drž menovku PRVÚ a escapuj ju (`escapeHtml` — XSS test `.toorder-supplier i` count==0).
 
+## Štyri stavové flagy = DVE OSI, nie štyri nezávislé zaškrtávatká (#211)
+
+Než pridáš alebo zmeníš per-riadkový príznak, vedz, ktorá os to je:
+
+- **Os A — „objednané"** (`ordered_items.json`): objednali sme to u dodávateľa. NEZÁVISLÁ,
+  znesie sa s čímkoľvek („objednané + čaká sa na dodávateľa" je presne to, čo hovorí
+  tooltip toho tlačidla; „objednané + skladom" = objednané a už prišlo).
+- **Os B — stav riadku: „čaká sa" ⊕ „skladom" ⊕ „nedostupné"** — VZÁJOMNE VÝLUČNÉ.
+
+**Vynucuje to SERVER, nie klient** (`_write_status_flag` v `app.py`): zapnutie príznaku osi
+B zhasne zvyšné dva v TOM ISTOM `with _lock:` bloku, takže žiaden čitateľ nikdy neuvidí
+riadok s dvomi protirečivými stavmi; zapisuje sa LEN store, ktorý sa naozaj zmenil (sú
+`protect=True` — netknutý súbor sa ani nevytvorí). Vypnutie príznaku nemení nič iné.
+Odpoveď KAŽDÉHO zápisu (vrátane `/api/ordered`) vracia `flags` so stavom všetkých štyroch.
+
+Prečo nie štvorcestná výlučnosť: manažérove živé dáta mali 27 riadkov s kombináciou a
+**každá jedna obsahovala „objednané"**, kým medzi „čaká sa"/„skladom"/„nedostupné" nebol
+ani jeden prekryv zo 41 kľúčov — štvorcestná by teda zmazala 27 reálnych označení pri
+prvom ďalšom kliku. Prečo nie len „display priorita": nechala by protirečivé dáta v
+storoch a `isHandled`/kopírovanie objednávky by ďalej rátali stav, ktorý nie je vidieť.
+
+Klient LEN ZRKADLÍ, a to pri KLIKU (nie keď príde odpoveď — riadok natretý „čaká sa +
+skladom" na dĺžku round-tripu je presne ten protirečivý stav). Zdieľaný `saveOrderWrite`
+berie ZOZNAM dotknutých príznakov a každý si nárokuje `seq` pri VYDANÍ cez tú istú
+evidenciu `_flagWrites` — takže zlyhaný zápis vráti VŠETKY dotknuté príznaky na
+`confirmed` (hodnotu servera). **Nezakladaj druhú, nesekvencovanú rollback cestu** pre
+zhasínané príznaky — platí o nich celá sekcia o `_flagWrites` nižšie.
+
 ## Pridanie nového per-riadkového flagu — kopíruj `ordered`/`waiting` vzor (NEvymýšľaj)
+
+**Najprv sa rozhodni, či je nový príznak os A (nezávislý) alebo ďalší stav osi B** — ak
+os B, pridaj ho do `_STATUS_AXIS` (server) aj `statusFlagSpecs()` (klient) a výlučnosť
+dostaneš zadarmo; NErob preň vlastný endpoint bez zhasínania.
 
 1. **app.py**: `X = os.path.join(OUT, "x_items.json")` + `_load_x`/`_save_x` (atomický `os.replace` cez `.tmp`).
 2. **app.py**: `@app.route("/api/x", methods=["GET","POST"])` — GET vráti mapu; POST `{key, x:bool}` pod `with _lock:` set/`pop`, `log.info`.

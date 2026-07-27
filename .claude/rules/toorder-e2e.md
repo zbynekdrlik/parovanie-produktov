@@ -7,7 +7,7 @@ paths:
 
 # E2E na tabe „Na objednanie" — čo vedieť skôr, než napíšeš test
 
-Tri veci, ktoré v tomto repozitári stáli cyklus. (Playwright pasce okolo schránky, reloadu a
+Veci, ktoré v tomto repozitári stáli cyklus. (Playwright pasce okolo schránky, reloadu a
 kontrastu sú v `.claude/skills/webreview` — toto sú tie, ktoré tam nie sú.)
 
 ## 1. `#tab-review` ani `#tab-toorder` NEEXISTUJÚ — aktívny tab čítaj z `ACTIVE_TAB`
@@ -65,3 +65,62 @@ skloňovanie". Keď meníš skloňovanie, prejdi `grep -n "položiek\|položky\|
 webreview/static/app.js` a posúď KAŽDÝ zásah. Pozor na prípady, kde sa skloňuje aj PRÍDAVNÉ
 meno („1 otvorená položka" / „5 otvorených položiek") — tam nestačí `itemsWord`, treba
 vlastnú frázovú funkciu, ktorá si podstatné meno stále vypýta od neho.
+
+## 4. Spy na HLÁSENIE inštaluj až PO načítaní — a počítaj SPRÁVY, nie volania
+
+Odkedy #234 nahradilo `alert()` bannerom `#toFails`, sa zlyhania hlásia cez
+`toOrderSaveFailed`. Spy naň sa NEDÁ založiť cez `add_init_script`: je to obyčajná
+`function` deklarácia v klasickom skripte, a tá zakladá globál priamo
+(`CreateGlobalFunctionBinding` → `DefineOwnProperty`), takže **obíde `defineProperty`
+setter aj akúkoľvek pascu položenú pred načítaním**. Inštaluj ho `page.evaluate`-om až
+za `wait_for_selector(".toorder-row")` (dovtedy nemá čo zlyhať).
+
+A hlavne: **spy, ktorý počíta VOLANIA, nemeria to isté ako počet správ, ktoré manažér
+videl.** Dedup per ZÁPIS (5 s) žije VNÚTRI `toOrderSaveFailed`, takže potlačené
+duplicitné volanie neprida do banneru nič. Spy preto porovná počet `.tofail` riadkov
+pred volaním a po ňom a zaznamená len vtedy, keď riadok naozaj pribudol — inak test
+„tá istá odmietnutá zmena sa hlási raz" spadne na správaní, ktoré je správne.
+Snapshot DOM ale ber PRED zavolaním pôvodnej funkcie — to je to, čo pinuje poradie
+„najprv rollback a prekreslenie, až potom hláška".
+
+Vzor: `_FAIL_SPY` + `_open` v `tests/e2e/test_order_save_errors.py`.
+
+## 5. `page.route` na endpoint chytá aj GET — odmietaj podľa METÓDY
+
+Test, ktorý odmietne zápis a potom si ten istý endpoint **prečíta späť** ako dôkaz
+(`fetch('/api/instock')` cez `page.evaluate`), dostane 500 aj na to čítanie a padne
+na `Object.keys(undefined)` — vyzerá to ako chyba appky, pritom je to stub.
+
+```python
+page.route("**/api/instock", lambda r: r.fulfill(status=500, ...)
+           if r.request.method == "POST" else r.continue_())
+```
+
+Rovnaká pasca ako `**/api/ordered` vs `/api/ordered/bulk` (bod vyššie): stub si vždy
+zúž na to, čo naozaj chceš rozbiť.
+
+## 6. Keď meníš SÉMANTIKU, cudzie testy starú sémantiku PRIPÍNAJÚ — hľadaj ich VOPRED
+
+`test_toorder_instock_and_unavailable_flags_toggle_and_persist` (z #84) doslova
+asertoval „nedostupné on too — **independent** of skladom, both stay active together",
+teda presne stav, ktorý #211 odstraňuje. Objavil sa až v plnom e2e prebehnutí, po
+zelenom GREEN commite. Po zmene invariantu si preto VOPRED vygrepuj testy na starý
+invariant (tu stačilo `grep -rn "instock" tests/e2e`) a nahraď ich vo VLASTNOM commite
+s odôvodnením — nikdy ich potichu neoslabuj.
+
+Pozor aj na **vlastné RED testy**: pri #211 dva z nich seedovali stav, ktorý nová
+sémantika odmieta (všetky tri príznaky osi B naraz), takže merali vlastný setup, nie
+opravu. **SETUP red testu musí byť legálny podľa novej sémantiky**, nielen jeho assert.
+
+A **upratovanie na konci testu prežije zmenu sémantiky len zriedka**: „vypni oba
+príznaky" po zavedení výlučnosti druhým klikom jeden zase ZAPNE a session-scoped
+fixtúru nechá špinavú.
+
+## 7. Hodnotu skopírovanú zo susedného testu treba overiť TIEŽ
+
+Nové #211 testy si prevzali kľúč `20261045|61247/L` z testu o dva riadky vyššie — a
+`LC_ALL=C grep -ac` nad `data/out/orders_cache.csv` ho našiel (4, resp. 1 výskyt):
+reálny kód objednávky naviazaný na meno, e-mail a telefón zákazníka, vo VEREJNOM
+repozitári. „Je to už v tomto súbore" nie je overenie (pred-existujúce výskyty →
+#289). Postup je v `.claude/rules/automation-health.md` — plus over aj 57 MB
+`data/products.csv`, nielen objednávkovú cache.
