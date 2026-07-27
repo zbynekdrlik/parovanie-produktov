@@ -233,7 +233,7 @@ def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkey
 
 
 # ── BUG 1 safety: FAIL-CLOSED when the export is missing/empty/unreadable. The
-#    exclusion guard (_codes_with_own_supplier) needs the catalog export to know which
+#    exclusion guard (_export_supplier_index) needs the catalog export to know which
 #    codes ALREADY carry their own eshop supplier. With NO export it cannot tell — it
 #    must NOT fall open and write, or a stale per-product assignment could clobber a
 #    real supplier in the live eshop (exactly the bug this PR fixes). The whole supplier
@@ -380,6 +380,7 @@ def test_large_supplier_batch_split_into_chunks(iso, monkeypatch):
     assigns = {f"{i}/S": f"SUP{i}" for i in range(n)}
     monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/S": "P" for i in range(n)})
     webapp._save_supplier_assign(assigns)
+    _stub_catalog_export(monkeypatch, list(assigns))
     fake_run, calls = _recording_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
 
