@@ -3747,6 +3747,20 @@ function renderShoptetSync() {
       + ` · katalóg: ${lr.catalog_products ?? 0} produktov (${lr.catalog_codes ?? 0} kódov)`
       + ` · zosynchronizované review karty: ${lr.review_synced ?? 0}`
       + (lr.review_stale ? ` (nenájdených v exporte: ${lr.review_stale})` : '')));
+    // #280 review — a NON-FATAL degradation has to be VISIBLE. Both of these leave
+    // last_status = ok on purpose (the critical refresh did land), so without a line
+    // here a degraded hour reads exactly like a healthy one: the „quietly dead
+    // automation" the playbook warns about. Own class, not `.autoerr` — the run did
+    // not fail, one source of it did.
+    if (lr.export_error) {
+      st.appendChild(el('div', 'autowarn',
+        '⚠️ Katalógový export sa neobnovil — pracujem s predošlým súborom na disku: '
+        + escapeHtml(lr.export_error)));
+    }
+    if (lr.customers_error) {
+      st.appendChild(el('div', 'autowarn',
+        '⚠️ Export zákazníkov sa neobnovil: ' + escapeHtml(lr.customers_error)));
+    }
   }
   wrap.appendChild(st);
 }
@@ -3813,18 +3827,36 @@ const _PAROVANIA_STATUS = {
   ok: ['✅ OK', 'ok'], blocked: ['⚠️ Časť zablokovaná', 'warn'],
   failed: ['❌ Zlyhalo', 'bad'],
 };
-// #270 — „eshop taký kód nemá". A variant code that is missing from the eshop's
-// own catalogue export can never be imported: Shoptet rejects that row on EVERY
-// run (the same „Zlyhanie variantov: 2" every night since 24. 7. 2026), and the
-// manager saw only a red count with no way to learn WHICH code or WHY. The push
+// #270/#275 — „eshop taký kód nemá". A variant code that is missing from the
+// eshop's own catalogue export can never be imported: Shoptet rejects that row on
+// EVERY run (the same „Zlyhanie variantov: 2" every night since 24. 7. 2026), and
+// the manager saw only a red count with no way to learn WHICH code or WHY. The push
 // now holds those rows back and names them here, with the value it wanted to
 // write, so the code can be fixed. `p`/`s` are the pairings/suppliers halves of
 // last_result; returns null when there is nothing to report (the normal night).
+// Since #275 BOTH halves hold, so a listed code means the same thing either way —
+// the per-row „(dodávateľ — zapisuje sa ďalej)" caveat is gone with the asymmetry.
+// Why the fail-closed gate blocked the supplier write-back (#280 review). Every block
+// used to render „(chýbajú kódy)", which is the one cause it never is: nothing is
+// missing, the export itself is not believable. `g` is suppliers.gate_blocked from the
+// run result, null on a healthy night AND on a block that really IS about missing codes
+// (#270) — that one keeps its original wording. Pure; unit-tested in the browser realm.
+function gateBlockedWhy(g) {
+  if (!g) return ' (chýbajú kódy)';
+  if (g.reason === 'stale') {
+    return ` (export je starý ${g.age_h} h, limit ${g.max_age_h} h`
+      + ' — čakám na čerstvý export)';
+  }
+  if (g.reason === 'small') {
+    return ` (export vyzerá neúplný — ${g.codes} kódov, limit ${g.min_codes}`
+      + ' — čakám na dobrý export)';
+  }
+  return ' (export chýba alebo je prázdny — čakám na dobrý export)';
+}
+
 // Pure enough to unit-test in the browser realm — see tests/e2e/test_shell.py.
 function missingCodesBox(p, s) {
-  const rows = [];
-  for (const m of (p.missing_in_eshop || [])) rows.push({ ...m, held: true });
-  for (const m of (s.missing_in_eshop || [])) rows.push({ ...m, held: false });
+  const rows = [...(p.missing_in_eshop || []), ...(s.missing_in_eshop || [])];
   const total = (Number(p.missing_count) || 0) + (Number(s.missing_count) || 0);
   if (!total) return null;
   // own class (styled FROM .autoerr): `.autoerr` means „the last run failed" and sits
@@ -3838,8 +3870,7 @@ function missingCodesBox(p, s) {
   for (const m of rows) {
     const li = document.createElement('li');
     // free text out of the manager's stores — textContent only, never innerHTML
-    li.textContent = m.code + (m.value ? ' → ' + m.value : '')
-      + (m.held ? '' : ' (dodávateľ — zapisuje sa ďalej)');
+    li.textContent = m.code + (m.value ? ' → ' + m.value : '');
     ul.appendChild(li);
   }
   box.appendChild(ul);
@@ -3919,7 +3950,7 @@ function renderParovaniaEshop() {
       + (p.order_blocked ? ` · ${p.order_blocked} prekrytých recenziou` : '')));
     box.appendChild(el('div', '',
       `🏷️ Dodávatelia: +${s.count ?? 0} nových`
-      + (s.blocked ? ` · ${s.blocked} zablokovaných (chýbajú kódy)` : '')
+      + (s.blocked ? ` · ${s.blocked} zablokovaných${gateBlockedWhy(s.gate_blocked)}` : '')
       + ` · spolu ${s.total_uploaded ?? 0} / ${s.total_assigned ?? 0} doplnených`
       + ` · chýba ${s.remaining ?? 0}`));
     if (s.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(s.error)));

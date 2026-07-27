@@ -269,3 +269,105 @@ def test_run_via_runner_customers_failure_stays_ok_with_error_surfaced(iso, monk
     assert st["last_status"] == "ok"
     assert "customers_error" in st["last_result"]
     assert st["last_result"]["review_synced"] == 1     # critical refresh happened
+
+
+# ── a REFUSED export download must not take the whole hourly sync down (PR #280
+#    review, MUST FIX 2) — and must not observe the watermark from stale bytes ──
+def test_a_refused_export_download_does_not_kill_the_rest_of_the_sync(iso, monkeypatch):
+    """`_refuse_implausible_export_download` raises out of `_fetch_export_csv`, and
+    `run_shoptet_sync` did not guard that call. Measured on dev before the fix:
+
+        run_shoptet_sync RAISED: RuntimeError: stiahnutý export katalógu je
+                                 nepravdepodobne malý (…)
+        stages that ran        : ['orders']    # resync_current SKIPPED, customers SKIPPED
+        watermark observed     : False
+
+    So every review card's price/stock refresh and the customer export died every hour
+    until the on-disk export aged past EXPORT_MAX_AGE_S — which is PRECISELY the
+    staleness that used to disarm the supplier hold (MUST FIX 1). The two new gates
+    created each other's blind spot.
+
+    The refusal is a guard we raise ON PURPOSE, and only ever when the bytes already on
+    disk are fresh AND plausible — i.e. exactly when carrying on with them is safe. So it
+    degrades like the customer export does: surfaced in the result, never fatal."""
+    iso["src"].write_bytes(EXPORT_CSV)          # the good bytes the guard is protecting
+
+    def refuse():
+        raise webapp.ExportDownloadRefused(
+            "stiahnutý export katalógu je nepravdepodobne malý (10 B oproti 8585 B "
+            "na disku, limit 4292 B) — vyzerá useknuto, nechávam na disku ten predošlý")
+    monkeypatch.setattr(webapp, "_fetch_export_csv", refuse)
+
+    result = webapp.run_shoptet_sync()          # does NOT raise
+
+    # the refusal is surfaced, not swallowed
+    assert "export_error" in result
+    assert "nepravdepodobne malý" in result["export_error"]
+    # the good bytes on disk are untouched — the whole point of the guard
+    assert iso["src"].read_bytes() == EXPORT_CSV
+    # …and EVERYTHING downstream still ran on them
+    assert result["catalog_codes"] == 2                       # index rebuilt
+    assert result["review_synced"] == 1                       # resync_current ran
+    assert webapp.PRODUCTS[0]["current"]["price"] == "59,90"
+    assert iso["orders_cache"].read_bytes() == ORDERS_CSV     # orders landed
+    assert iso["customers_cache"].read_bytes() == CUSTOMERS_CSV   # customers still ran
+
+
+def test_a_refused_export_download_does_not_observe_the_watermark(iso, monkeypatch):
+    """The watermark may only be measured from FRESHLY DOWNLOADED bytes (playbook, #277).
+    Re-observing the on-disk export after a refusal would let a stale export keep
+    re-asserting the old size for ever, which is exactly what disables the ratio floor's
+    time-based self-healing."""
+    iso["src"].write_bytes(EXPORT_CSV)
+    wm = iso["tmp"] / "export_watermark.json"
+    monkeypatch.setattr(webapp, "EXPORT_WATERMARK", str(wm))
+
+    def refuse():
+        raise webapp.ExportDownloadRefused("stiahnutý export katalógu je nepravdepodobne malý")
+    monkeypatch.setattr(webapp, "_fetch_export_csv", refuse)
+
+    webapp.run_shoptet_sync()
+
+    assert not wm.exists(), "the watermark was observed from bytes we did NOT just download"
+
+
+def test_a_network_failure_on_the_export_stays_fatal(iso, monkeypatch):
+    """Deliberately NOT widened to every fetch error. The refusal is self-inflicted and
+    proves the on-disk copy is fresh + plausible; a network failure proves nothing about
+    it, and a sync that quietly runs for a week on an old export while reporting OK is
+    worse than a red row."""
+    def boom():
+        raise RuntimeError("stiahnutie katalógového exportu zlyhalo: ConnectionError "
+                           "(URL skrytá — over SHOPTET_EXPORT_URL)")
+    monkeypatch.setattr(webapp, "_fetch_export_csv", boom)
+
+    with pytest.raises(RuntimeError, match="stiahnutie katalógového exportu zlyhalo"):
+        webapp.run_shoptet_sync()
+
+
+def test_run_via_runner_refused_export_stays_ok_with_error_surfaced(iso, monkeypatch):
+    iso["src"].write_bytes(EXPORT_CSV)
+
+    def refuse():
+        raise webapp.ExportDownloadRefused("stiahnutý export katalógu je nepravdepodobne malý")
+    monkeypatch.setattr(webapp, "_fetch_export_csv", refuse)
+
+    assert webapp.RUNNER._execute("shoptet_sync") is True
+    (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "shoptet_sync"]
+    assert st["last_status"] == "ok"
+    assert "export_error" in st["last_result"]
+    assert st["last_result"]["review_synced"] == 1     # critical refresh happened
+
+
+def test_the_refusal_guard_raises_the_dedicated_type(iso, monkeypatch):
+    """The non-fatal branch keys on the TYPE, so the guard must actually raise it —
+    otherwise the catch above silently degrades to catching nothing."""
+    iso["src"].write_bytes(EXPORT_CSV)
+    now = __import__("time").time()
+    os.utime(iso["src"], (now, now))
+
+    with pytest.raises(webapp.ExportDownloadRefused):
+        webapp._refuse_implausible_export_download(10)
+
+    # still a RuntimeError, so every existing caller/except keeps working
+    assert issubclass(webapp.ExportDownloadRefused, RuntimeError)

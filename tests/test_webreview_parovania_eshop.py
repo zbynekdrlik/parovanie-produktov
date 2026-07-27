@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -254,28 +255,22 @@ def test_do_upload_suppliers_blocks_when_export_empty(iso, monkeypatch):
     assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
 
 
-# ── BUG 1 (case c): a code that IS in supplier_assignments but is NOT present in the
-#    current export has no "own supplier" there → it is NOT excluded, and the nightly
-#    write-back STILL emits it (unchanged pre-PR behaviour). A present-but-partial
-#    export must not silently drop a legitimate fill-in assignment — only a genuinely
-#    empty export blocks (test above), a non-empty one that merely lacks the code writes. ─
-def test_do_upload_suppliers_emits_code_absent_from_export(iso, monkeypatch):
+# ── BUG 1 (case c): a code that IS in supplier_assignments but has no "own supplier"
+#    in the current export is NOT excluded by the clobber guard. Whether it is then
+#    SENT depends on the #270 catalogue verdict, which lives in its own tests below —
+#    this one pins only that the BUG 1 exclusion helper leaves it alone. ─────────────
+def test_the_clobber_guard_does_not_flag_a_code_absent_from_the_export(iso, monkeypatch):
     webapp._save_supplier_assign({"9/Z": "BETALOV"})
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
     # a NON-empty export listing OTHER products (5/A carries its own supplier) but NOT 9/Z
     export = ("code;pairCode;supplier\r\n"
               "5/A;555;REAL_SUPPLIER\r\n")
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(export))
-    # the exclusion helper does NOT flag 9/Z (it is absent from the export)
-    assert "9/Z" not in webapp._export_supplier_index()[0]
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
 
-    result, status = webapp._do_upload_suppliers(dry=False)
-    assert status == 200
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert {r[0] for r in sup["rows"]} == {"9/Z"}      # still written (not excluded)
-    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {"9/Z": "BETALOV"}
+    own, codes, present = webapp._export_supplier_index()
+
+    assert "9/Z" not in own            # nothing to clobber — the eshop has no supplier there
+    assert codes == {"5/A"} and present is True
 
 
 def test_run_is_idempotent_second_run_pushes_nothing(iso, monkeypatch):
@@ -1031,16 +1026,20 @@ def test_a_missing_code_turns_the_run_orange_and_reaches_the_tab(iso, monkeypatc
     assert result["pairings"]["missing_in_eshop"][0]["code"] == "1/M"
 
 
-def test_supplier_codes_absent_from_the_catalogue_are_reported_but_still_written(iso, monkeypatch):
-    """DELIBERATE ASYMMETRY. The supplier write-back keeps writing a code the export
-    does not list (PR #213 decided a present-but-partial export must never drop a
-    fill-in assignment — that path can only ADD a supplier where the eshop has
-    none). It only REPORTS them, so the manager sees the same bad code from both
-    sides of the nightly push."""
-    webapp._save_supplier_assign({"9/Z": "BETALOV"})
-    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+def test_supplier_codes_absent_from_the_catalogue_are_HELD_not_written(iso, monkeypatch):
+    """#275 — the supplier write-back now holds a code the eshop's catalogue does not
+    carry, exactly as the pairings half has since #270.
+
+    Such a row can NEVER import: Shoptet rejects it on every single run, so
+    uploaded_suppliers.json never records it, it stays „new" for ever and the whole
+    nightly run goes red every night (live on prod: 145/3XL). Holding is NOT the drop
+    PR #213 forbade — the assignment stays in supplier_assignments.json, is never
+    credited, and goes up the moment the code appears in the catalogue."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "1/M": "ORBIS"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "1/M": "P1"})
+    # a trusted export that carries 1/M but NOT 9/Z
     monkeypatch.setattr(webapp, "_iter_export_lines",
-                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
+                        _export_lines("code;pairCode;supplier\r\n1/M;P1;\r\n5/A;555;REAL\r\n"))
     fake_run, calls = _ok_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
 
@@ -1048,9 +1047,160 @@ def test_supplier_codes_absent_from_the_catalogue_are_reported_but_still_written
 
     assert status == 200
     sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert {r[0] for r in sup["rows"]} == {"9/Z"}          # still written
+    assert {r[0] for r in sup["rows"]} == {"1/M"}          # 9/Z withheld, 1/M still sent
+    # …and it is NEVER recorded uploaded, so it is retried the moment the code exists
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {"1/M": "ORBIS"}
+    # still surfaced by name, with the value we wanted to write (the tab renders this)
     assert s["missing_in_eshop"] == [{"code": "9/Z", "value": "BETALOV"}]
     assert s["missing_count"] == 1
+
+
+def test_a_held_supplier_code_goes_up_once_the_catalogue_carries_it(iso, monkeypatch):
+    """The hold is bounded and self-healing — the property that makes it safe."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    assert webapp._do_upload_suppliers(dry=False)[0]["count"] == 0
+    assert calls == []
+
+    # the manager fixes the code in the eshop → it appears in the next export
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL\r\n9/Z;777;\r\n"))
+
+    s, _st = webapp._do_upload_suppliers(dry=False)
+
+    assert s["count"] == 1 and s["missing_count"] == 0
+    assert {r[0] for r in calls[0]["rows"]} == {"9/Z"}
+
+
+# RETIRED (PR #280 review) — `test_an_untrusted_export_holds_nothing_on_the_supplier_side`
+# stood here and asserted that a STALE export makes the write-back SEND the very code the
+# catalogue does not carry (`{r[0] for r in calls[0]["rows"]} == {"9/Z"}  # sent, not held`).
+#
+# Its premise was that suppressing the hold is the safe fallback, because the hold is a
+# WRITE condition and may only stand on bytes we believe. Half of that is right — the hold
+# does need trusted bytes. The conclusion does not follow: with no trustworthy export the
+# answer is to write NOTHING, not to write EVERYTHING. Suppressing only the hold left the
+# dangerous half (the eshop write) running on bytes we had just declared untrustworthy,
+# so it fail-OPENED — and #275's whole fix evaporated during any window in which the
+# hourly sync had been down for 6 h before the 21:00 push. Worse, the BUG 1 clobber guard
+# then ran on the same stale `own_supplier` bytes, so an assignment could overwrite a
+# supplier a colleague had set in Shoptet meanwhile.
+#
+# It is replaced (not weakened) by
+# `test_a_stale_export_blocks_the_whole_supplier_write_back` below: a stale export now
+# blocks the upload and HOLDS every assignment, which is safe and self-healing — the same
+# shape the size gate beside it has always had. Retired in its own commit, per the rule
+# that a test codifying a defect is replaced with a stated justification, never quietly
+# edited into agreement.
+
+
+def test_a_stale_export_blocks_the_whole_supplier_write_back(iso, monkeypatch):
+    """PR #280 review, MUST FIX 1. Freshness must gate the WRITE, not merely the hold.
+
+    Measured on `dev` before the fix, with a catalogue carrying only 5/A:
+
+        fresh export (1 h)     ROWS SENT: [['5/A', …]]                  missing=1
+        stale export (6h + 1s) ROWS SENT: [['5/A', …], ['9/Z', …]]      missing=0
+        stale export (3 days)  ROWS SENT: [['5/A', …], ['9/Z', …]]      missing=0
+
+    9/Z is exactly the catalogue-absent code #275 exists to hold, so the fix evaporated
+    in any window where the hourly sync had been down 6 h before the 21:00 push — and the
+    BUG 1 clobber guard then ran on the same stale `own_supplier` bytes, letting an
+    assignment overwrite a supplier a colleague had set in Shoptet meanwhile.
+
+    A stale export is therefore treated exactly like an implausibly small one: the WHOLE
+    upload is blocked and every assignment HELD."""
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGNMENT", "9/Z": "FOREST"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "5", "9/Z": "777"})
+    # plausible and complete-looking, but OLD: the catalogue carries 5/A, not 9/Z
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: webapp.EXPORT_MAX_AGE_S + 1)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200
+    assert calls == []                       # NOTHING reached the live eshop
+    assert result["count"] == 0
+    assert result["blocked"] == 2            # both HELD — held is not dropped
+    # the assignments survive untouched, so the next good export sends them
+    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+    assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGNMENT", "9/Z": "FOREST"}
+
+
+def test_a_held_stale_run_goes_up_in_full_once_the_export_is_fresh_again(iso, monkeypatch):
+    """The stale block is bounded and self-healing — the property that makes holding safe.
+    Mirrors the size gate's own second half (test_an_implausibly_small_export_...)."""
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "5"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: webapp.EXPORT_MAX_AGE_S + 1)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    assert webapp._do_upload_suppliers(dry=False)[0]["count"] == 0
+    assert calls == []
+
+    # the hourly sync recovers → the export on disk is fresh again
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 60.0)
+
+    s, _st = webapp._do_upload_suppliers(dry=False)
+
+    # the success path carries no block at all (neither the count nor the reason)
+    assert s["count"] == 1 and not s.get("blocked") and "gate_blocked" not in s
+    assert {r[0] for r in calls[0]["rows"]} == {"5/A"}
+
+
+def test_an_unknown_export_age_does_not_block_the_supplier_write_back(iso, monkeypatch):
+    """`_export_age_s()` returns None when the file cannot be stat'd. Unknown age must
+    never BLOCK (the documented contract): with no file at all the export index yields
+    nothing, so the size gate above already refuses — this branch must not add a second,
+    stricter refusal that a patched reader (every test seam) would trip over."""
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "5"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    s, _st = webapp._do_upload_suppliers(dry=False)
+
+    assert s["count"] == 1
+    assert {r[0] for r in calls[0]["rows"]} == {"5/A"}
+
+
+def test_a_run_whose_only_fault_is_a_missing_code_is_orange_not_red(iso, monkeypatch):
+    """The point of the ticket, end to end. Until now the held-back code was still sent,
+    Shoptet refused it, s_ok went False and run_parovania_eshop reported „failed" — a red
+    row every single night for a condition the manager cannot read out of a red count."""
+    _seed_pairing()
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"1/M": "P1", "9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;internalNote;supplier\r\n1/M;P1;;\r\n"))
+
+    def refuses_unknown_codes(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rows = list(_csv.reader(f, delimiter=";"))[1:]
+        if any(r[0] == "9/Z" for r in rows):   # what the real Shoptet does with 145/3XL
+            return (2, "POZOR: Shoptet hlási zlyhania\n"
+                    "VÝSLEDOK: spracované=1 upravené=0 zlyhania=1", "")
+        n = len(rows)
+        return 0, f"VÝSLEDOK: spracované={n} upravené={n} zlyhania=0", ""
+    monkeypatch.setattr(webapp, "run_import", refuses_unknown_codes)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["suppliers"]["ok"] is True
+    assert result["status"] == "blocked"                   # orange, not red
+    assert result["suppliers"]["missing_count"] == 1
 
 
 def test_an_implausibly_small_export_is_not_trusted(tmp_path, monkeypatch):
@@ -1131,3 +1281,84 @@ def test_an_implausibly_small_export_blocks_the_supplier_write_back(iso, monkeyp
     sup = next(c for c in calls if c["header"][2] == "supplier")
     assert {r[0] for r in sup["rows"]} == {"9/Z"}
     assert result2["count"] == 1
+
+
+def test_the_supplier_write_gate_uses_the_same_ratio_floor_as_the_verdicts(iso, monkeypatch):
+    """#277 — ONE threshold, TWO gates, now that the threshold is a ratio of the
+    catalogue watermark rather than a flat 1000. A 1 200-code export clears the
+    absolute floor and would have been fully trusted; against a 14 066-code catalogue
+    it is a broken feed, and the DANGEROUS half (the live `supplier` write) must never
+    be the permissive one — the PR #276 review's lesson restated against the stronger
+    floor. Pinned at the PRODUCTION absolute floor so the fixture cannot disarm it."""
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", PROD_EXPORT_MIN_CODES)
+    today = datetime.now(timezone.utc).date().isoformat()
+    (iso["tmp"] / "export_watermark.json").write_text(
+        json.dumps({"days": {today: 14066}}), encoding="utf-8")
+    webapp._save_supplier_assign({"9/Z": "STALE_ASSIGNMENT"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n"
+        + "".join(f"{i}/A;{i};\r\n" for i in range(PROD_EXPORT_MIN_CODES + 200))))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200
+    assert calls == []                       # NOTHING reached the live eshop
+    assert result["count"] == 0 and result["blocked"] == 1      # held, not dropped
+    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+
+
+def test_the_blocked_run_reports_WHY_the_gate_blocked(iso, monkeypatch):
+    """PR #280 review, item 3. During ANY gate block the card read
+    „🏷️ Dodávatelia: … N zablokovaných (chýbajú kódy)" — which names the wrong cause:
+    nothing is missing, the export is simply not believable. `_do_upload_suppliers`
+    already carried a `message`, but `run_parovania_eshop` never propagated it and the
+    concrete numbers stayed in a log.warning. #277 widens the blocking band from <1000
+    to <7033 codes, so the manager WILL meet this state."""
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "5"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: webapp.EXPORT_MAX_AGE_S + 1)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    g = result["suppliers"]["gate_blocked"]
+    assert g["reason"] == "stale"
+    assert g["age_h"] == 6.0 and g["max_age_h"] == 6.0
+    assert result["suppliers"]["blocked"] == 1
+    assert result["status"] == "blocked"          # orange, not falsely green
+    assert calls == []
+
+
+def test_a_too_small_export_reports_the_size_reason_with_the_numbers(iso, monkeypatch):
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "5"})
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 7033)
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    g = result["suppliers"]["gate_blocked"]
+    assert g["reason"] == "small"
+    assert g["codes"] == 1 and g["min_codes"] == 7033
+    assert calls == []
+
+
+def test_a_healthy_run_carries_no_gate_reason(iso, monkeypatch):
+    """The absence matters: the card must not render a blocked line on a good night."""
+    webapp._save_supplier_assign({"1/M": "BETALOV"})
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["suppliers"]["gate_blocked"] is None
+    assert result["suppliers"]["count"] == 1

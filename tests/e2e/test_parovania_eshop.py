@@ -94,3 +94,62 @@ def test_run_now_zero_new_reports_ok_without_touching_eshop(page, automations_se
     page.wait_for_selector('[data-testid="posta-status"]')
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #280 review, item 3: a blocked run must name the REAL cause ────────────────
+def test_a_gate_blocked_run_names_the_export_not_missing_codes(page, automations_server):
+    """Before the fix every gate block rendered „N zablokovaných (chýbajú kódy)", which
+    is the wrong cause: nothing is missing, the export is simply not believable (too
+    small, too old, or absent). #277 widens the blocking band from <1000 to <7033 codes,
+    so the manager WILL meet this state and must be able to act on it.
+
+    Driven through the real page globals — app.js is a plain <script>, so its functions
+    and `let` globals are reachable from page.evaluate (the playbook's pure-JS pattern)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    def render(gate):
+        return page.evaluate(
+            """(gate) => {
+                 const saved = AUTOMATIONS;
+                 AUTOMATIONS = [{key: 'parovania_eshop', name: 'Párovania → eshop',
+                   enabled: false, running: false, schedule: 'denne o 21:00',
+                   last_run: '2026-07-27T21:00:00+00:00', last_status: 'ok',
+                   last_result: {status: 'blocked',
+                     pairings: {count: 0, total_uploaded: 0, total_products: 0,
+                                remaining: 0, blocked: 0, order_count: 0,
+                                order_blocked: 0, missing_count: 0, missing_in_eshop: [],
+                                confirmed_in_export: 0, rejected: 0, partial: false,
+                                ok: true, error: ''},
+                     suppliers: {count: 0, total_uploaded: 0, total_assigned: 3,
+                                 remaining: 3, blocked: 3, missing_count: 0,
+                                 missing_in_eshop: [], gate_blocked: gate,
+                                 ok: true, error: ''}}}];
+                 renderParovaniaEshop();
+                 const txt = document.getElementById('tab-parovania_eshop').innerText;
+                 AUTOMATIONS = saved; renderParovaniaEshop();
+                 return txt;
+               }""", gate)
+
+    stale = render({"reason": "stale", "codes": 14066, "min_codes": 7033,
+                    "age_h": 31.5, "max_age_h": 6.0})
+    assert "chýbajú kódy" not in stale, "still blames missing codes on a stale export"
+    assert "3 zablokovaných" in stale
+    assert "starý" in stale and "31.5" in stale       # says WHAT is wrong, with the number
+
+    small = render({"reason": "small", "codes": 312, "min_codes": 7033,
+                    "age_h": 1.0, "max_age_h": 6.0})
+    assert "chýbajú kódy" not in small
+    assert "312" in small and "7033" in small
+    assert "neúplný" in small
+
+    missing = render({"reason": "missing", "codes": 0, "min_codes": 7033,
+                      "age_h": None, "max_age_h": 6.0})
+    assert "chýbajú kódy" not in missing
+    assert "chýba" in missing or "prázdny" in missing
+
+    # …and a run blocked by genuinely missing CODES still says exactly that
+    codes = render(None)
+    assert "chýbajú kódy" in codes
+
+    assert console == [], f"console not clean: {console}"

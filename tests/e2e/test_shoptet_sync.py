@@ -83,3 +83,48 @@ def test_run_now_missing_creds_degrades_gracefully(page, automations_server):
     page.wait_for_selector('[data-testid="posta-status"]')
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #280 review: a NON-FATAL degradation must be visible on the card ──────────
+def test_a_degraded_sync_announces_it_instead_of_reading_as_a_clean_run(
+        page, automations_server):
+    """`export_error` (a refused catalogue download, #280 review MUST FIX 2) and the
+    pre-existing `customers_error` are both surfaced in the run result and were both
+    rendered NOWHERE — the run showed last_status ok with a normal counts line, i.e.
+    indistinguishable from a healthy hour. That is the „quietly dead automation" the
+    playbook warns about: fail-soft on the server is only half a fix unless the tab
+    says so.
+
+    Driven through the real page globals (the playbook's pure-JS pattern)."""
+    console = _console(page)
+    _open_tab(page, automations_server)
+
+    def render(extra):
+        return page.evaluate(
+            """(extra) => {
+                 const saved = AUTOMATIONS;
+                 AUTOMATIONS = [{key: 'shoptet_sync', name: 'Sync zo Shoptetu',
+                   enabled: true, running: false, schedule: 'každú hodinu',
+                   last_run: '2026-07-27T20:00:00+00:00', last_status: 'ok',
+                   last_result: Object.assign({orders_bytes: 1000, catalog_products: 4378,
+                     catalog_codes: 14066, review_synced: 12, review_stale: 0,
+                     customers_bytes: 500}, extra)}];
+                 renderShoptetSync();
+                 const txt = document.getElementById('tab-shoptet_sync').innerText;
+                 AUTOMATIONS = saved; renderShoptetSync();
+                 return txt;
+               }""", extra)
+
+    exp = render({"export_error": "stiahnutý export katalógu je nepravdepodobne malý "
+                                  "(10 B oproti 8585 B na disku, limit 4292 B)"})
+    assert "nepravdepodobne malý" in exp, "a refused export download renders nowhere"
+    assert "katalóg" in exp.lower()
+
+    cus = render({"customers_error": "stiahnutie exportu zákazníkov zlyhalo: ConnectionError"})
+    assert "ConnectionError" in cus, "a failed customer export renders nowhere"
+
+    # …and a healthy run says nothing of the sort
+    ok = render({})
+    assert "nepravdepodobne" not in ok and "zlyhalo" not in ok
+
+    assert console == [], f"console not clean: {console}"
