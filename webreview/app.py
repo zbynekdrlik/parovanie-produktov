@@ -4914,15 +4914,45 @@ def _do_upload_suppliers(dry):
     # IMPORTANT 1 (pinned: test_an_implausibly_small_export_blocks_the_supplier_write_back).
     # A PLAUSIBLE-but-partial export that merely lacks a given code is still fine — that
     # code is simply not excluded and gets written (unchanged behaviour, PR #213).
+    #
+    # FRESHNESS belongs to this SAME gate (PR #280 review, MUST FIX 1). It used to sit
+    # further down, inside `export_trusted`, where it decided only whether `missing_codes`
+    # was computed — never whether the upload ran. So a stale export SUPPRESSED THE HOLD
+    # BUT NOT THE WRITE: measured on dev, an export 6 h + 1 s old sent the very
+    # catalogue-absent code #275 exists to hold (['9/Z', '777', 'FOREST']), i.e. #275's
+    # fix evaporated in any window where the hourly sync had been down before the 21:00
+    # push. And the clobber guard above ran on the SAME stale `own_supplier` bytes, so an
+    # assignment could overwrite a supplier a colleague had set in Shoptet meanwhile.
+    # An old export is exactly as unusable as a small one, so it gets the same answer:
+    # write nothing, hold everything. Suppressing only the hold was the fail-OPEN.
+    #
+    # Unknown age (`None` — the file cannot be stat'd, or a test patches the reader) never
+    # blocks, per the documented contract: with no file at all the index above yields
+    # nothing and `export_present` already refuses.
     own_supplier, export_codes, export_present = _export_supplier_index()
     min_codes = _export_min_codes()          # #277: ONE threshold, shared with the verdicts
-    if not export_present or len(export_codes) < min_codes:
-        log.warning("n8n suppliers: export missing/empty/implausibly small (%d codes < %d) "
-                    "— supplier upload BLOCKED (%d new assignments held, no eshop write)",
-                    len(export_codes), min_codes, len(new_codes))
+    export_age = _export_age_s()
+    export_stale = export_age is not None and export_age > EXPORT_MAX_AGE_S
+    if not export_present or len(export_codes) < min_codes or export_stale:
+        # WHY the upload was blocked, in machine-readable terms — the card used to read
+        # „N zablokovaných (chýbajú kódy)" for every one of these, which names the wrong
+        # cause (nothing is missing; the export is not believable). #277 widens the
+        # blocking band from <1000 to <7033 codes, so the manager WILL meet this state.
+        reason = ("stale" if export_stale
+                  else "missing" if not export_present else "small")
+        log.warning("n8n suppliers: export not believable (reason=%s, %d codes < %d, "
+                    "age=%s h) — supplier upload BLOCKED (%d new assignments held, "
+                    "no eshop write)", reason, len(export_codes), min_codes,
+                    f"{export_age / 3600:.1f}" if export_age is not None else "?",
+                    len(new_codes))
         return {"ok": True, "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
+                "gate_blocked": {"reason": reason, "codes": len(export_codes),
+                                 "min_codes": min_codes,
+                                 "age_h": (round(export_age / 3600, 1)
+                                           if export_age is not None else None),
+                                 "max_age_h": round(EXPORT_MAX_AGE_S / 3600, 1)},
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
@@ -4941,14 +4971,12 @@ def _do_upload_suppliers(dry):
     # self-healing, while sending it costs a red run every night for ever.
     #
     # Withholding a row is a WRITE condition, so it may only stand on bytes we believe:
-    # the same gates as the pairings verdict. The SIZE gate (now the #277 ratio floor)
-    # already ran above — an implausible export never gets this far and blocks the whole
-    # upload — so only freshness is left here. An untrusted export yields no missing
-    # codes at all, i.e. nothing is held and behaviour falls back to sending.
-    export_age = _export_age_s()
-    export_trusted = (len(export_codes) >= min_codes
-                      and (export_age is None or export_age <= EXPORT_MAX_AGE_S))
-    missing_codes = sorted(c for c in new_codes if c not in export_codes) if export_trusted else []
+    # the same gates as the pairings verdict. BOTH of those gates — the #277 ratio floor
+    # AND freshness — now stand together above and block the whole upload, so reaching
+    # this line already PROVES the export is believable. The hold is therefore
+    # unconditional: there is no longer an „untrusted" branch that would suppress it while
+    # letting the write through (the fail-open the PR #280 review found).
+    missing_codes = sorted(c for c in new_codes if c not in export_codes)
     if missing_codes:
         log.warning("n8n suppliers: %d kódov eshop v katalógu vôbec nemá — "
                     "zadržiavam ich (Shoptet by ich zakaždým odmietol): %s",

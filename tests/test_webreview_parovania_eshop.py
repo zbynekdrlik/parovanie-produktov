@@ -1152,7 +1152,8 @@ def test_a_held_stale_run_goes_up_in_full_once_the_export_is_fresh_again(iso, mo
 
     s, _st = webapp._do_upload_suppliers(dry=False)
 
-    assert s["count"] == 1 and s["blocked"] in (0, None)
+    # the success path carries no block at all (neither the count nor the reason)
+    assert s["count"] == 1 and not s.get("blocked") and "gate_blocked" not in s
     assert {r[0] for r in calls[0]["rows"]} == {"5/A"}
 
 
