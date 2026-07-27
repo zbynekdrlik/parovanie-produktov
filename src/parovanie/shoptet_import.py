@@ -155,6 +155,14 @@ def log_entry_id(text):
 # progress chatter — including the echo of the baseline Log entry, whose own
 # 'Spracované: N' would otherwise be read as this run's result (#196/#257).
 RESULT_MARKER = "VÝSLEDOK:"
+# …matched TOLERANTLY when read back. `encoding=` on the Popen fixes only the PARENT's
+# decoding; the child encodes with its own locale, so on a non-UTF-8 box the marker
+# arrives mojibake'd ('V?SLEDOK:', 'VÃSLEDOK:'). An exact-substring search then misses,
+# every slice is empty, processed=None and the WHOLE nightly push is booked failed on
+# one character. webreview/app.py::run_import pins PYTHONIOENCODING=utf-8 so this never
+# happens; the wildcard is the belt to that brace (the ASCII tail 'SLEDOK:' is what
+# actually identifies the marker — only 'Ý' can mangle).
+_RESULT_MARKER_RE = re.compile(r"V.{0,2}SLEDOK:")
 # …and the raw Shoptet line of a HARD error (an import aborted with no summary at
 # all) is printed after it, so the reason survives the slicing below.
 HARD_ERROR_MARKER = "CHYBA LOGU:"
@@ -203,8 +211,8 @@ def result_stdout_slice(text):
     which parses to processed=None → an unreadable, never-successful result."""
     if not text:
         return ""
-    idx = text.rfind(RESULT_MARKER)
-    return text[idx:] if idx >= 0 else ""
+    hits = list(_RESULT_MARKER_RE.finditer(text))
+    return text[hits[-1].start():] if hits else ""
 
 
 def _new_entries(entries, baseline):
@@ -294,7 +302,12 @@ def chunk_outcome(rc, parsed, rows_sent) -> str:
     """Classify ONE imported chunk from the import script's exit code + the counts
     it printed. Returns:
 
-      'ok'      — clean run (rc 0).
+      'ok'      — clean run (rc 0) whose reported 'Spracované' count really is every
+                  row we sent. rc 0 alone is NOT enough: the invariant that makes it
+                  mean "all rows landed" lives in result_exit_code, a different module,
+                  and a rc-0 result whose counts disagree would book the whole chunk as
+                  landed (success_codes → uploaded_pairings.json → never re-sent). A run
+                  that printed NO count at all stays ok — that is the --dry-run path.
       'partial' — Shoptet PROCESSED every row we sent ('Spracované' == rows_sent)
                   but rejected some of them ('Zlyhanie variantov: N', N < rows_sent).
                   The rest genuinely landed in the eshop, so this must NOT abort the
@@ -311,10 +324,10 @@ def chunk_outcome(rc, parsed, rows_sent) -> str:
     failed. 'partial' therefore means "some of these rows landed, we cannot tell
     which"; proving a specific row landed needs the eshop's own catalog export (see
     webreview/app.py::_export_internal_notes)."""
-    if rc == 0:
-        return "ok"
     parsed = parsed or {}
     processed, failed = parsed.get("processed"), parsed.get("failed") or 0
+    if rc == 0:
+        return "ok" if processed is None or processed == rows_sent else "failed"
     if (rows_sent and processed == rows_sent and 0 < failed < rows_sent
             and not parsed.get("error_detail")):
         return "partial"

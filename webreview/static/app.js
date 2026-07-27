@@ -3852,6 +3852,17 @@ function renderParovaniaEshop() {
       + (p.blocked ? ` · ${p.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${p.total_uploaded ?? 0} / ${p.total_products ?? 0} napárovaných`
       + ` · chýba ${p.remaining ?? 0}`));
+    // #257: the two facts a partially-accepted push turns on. Both come from the API
+    // result and were invisible here, so the manager could not see that Shoptet had
+    // rejected rows at all — only the generic error line below (if any).
+    //   • potvrdené z exportu = rows the eshop already had exactly as we would write
+    //     them, credited from its own export and NOT re-sent;
+    //   • odmietol = rows Shoptet refused out of the ones we did send (they stay
+    //     pending and are re-sent until the export confirms them).
+    box.appendChild(el('div', 'sub2',
+      `✔ Už v eshope (potvrdené z exportu): ${p.confirmed_in_export ?? 0}`
+      + ` · ⛔ Shoptet odmietol: ${p.rejected ?? 0} riadkov`
+      + (p.partial ? ' · časť dávky odmietnutá — zvyšok sa potvrdí z exportu' : '')));
     // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
     // successful chunks ARE saved → the next run only retries the rest)
     if (p.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(p.error)));

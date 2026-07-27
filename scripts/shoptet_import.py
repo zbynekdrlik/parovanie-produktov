@@ -269,17 +269,13 @@ def _row_texts(page):
     )
 
 
-def _same_entry(a, b):
-    """Do two reads of the Log point at the SAME entry? Compare Shoptet's entry number
-    when both carry one — the rendered row text is not stable (a late-rendered link, a
-    relative time), and settling on the text would make a perfectly good import never
-    agree with itself and end up unattributable."""
-    if b is None:
-        return False
-    ia, ib = log_entry_id(a), log_entry_id(b)
-    if ia is not None and ib is not None:
-        return ia == ib
-    return a == b
+def _entry_key(row):
+    """WHICH Log entry a row text points at — Shoptet's own entry number when the row
+    carries one, else the text itself. The rendered text is NOT stable (a late-rendered
+    link, a relative time), so keying on it alone would make a perfectly good import
+    never agree with itself and end up unattributable."""
+    eid = log_entry_id(row)
+    return eid if eid is not None else row
 
 
 def _read_result(page, baseline=None, expected_rows=None, retries=6, wait_s=2.0):
@@ -297,29 +293,37 @@ def _read_result(page, baseline=None, expected_rows=None, retries=6, wait_s=2.0)
     skip past it to a PREVIOUS run's 'Spracované' row and report a stale
     success.
 
-    A pick is accepted only once TWO CONSECUTIVE reads agree on it (the result must
-    SETTLE). The row count alone cannot tell our entry from a concurrent import of
-    the same size — and every large batch is chunked to exactly IMPORT_CHUNK_ROWS
-    rows, so "same size" is the normal collision, not an exotic one. If a foreign
-    entry is momentarily the only match, the settle read gives our own entry time to
-    appear; two matching entries are then ambiguous → None → exit 2, instead of
-    crediting a whole chunk that never landed.
+    The WHOLE poll window is always exhausted before anything is accepted, and a pick
+    counts only if EXACTLY ONE entry matched across every read AND it is still the
+    match at the LAST read. The row count alone cannot tell our entry from a concurrent
+    import of the same size — and every large batch is chunked to exactly
+    IMPORT_CHUNK_ROWS rows, so "same size" is the normal collision, not an exotic one.
+    Returning as soon as two consecutive reads agreed (the first shape of this settle
+    check) covered only ~ONE wait_s interval: a foreign 300-row import writing between
+    our baseline and our first read was accepted ~2 s later, before Shoptet had written
+    OUR entry at all — chunk_outcome booked `ok`, its 300 codes were recorded uploaded
+    and new_pairing_keys skipped them forever (a permanent, silent loss). Waiting the
+    window out lets our own entry appear, which makes the read ambiguous → None → exit 2
+    (fail closed, the rows are simply re-sent next run) instead of a false success.
 
     Returns the picked row text, or None if our own entry never appeared / no
     log entry is found at all / two same-sized imports made it ambiguous.
     parse_import_log(None) then yields processed=None, which result_exit_code()
     treats as an UNREADABLE result (exit 2) — never a silent success."""
-    picked = None
+    seen, row = set(), None
     for attempt in range(retries):
         row = pick_result_row(_row_texts(page), baseline=baseline,
                               expected_rows=expected_rows)
-        if row is not None and _same_entry(row, picked):
-            return row
-        picked = row
+        if row is not None:
+            seen.add(_entry_key(row))
         if attempt < retries - 1:
             page.wait_for_timeout(int(wait_s * 1000))
             page.reload(wait_until="networkidle")
-    return None
+    # `row` is the LAST read: None means the match was not stable to the end (it
+    # vanished, or a second same-sized entry made the final read ambiguous).
+    if row is None or len(seen) != 1:
+        return None
+    return row
 
 
 def _do_import(page, csv_path, baseline=None, expected_rows=None):

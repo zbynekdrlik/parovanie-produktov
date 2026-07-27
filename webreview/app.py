@@ -4008,7 +4008,14 @@ def run_import(csv_path, dry_run=False, timeout=300):
     cmd = [sys.executable, IMPORT_SCRIPT, "--file", csv_path, "--yes"]
     if dry_run:
         cmd.append("--dry-run")
-    env = {**os.environ, "PYTHONPATH": os.path.join(ROOT, "src")}
+    # PYTHONIOENCODING pins how the CHILD ENCODES its stdout; `encoding=` below only
+    # says how WE DECODE it. Without the pin the child follows the box's locale, so on
+    # a non-UTF-8 box the result marker arrives mojibake'd ('V?SLEDOK:'), the slice is
+    # empty, processed=None and EVERY chunk is booked failed/unreadable — the whole
+    # nightly push dies on one character. Both ends must agree; only then does the
+    # non-ASCII marker survive the pipe.
+    env = {**os.environ, "PYTHONPATH": os.path.join(ROOT, "src"),
+           "PYTHONIOENCODING": "utf-8"}
     # decode the child's output as UTF-8 EXPLICITLY — never the box's locale. The
     # result is read by slicing on the non-ASCII marker 'VÝSLEDOK:' (parse_result_stdout);
     # under a non-UTF-8 locale that marker would mojibake, every slice would come back
@@ -4106,6 +4113,9 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
                       prefix, i, len(chunks))
             rc, err_tail = 1, "import timeout"
             error_detail = error_detail or "import timeout"
+            # the CSV was submitted and Shoptet was very likely still processing it —
+            # exactly the "we cannot read our own answer" case, NOT "nothing landed"
+            unreadable = True
             break
         finally:
             _safe_unlink(chunk_path)
@@ -4182,14 +4192,21 @@ def _chunk_error_msg(res, total_rows, confirms_from_export=False):
         count = f"{res['rows_ok']}"
         if res.get("rows_partial"):
             # rows_ok counts only fully clean chunks; a preceding partial chunk did
-            # write most of its rows, so report it instead of understating the push
-            count += f" (+{res['rows_partial'] - res.get('partial_failed', 0)} čiastočne prijatých)"
+            # write most of its rows, so report it instead of understating the push.
+            # Clamped: 'Zlyhanie variantov: N' is an aggregate Shoptet count and may
+            # exceed the rows we sent if it ever counts VARIANTS rather than rows —
+            # a NEGATIVE number of accepted rows would be nonsense to the manager.
+            accepted = max(0, res["rows_partial"] - res.get("partial_failed", 0))
+            count += f" (+{accepted} čiastočne prijatých)"
+        detail = f": {res['error_detail']}" if res.get("error_detail") else ""
         if res.get("unreadable"):
             # NOT the same as "nothing was imported": the rows WERE submitted and very
-            # likely landed, we just could not read/attribute Shoptet's own answer
+            # likely landed, we just could not read/attribute Shoptet's own answer (an
+            # unattributable Log entry — or a TIMEOUT, where Shoptet was still chewing
+            # on a CSV it had already accepted)
             return (f"výsledok {where} sa nepodarilo prečítať — riadky mohli prejsť, "
-                    f"over Log v Shoptete (potvrdených {count} z {total_rows} riadkov)")
-        detail = f": {res['error_detail']}" if res.get("error_detail") else ""
+                    f"over Log v Shoptete (potvrdených {count} z {total_rows} riadkov)"
+                    + detail)
         return (f"import zlyhal na {where} "
                 f"(naimportované {count} z {total_rows} riadkov){detail}")
     tail = (" (zvyšok sa naimportoval; potvrdí sa z exportu eshopu)"
@@ -4230,12 +4247,43 @@ def _export_internal_notes(text: str | None = None) -> dict:
     return notes
 
 
+# How old the catalog export may be and still PROVE a row landed. „Sync zo Shoptetu"
+# rewrites data/products.csv hourly, so 6 h tolerates a few missed syncs and still
+# refuses an export from a sync that has been off/broken for half a day.
+EXPORT_MAX_AGE_S = 6 * 3600
+
+
+def _export_age_s():
+    """Age of the on-disk catalog export in seconds, or None when it cannot be stat'd
+    (missing file / a test that patches the reader). Unknown age never BLOCKS: with no
+    file at all `_read_export_for_links` already yields '' → nothing is confirmed."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(SRC))
+    except OSError:
+        return None
+
+
 def _codes_confirmed_in_export(rows, note_col=2, notes=None) -> set:
     """The subset of `rows` (code;pairCode;internalNote) the eshop ALREADY carries
     exactly as we would write them — proven uploaded, so they need neither a
     re-upload nor a guess. This is what un-freezes the nightly push (#257): rows
     Shoptet accepted inside a partially-rejected batch are credited on the next run
-    from the eshop's own export instead of being re-sent forever."""
+    from the eshop's own export instead of being re-sent forever.
+
+    A confirmed row is NOT sent at all and IS recorded uploaded, so this credit is only
+    as trustworthy as the export it reads. data/products.csv is refreshed by a SEPARATE
+    hourly automation; while that sync is off/broken the file keeps its last contents,
+    and a code cleared or changed in the eshop since then would be credited from stale
+    bytes and silently never re-written. Refuse to credit anything from an export older
+    than EXPORT_MAX_AGE_S and fall back to actually SENDING those rows (idempotent —
+    the same URL is simply written again), mirroring the supplier write-back's
+    fail-closed stance on an unusable export."""
+    age = _export_age_s()
+    if age is not None and age > EXPORT_MAX_AGE_S:
+        log.warning("export je starý %.1f h (limit %.1f h) — nepotvrdzujem z neho "
+                    "žiadne riadky, radšej ich pošlem znova",
+                    age / 3600, EXPORT_MAX_AGE_S / 3600)
+        return set()
     if notes is None:
         notes = _export_internal_notes()
     if not notes:
