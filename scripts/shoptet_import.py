@@ -26,6 +26,7 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from parovanie.shoptet_import import (  # noqa: E402
     ShoptetError,
+    has_log_entries,
     load_credentials,
     log_entry_id,
     parse_import_log,
@@ -306,24 +307,45 @@ def _read_result(page, baseline=None, expected_rows=None, retries=6, wait_s=2.0)
     window out lets our own entry appear, which makes the read ambiguous → None → exit 2
     (fail closed, the rows are simply re-sent next run) instead of a false success.
 
+    The verdict is taken from the last read that could actually SEE the Log
+    (has_log_entries), not simply from the last read: `page.reload(networkidle)` can
+    return before Shoptet paints the table, and one such empty read at the end of the
+    window used to discard a window in which every real read had agreed on our entry
+    — booking a successful chunk as unreadable and, through the caller's `break`,
+    skipping the rest of the night's chunks. A read that DID render log rows and still
+    could not attribute them stays fatal: on a LATE ambiguity pick_result_row returns
+    None without adding to `seen`, so `len(seen) == 1` alone would credit a run
+    Shoptet never confirmed.
+
+    Deliberate trade in the settle check: `_entry_key` falls back to the raw row text
+    for an entry that carries no '#id', so a ticking relative time in such a row makes
+    every read a different key → ambiguous → None, where the older two-consecutive
+    settle would have returned it. That path is only reachable on the "older/other
+    renderings" log_entry_id documents (every live fixture and every archived log
+    carries a '#12689'-style id) and it fails CLOSED — the rows are re-sent next run.
+    Trading a rare needless retry for never crediting an unidentifiable entry is the
+    intended behaviour here, not an oversight.
+
     Returns the picked row text, or None if our own entry never appeared / no
     log entry is found at all / two same-sized imports made it ambiguous.
     parse_import_log(None) then yields processed=None, which result_exit_code()
     treats as an UNREADABLE result (exit 2) — never a silent success."""
-    seen, row = set(), None
+    seen, verdict, verdict_is_real = set(), None, False
     for attempt in range(retries):
-        row = pick_result_row(_row_texts(page), baseline=baseline,
-                              expected_rows=expected_rows)
+        texts = _row_texts(page)
+        row = pick_result_row(texts, baseline=baseline, expected_rows=expected_rows)
         if row is not None:
             seen.add(_entry_key(row))
+        if has_log_entries(texts):
+            # this read really saw the Log — its outcome (a row, or None for
+            # "rendered but unattributable") supersedes any earlier one
+            verdict, verdict_is_real = row, True
         if attempt < retries - 1:
             page.wait_for_timeout(int(wait_s * 1000))
             page.reload(wait_until="networkidle")
-    # `row` is the LAST read: None means the match was not stable to the end (it
-    # vanished, or a second same-sized entry made the final read ambiguous).
-    if row is None or len(seen) != 1:
+    if not verdict_is_real or verdict is None or len(seen) != 1:
         return None
-    return row
+    return verdict
 
 
 def _do_import(page, csv_path, baseline=None, expected_rows=None):

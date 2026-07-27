@@ -232,6 +232,19 @@ def _new_entries(entries, baseline):
     return out
 
 
+def has_log_entries(row_texts) -> bool:
+    """Did this read of the page see the Log TABLE at all — i.e. at least one row
+    shaped like a genuine import-log entry (a summary or a hard error)? The header
+    row and empty page chrome do not count.
+
+    This is what tells the read-back's two "nothing picked" cases apart, which look
+    identical from pick_result_row's None alone: a page that has not RENDERED the Log
+    yet (a reload returning before the table paints — retry-able, and the earlier
+    reads' verdict still stands) versus a rendered Log whose entries could not be
+    attributed (genuinely ambiguous — fatal)."""
+    return any(_RESULT_ROW_RE.search(t or "") for t in (row_texts or []))
+
+
 def pick_result_row(row_texts, baseline=None, expected_rows=None):
     """Pick the row that reflects the import THIS run just triggered, from a list
     of table-row texts as Shoptet renders its Log — NEWEST FIRST.

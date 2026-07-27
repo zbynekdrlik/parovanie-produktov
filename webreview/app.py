@@ -4263,7 +4263,7 @@ def _export_age_s():
         return None
 
 
-def _codes_confirmed_in_export(rows, note_col=2, notes=None) -> set:
+def _codes_confirmed_in_export(rows, note_col=2) -> set:
     """The subset of `rows` (code;pairCode;internalNote) the eshop ALREADY carries
     exactly as we would write them — proven uploaded, so they need neither a
     re-upload nor a guess. This is what un-freezes the nightly push (#257): rows
@@ -4277,15 +4277,20 @@ def _codes_confirmed_in_export(rows, note_col=2, notes=None) -> set:
     bytes and silently never re-written. Refuse to credit anything from an export older
     than EXPORT_MAX_AGE_S and fall back to actually SENDING those rows (idempotent —
     the same URL is simply written again), mirroring the supplier write-back's
-    fail-closed stance on an unusable export."""
+    fail-closed stance on an unusable export.
+
+    The export is read HERE, never handed in: a `notes=` parameter (no caller ever
+    used one) would be the single entry point through which the natural future
+    optimisation „read the export once, pass it down" could credit rows from bytes
+    whose age was never checked — the guard below can only hold while the read and
+    the freshness check stay in the same place."""
     age = _export_age_s()
     if age is not None and age > EXPORT_MAX_AGE_S:
         log.warning("export je starý %.1f h (limit %.1f h) — nepotvrdzujem z neho "
                     "žiadne riadky, radšej ich pošlem znova",
                     age / 3600, EXPORT_MAX_AGE_S / 3600)
         return set()
-    if notes is None:
-        notes = _export_internal_notes()
+    notes = _export_internal_notes()
     if not notes:
         return set()
     return {r[0] for r in rows
