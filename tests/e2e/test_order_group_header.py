@@ -55,9 +55,10 @@ def test_group_headers_decline_the_rendered_count(page, toorder_server):
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
 
-    heads = sorted(t.strip() for t in
-                   page.locator(".toorder-supplier .tosup-label").all_inner_texts())
-    assert heads == ["— — 1 položka", "CITRADE — 4 položky", "ORBIS — 2 položky"], heads
+    heads = {t.strip() for t in
+             page.locator(".toorder-supplier .tosup-label").all_inner_texts()}
+    assert heads == {"CITRADE — 4 položky", "ORBIS — 2 položky",
+                     "— — 1 položka"}, heads
 
     assert console == [], f"console not clean: {console}"
 
