@@ -48,7 +48,11 @@ def _ok_import():
         with open(csv_path, encoding="utf-8-sig", newline="") as f:
             rd = list(_csv.reader(f, delimiter=";"))
         calls.append({"header": rd[0], "rows": rd[1:], "dry_run": dry_run})
-        return 0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""
+        # report back exactly as many rows as the CSV carried — the real script always
+        # does (Shoptet's 'Spracované: N' == the rows we submitted), and an rc-0 result
+        # whose count disagrees is now correctly refused as a chunk we may not credit
+        n = len(rd) - 1
+        return 0, f"VÝSLEDOK: spracované={n} upravené={n} zlyhania=0", ""
     return fake_run, calls
 
 
