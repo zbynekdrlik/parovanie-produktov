@@ -151,12 +151,11 @@ def log_entry_id(text):
     return int(m.group(1)) if m else None
 
 
-# The import script prints its own result after this marker. Everything BEFORE it is
-# progress chatter — including the echo of the baseline Log entry, whose own
-# 'Spracované: N' would otherwise be read as this run's result (#196/#257).
-RESULT_MARKER = "VÝSLEDOK:"
-# …matched TOLERANTLY when read back. `encoding=` on the Popen fixes only the PARENT's
-# decoding; the child encodes with its own locale, so on a non-UTF-8 box the marker
+# The import script prints its own result after the 'VÝSLEDOK:' marker. Everything
+# BEFORE it is progress chatter — including the echo of the baseline Log entry, whose
+# own 'Spracované: N' would otherwise be read as this run's result (#196/#257).
+# The marker is matched TOLERANTLY when read back: `encoding=` on the Popen fixes only
+# the PARENT's decoding; the child encodes with its own locale, so on a non-UTF-8 box the marker
 # arrives mojibake'd ('V?SLEDOK:', 'VÃSLEDOK:'). An exact-substring search then misses,
 # every slice is empty, processed=None and the WHOLE nightly push is booked failed on
 # one character. webreview/app.py::run_import pins PYTHONIOENCODING=utf-8 so this never
@@ -199,8 +198,9 @@ def parse_result_stdout(text):
 
 def result_stdout_slice(text):
     """The part of scripts/shoptet_import.py's stdout that describes THIS run —
-    everything from its last RESULT_MARKER on. ALWAYS parse this slice, never the raw
-    stdout: `parse_import_log` returns the FIRST count it finds, and the stdout opens
+    everything from its last 'VÝSLEDOK:' marker (`_RESULT_MARKER_RE`) on. ALWAYS parse
+    this slice, never the raw stdout: `parse_import_log` returns the FIRST count it
+    finds, and the stdout opens
     with '[import] baseline …: #12688 … Spracované: 4. Upravené: 1.' — the PREVIOUS
     entry. Reading that as the result is exactly the '#196' symptom (processed=1/
     failed=1 while 260 rows were really processed) and it silently defeats the
