@@ -127,14 +127,17 @@ def unguarded_export_readers(source: str) -> tuple:
     — the playbook's rule for drift guards: „Vždy si guard otestuj tým, že mu podhodíš
     každý tvar"."""
     tree = ast.parse(source)
+    consts = _module_level_str_consts(tree)
     offenders, seen = [], 0
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "open"):
             continue
         kw = {k.arg: k.value for k in node.keywords if k.arg}
-        enc = kw.get("encoding")
-        if not (isinstance(enc, ast.Constant) and enc.value == "cp1250"):
+        path = node.args[0] if node.args else kw.get("file")
+        reads_export = (_is_cp1250(kw.get("encoding"), consts)
+                        or (path is not None and _names_the_export_path(path)))
+        if not reads_export or _is_binary(node):
             continue
         seen += 1
         nl = kw.get("newline")
