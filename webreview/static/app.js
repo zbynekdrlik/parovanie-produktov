@@ -807,6 +807,9 @@ async function switchTab(tab) {
 // a map object about to be thrown away — a rollback into thin air.
 async function loadOrders() {
   const _wipe = () => { for (const k of Object.keys(_flagWrites)) delete _flagWrites[k]; };
+  // A reload re-reads every flag from the server, so nothing on screen is an unsaved
+  // intent any more — there is no lost work left for the banner (#234) to be about.
+  clearToOrderFails();
   try {
     const [orders, ordered, waiting, instock, unavail, comments] = await Promise.all(
       ['/api/orders', '/api/ordered', '/api/waiting', '/api/instock', '/api/unavailable',
@@ -841,11 +844,52 @@ const _toOrderErrSeen = Object.create(null);
 // `value` never reaches the manager — it is dedup-only. Without it a CORRECTION is
 // swallowed: he fixes a rejected pair URL and re-saves within the window (same what /
 // where / 'chyba 500') and gets no feedback at all, which is the silence being fixed.
+// #234 — every failure the manager has not dealt with yet, oldest first. The list is what
+// the banner renders; it is emptied by the things that mean „there is nothing left to
+// redo": a write that SUCCEEDS, a reload, or his own „×".
+let _toOrderFails = [];
+
+// The banner lives in the TOP BAR (`#toFails` in index.html), never inside `#list`. Every
+// rollback repaints the list BEFORE it reports, so a banner in there would be wiped by the
+// NEXT failure and he would finish an outage holding only the last row's name. It is also
+// why nothing here goes through captureOpenEditors/restoreOpenEditors (#208/#233).
+function renderToOrderFails() {
+  const box = document.getElementById('toFails');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!_toOrderFails.length) { box.hidden = true; return; }
+  const head = el('div', 'tofail-head');
+  // the count first: during an outage he wants to know HOW MANY rows he has to redo
+  // without counting lines, and „položiek" is declined like every other tally on this tab
+  head.textContent = '⚠️ Nepodarilo sa uložiť ' + _toOrderFails.length + ' '
+    + itemsWord(_toOrderFails.length) + ' — skús to prosím znova.';
+  const x = el('button', 'tofail-close', '×');
+  x.title = 'Zavrieť';
+  x.onclick = () => { _toOrderFails = []; renderToOrderFails(); };
+  head.appendChild(x);
+  box.appendChild(head);
+  for (const f of _toOrderFails) {
+    // free text (a supplier name in `where`, the server's own reason in `detail`) —
+    // textContent, never innerHTML
+    const line = el('div', 'tofail');
+    line.textContent = f.what + (f.where ? ' — ' + f.where : '')
+      + (f.detail ? ' (' + f.detail + ')' : '');
+    box.appendChild(line);
+  }
+  box.hidden = false;
+}
+
+// Nothing is left to redo — drop the report rather than leave a stale warning over a tab
+// that is saving fine again (a warning he learns to ignore is one he stops reading).
+function clearToOrderFails() {
+  if (!_toOrderFails.length) return;
+  _toOrderFails = [];
+  renderToOrderFails();
+}
+
 function toOrderSaveFailed(what, detail, where, value) {
-  const msg = '⚠️ ' + what + ' sa nepodarilo uložiť' + (where ? ' — ' + where : '')
-    + (detail ? ' (' + detail + ')' : '') + '. Skús to prosím znova.';
-  // alert() blocks the thread, so re-clicking the SAME refused write during one outage
-  // must still yield one modal — dedup per WRITE, within a few seconds.
+  // The same refused write re-clicked inside the window is one event, not two — dedup per
+  // WRITE, as it was when this was a modal.
   const now = Date.now();
   for (const k of Object.keys(_toOrderErrSeen)) {
     if (now - _toOrderErrSeen[k] >= TO_ERR_DEDUP_MS) delete _toOrderErrSeen[k];
@@ -857,7 +901,8 @@ function toOrderSaveFailed(what, detail, where, value) {
     .join('\u0000');
   if (_toOrderErrSeen[dedupKey] !== undefined) return;
   _toOrderErrSeen[dedupKey] = now;
-  alert(msg);
+  _toOrderFails.push({ what, where: where || '', detail: detail || '', at: now });
+  renderToOrderFails();
 }
 
 // „obj. 20260910, kód C1" — the per-line key (orderCode|itemCode) in the manager's terms.
@@ -878,7 +923,9 @@ async function postToOrder(path, payload) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (r.ok) return '';
+    // A write that LANDS means the outage is over and the banner is about work that no
+    // longer needs redoing — this is the one place every to-order write passes through.
+    if (r.ok) { clearToOrderFails(); return ''; }
     // surface the endpoint's own reason — 'comment too long' / 'invalid supplier' /
     // 'unauthorized' are all deterministic, so a bare status code would have the manager
     // retrying a write that can never succeed
@@ -1341,8 +1388,12 @@ function leaveEditorsWarning(typed, opened) {
 async function openSplitSizes(o) {
   const p = (PRODUCTS || []).find(x => x.key === o.reviewKey);
   if (!p) {
-    alert('⚠️ Tento produkt je rozdelený na veľkosti, ale nenašiel sa v revízii — '
-          + 'otvor tab „Kontrola párovania" a oprav odkaz pri konkrétnej veľkosti.');
+    // #234 — through the banner like every other refusal on this tab: a modal here
+    // freezes the tab just as hard, and this one lands mid-click while he is working
+    // down a group.
+    toOrderSaveFailed('Odkaz podľa veľkostí', 'produkt sa nenašiel v revízii — otvor tab '
+                      + '„Kontrola párovania" a oprav odkaz pri konkrétnej veľkosti',
+                      toOrderPartLabel('kód', o.itemCode), o.reviewKey);
     return;
   }
   // Leaving the tab rebuilds `#list` from scratch, so every open inline editor on every
@@ -1376,16 +1427,21 @@ async function savePairUrl(o, url) {
     return false;
   }
   if (url && !/^https?:\/\//.test(url)) {
-    // #214 — the guard used to drop a typo'd URL on the floor with no explanation
-    alert('⚠️ Zadaj platnú adresu začínajúcu http:// alebo https:// — takto sa uložiť nedá.');
+    // #214 — the guard used to drop a typo'd URL on the floor with no explanation.
+    // #234 — and it said so through a modal, which is the same interruption as a refused
+    // write; a client-side refusal is a refusal and belongs in the same banner.
+    toOrderSaveFailed('Párovacia URL', 'zadaj adresu začínajúcu http:// alebo https://',
+                      toOrderPartLabel('kód', o.itemCode), url);
     return false;
   }
   if (o.reviewKey) {
     if (!url) {
       // clearing a reviewed pairing is a review-tab decision ('↩ Vrátiť'); an empty save
       // here would look like it un-paired the product while nothing actually changed
-      alert('⚠️ Tento produkt je napárovaný v revízii — prázdnou hodnotou sa párovanie '
-            + 'nezruší. Zadaj opravenú adresu, alebo zruš párovanie v tabe „Kontrola párovania".');
+      toOrderSaveFailed('Párovacia URL', 'produkt je napárovaný v revízii — prázdnou '
+                        + 'hodnotou sa párovanie nezruší; zadaj opravenú adresu, alebo '
+                        + 'zruš párovanie v tabe „Kontrola párovania"',
+                        toOrderPartLabel('kód', o.itemCode), url);
       return false;
     }
     const derr = await postToOrder('/api/order-decision-url', { key: o.reviewKey, url });
@@ -4934,6 +4990,11 @@ function render() {
   const dls = document.querySelector('.downloads'); if (dls) dls.style.display = (toorder || plain) ? 'none' : '';
   const filt = document.getElementById('filters'); if (filt) filt.style.display = plain ? 'none' : '';
   const tbar = document.getElementById('toToolbar'); if (tbar) tbar.hidden = !toorder;   // #208
+  // #234 — the top bar is SHARED with the review tab (the `setEmptyText` lesson), so a
+  // warning about order lines must not follow him there. It is only ever shown on this
+  // tab, and only while something on it still needs redoing.
+  const fbox = document.getElementById('toFails');
+  if (fbox) fbox.hidden = !toorder || !_toOrderFails.length;
   const secNd = document.getElementById('tab-nedostupne'); if (secNd) secNd.hidden = !nedostupne;
   const secVy = document.getElementById('tab-vystavy'); if (secVy) secVy.hidden = !vystavy;
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;
