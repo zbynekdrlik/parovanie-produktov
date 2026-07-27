@@ -122,7 +122,7 @@ def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
                      # is NOT degraded. The alarm has to be quiet here or it is worthless.
                      "source_degraded": False, "dispatched_orders": 3,
                      "dispatched_without_package": 0, "missing_package": 0,
-                     "days_since_last_package": 3}
+                     "days_since_last_package": 3, "dispatched_status_unknown": False}
     # exactly ONE customer mail, template #1. run_posta_uncollected no longer
     # passes an explicit bcc — _send_mail_html itself defaults it to MAIL_BCC
     # (tested directly below); here it's stubbed, so bcc arrives as None.
@@ -235,7 +235,10 @@ def test_posta_run_flags_a_dead_shipment_source(iso, monkeypatch):
     assert stats["days_since_last_package"] == 26
     # the number that used to be the ONLY visible signal — and it looks like a calm day
     assert stats["checked"] == 1 and stats["uncollected"] == 0
-    # persisted, so the tab renders the alarm from the store and not only from a live run
+    # Also persisted into the run's own store. NOTE what this does and does not prove: the TAB
+    # renders from `last_result` in automations.json (what the runner stores from this return
+    # value), not from here — this copy is the diagnostic record that survives in the store next
+    # to the shipment list the manager is looking at.
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert st["stats"]["source_degraded"] is True
 

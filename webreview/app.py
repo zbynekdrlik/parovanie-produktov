@@ -5599,15 +5599,27 @@ def run_posta_uncollected() -> dict:
         term_cache = dict(st0.get("terminal") or {}) if isinstance(
             st0.get("terminal"), dict) else {}
     csv_bytes = _orders_csv_cached()
-    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes)
-    uncollected, invalid, errors = [], [], []
-    sent = failed = api_skipped = 0
+    # ONE `today` for the whole run, passed to both readers of the export. They are documented as
+    # counting the same set of orders, so they must not be able to straddle midnight between two
+    # calls that each defaulted to date.today() on their own.
     today = datetime.now().date()
     today_iso = today.isoformat()
+    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes, today)
+    uncollected, invalid, errors = [], [], []
+    sent = failed = api_skipped = 0
     # Is the SOURCE still alive (#282)? `checked` above only ever counts orders that DID carry a
     # package number, so an export that stops carrying them reads as a calm day. This is the one
     # stat that can tell those two apart. Pure counting over the same export — no send, no API.
     coverage = posta_uncollected.source_coverage(csv_bytes, today)
+    if coverage["dispatched_status_unknown"]:
+        # The alarm's own blind spot, logged rather than assumed away: every count above hangs off
+        # one hard-coded status string. Orders in the window of which NOT ONE is recognised as
+        # dispatched means that vocabulary moved — and this alarm would then sit green forever,
+        # exactly like the automation it was built to watch.
+        log.error("posta: v okne je %d objednávok, ale ANI JEDNA nemá stav Vybavená — stavy sa v "
+                  "Shoptete zrejme premenovali; kontrola pokrytia podacích čísel je odteraz "
+                  "slepá, kým sa nový názov stavu nedoplní do DISPATCHED_STATUS",
+                  coverage["missing_package"] + coverage["dispatched_orders"])
     if coverage["degraded"]:
         log.error("posta: ZDROJ ZÁSIELOK JE DEGRADOVANÝ — %d z %d odoslaných objednávok v okne "
                   "nemá podacie číslo, posledné pribudlo pred %s dňami; automatizácia z nich "
@@ -5755,7 +5767,8 @@ def run_posta_uncollected() -> dict:
              "dispatched_orders": coverage["dispatched_orders"],
              "dispatched_without_package": coverage["dispatched_without_package"],
              "missing_package": coverage["missing_package"],
-             "days_since_last_package": coverage["days_since_last_package"]}
+             "days_since_last_package": coverage["days_since_last_package"],
+             "dispatched_status_unknown": coverage["dispatched_status_unknown"]}
     with _lock:
         # Re-read under the lock and update that map, rather than writing a brand-new dict:
         # `esc`/`term_cache` were read before minutes of Pošta SK round-trips, so this both

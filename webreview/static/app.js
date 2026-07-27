@@ -559,12 +559,18 @@ function navCount(key) {
 // straight from AUTOMATIONS (prefetched at init(), see below) so the badge shows on ANY page —
 // the manager must not have to open the failing automation's own tab to find out (that silence
 // is exactly why the #156 timeout went unnoticed until a human spotted it by chance).
+// The sidebar tab key is not always the automation key: the Pošta tab is the legacy 'posta'
+// while its Automation.key is 'posta_uncollected' (same pairing app.py notes at AUTOMATION_TABS).
+// `autoByKey('posta')` therefore matched NOTHING, so the ⚠ badge could never light for that
+// automation — not for a degraded run, and not for the failed run #153 built it for either.
+const NAV_AUTOMATION_KEY = { posta: 'posta_uncollected' };
+
 // #282 — a DEGRADED run counts as a failure here too. The Pošta automation's source dried up on
 // 2.7. and every run afterwards ended `ok`, so this badge stayed dark and the tab kept reporting
 // „0 nevyzdvihnutých" while a real parcel ran out its pickup deadline. A run that cannot see its
 // own input has failed, whether or not it threw.
 function navError(key) {
-  const a = autoByKey(key);
+  const a = autoByKey(NAV_AUTOMATION_KEY[key] || key);
   return !!(a && (a.last_status === 'error' || (a.last_result || {}).source_degraded));
 }
 
@@ -588,7 +594,7 @@ function _navButton(key, defaultLbl) {
   // table complete, this keeps the fallback harmless if one ever slips through.
   bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key] || ''}</svg>`
     + `<span class="tlabel">${escapeHtml(lbl)}</span>`
-    + (err ? '<span class="navwarn" title="posledný beh zlyhal">⚠</span>' : '')
+    + (err ? '<span class="navwarn" title="posledný beh zlyhal alebo je degradovaný">⚠</span>' : '')
     + (n > 0 ? `<span class="navcount">${n}</span>` : '');
   bt.onclick = () => switchTab(key);
   const row = el('div', 'navrow');
@@ -3494,12 +3500,17 @@ function bccMissingWarning() {
 // see HOW blind it is, and what to go and check.
 function sourceDegradedWarning(lr) {
   const gap = lr.days_since_last_package;
+  // „pred" governs the instrumental in Slovak — „pred 26 dňami", never „pred 26 dní". dniLabel()
+  // gives the nominative/genitive forms used by the bare-count sites ("5 dní v stave"), so it is
+  // deliberately NOT reused here. The wording also says what the number actually measures: the
+  // age of the newest ORDER carrying a number, which is not quite „when a number last arrived".
   const since = (gap === null || gap === undefined)
-    ? 'a v celom 30-dňovom okne nie je ani jedno'
-    : (gap === 0 ? '' : `posledné pribudlo pred ${gap} ${dniLabel(gap)}`);
+    ? 'a v celom 30-dňovom okne nie je ani jedna'
+    : (gap === 0 ? '' : `najnovšia objednávka s číslom je spred ${Number(gap)} `
+        + `${gap === 1 ? 'dňa' : 'dní'}`);
   return el('div', 'autoerr',
-    `⛔ Automatizácia nevidí takmer žiadne zásielky — ${lr.dispatched_without_package ?? 0} `
-    + `z ${lr.dispatched_orders ?? 0} odoslaných objednávok nemá podacie číslo`
+    `⛔ Automatizácia nevidí takmer žiadne zásielky — ${Number(lr.dispatched_without_package ?? 0)} `
+    + `z ${Number(lr.dispatched_orders ?? 0)} odoslaných objednávok nemá podacie číslo`
     + (since ? ` (${since})` : '')
     + '. Kým sa čísla nezačnú zapisovať, nikoho neupozorní na nevyzdvihnutú zásielku — '
     + 'skontroluj, či sa podacie čísla ešte dostávajú do Shoptetu.');

@@ -190,3 +190,39 @@ def test_a_fail_closed_automation_state_shows_the_repair_message_not_a_healthy_t
     warn = page.locator('[data-testid="sched-warn"]')
     warn.wait_for(state="visible")
     assert "NEMAŽ" in warn.inner_text(), warn.inner_text()
+
+
+# ── #282 — a dead shipment source must be impossible to miss ─────────────────────
+def test_degraded_source_run_is_not_shown_as_a_healthy_ok_run(page, posta_degraded_server):
+    """The failure this exists for: for five days the card said „✅ OK" and „0 nevyzdvihnutých"
+    while the automation could no longer see a single shipment, and a real parcel ran out its
+    pickup deadline. The run did not crash, so `last_status` is legitimately 'ok' — what failed is
+    the input, and THAT is what the manager has to see."""
+    console = _console(page)
+    _open_tab(page, posta_degraded_server)
+
+    meta = page.locator(".autometa").inner_text()
+    assert "DEGRADOVANÝ" in meta                     # …not the „✅ OK" that hid the outage
+    assert "✅ OK" not in meta
+
+    # the banner names the real numbers and what to go and check — no adjectives
+    banner = page.locator(".autoerr").first.inner_text()
+    assert "87 z 91" in banner
+    assert "podacie číslo" in banner
+    assert "spred 26 dní" in banner                  # „pred" + instrumental would be ungrammatical
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_degraded_source_lights_the_nav_badge_from_any_page(page, posta_degraded_server):
+    """Same reasoning as the #153 badge: the manager must learn about it WITHOUT opening the
+    automation's own tab. A run that cannot see its own input has failed, whether or not it threw
+    — and this automation has no other push channel at all (#285)."""
+    console = _console(page)
+    page.goto(posta_degraded_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    posta_btn = page.get_by_role("button", name="Nevyzdvihnuté zásielky")
+    assert posta_btn.locator(".navwarn").count() == 1
+
+    assert console == [], f"console not clean: {console}"

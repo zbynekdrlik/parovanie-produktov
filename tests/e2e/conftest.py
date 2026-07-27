@@ -65,7 +65,8 @@ def _admin_session_cookie(base: str) -> str:
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
-                    "automations_server", "imgfail_server", "imgflood_server", "dev_server",
+                    "automations_server", "posta_degraded_server", "imgfail_server",
+                    "imgflood_server", "dev_server",
                     "nedostupne_server", "vystavy_server", "toorder_server",
                     "toorder_wide_server")
 
@@ -566,6 +567,63 @@ def automations_server(tmp_path_factory):
         # Same reasoning for MAIL_BCC: the runs report `bcc_missing` in their stats and both
         # customer-automation tabs render a ⚠ line from it, so an inherited value would make the
         # tab look different on a dev box (has data/.mail_env) than on CI (does not).
+        "MAIL_BCC": "owner@example.com",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def posta_degraded_server(tmp_path_factory):
+    """Isolated webreview instance whose LAST Pošta run ended degraded (#282).
+
+    The alarm's whole point is what the manager SEES, so it needs its own browser coverage: the
+    real failure ran five days of green „✅ OK" cards while the source was dead. Seeded through
+    `automations.json` → `last_result`, which is what the card actually renders from; the run
+    itself is never triggered here (no network, no SMTP, nothing to send)."""
+    out = tmp_path_factory.mktemp("wr_posta_degraded_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "posta_uncollected.json").write_text(json.dumps({
+        "escalation": {}, "last_check": "2026-07-27T09:00:05+02:00",
+        "uncollected": [], "invalid": [], "errors": [],
+        "stats": {"checked": 4, "uncollected": 0, "invalid": 0, "errors": 0,
+                  "emails_sent": 0, "emails_failed": 0, "source_degraded": True},
+    }, ensure_ascii=False), encoding="utf-8")
+    # the live shape of the outage: a run that ended `ok` having seen almost nothing
+    (out / "automations.json").write_text(json.dumps({
+        "posta_uncollected": {
+            "last_run": "2026-07-27T09:00:05+02:00",
+            "last_status": "ok",
+            "last_result": {"checked": 4, "uncollected": 0, "invalid": 0, "errors": 0,
+                            "emails_sent": 0, "emails_failed": 0, "api_skipped": 4,
+                            "bcc_missing": False, "source_degraded": True,
+                            "dispatched_orders": 91, "dispatched_without_package": 87,
+                            "missing_package": 138, "days_since_last_package": 26,
+                            "dispatched_status_unknown": False},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+        "2026200;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),
+        "MAIL_HOST": "",
         "MAIL_BCC": "owner@example.com",
     }
     proc = subprocess.Popen(

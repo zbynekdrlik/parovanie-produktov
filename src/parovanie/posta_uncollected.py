@@ -80,7 +80,8 @@ DISPATCHED_STATUS = "vybavená"
 #     stricter floor would alarm on normal trading noise.
 #   staleness — the longest gap between two days bringing a new package number in 1.5.–1.7. was
 #     3 days (54 such days, gaps of 1/2/3). Tonight: 26 days. A 7-day limit is over twice the
-#     worst healthy gap, so a weekend or a holiday cannot trip it.
+#     worst healthy gap. It is measured from the newest DISPATCHED order, never from today, so a
+#     week when nothing shipped at all cannot trip it — see source_coverage's docstring.
 #
 # Against the real outage (source died 1.7.) staleness would have gone red on 8.7. and coverage
 # around 10.7. — 17-19 days before the deadline of the shipment that was actually lost.
@@ -183,9 +184,18 @@ def source_coverage(orders_csv, today: date | None = None) -> dict:
     """Is the shipment SOURCE still alive? → counts + a `degraded` verdict (#282).
 
     Everything here is counted over the same eligible orders the automation chases
-    (_eligible_orders). `degraded` is True when the window holds dispatched orders AND either
-    fewer than MIN_PACKAGE_COVERAGE of them carry a package number, or no order has brought a new
-    one for MAX_PACKAGE_GAP_DAYS (see the calibration above each constant).
+    (_eligible_orders). `degraded` is True when the window holds enough dispatched orders AND
+    either fewer than MIN_PACKAGE_COVERAGE of them carry a package number, or we have gone on
+    DISPATCHING for MAX_PACKAGE_GAP_DAYS since the last number arrived (calibration: see each
+    constant).
+
+    Note what the staleness rule measures: the gap between the newest DISPATCHED order and the
+    newest order carrying a number — NOT the gap to today. Measured against today it would trip on
+    any quiet stretch (shop holiday, a slow week): orders dispatched earlier stay in the 30-day
+    window, nothing new ships, and a perfectly healthy source reads as dead. Against the newest
+    dispatched order it says the thing we actually mean — „we keep sending parcels out and no
+    number has come back" — which is exactly the outage, and stays silent when nothing shipped at
+    all. A window with NO numbers whatsoever needs no staleness rule: 0 % coverage already trips.
 
     Three things it deliberately does NOT do. It never degrades on a window holding fewer than
     MIN_DISPATCHED_FOR_ALARM dispatched orders — too little evidence to tell a dead source from a
@@ -197,14 +207,16 @@ def source_coverage(orders_csv, today: date | None = None) -> dict:
     dispatched = [(od, pkg) for r, od, pkg in eligible
                   if (r.get("statusName") or "").strip().lower() == DISPATCHED_STATUS]
     with_pkg = sum(1 for _, pkg in dispatched if pkg)
-    # Only orders dated TODAY OR EARLIER count as „a number arrived". A future-dated row (a
-    # mistyped order date, a clock jump on the export side) would otherwise make `gap` NEGATIVE,
-    # which both renders as nonsense („pred -3 dňami") and — far worse — reads as fresher than
-    # any threshold, silently switching the staleness rule off for as long as that row stays in
-    # the window. Same fail-safe the terminal cache uses for its `at` stamp: a date we cannot
-    # believe degrades to „no evidence of freshness", never to „everything is fine".
+    # Only orders dated TODAY OR EARLIER count, for the numbers AND for the dispatch reference. A
+    # future-dated row (a mistyped order date, a clock jump on the export side) would otherwise
+    # make a gap NEGATIVE — which renders as nonsense („pred -3 dňami") and, far worse, reads as
+    # fresher than any threshold, silently switching the staleness rule off for as long as that
+    # row stays in the window. Same fail-safe the terminal cache uses for its `at` stamp: a date
+    # we cannot believe degrades to „no evidence", never to „everything is fine".
     pkg_dates = [od for _, od, pkg in eligible if pkg and od <= today]
-    gap = (today - max(pkg_dates)).days if pkg_dates else None
+    last_pkg = max(pkg_dates) if pkg_dates else None
+    disp_dates = [od for od, _ in dispatched if od <= today]
+    last_dispatch = max(disp_dates) if disp_dates else None
     out = {
         "dispatched_orders": len(dispatched),
         "dispatched_with_package": with_pkg,
@@ -212,12 +224,21 @@ def source_coverage(orders_csv, today: date | None = None) -> dict:
         # every eligible order with no number, dispatched or not — reported for context, NOT used
         # as the rule (the not-yet-shipped ones are a normal, permanent part of it)
         "missing_package": sum(1 for _, _, pkg in eligible if not pkg),
-        "days_since_last_package": gap,
+        # for the human reading the banner: „when did we last see a number at all". The RULE uses
+        # the dispatch-relative gap below, which is a different (and fairer) question.
+        "days_since_last_package": (today - last_pkg).days if last_pkg else None,
+        # The alarm's own blind spot, surfaced rather than hidden: every count here hangs off one
+        # hard-coded Shoptet status string. If that vocabulary ever changes, `dispatched_orders`
+        # silently falls to 0 and this alarm — built against silent death — would itself go
+        # quietly green forever. Eligible orders but not one of them dispatched is the signature.
+        "dispatched_status_unknown": (len(eligible) >= MIN_DISPATCHED_FOR_ALARM
+                                      and not dispatched),
         "degraded": False,
     }
     if len(dispatched) >= MIN_DISPATCHED_FOR_ALARM:
         thin = with_pkg / len(dispatched) < MIN_PACKAGE_COVERAGE
-        stale = gap is None or gap >= MAX_PACKAGE_GAP_DAYS
+        stale = (last_pkg is not None and last_dispatch is not None
+                 and (last_dispatch - last_pkg).days >= MAX_PACKAGE_GAP_DAYS)
         out["degraded"] = thin or stale
     return out
 
@@ -264,13 +285,15 @@ def classify_tracking(api_json, today: date | None = None) -> dict:
         # wrong-footed by whichever one the API answers with. Empty here is not harmless: it
         # silently downgrades „vyzdvihnite si ju do <dátum>" to a vague „čo najskôr", which is
         # what the customer of the shipment behind #283 was told instead of their real deadline.
-        if p.get("retainedTill"):
-            out["retained_till"] = str(p["retainedTill"])
-        else:
-            for e in events:            # n8n: first event carrying retainedTill
-                if e.get("retainedTill"):
-                    out["retained_till"] = str(e["retainedTill"])
-                    break
+        raw_till = p.get("retainedTill") or next(
+            (e["retainedTill"] for e in events if e.get("retainedTill")), "")
+        if raw_till:
+            # Normalised to a bare YYYY-MM-DD: we have one live sample of the result-level shape,
+            # so a timestamped value („2026-08-03T00:00:00") is entirely possible and would
+            # otherwise land verbatim in a customer's e-mail. Anything unparsable is kept as-is
+            # rather than dropped — a display string we do not recognise still beats none.
+            d = _parse_date(raw_till)
+            out["retained_till"] = d.isoformat() if d else str(raw_till)
     return out
 
 
@@ -348,10 +371,21 @@ def should_send(count: int, last_sent: date | None, today: date | None = None) -
 
 
 def build_email(count: int, name: str, track_num: str, office_name: str,
-                office_addr: str, retained_till: str) -> tuple[str, str]:
+                office_addr: str, retained_till: str,
+                today: date | None = None) -> tuple[str, str]:
     """(subject, html_body) for customer e-mail #count — the verbatim n8n
     templates. Free-text fields (customer name, office) are HTML-escaped here
-    (the one hardening added over n8n)."""
+    (the one hardening added over n8n).
+
+    A retention date that has already PASSED is treated as no date at all. Until #283 the field
+    was never populated at all, so every mail used the dateless wording; now that it is read
+    correctly, a parcel first seen late in its retention (or chased through the day 0 → +3 → +3 →
+    +7 cadence) could otherwise be told „ak si ju nevyzdvihnete do <a date last week>". The
+    dateless „čo najskôr" wording is the honest thing to send once the deadline is behind us."""
+    if retained_till:
+        d = _parse_date(retained_till)
+        if d is not None and d < (today or date.today()):
+            retained_till = ""
     link = TRACKING_LINK.format(q=track_num)
     name_h = escape(name)
     num_h = f"<strong>{escape(track_num)}</strong>"
@@ -447,5 +481,5 @@ def evaluate_shipment(shipment: dict, tracking_json, state_value,
     if send:
         r["email_subject"], r["email_body"] = build_email(
             new_count, r["name"], r["packageNumber"],
-            cls["office_name"], cls["office_addr"], cls["retained_till"])
+            cls["office_name"], cls["office_addr"], cls["retained_till"], today)
     return r
