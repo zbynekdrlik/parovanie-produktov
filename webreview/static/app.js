@@ -559,9 +559,19 @@ function navCount(key) {
 // straight from AUTOMATIONS (prefetched at init(), see below) so the badge shows on ANY page —
 // the manager must not have to open the failing automation's own tab to find out (that silence
 // is exactly why the #156 timeout went unnoticed until a human spotted it by chance).
+// The sidebar tab key is not always the automation key: the Pošta tab is the legacy 'posta'
+// while its Automation.key is 'posta_uncollected' (same pairing app.py notes at AUTOMATION_TABS).
+// `autoByKey('posta')` therefore matched NOTHING, so the ⚠ badge could never light for that
+// automation — not for a degraded run, and not for the failed run #153 built it for either.
+const NAV_AUTOMATION_KEY = { posta: 'posta_uncollected' };
+
+// #282 — a DEGRADED run counts as a failure here too. The Pošta automation's source dried up on
+// 2.7. and every run afterwards ended `ok`, so this badge stayed dark and the tab kept reporting
+// „0 nevyzdvihnutých" while a real parcel ran out its pickup deadline. A run that cannot see its
+// own input has failed, whether or not it threw.
 function navError(key) {
-  const a = autoByKey(key);
-  return !!(a && a.last_status === 'error');
+  const a = autoByKey(NAV_AUTOMATION_KEY[key] || key);
+  return !!(a && (a.last_status === 'error' || (a.last_result || {}).source_degraded));
 }
 
 // `defaultLbl` = the built-in name; an admin-set override in UI_LABELS (#173)
@@ -584,7 +594,7 @@ function _navButton(key, defaultLbl) {
   // table complete, this keeps the fallback harmless if one ever slips through.
   bt.innerHTML = `<svg viewBox="0 0 24 24" aria-hidden="true">${NAV_ICONS[key] || ''}</svg>`
     + `<span class="tlabel">${escapeHtml(lbl)}</span>`
-    + (err ? '<span class="navwarn" title="posledný beh zlyhal">⚠</span>' : '')
+    + (err ? '<span class="navwarn" title="posledný beh zlyhal alebo je degradovaný">⚠</span>' : '')
     + (n > 0 ? `<span class="navcount">${n}</span>` : '');
   bt.onclick = () => switchTab(key);
   const row = el('div', 'navrow');
@@ -3482,6 +3492,30 @@ function bccMissingWarning() {
     + 'žiadne e-maily zákazníkom, kým sa nedoplní konfigurácia.');
 }
 
+// #282 — one step upstream of bcc_missing: the automation could still send, but it has nothing to
+// send ABOUT. Its only source of shipments is the export's „podacie číslo" column; that column
+// stopped being filled on 2.7. and every run since ended a healthy-looking `ok` with a shrinking
+// „Skontrolovaných zásielok" (21 → 13 → 9 → 6 → 4), the tab reading „0 nevyzdvihnutých" while a
+// parcel sat at the post office until its deadline. Numbers, not adjectives: the manager has to
+// see HOW blind it is, and what to go and check.
+function sourceDegradedWarning(lr) {
+  const gap = lr.days_since_last_package;
+  // „pred" governs the instrumental in Slovak — „pred 26 dňami", never „pred 26 dní". dniLabel()
+  // gives the nominative/genitive forms used by the bare-count sites ("5 dní v stave"), so it is
+  // deliberately NOT reused here. The wording also says what the number actually measures: the
+  // age of the newest ORDER carrying a number, which is not quite „when a number last arrived".
+  const since = (gap === null || gap === undefined)
+    ? 'a v celom 30-dňovom okne nie je ani jedna'
+    : (gap === 0 ? '' : `najnovšia objednávka s číslom je spred ${Number(gap)} `
+        + `${gap === 1 ? 'dňa' : 'dní'}`);
+  return el('div', 'autoerr',
+    `⛔ Automatizácia nevidí takmer žiadne zásielky — ${Number(lr.dispatched_without_package ?? 0)} `
+    + `z ${Number(lr.dispatched_orders ?? 0)} odoslaných objednávok nemá podacie číslo`
+    + (since ? ` (${since})` : '')
+    + '. Kým sa čísla nezačnú zapisovať, nikoho neupozorní na nevyzdvihnutú zásielku — '
+    + 'skontroluj, či sa podacie čísla ešte dostávajú do Shoptetu.');
+}
+
 // #225 — the evidence of who was already mailed is unreadable, so the automation refuses to send
 // anything. Without this banner the tab would render as a clean, empty day: the manager would see
 // „0 objednávok" and never learn the automation had stopped (same class of silent death the
@@ -3598,10 +3632,16 @@ function renderPosta() {
     st.appendChild(head);
     if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
+    const lr = a.last_result || {};
+    // #282 — a run whose source went dry must NOT read „✅ OK". It did not crash, so `last_status`
+    // is legitimately 'ok'; what failed is the input, and that is exactly the state five days of
+    // green runs hid while `checked` slid 21 → 4.
+    const degraded = !!lr.source_degraded;
     const meta = el('div', 'autometa');
     const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
     bits.push('Posledný beh: ' + (a.last_run
-      ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+      ? `${fmtDt(a.last_run)} — ${a.last_status !== 'ok' ? '❌ CHYBA'
+          : (degraded ? '⚠️ DEGRADOVANÝ' : '✅ OK')}`
       : 'zatiaľ nikdy'));
     if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
     meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
@@ -3609,7 +3649,6 @@ function renderPosta() {
     if (a.last_status === 'error' && a.last_error) {
       st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
     }
-    const lr = a.last_result || {};
     if (a.last_run && a.last_status === 'ok') {
       st.appendChild(el('div', 'muted',
         `Skontrolovaných zásielok: ${lr.checked ?? 0} · nevyzdvihnuté: ${lr.uncollected ?? 0}`
@@ -3618,6 +3657,7 @@ function renderPosta() {
         + (lr.api_skipped ? ` · už doručené/vrátené (nekontrolujú sa): ${lr.api_skipped}` : '')
         + (lr.errors ? ` · chyby pri kontrole: ${lr.errors}` : '')));
     }
+    if (a.last_run && degraded) st.appendChild(sourceDegradedWarning(lr));
     if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
   }
   wrap.appendChild(st);

@@ -5599,11 +5599,38 @@ def run_posta_uncollected() -> dict:
         term_cache = dict(st0.get("terminal") or {}) if isinstance(
             st0.get("terminal"), dict) else {}
     csv_bytes = _orders_csv_cached()
-    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes)
-    uncollected, invalid, errors = [], [], []
-    sent = failed = api_skipped = 0
+    # ONE `today` for the whole run, passed to both readers of the export. They are documented as
+    # counting the same set of orders, so they must not be able to straddle midnight between two
+    # calls that each defaulted to date.today() on their own.
     today = datetime.now().date()
     today_iso = today.isoformat()
+    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes, today)
+    uncollected, invalid, errors = [], [], []
+    sent = failed = api_skipped = 0
+    # Is the SOURCE still alive (#282)? `checked` above only ever counts orders that DID carry a
+    # package number, so an export that stops carrying them reads as a calm day. This is the one
+    # stat that can tell those two apart. Pure counting over the same export — no send, no API.
+    coverage = posta_uncollected.source_coverage(csv_bytes, today)
+    if coverage["dispatched_status_unknown"]:
+        # The alarm's own blind spot, logged rather than assumed away: every count above hangs off
+        # one hard-coded status string. Orders in the window of which NOT ONE is recognised as
+        # dispatched means that vocabulary moved — and this alarm would then sit green forever,
+        # exactly like the automation it was built to watch.
+        # `eligible_orders` and not `missing_package + dispatched_orders`: this branch fires only
+        # when dispatched_orders is 0, so that sum degenerates to „orders WITHOUT a number", and a
+        # window whose orders all carry one reported „v okne je 0 objednávok, ale ANI JEDNA…" —
+        # self-contradictory, and wrong about the only number the reader can act on.
+        log.error("posta: v okne je %d objednávok, ale ANI JEDNA nemá stav Vybavená — stavy sa v "
+                  "Shoptete zrejme premenovali; kontrola pokrytia podacích čísel je odteraz "
+                  "slepá, kým sa nový názov stavu nedoplní do DISPATCHED_STATUS",
+                  coverage["eligible_orders"])
+    if coverage["degraded"]:
+        log.error("posta: ZDROJ ZÁSIELOK JE DEGRADOVANÝ — %d z %d odoslaných objednávok v okne "
+                  "nemá podacie číslo, posledné pribudlo pred %s dňami; automatizácia z nich "
+                  "nevidí takmer nič a nikoho neupozorní",
+                  coverage["dispatched_without_package"], coverage["dispatched_orders"],
+                  coverage["days_since_last_package"]
+                  if coverage["days_since_last_package"] is not None else "30+")
     # A cached terminal verdict is trusted for this long, then re-verified once. Cheap insurance:
     # it still removes ~6 of every 7 calls for a delivered parcel, while bounding ANY wrong or
     # freak reading to a week instead of the full 30-day source window.
@@ -5735,7 +5762,17 @@ def run_posta_uncollected() -> dict:
              # „BCC vždy" is BINDING for these customer mails (require_bcc): with no MAIL_BCC not
              # one escalation goes out. Surfaced so the tab shows a dead automation as dead
              # instead of a healthy-looking run that quietly mailed nobody (ERROR log only).
-             "bcc_missing": _mail_bcc() is None}
+             "bcc_missing": _mail_bcc() is None,
+             # #282 — the same idea one step upstream: with no package numbers in the export there
+             # is nothing to check at all, and `checked` shrinking towards zero looks exactly like
+             # a quiet week. These four make the difference visible; `source_degraded` is what
+             # turns the card red instead of leaving a green „✅ OK" over a blind automation.
+             "source_degraded": coverage["degraded"],
+             "dispatched_orders": coverage["dispatched_orders"],
+             "dispatched_without_package": coverage["dispatched_without_package"],
+             "missing_package": coverage["missing_package"],
+             "days_since_last_package": coverage["days_since_last_package"],
+             "dispatched_status_unknown": coverage["dispatched_status_unknown"]}
     with _lock:
         # Re-read under the lock and update that map, rather than writing a brand-new dict:
         # `esc`/`term_cache` were read before minutes of Pošta SK round-trips, so this both

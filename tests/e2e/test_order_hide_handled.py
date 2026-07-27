@@ -40,7 +40,16 @@ def test_hide_handled_toggles_and_survives_a_reload(page, toorder_server):
 
     # Flagging a line does NOT repaint the list, so the row the manager is looking at
     # stays put mid-interaction (it disappears on the next real repaint / visit).
-    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    #
+    # The flag write is OPTIMISTIC (saveOrderFlag updates the map, then POSTs), so the
+    # toolbar text below flips before the server has heard anything. The reload further
+    # down re-reads /api/instock FROM THE SERVER, so it must not be allowed to race the
+    # POST — wait for the response, not just for the repaint. Without this the reload
+    # occasionally arrived first and the „handled" row came back unflagged (7 rows
+    # instead of 6): a genuinely non-deterministic test, CI run 30306010632.
+    with page.expect_response(lambda r: "/api/instock" in r.url
+                              and r.request.method == "POST"):
+        page.locator(".toorder-row[data-code='C1'] .to-instock").click()
     page.wait_for_function(
         "() => /Ostáva vybaviť 6 položiek z 7/.test(document.getElementById('toToolbar').textContent)")
     assert page.locator(".toorder-row").count() == TOTAL_LINES

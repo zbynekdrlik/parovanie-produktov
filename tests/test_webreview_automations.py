@@ -6,6 +6,7 @@ ever sent), the orders export is a fixture CSV, and every store path is
 redirected to tmp. Mirrors the test_webreview.py import pattern.
 """
 import json
+import logging
 import os
 import sys
 from datetime import date, timedelta
@@ -36,13 +37,13 @@ D = (TODAY - timedelta(days=3)).isoformat()          # order date inside the 30-
 ORDERS_CSV = (
     "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
     f"2026100;{D} 10:00:00;Vybavená;jan@example.com;+421900111222;Ján Vzor;EF000000002SK;1/M\r\n"
-    f"2026101;{D} 09:00:00;Vybavená;eva@example.com;;Eva Testová;06565700348274;3/S\r\n"
+    f"2026101;{D} 09:00:00;Vybavená;eva@example.com;;Eva Testová;00000000000003;3/S\r\n"
     f"2026105;{D} 08:00:00;Vybavená;peter@example.com;;Peter Prevzatý;EF000000001SK;7/A\r\n"
 ).encode("cp1250")
 
 TRACKING = {
     "EF000000002SK": _fix("tracking_notified_znp.json"),     # uncollected → mail
-    "06565700348274": _fix("tracking_invalid_format.json"),  # the n8n-breaking class
+    "00000000000003": _fix("tracking_invalid_format.json"),  # the n8n-breaking class
     "EF000000001SK": _fix("tracking_delivered.json"),        # delivered → nothing
 }
 
@@ -116,7 +117,13 @@ def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
     # a deliberate change, not something that quietly appears.
     assert stats == {"checked": 3, "uncollected": 1, "invalid": 1, "errors": 0,
                      "emails_sent": 1, "emails_failed": 0, "bcc_missing": False,
-                     "api_skipped": 0}
+                     "api_skipped": 0,
+                     # #282 — all three orders in this window are dispatched AND carry a package
+                     # number, and the newest is 3 days old, so the source is healthy and the run
+                     # is NOT degraded. The alarm has to be quiet here or it is worthless.
+                     "source_degraded": False, "dispatched_orders": 3,
+                     "dispatched_without_package": 0, "missing_package": 0,
+                     "days_since_last_package": 3, "dispatched_status_unknown": False}
     # exactly ONE customer mail, template #1. run_posta_uncollected no longer
     # passes an explicit bcc — _send_mail_html itself defaults it to MAIL_BCC
     # (tested directly below); here it's stubbed, so bcc arrives as None.
@@ -132,7 +139,7 @@ def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
     assert u["packageNumber"] == "EF000000002SK"
     assert u["count"] == 1 and u["call_needed"] is False
     (i,) = st["invalid"]
-    assert i["packageNumber"] == "06565700348274"    # surfaced, never silent
+    assert i["packageNumber"] == "00000000000003"    # surfaced, never silent
     assert st["errors"] == []
     # the tab endpoint serves the same data
     c = authed_client()
@@ -200,6 +207,85 @@ def test_posta_escalation_pruned_when_order_leaves_window(iso):
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert "1999999" not in st["escalation"]          # gone from the source window
     assert "2026100" in st["escalation"]              # still tracked (and bumped to 2)
+
+
+# ── #282 part 1 — a dead shipment source must not report a healthy run ────────
+# From 2.7. the orders export stopped carrying package numbers. The automation's ONLY source of
+# shipments is that column, so every run afterwards checked fewer and fewer parcels (21 → 13 → 9
+# → 6 → 4) and still ended `ok`; the tab said „0 nevyzdvihnutých" while a real parcel ran out its
+# 27.7. pickup deadline unnoticed. `checked` cannot tell that apart from a quiet week — only the
+# coverage stats can.
+def _dead_source_csv(days_ago_tracked=26, dispatched_without=87):
+    """The live shape of the outage: ONE order still carrying a (long since delivered) package
+    number and 87 dispatched orders carrying none."""
+    d = (TODAY - timedelta(days=days_ago_tracked)).isoformat()
+    rows = [f"7000;{d} 10:00:00;Vybavená;a@example.com;;Zákazník A;EF000000001SK;1/M"]
+    for i in range(dispatched_without):
+        di = (TODAY - timedelta(days=i % 30)).isoformat()
+        rows.append(f"{7100 + i};{di} 10:00:00;Vybavená;b{i}@example.com;;Zákazník B{i};;1/M")
+    return ("code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+            + "\r\n".join(rows) + "\r\n").encode("cp1250")
+
+
+def test_posta_run_flags_a_dead_shipment_source(iso, monkeypatch):
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _dead_source_csv)
+    stats = webapp.run_posta_uncollected()
+    assert stats["source_degraded"] is True
+    assert stats["dispatched_orders"] == 88
+    assert stats["dispatched_without_package"] == 87
+    assert stats["days_since_last_package"] == 26
+    # the number that used to be the ONLY visible signal — and it looks like a calm day
+    assert stats["checked"] == 1 and stats["uncollected"] == 0
+    # Also persisted into the run's own store. NOTE what this does and does not prove: the TAB
+    # renders from `last_result` in automations.json (what the runner stores from this return
+    # value), not from here — this copy is the diagnostic record that survives in the store next
+    # to the shipment list the manager is looking at.
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["stats"]["source_degraded"] is True
+
+
+def _renamed_status_csv():
+    """The blind spot itself: six eligible orders in the window, every one of them carrying a
+    package number, and NOT ONE in a status the code recognises as dispatched (Shoptet renamed
+    „Vybavená")."""
+    rows = [f"{7200 + i};{(TODAY - timedelta(days=i)).isoformat()} 10:00:00;Odoslaná;"
+            f"c{i}@example.com;;Zákazník C{i};EF00000000{i}SK;1/M" for i in range(6)]
+    return ("code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+            + "\r\n".join(rows) + "\r\n").encode("cp1250")
+
+
+def test_posta_blind_spot_log_states_the_true_order_count(iso, monkeypatch, caplog):
+    """The ERROR that fires when the dispatched-status vocabulary moves must not contradict
+    itself. It logged `missing_package + dispatched_orders`, but in the only branch that fires
+    (dispatched == 0) that counts orders WITHOUT a package number only — so a window of six
+    eligible orders that all carry one reported „v okne je 0 objednávok, ale ANI JEDNA nemá stav
+    Vybavená". Zero orders and none-of-them are the same statement; the reader learns nothing and
+    is told a falsehood about the one number that matters."""
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _renamed_status_csv)
+    # every one of them already delivered — the run itself is a no-op, so the only ERROR this
+    # test can see is the blind-spot one it is about
+    monkeypatch.setattr(webapp, "_fetch_tracking", lambda pkg: _fix("tracking_delivered.json"))
+    with caplog.at_level(logging.ERROR):
+        stats = webapp.run_posta_uncollected()
+    assert stats["dispatched_status_unknown"] is True
+    blind = [r.getMessage() for r in caplog.records if "ANI JEDNA" in r.getMessage()]
+    assert len(blind) == 1, blind
+    assert "v okne je 6 objednávok" in blind[0]
+    assert "v okne je 0 objednávok" not in blind[0]
+
+
+def test_posta_source_alarm_never_widens_what_gets_mailed(iso, monkeypatch):
+    """SAFETY: the alarm is a counter over the export, nothing more. Once the source is fixed, 130
+    shipments become visible at once and an escalation avalanche is a real risk (#282) — so this
+    pins that raising the alarm does not itself send anything, nor pull an order with no package
+    number into the escalation."""
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _dead_source_csv)
+    stats = webapp.run_posta_uncollected()
+    assert stats["source_degraded"] is True
+    assert iso["sent"] == []                          # not one mail
+    assert stats["emails_sent"] == 0
+    st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
+    assert st["escalation"] == {}                     # nobody entered the cadence
 
 
 def test_run_now_endpoint_executes_in_background(iso):
@@ -363,7 +449,7 @@ def test_an_uncollected_shipment_is_never_cached_as_terminal(iso):
     webapp.run_posta_uncollected()
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert "EF000000002SK" not in (st.get("terminal") or {})
-    assert "06565700348274" not in (st.get("terminal") or {})   # invalid_format is not final
+    assert "00000000000003" not in (st.get("terminal") or {})   # invalid_format is not final
 
 
 def test_terminal_cache_is_pruned_when_the_shipment_leaves_the_window(iso):

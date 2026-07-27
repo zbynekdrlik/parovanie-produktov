@@ -3,6 +3,14 @@
 Hermetic: tracking responses are saved fixtures (shapes verified against the
 LIVE api.posta.sk on 2026-07-22 — the delivered + invalid_format ones are real
 responses with anonymized numbers), no network, no SMTP.
+
+`tracking_notified_znp.json` was rebuilt for #283: the original was invented
+alongside the feature and put `retainedTill` on the notified EVENT, a shape the
+live API does not produce — it carries the field at RESULT level. That invented
+shape is exactly why the missing pickup deadline in the escalation mails went
+unnoticed, so the fixture now mirrors the real response (result-level
+`retainedTill`, real `detailCode` ZNP1AN as seen in the anonymized
+`tracking_collected_at_office.json`).
 """
 import json
 import os
@@ -25,7 +33,7 @@ ORDERS_CSV = (
     # second item line of the SAME order — must dedupe to one shipment
     "2026100;2026-07-10 10:00:00;Vybavená;jan@example.com;+421900111222;Ján Vzor;EF000000002SK;2/L\r\n"
     # the numeric-label class that broke n8n (still a shipment — checked, then flagged invalid)
-    "2026101;2026-07-12 09:00:00;Vybavená;eva@example.com;;Eva Testová;06565700348274;3/S\r\n"
+    "2026101;2026-07-12 09:00:00;Vybavená;eva@example.com;;Eva Testová;00000000000003;3/S\r\n"
     # cancelled order — never nag the customer
     "2026102;2026-07-15 09:00:00;Stornovaná;x@example.com;;Storno Osoba;EF000000003SK;4/S\r\n"
     # older than the 30-day source window
@@ -76,12 +84,12 @@ CARRIER_CSV = (
     "EF000000009SK;1/M;Obuv\r\n"
     # DPD home delivery — EXCLUDED even though it has a non-empty packageNumber
     "3002;2026-07-11 10:00:00;Vybavená;dpd@example.com;;Dpd Zákazník;"
-    "06565700398918;2/M;Obuv\r\n"
+    "00000000000001;2/M;Obuv\r\n"
     "3002;2026-07-11 10:00:00;Vybavená;dpd@example.com;;Dpd Zákazník;"
-    "06565700398918;SHIPPING23;DPD doručenie na adresu\r\n"
+    "00000000000001;SHIPPING23;DPD doručenie na adresu\r\n"
     # second DPD shipping method label, lower-case check — EXCLUDED
     "3003;2026-07-12 10:00:00;Vybavená;dpd2@example.com;;Dpd2 Zákazník;"
-    "06565700398920;SHIPPING26;dpd kuriér\r\n"
+    "00000000000002;SHIPPING26;dpd kuriér\r\n"
     # no SHIPPING row present at all (older/partial export) — fail-open, INCLUDED
     "3004;2026-07-13 10:00:00;Vybavená;nokur@example.com;;Bez Info;"
     "EF000000010SK;9/L;Obuv\r\n"
@@ -108,6 +116,36 @@ def test_classify_notified_znp_is_uncollected():
     assert c["retained_till"] == "2026-08-03"
     assert c["notified_since"] == "2026-07-16"
     assert c["days_at_post"] == 6                       # 22.7. - 16.7.
+
+
+def test_classify_reads_retained_till_from_result_level():
+    """#283 — the live API returns `retainedTill` on the RESULT, never on an event. Reading it
+    only from the events left `retained_till` empty, so the escalation mail dropped its „vyzdvihnite
+    si ju do <dátum>" line and fell back to a vague „čo najskôr" — on the shipment that started
+    this issue the missing date was the actual deadline."""
+    j = {"results": [{"status": "ok", "retainedTill": "2026-07-27", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-07-27"
+
+
+def test_classify_retained_till_event_fallback_kept():
+    """The event-level shape is what the ported n8n workflow observed. We have exactly one live
+    sample of the result-level shape, so the old reading stays as a fallback rather than being
+    swapped for it — the field is display-only and never gates a send, so honouring both costs
+    nothing and cannot be wrong-footed by whichever shape the API answers with."""
+    j = {"results": [{"status": "ok", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00",
+         "retainedTill": "2026-08-03"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-08-03"
+
+
+def test_classify_result_level_retained_till_wins_over_event():
+    """Both shapes present: the result-level value is the shipment's current deadline, an event's
+    is whatever was true when that event was written — so the result wins."""
+    j = {"results": [{"status": "ok", "retainedTill": "2026-07-27", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00",
+         "retainedTill": "2026-08-03"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-07-27"
 
 
 def test_classify_delivered_not_uncollected():
@@ -193,7 +231,10 @@ def test_build_email_body_contents():
     assert "Dobrý deň, <strong>Ján Vzor</strong>" in body
     assert "EF000000002SK" in body
     assert "Skalica 1" in body
-    assert "2026-08-03" in body
+    # …and the deadline is rendered the way a Slovak reader writes a date, never the ISO form
+    # the API and our own store use internally (see test_build_email_renders_a_slovak_date)
+    assert "3. 8. 2026" in body
+    assert "2026-08-03" not in body
     assert "https://www.posta.sk/sledovanie-zasielok#parcel=EF000000002SK" in body
     assert "eshop@forestshop.sk" in body
 
@@ -256,7 +297,7 @@ def test_evaluate_delivered_resets_nothing_sends_nothing():
 
 
 def test_evaluate_invalid_format():
-    ship = dict(SHIP, packageNumber="06565700348274")
+    ship = dict(SHIP, packageNumber="00000000000003")
     r = pu.evaluate_shipment(ship, _fix("tracking_invalid_format.json"), "", today=TODAY)
     assert r["invalid"] is True
     assert not r["uncollected"] and not r["send"]
@@ -310,3 +351,284 @@ def test_unknown_state_is_never_treated_as_terminal():
     assert pu.terminal_state({}) == ""
     assert pu.terminal_state(None) == ""
     assert pu.terminal_state([]) == ""
+
+
+# ── source_coverage: the „zdroj prestal dávať zásielky" alarm (#282 part 1) ────
+# The automation's only source of shipments is the `packageNumber` column of the orders export.
+# When that column stopped being filled (2026-07-02) the run kept reporting a healthy `ok` with a
+# quietly shrinking `checked` — 21 → 13 → 9 → 6 → 4 over five days — and the tab read „0
+# nevyzdvihnutých" while a real parcel sat at the post office until its deadline. These tests pin
+# the alarm that makes that state impossible to miss, and — just as importantly — pin that it
+# stays QUIET on the healthy history it was calibrated against.
+def _orders(rows, base=date(2026, 7, 27)):
+    """rows = (days_ago, statusName, packageNumber, carrier) → orders export CSV (str)."""
+    out = ["code;date;statusName;email;phone;billFullName;packageNumber;itemCode;itemName"]
+    for i, (days_ago, status, pkg, carrier) in enumerate(rows):
+        d = (base - timedelta(days=days_ago)).isoformat()
+        out.append(f"{9000 + i};{d} 10:00:00;{status};k{i}@example.com;;Zákazník {i};"
+                   f"{pkg};1/M;Topánky")
+        if carrier:
+            out.append(f"{9000 + i};{d} 10:00:00;{status};k{i}@example.com;;Zákazník {i};"
+                       f"{pkg};SHIPPING1;{carrier}")
+    return "\r\n".join(out) + "\r\n"
+
+
+def test_source_coverage_fires_on_the_live_failure_shape():
+    """Tonight's real numbers, measured read-only off the live orders export (27.7. 21:02): in the
+    30-day window 4 Pošta-eligible orders carry a package number and 87 dispatched ones do not,
+    and the newest order carrying one is 26 days old. Both rules trip; the run must be degraded."""
+    rows = ([(26, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(4)]
+            + [(d % 30, "Vybavená", "", "Kuriér") for d in range(87)]
+            + [(d % 20, "Vybavuje sa", "", "Kuriér") for d in range(48)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 91
+    assert c["dispatched_without_package"] == 87
+    assert c["missing_package"] == 135          # incl. the 48 not-yet-dispatched ones
+    assert c["days_since_last_package"] == 26
+    assert c["degraded"] is True
+
+
+def test_source_coverage_quiet_on_a_healthy_window():
+    """The healthy baseline the thresholds were calibrated on: a rolling 30-day window in May/June
+    never dropped below 73.2 % coverage of dispatched orders and never went more than 3 days
+    without a new package number. That must NOT raise an alarm — an alarm that cries on normal
+    trading is one the manager learns to ignore."""
+    rows = ([(d % 30, "Vybavená", f"EF10000{i:03d}SK", "Kuriér")
+             for i, d in enumerate(range(115))]                     # 115 dispatched WITH a number
+            + [(d % 30, "Vybavená", "", "Kuriér") for d in range(42)]  # 42 without → 73.2 %
+            + [(d % 10, "Vybavuje sa", "", "Kuriér") for d in range(30)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 157
+    assert c["dispatched_without_package"] == 42
+    assert c["days_since_last_package"] == 0
+    assert c["degraded"] is False
+
+
+def test_source_coverage_staleness_alone_degrades():
+    """The sharper of the two rules, and the one that would have caught the real outage on 8.7.
+    Coverage is still over the floor (6 of 11 dispatched orders carry a number), so only staleness
+    can be firing: parcels kept going out for the last two days while the newest number is 10 days
+    old. In the healthy two months the longest such gap was 3 days."""
+    rows = ([(10, "Vybavená", f"EF20000{d:03d}SK", "Kuriér") for d in range(6)]   # 54.5 % coverage
+            + [(d % 3, "Vybavená", "", "Kuriér") for d in range(5)])              # still shipping
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_with_package"] == 6 and c["dispatched_orders"] == 11     # coverage OK…
+    assert c["days_since_last_package"] == 10
+    assert c["degraded"] is True                    # …and it is still degraded
+
+
+def test_source_coverage_quiet_stretch_is_not_a_dead_source():
+    """The false positive this rule must not have. Measured against TODAY, any drought — a shop
+    holiday, a slow week — trips staleness: orders dispatched earlier stay in the 30-day window,
+    nothing new ships, and a perfectly healthy source reads as dead. Here nothing has shipped for
+    12 days and every parcel that DID ship carries its number, so there is no evidence of anything
+    wrong and the run must stay quiet."""
+    rows = [(12 + d, "Vybavená", f"EF21000{d:03d}SK", "Kuriér") for d in range(10)]
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_without_package"] == 0
+    assert c["days_since_last_package"] == 12       # stale by the naive measure…
+    assert c["degraded"] is False                   # …but nothing shipped without a number
+
+
+def test_source_coverage_surfaces_an_unrecognised_order_status():
+    """The alarm's own blind spot. Every count hangs off one hard-coded Shoptet status string; if
+    that vocabulary ever changes, `dispatched_orders` falls to 0 and this alarm — the one built
+    against silent death — would itself go quietly green forever. Eligible orders of which not one
+    is dispatched is the signature, and it must be visible."""
+    rows = [(d, "Odoslaná kuriérom", "", "Kuriér") for d in range(8)]   # status we do not know
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 0
+    assert c["dispatched_status_unknown"] is True
+    # …and a window we DO understand never raises it
+    healthy = [(d, "Vybavená", f"EF22000{d:03d}SK", "Kuriér") for d in range(8)]
+    assert pu.source_coverage(_orders(healthy),
+                              today=date(2026, 7, 27))["dispatched_status_unknown"] is False
+
+
+def test_source_coverage_low_coverage_alone_degrades():
+    """The other direction: numbers are still arriving (gap 0), but only a third of the dispatched
+    orders get one — a half-broken source, which the staleness rule alone would never see."""
+    rows = ([(d, "Vybavená", f"EF30000{d:03d}SK", "Kuriér") for d in range(5)]
+            + [(d % 20, "Vybavená", "", "Kuriér") for d in range(15)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["days_since_last_package"] == 0        # fresh numbers still coming in…
+    assert c["degraded"] is True                    # …but 5/20 = 25 % coverage
+
+
+def test_source_coverage_pending_orders_never_degrade():
+    """An order still being picked („Vybavuje sa") has no package number yet and that is entirely
+    normal — counting those into the rule would light the alarm up every single day."""
+    rows = [(d % 25, "Vybavuje sa", "", "Kuriér") for d in range(40)]
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 0
+    assert c["missing_package"] == 40
+    assert c["degraded"] is False
+
+
+def test_source_coverage_ignores_a_future_dated_package_number():
+    """A single mistyped/clock-skewed order date must not be able to switch the staleness rule
+    off. Counted naively it would give a NEGATIVE gap — which reads as fresher than any threshold
+    and would silence the alarm for as long as that row sits in the window."""
+    rows = ([(-5, "Vybavená", "EF40000001SK", "Kuriér")]          # dated 5 days in the FUTURE
+            + [(20, "Vybavená", "", "Kuriér") for _ in range(10)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["days_since_last_package"] is None       # not -5, and not treated as fresh
+    assert c["degraded"] is True
+
+
+def test_source_coverage_needs_enough_evidence_to_accuse_the_source():
+    """~27 % of dispatched orders legitimately carry no number even in a healthy month, so on a
+    near-empty window „no numbers at all" is a coincidence (odds 0.27 at one order, 0.02 at three),
+    not proof of a dead source. Four dispatched orders without one stay quiet; the real failure
+    runs 91 orders deep, so this floor costs nothing against it."""
+    rows = [(20, "Vybavená", "", "Kuriér") for _ in range(4)]
+    assert pu.source_coverage(_orders(rows), today=date(2026, 7, 27))["degraded"] is False
+    # …one more order and the same evidence is worth acting on
+    rows.append((20, "Vybavená", "", "Kuriér"))
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 5 and c["degraded"] is True
+
+
+def test_source_coverage_empty_window_never_degrades():
+    """No eligible orders at all (shop closed, fresh install, export not pulled yet) is not
+    evidence of a broken source — no orders can prove nothing."""
+    c = pu.source_coverage(_orders([]), today=date(2026, 7, 27))
+    assert c == {"eligible_orders": 0,
+                 "dispatched_orders": 0, "dispatched_with_package": 0, "missing_package": 0,
+                 "dispatched_without_package": 0, "days_since_last_package": None,
+                 "dispatched_status_unknown": False, "degraded": False}
+
+
+def test_source_coverage_reports_the_eligible_count_the_blind_spot_triggers_on():
+    """`dispatched_status_unknown` triggers on the number of ELIGIBLE orders in the window, but
+    that number was never returned — so the ERROR log had to approximate it, and the only
+    approximation available (missing_package + dispatched_orders) collapses in exactly the branch
+    that fires: with dispatched == 0 it counts numberless orders ONLY, so a window of six eligible
+    orders that all carry a number logs „v okne je 0 objednávok, ale ANI JEDNA nemá stav
+    Vybavená" — self-contradictory, and the one number the reader needs is the one that is wrong.
+    The alarm must publish the count it actually triggers on."""
+    rows = [(2, "Prijatá", f"EF5000000{i}SK", "Kuriér") for i in range(6)]
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_status_unknown"] is True
+    assert c["eligible_orders"] == 6
+    # the old approximation, pinned as the wrong answer it was
+    assert c["missing_package"] + c["dispatched_orders"] == 0
+
+
+def test_source_coverage_uses_the_same_eligibility_as_the_shipment_source():
+    """The alarm must count exactly the orders the automation would have chased — otherwise it
+    reports a gap that was never its job. Cancelled orders, non-Pošta couriers and orders outside
+    the 30-day window are excluded here exactly as they are in shipments_from_orders_csv."""
+    # The three excluded rows carry a NON-EMPTY package number on purpose: with empty ones the
+    # `shipments_from_orders_csv` assertion below would hold no matter what the eligibility
+    # filters did (it drops numberless orders anyway) and would prove nothing. The numbers are
+    # obviously fictitious — a fixture never needs a real one to be realistic (automation-health.md).
+    rows = [(2, "Stornovaná", "EF50000001SK", "Kuriér"),      # cancelled → not our shipment
+            (2, "Vybavená", "00000000000001", "DPD kuriér"),  # DPD → different carrier entirely
+            (45, "Vybavená", "EF50000003SK", "Kuriér"),       # older than the 30-day window
+            (2, "Vybavená", "", "Kuriér")]                    # the only one that counts
+    csv_text = _orders(rows)
+    c = pu.source_coverage(csv_text, today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 1 and c["missing_package"] == 1
+    # and the two functions really do agree on what is eligible: every row the alarm excluded is
+    # also a row the automation never chases, even though three of them DO carry a number
+    assert pu.shipments_from_orders_csv(csv_text, today=date(2026, 7, 27)) == []
+
+
+def test_build_email_ignores_a_deadline_that_already_passed():
+    """#283 side effect. Until the deadline was read correctly the field was ALWAYS empty, so
+    every mail used the dateless wording. Now that it is populated, a parcel first seen late — or
+    chased through the day 0 → +3 → +3 → +7 cadence — could be told „ak si ju nevyzdvihnete do
+    <minulý týždeň>". Past the deadline the honest wording is the dateless one."""
+    past = (TODAY - timedelta(days=4)).isoformat()
+    future = (TODAY + timedelta(days=4)).isoformat()
+    for count, dateless in ((1, "čo najskôr"), (2, "čo najskôr"), (3, "čoskoro")):
+        _, body = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "", past, today=TODAY)
+        assert past not in body, f"mail #{count} quoted a deadline that already passed"
+        assert dateless in body, f"mail #{count} did not fall back to the dateless wording"
+        # …and a deadline still ahead of us is named, as it must be (in the Slovak reading form)
+        _, ahead = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "", future, today=TODAY)
+        assert "26. 7. 2026" in ahead
+        assert future not in ahead      # never the ISO form in customer-facing text
+
+
+def test_classify_normalises_a_timestamped_retained_till():
+    """One live sample of the result-level shape is not enough to assume it is always a bare date;
+    a timestamp would otherwise be quoted verbatim at the customer."""
+    j = {"results": [{"status": "ok", "retainedTill": "2026-08-03T00:00:00", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-08-03"
+
+
+def test_classify_drops_an_unparsable_retained_till():
+    """Retires the defect this test used to PIN („a shape we do not recognise is still better
+    shown than silently dropped"). It is not: `retained_till` is a DATE field, and the mail
+    template hard-codes the „…vyzdvihnite si ju do <hodnota>" prefix around it, so anything that
+    is not a date reads as nonsense at a real customer („do do odvolania"). Worse, the expiry
+    guard in build_email is the SAME parser — a value it cannot read is silently exempt from the
+    „deadline already passed" check, so a garbled AND long-expired value would be presented as if
+    it were still ahead. Fail-soft for a date field is to DROP it and use the dateless wording."""
+    j = {"results": [{"status": "ok", "retainedTill": "do odvolania", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == ""
+
+
+# The shapes a foreign API can hand us for one date field: a nonsense calendar date, a Slovak
+# d.m.yyyy string, free text, and a raw JSON type. None of them is a date we can reason about,
+# so none of them may reach a customer — the mail must fall back to the dateless wording.
+UNPARSABLE_TILLS = ["2026-13-45", "20.07.2026", "do odvolania", True, {"date": "x"}, []]
+
+
+def test_classify_accepts_the_basic_iso_form():
+    """Counterpart to the hostile set: `20260803` is not junk — it is ISO-8601 BASIC form, which
+    date.fromisoformat reads unambiguously, so it must be accepted (and normalised), not dropped.
+    Pinned so the fail-soft above can never be widened into „anything I don't like is empty"."""
+    j = {"results": [{"status": "ok", "retainedTill": 20260803, "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-08-03"
+
+
+def test_classify_drops_every_unrecognised_retained_till_shape():
+    """Companion to the test above, across the whole hostile set — including a non-string type,
+    which `str(raw)` used to smuggle through as the literal „True"."""
+    for raw in UNPARSABLE_TILLS:
+        j = {"results": [{"status": "ok", "retainedTill": raw, "events": [
+            {"stateCode": "notified", "detailCode": "ZNP1AN",
+             "localDate": "2026-07-16T08:10:00"}]}]}
+        assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "", repr(raw)
+    # whitespace too (checked only here — as a substring it would match the mail's own indentation)
+    j = {"results": [{"status": "ok", "retainedTill": "   ", "events": [
+        {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == ""
+    assert pu.build_email(1, "X", "EF1SK", "P", "", "   ", today=TODAY)[1].count(
+        "vyzdvihnite si ju čo najskôr") == 1
+
+
+def test_build_email_never_pastes_an_unrecognised_deadline():
+    """Defence in depth for the SAME defect one layer lower. classify_tracking is not the only
+    way a value reaches build_email: the preview endpoint feeds it `retained_till` straight out
+    of posta_uncollected.json, so a garbled value written by an older run would still be pasted
+    into a customer's mail — and, because build_email's expiry guard uses the same parser, would
+    ALSO bypass the „deadline already passed" check. The builder must refuse it on its own."""
+    for raw in UNPARSABLE_TILLS:
+        for count, dateless in ((1, "čo najskôr"), (2, "čo najskôr"), (3, "čoskoro")):
+            _, body = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "",
+                                     raw, today=TODAY)
+            assert str(raw) not in body, f"mail #{count} pasted {raw!r} at the customer"
+            assert "vyzdvihnite si ju do <strong>" not in body
+            assert "nevyzdvihnete do <strong>" not in body
+            assert dateless in body, f"mail #{count} did not fall back to the dateless wording"
+
+
+def test_build_email_renders_a_slovak_date_not_iso():
+    """The customer-visible deadline is read by a person, not a machine: no Slovak eshop writes
+    „2026-08-03". The stored/internal value stays ISO (the API's shape, the web table, the JSON
+    store) — only the rendered mail is translated."""
+    for count in (1, 2, 3):
+        _, body = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "",
+                                 "2026-08-03", today=TODAY)
+        assert "3. 8. 2026" in body, f"mail #{count} did not render the Slovak date"
+        assert "2026-08-03" not in body, f"mail #{count} leaked the ISO date to the customer"
+    # no zero padding — „03. 08. 2026" is not how it is written either
+    _, body = pu.build_email(1, "Ján Vzor", "EF1SK", "Skalica 1", "", "2026-08-03", today=TODAY)
+    assert "03. 08. 2026" not in body
