@@ -80,6 +80,17 @@ Keď pridávaš automatizáciu alebo nový spôsob, akým môže oslepnúť, uro
 4. **Stav karty a bočný ⚠ odznak** — `navError()` musí svietiť aj pre degradovaný beh, inak sa to
    manažér dozvie len keď sám otvorí tú konkrétnu záložku (presne preto vznikol #153). Beh, ktorý
    nevidí vlastný vstup, ZLYHAL, aj keď nespadol.
+   **Pozor na kľúče:** kľúč záložky v `AUTOMATION_TABS` NIE JE vždy kľúč automatizácie —
+   pošta má v menu legacy `posta`, ale `Automation.key` je `posta_uncollected`. `autoByKey('posta')`
+   preto roky nenašiel nič a odznak sa pri tejto automatizácii nerozsvietil ANI pri zlyhaní
+   (mapa `NAV_AUTOMATION_KEY`). Keď pridávaš signál do bočného menu, over ho E2E testom — táto
+   chyba prežila len preto, že ju nikdy nikto neklikol.
+
+**Každý takýto stav si zaslúži E2E test.** Celý prínos alarmu je to, ČO manažér uvidí; jednotkový
+test na `stats` dokazuje len polovicu. Vzor: fixture server so zaseknutým `last_result`
+(`posta_degraded_server` v `tests/e2e/conftest.py` — nový server treba pridať aj do
+`_SERVER_FIXTURES`), potom skontroluj text karty, banner aj odznak. Práve tento test odhalil
+nefunkčný odznak vyššie.
 
 Alarm musí ostať **iba počítadlom**: nesmie nič odoslať ani rozšíriť množinu zásielok, ktoré idú
 do eskalácie — pripni to testom (`test_posta_source_alarm_never_widens_what_gets_mailed`). Pri
