@@ -1026,6 +1026,102 @@ def test_a_missing_code_turns_the_run_orange_and_reaches_the_tab(iso, monkeypatc
     assert result["pairings"]["missing_in_eshop"][0]["code"] == "1/M"
 
 
+def test_supplier_codes_absent_from_the_catalogue_are_HELD_not_written(iso, monkeypatch):
+    """#275 — the supplier write-back now holds a code the eshop's catalogue does not
+    carry, exactly as the pairings half has since #270.
+
+    Such a row can NEVER import: Shoptet rejects it on every single run, so
+    uploaded_suppliers.json never records it, it stays „new" for ever and the whole
+    nightly run goes red every night (live on prod: 145/3XL). Holding is NOT the drop
+    PR #213 forbade — the assignment stays in supplier_assignments.json, is never
+    credited, and goes up the moment the code appears in the catalogue."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "1/M": "ORBIS"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "1/M": "P1"})
+    # a trusted export that carries 1/M but NOT 9/Z
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n1/M;P1;\r\n5/A;555;REAL\r\n"))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    s, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200
+    sup = next(c for c in calls if c["header"][2] == "supplier")
+    assert {r[0] for r in sup["rows"]} == {"1/M"}          # 9/Z withheld, 1/M still sent
+    # …and it is NEVER recorded uploaded, so it is retried the moment the code exists
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {"1/M": "ORBIS"}
+    # still surfaced by name, with the value we wanted to write (the tab renders this)
+    assert s["missing_in_eshop"] == [{"code": "9/Z", "value": "BETALOV"}]
+    assert s["missing_count"] == 1
+
+
+def test_a_held_supplier_code_goes_up_once_the_catalogue_carries_it(iso, monkeypatch):
+    """The hold is bounded and self-healing — the property that makes it safe."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    assert webapp._do_upload_suppliers(dry=False)[0]["count"] == 0
+    assert calls == []
+
+    # the manager fixes the code in the eshop → it appears in the next export
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL\r\n9/Z;777;\r\n"))
+
+    s, _st = webapp._do_upload_suppliers(dry=False)
+
+    assert s["count"] == 1 and s["missing_count"] == 0
+    assert {r[0] for r in calls[0]["rows"]} == {"9/Z"}
+
+
+def test_an_untrusted_export_holds_nothing_on_the_supplier_side(iso, monkeypatch):
+    """The hold is a WRITE condition, so it may only stand on bytes we believe. A stale
+    export must not withhold a code the eshop has had for days — the same gate that
+    already suppressed the mere REPORT now also suppresses the hold, so behaviour falls
+    back to sending (idempotent, the same name written again)."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: webapp.EXPORT_MAX_AGE_S + 60)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    s, _st = webapp._do_upload_suppliers(dry=False)
+
+    assert {r[0] for r in calls[0]["rows"]} == {"9/Z"}     # sent, not held
+    assert s["missing_count"] == 0
+
+
+def test_a_run_whose_only_fault_is_a_missing_code_is_orange_not_red(iso, monkeypatch):
+    """The point of the ticket, end to end. Until now the held-back code was still sent,
+    Shoptet refused it, s_ok went False and run_parovania_eshop reported „failed" — a red
+    row every single night for a condition the manager cannot read out of a red count."""
+    _seed_pairing()
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"1/M": "P1", "9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;internalNote;supplier\r\n1/M;P1;;\r\n"))
+
+    def refuses_unknown_codes(csv_path, dry_run=False, timeout=300):
+        with open(csv_path, encoding="utf-8-sig", newline="") as f:
+            rows = list(_csv.reader(f, delimiter=";"))[1:]
+        if any(r[0] == "9/Z" for r in rows):   # what the real Shoptet does with 145/3XL
+            return (2, "POZOR: Shoptet hlási zlyhania\n"
+                    "VÝSLEDOK: spracované=1 upravené=0 zlyhania=1", "")
+        n = len(rows)
+        return 0, f"VÝSLEDOK: spracované={n} upravené={n} zlyhania=0", ""
+    monkeypatch.setattr(webapp, "run_import", refuses_unknown_codes)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["suppliers"]["ok"] is True
+    assert result["status"] == "blocked"                   # orange, not red
+    assert result["suppliers"]["missing_count"] == 1
+
+
 def test_an_implausibly_small_export_is_not_trusted(tmp_path, monkeypatch):
     """The catalogue is ~14 000 variant codes. A fresh, non-empty export carrying a
     handful is a BROKEN feed (truncated download, a filter left on), not a small shop —

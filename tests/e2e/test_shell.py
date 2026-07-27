@@ -349,11 +349,14 @@ def test_no_nav_item_renders_the_literal_undefined(page, live_server):
 
 
 def test_missing_eshop_codes_are_listed_with_what_we_wanted_to_write(page, live_server):
-    """#270 — the nightly push holds back rows whose variant code the eshop's
+    """#270/#275 — the nightly push holds back rows whose variant code the eshop's
     catalogue does not carry (Shoptet rejected them every single night) and names
     them on the automation card. Unit-tests the pure builder in the browser realm:
-    both halves of the run are listed, the supplier half is marked as still being
-    written, the overflow is counted, and the manager's free text is never HTML."""
+    both halves of the run are listed, the overflow is counted, and the manager's free
+    text is never HTML.
+
+    Since #275 the supplier half HOLDS them too, so the „(dodávateľ — zapisuje sa
+    ďalej)" caveat is gone: a listed code now means the same thing on both halves."""
     console = _console(page)
     page.goto(live_server)
     page.wait_for_selector(".sidebar #tabs button")
@@ -372,7 +375,8 @@ def test_missing_eshop_codes_are_listed_with_what_we_wanted_to_write(page, live_
     assert out["quiet"] is None                      # a normal night renders nothing
     assert "(4)" in out["text"]                      # exact total, both halves
     assert "15813/110 → https://x/<b>y</b>" in out["text"]
-    assert "145/3XL → FOREST (dodávateľ — zapisuje sa ďalej)" in out["text"]
+    assert "145/3XL → FOREST" in out["text"]
+    assert "zapisuje sa ďalej" not in out["text"]     # #275 — both halves hold now
     assert out["bolds"] == 0                         # free text, never markup
     # its OWN class — `.autoerr` means „the last run failed" and every unscoped
     # `.autoerr` locator in the e2e suite would break on a second, nested match
