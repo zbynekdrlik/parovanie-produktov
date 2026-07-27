@@ -84,12 +84,12 @@ CARRIER_CSV = (
     "EF000000009SK;1/M;Obuv\r\n"
     # DPD home delivery — EXCLUDED even though it has a non-empty packageNumber
     "3002;2026-07-11 10:00:00;Vybavená;dpd@example.com;;Dpd Zákazník;"
-    "06565700398918;2/M;Obuv\r\n"
+    "00000000000001;2/M;Obuv\r\n"
     "3002;2026-07-11 10:00:00;Vybavená;dpd@example.com;;Dpd Zákazník;"
-    "06565700398918;SHIPPING23;DPD doručenie na adresu\r\n"
+    "00000000000001;SHIPPING23;DPD doručenie na adresu\r\n"
     # second DPD shipping method label, lower-case check — EXCLUDED
     "3003;2026-07-12 10:00:00;Vybavená;dpd2@example.com;;Dpd2 Zákazník;"
-    "06565700398920;SHIPPING26;dpd kuriér\r\n"
+    "00000000000002;SHIPPING26;dpd kuriér\r\n"
     # no SHIPPING row present at all (older/partial export) — fail-open, INCLUDED
     "3004;2026-07-13 10:00:00;Vybavená;nokur@example.com;;Bez Info;"
     "EF000000010SK;9/L;Obuv\r\n"
@@ -499,11 +499,12 @@ def test_source_coverage_uses_the_same_eligibility_as_the_shipment_source():
     """The alarm must count exactly the orders the automation would have chased — otherwise it
     reports a gap that was never its job. Cancelled orders, non-Pošta couriers and orders outside
     the 30-day window are excluded here exactly as they are in shipments_from_orders_csv."""
-    # The three excluded rows carry REAL package numbers on purpose: with empty ones the
+    # The three excluded rows carry a NON-EMPTY package number on purpose: with empty ones the
     # `shipments_from_orders_csv` assertion below would hold no matter what the eligibility
-    # filters did (it drops numberless orders anyway) and would prove nothing.
+    # filters did (it drops numberless orders anyway) and would prove nothing. The numbers are
+    # obviously fictitious — a fixture never needs a real one to be realistic (automation-health.md).
     rows = [(2, "Stornovaná", "EF50000001SK", "Kuriér"),      # cancelled → not our shipment
-            (2, "Vybavená", "06565700398918", "DPD kuriér"),  # DPD → different carrier entirely
+            (2, "Vybavená", "00000000000001", "DPD kuriér"),  # DPD → different carrier entirely
             (45, "Vybavená", "EF50000003SK", "Kuriér"),       # older than the 30-day window
             (2, "Vybavená", "", "Kuriér")]                    # the only one that counts
     csv_text = _orders(rows)
