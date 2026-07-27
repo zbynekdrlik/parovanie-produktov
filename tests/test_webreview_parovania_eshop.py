@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -1131,3 +1132,30 @@ def test_an_implausibly_small_export_blocks_the_supplier_write_back(iso, monkeyp
     sup = next(c for c in calls if c["header"][2] == "supplier")
     assert {r[0] for r in sup["rows"]} == {"9/Z"}
     assert result2["count"] == 1
+
+
+def test_the_supplier_write_gate_uses_the_same_ratio_floor_as_the_verdicts(iso, monkeypatch):
+    """#277 — ONE threshold, TWO gates, now that the threshold is a ratio of the
+    catalogue watermark rather than a flat 1000. A 1 200-code export clears the
+    absolute floor and would have been fully trusted; against a 14 066-code catalogue
+    it is a broken feed, and the DANGEROUS half (the live `supplier` write) must never
+    be the permissive one — the PR #276 review's lesson restated against the stronger
+    floor. Pinned at the PRODUCTION absolute floor so the fixture cannot disarm it."""
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", PROD_EXPORT_MIN_CODES)
+    today = datetime.now(timezone.utc).date().isoformat()
+    (iso["tmp"] / "export_watermark.json").write_text(
+        json.dumps({"days": {today: 14066}}), encoding="utf-8")
+    webapp._save_supplier_assign({"9/Z": "STALE_ASSIGNMENT"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n"
+        + "".join(f"{i}/A;{i};\r\n" for i in range(PROD_EXPORT_MIN_CODES + 200))))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200
+    assert calls == []                       # NOTHING reached the live eshop
+    assert result["count"] == 0 and result["blocked"] == 1      # held, not dropped
+    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
