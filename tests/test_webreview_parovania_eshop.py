@@ -1308,3 +1308,57 @@ def test_the_supplier_write_gate_uses_the_same_ratio_floor_as_the_verdicts(iso, 
     assert calls == []                       # NOTHING reached the live eshop
     assert result["count"] == 0 and result["blocked"] == 1      # held, not dropped
     assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+
+
+def test_the_blocked_run_reports_WHY_the_gate_blocked(iso, monkeypatch):
+    """PR #280 review, item 3. During ANY gate block the card read
+    „🏷️ Dodávatelia: … N zablokovaných (chýbajú kódy)" — which names the wrong cause:
+    nothing is missing, the export is simply not believable. `_do_upload_suppliers`
+    already carried a `message`, but `run_parovania_eshop` never propagated it and the
+    concrete numbers stayed in a log.warning. #277 widens the blocking band from <1000
+    to <7033 codes, so the manager WILL meet this state."""
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "5"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: webapp.EXPORT_MAX_AGE_S + 1)
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    g = result["suppliers"]["gate_blocked"]
+    assert g["reason"] == "stale"
+    assert g["age_h"] == 6.0 and g["max_age_h"] == 6.0
+    assert result["suppliers"]["blocked"] == 1
+    assert result["status"] == "blocked"          # orange, not falsely green
+    assert calls == []
+
+
+def test_a_too_small_export_reports_the_size_reason_with_the_numbers(iso, monkeypatch):
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "5"})
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 7033)
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
+    fake_run, calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    g = result["suppliers"]["gate_blocked"]
+    assert g["reason"] == "small"
+    assert g["codes"] == 1 and g["min_codes"] == 7033
+    assert calls == []
+
+
+def test_a_healthy_run_carries_no_gate_reason(iso, monkeypatch):
+    """The absence matters: the card must not render a blocked line on a good night."""
+    webapp._save_supplier_assign({"1/M": "BETALOV"})
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result = webapp.run_parovania_eshop()
+
+    assert result["suppliers"]["gate_blocked"] is None
+    assert result["suppliers"]["count"] == 1
