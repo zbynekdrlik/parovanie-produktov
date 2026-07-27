@@ -783,3 +783,71 @@ def test_partially_accepted_row_count_never_goes_negative():
            "error_detail": None}
     msg = webapp._chunk_error_msg(res, 900)
     assert "-100" not in msg and "+0 čiastočne prijatých" in msg
+
+
+# --------------------------------------------------------------------------- #
+# #272 — the nightly push read the WHOLE 57 MB catalog export into memory (and
+# copied it again through io.StringIO, ~115 MB transient) on EVERY run, dry runs
+# included, just to learn which codes the eshop already carries. The index is
+# built by STREAMING the file line by line; only the {code: internalNote} pairs
+# survive the pass.
+# --------------------------------------------------------------------------- #
+def _big_export(path, rows=6000, pad=2000):
+    with open(path, "wb") as f:
+        f.write(b"code;pairCode;internalNote;supplier;description\r\n")
+        filler = "x" * pad
+        for i in range(rows):
+            f.write(f"{i}/M;P{i};https://s/{i};;{filler}\r\n".encode("cp1250"))
+    return path.stat().st_size
+
+
+def test_the_export_index_streams_instead_of_materialising_the_whole_file(tmp_path, monkeypatch):
+    import tracemalloc
+    p = tmp_path / "products.csv"
+    size = _big_export(p)
+    monkeypatch.setattr(webapp, "SRC", str(p))
+
+    tracemalloc.start()
+    try:
+        notes, codes = webapp._export_note_index()
+        _cur, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(codes) == 6000 and notes["0/M"] == "https://s/0"
+    # the old path allocated >= 2x the file size (bytes -> str -> io.StringIO copy)
+    assert peak < size / 2, (
+        f"export index peaked at {peak / 1e6:.1f} MB for a {size / 1e6:.1f} MB export "
+        "— it is still materialising the file instead of streaming it")
+
+
+def test_the_streamed_index_parses_exactly_like_a_whole_text_parse(tmp_path, monkeypatch):
+    """Streaming must not change WHAT is parsed: cp1250 decoding, quoted fields with
+    an embedded newline, empty notes, and the duplicate-code rule (two rows that
+    disagree about a code prove nothing, so the code is dropped from the notes but
+    is still PRESENT in the catalog)."""
+    text = ("code;pairCode;internalNote;supplier\r\n"
+            "1/M;P1;https://s/x;\r\n"
+            "2/M;P2;\"riadok\r\ns novým riadkom\";\r\n"
+            "3/M;P3;;\r\n"
+            "4/M;P4;https://s/A;\r\n"
+            "4/M;P4;https://s/B;\r\n")
+    p = tmp_path / "products.csv"
+    p.write_bytes(text.encode("cp1250"))
+    monkeypatch.setattr(webapp, "SRC", str(p))
+
+    notes, codes = webapp._export_note_index()
+
+    assert codes == {"1/M", "2/M", "3/M", "4/M"}
+    assert notes["1/M"] == "https://s/x"
+    assert "novým riadkom" in notes["2/M"]
+    assert notes["3/M"] == ""
+    assert "4/M" not in notes                      # conflicting rows prove nothing
+    # the whole-text reader (still used by the scraping automations) is unchanged
+    assert webapp._read_export_for_links() == text
+
+
+def test_a_missing_export_yields_an_empty_index_and_never_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "SRC", str(tmp_path / "nope.csv"))
+    assert webapp._export_note_index() == ({}, set())
+    assert webapp._read_export_for_links() == ""
