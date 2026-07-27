@@ -231,7 +231,10 @@ def test_build_email_body_contents():
     assert "Dobrý deň, <strong>Ján Vzor</strong>" in body
     assert "EF000000002SK" in body
     assert "Skalica 1" in body
-    assert "2026-08-03" in body
+    # …and the deadline is rendered the way a Slovak reader writes a date, never the ISO form
+    # the API and our own store use internally (see test_build_email_renders_a_slovak_date)
+    assert "3. 8. 2026" in body
+    assert "2026-08-03" not in body
     assert "https://www.posta.sk/sledovanie-zasielok#parcel=EF000000002SK" in body
     assert "eshop@forestshop.sk" in body
 
@@ -526,9 +529,10 @@ def test_build_email_ignores_a_deadline_that_already_passed():
         _, body = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "", past, today=TODAY)
         assert past not in body, f"mail #{count} quoted a deadline that already passed"
         assert dateless in body, f"mail #{count} did not fall back to the dateless wording"
-        # …and a deadline still ahead of us is named, as it must be
+        # …and a deadline still ahead of us is named, as it must be (in the Slovak reading form)
         _, ahead = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "", future, today=TODAY)
-        assert future in ahead
+        assert "26. 7. 2026" in ahead
+        assert future not in ahead      # never the ISO form in customer-facing text
 
 
 def test_classify_normalises_a_timestamped_retained_till():
@@ -550,3 +554,49 @@ def test_classify_drops_an_unparsable_retained_till():
     j = {"results": [{"status": "ok", "retainedTill": "do odvolania", "events": [
         {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
     assert pu.classify_tracking(j, today=TODAY)["retained_till"] == ""
+
+
+# The shapes a foreign API can hand us for one date field: a nonsense calendar date, a Slovak
+# d.m.yyyy string, free text, and a raw JSON type. None of them is a date we can reason about,
+# so none of them may reach a customer — the mail must fall back to the dateless wording.
+UNPARSABLE_TILLS = ["2026-13-45", "20.07.2026", "do odvolania", True, 20260803, {"date": "x"}]
+
+
+def test_classify_drops_every_unrecognised_retained_till_shape():
+    """Companion to the test above, across the whole hostile set — including a non-string type,
+    which `str(raw)` used to smuggle through as the literal „True"."""
+    for raw in UNPARSABLE_TILLS:
+        j = {"results": [{"status": "ok", "retainedTill": raw, "events": [
+            {"stateCode": "notified", "detailCode": "ZNP1AN",
+             "localDate": "2026-07-16T08:10:00"}]}]}
+        assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "", repr(raw)
+
+
+def test_build_email_never_pastes_an_unrecognised_deadline():
+    """Defence in depth for the SAME defect one layer lower. classify_tracking is not the only
+    way a value reaches build_email: the preview endpoint feeds it `retained_till` straight out
+    of posta_uncollected.json, so a garbled value written by an older run would still be pasted
+    into a customer's mail — and, because build_email's expiry guard uses the same parser, would
+    ALSO bypass the „deadline already passed" check. The builder must refuse it on its own."""
+    for raw in UNPARSABLE_TILLS:
+        for count, dateless in ((1, "čo najskôr"), (2, "čo najskôr"), (3, "čoskoro")):
+            _, body = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "",
+                                     raw, today=TODAY)
+            assert str(raw) not in body, f"mail #{count} pasted {raw!r} at the customer"
+            assert "vyzdvihnite si ju do <strong>" not in body
+            assert "nevyzdvihnete do <strong>" not in body
+            assert dateless in body, f"mail #{count} did not fall back to the dateless wording"
+
+
+def test_build_email_renders_a_slovak_date_not_iso():
+    """The customer-visible deadline is read by a person, not a machine: no Slovak eshop writes
+    „2026-08-03". The stored/internal value stays ISO (the API's shape, the web table, the JSON
+    store) — only the rendered mail is translated."""
+    for count in (1, 2, 3):
+        _, body = pu.build_email(count, "Ján Vzor", "EF1SK", "Skalica 1", "",
+                                 "2026-08-03", today=TODAY)
+        assert "3. 8. 2026" in body, f"mail #{count} did not render the Slovak date"
+        assert "2026-08-03" not in body, f"mail #{count} leaked the ISO date to the customer"
+    # no zero padding — „03. 08. 2026" is not how it is written either
+    _, body = pu.build_email(1, "Ján Vzor", "EF1SK", "Skalica 1", "", "2026-08-03", today=TODAY)
+    assert "03. 08. 2026" not in body
