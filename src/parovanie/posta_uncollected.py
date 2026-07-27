@@ -8,7 +8,8 @@ Faithful port of the n8n workflow „Notifikácia nevyzdvihnutých zásielok - P
   Google Sheet — it already carries packageNumber/email/phone/billFullName);
 - tracking:   GET https://api.posta.sk/tracking?q=<pkg>&l=sk&p=1 per shipment;
 - uncollected = LAST event stateCode=='notified' AND detailCode starts 'ZNP';
-  post office + retainedTill + days-on-post extracted from the events;
+  post office + days-on-post extracted from the events, retainedTill from the
+  RESULT (that is where the live API puts it — #283 — events are a fallback);
 - escalation: max 4 customer e-mails, cadence day 0 → +3 → +3 → +7, state
   'count|YYYY-MM-DD' per order (data/out/posta_uncollected.json);
 - ALL 4 e-mails go to the CUSTOMER (verbatim n8n HTML templates below);
@@ -166,10 +167,21 @@ def classify_tracking(api_json, today: date | None = None) -> dict:
         nd = _parse_date(ld)
         if nd is not None:              # unparsable date keeps the n8n default of 1
             out["days_at_post"] = max(1, (today - nd).days)
-        for e in events:                # n8n: first event carrying retainedTill
-            if e.get("retainedTill"):
-                out["retained_till"] = str(e["retainedTill"])
-                break
+        # The pickup deadline. The LIVE api.posta.sk returns it on the RESULT (#283) — no event
+        # ever carries it — so the result is read first. The per-event lookup below is what the
+        # ported n8n workflow did and stays as a fallback: we have one live sample of the
+        # result-level shape, and this field only ever shapes the mail's wording (it never
+        # decides whether a mail goes out), so honouring BOTH shapes costs nothing and cannot be
+        # wrong-footed by whichever one the API answers with. Empty here is not harmless: it
+        # silently downgrades „vyzdvihnite si ju do <dátum>" to a vague „čo najskôr", which is
+        # what the customer of the shipment behind #283 was told instead of their real deadline.
+        if p.get("retainedTill"):
+            out["retained_till"] = str(p["retainedTill"])
+        else:
+            for e in events:            # n8n: first event carrying retainedTill
+                if e.get("retainedTill"):
+                    out["retained_till"] = str(e["retainedTill"])
+                    break
     return out
 
 
