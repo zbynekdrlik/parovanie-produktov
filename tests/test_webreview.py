@@ -8,6 +8,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
@@ -225,6 +227,125 @@ def test_instock_unavailable_tolerate_corrupt_store(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "UNAVAIL", str(unf))
     assert webapp._load_instock() == {}
     assert webapp._load_unavailable() == {}
+
+
+# --- #211: the STATUS flags are mutually exclusive; the SERVER enforces it ------ #
+#
+# Two axes, decided from the manager's own live data (27 rows carried a combination and
+# EVERY one of them involved „objednané"; „čaká sa"/„skladom"/„nedostupné" never once
+# overlapped each other):
+#   axis A  „objednané"  = we placed the order — independent, coexists with anything
+#   axis B  „čaká sa" ⊕ „skladom" ⊕ „nedostupné" = the line's status — mutually exclusive
+# Setting an axis-B flag clears the other two IN THE SAME `with _lock:` write, so no
+# reader can ever observe a row holding two contradictory statuses.
+def _flag_paths(monkeypatch, tmp_path):
+    for name, fn in (("ORDERED", "o.json"), ("WAITING", "w.json"),
+                     ("INSTOCK", "is.json"), ("UNAVAIL", "un.json")):
+        monkeypatch.setattr(webapp, name, str(tmp_path / fn))
+
+
+_STATUS = [("/api/waiting", "waiting"), ("/api/instock", "instock"),
+           ("/api/unavailable", "unavailable")]
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
+def test_setting_a_status_flag_clears_the_other_two(monkeypatch, tmp_path, path, field):
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "20261045|61247/L"
+    for p, f in _STATUS:            # start from every other status already set
+        if p != path:
+            c.post(p, json={"key": key, f: True})
+    r = c.post(path, json={"key": key, field: True})
+    assert r.status_code == 200
+    for p, f in _STATUS:
+        got = c.get(p).get_json()[f]
+        assert (key in got) is (p == path), (p, got)
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
+def test_a_status_flag_never_clears_objednane(monkeypatch, tmp_path, path, field):
+    """„objednané" is the OTHER axis: objednané + čaká sa na dodávateľa (the row button's
+    own tooltip) and objednané + už prišlo are both real states the manager uses. Clearing
+    it here would delete markings he made on purpose."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "20261045|61247/L"
+    c.post("/api/ordered", json={"key": key, "ordered": True})
+    c.post(path, json={"key": key, field: True})
+    assert c.get("/api/ordered").get_json()["ordered"][key] is True
+    # …and the reverse: marking it ordered afterwards leaves the status flag alone
+    c.post("/api/ordered", json={"key": key, "ordered": True})
+    assert key in c.get(path).get_json()[field]
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
+def test_turning_a_status_flag_OFF_clears_nothing_else(monkeypatch, tmp_path, path, field):
+    """Only switching a flag ON is a statement about the line's status. Switching one OFF
+    just makes the line unhandled again — it must not reach into the other stores."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key, other = "20261045|61247/L", "20261045|OTHER"
+    c.post("/api/ordered", json={"key": key, "ordered": True})
+    for p, f in _STATUS:
+        c.post(p, json={"key": other, f: True})       # a DIFFERENT row keeps its flags
+    c.post(path, json={"key": key, field: False})
+    assert c.get("/api/ordered").get_json()["ordered"][key] is True
+    for p, f in _STATUS:
+        assert other in c.get(p).get_json()[f], p
+
+
+@pytest.mark.parametrize("path, field", _STATUS + [("/api/ordered", "ordered")])
+def test_the_write_answers_with_the_resulting_flags(monkeypatch, tmp_path, path, field):
+    """The server is the authority on the row's state, so it says what the state now IS —
+    the client only reflects it."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "20261045|61247/L"
+    c.post("/api/waiting", json={"key": key, "waiting": True})
+    flags = c.post(path, json={"key": key, field: True}).get_json()["flags"]
+    assert flags[field] is True
+    assert set(flags) == {"ordered", "waiting", "instock", "unavailable"}
+    for p, f in _STATUS:
+        assert flags[f] is (f == field), (f, flags)
+
+
+def test_a_status_flag_only_touches_the_row_it_names(monkeypatch, tmp_path):
+    """The clear is per KEY. A sibling line of the same product (or any other row) that
+    happens to be „čaká sa" must be untouched — the flags are per ORDER LINE."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})
+    c.post("/api/waiting", json={"key": "B|1", "waiting": True})
+    c.post("/api/instock", json={"key": "A|1", "instock": True})
+    assert c.get("/api/waiting").get_json()["waiting"] == {"B|1": True}
+
+
+def test_ordered_bulk_leaves_every_status_flag_alone(monkeypatch, tmp_path):
+    """Marking a whole supplier group „objednané" is axis A — it says nothing about
+    whether those lines are waiting / in stock / unavailable."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})
+    c.post("/api/instock", json={"key": "B|2", "instock": True})
+    c.post("/api/ordered/bulk", json={"keys": ["A|1", "B|2"], "ordered": True})
+    assert c.get("/api/waiting").get_json()["waiting"] == {"A|1": True}
+    assert c.get("/api/instock").get_json()["instock"] == {"B|2": True}
+
+
+def test_clearing_conflicts_never_writes_a_store_it_did_not_change(monkeypatch, tmp_path):
+    """These stores are `protect=True` — the manager's irreplaceable work. A write that
+    changes nothing must not rewrite the file at all (and a store that does not exist yet
+    must not be created just because a conflicting flag was checked for)."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    c.post("/api/instock", json={"key": "A|1", "instock": True})
+    assert not (tmp_path / "w.json").exists(), "an untouched store was written"
+    assert not (tmp_path / "un.json").exists(), "an untouched store was written"
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})
+    before = (tmp_path / "un.json").exists()
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})   # idempotent re-write
+    assert (tmp_path / "un.json").exists() is before
 
 
 def test_orders_route_merges_instock_and_unavailable(monkeypatch, tmp_path):
