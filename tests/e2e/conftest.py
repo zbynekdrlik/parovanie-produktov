@@ -405,7 +405,7 @@ def automations_server(tmp_path_factory):
             "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=2026100&src=orders",
         }],
         "invalid": [{
-            "orderCode": "2026101", "packageNumber": "06565700348274",
+            "orderCode": "2026101", "packageNumber": "00000000000003",
             "name": "Eva Testová",
             "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=2026101&src=orders",
         }],

@@ -33,7 +33,7 @@ ORDERS_CSV = (
     # second item line of the SAME order — must dedupe to one shipment
     "2026100;2026-07-10 10:00:00;Vybavená;jan@example.com;+421900111222;Ján Vzor;EF000000002SK;2/L\r\n"
     # the numeric-label class that broke n8n (still a shipment — checked, then flagged invalid)
-    "2026101;2026-07-12 09:00:00;Vybavená;eva@example.com;;Eva Testová;06565700348274;3/S\r\n"
+    "2026101;2026-07-12 09:00:00;Vybavená;eva@example.com;;Eva Testová;00000000000003;3/S\r\n"
     # cancelled order — never nag the customer
     "2026102;2026-07-15 09:00:00;Stornovaná;x@example.com;;Storno Osoba;EF000000003SK;4/S\r\n"
     # older than the 30-day source window
@@ -297,7 +297,7 @@ def test_evaluate_delivered_resets_nothing_sends_nothing():
 
 
 def test_evaluate_invalid_format():
-    ship = dict(SHIP, packageNumber="06565700348274")
+    ship = dict(SHIP, packageNumber="00000000000003")
     r = pu.evaluate_shipment(ship, _fix("tracking_invalid_format.json"), "", today=TODAY)
     assert r["invalid"] is True
     assert not r["uncollected"] and not r["send"]
@@ -493,9 +493,26 @@ def test_source_coverage_empty_window_never_degrades():
     """No eligible orders at all (shop closed, fresh install, export not pulled yet) is not
     evidence of a broken source — no orders can prove nothing."""
     c = pu.source_coverage(_orders([]), today=date(2026, 7, 27))
-    assert c == {"dispatched_orders": 0, "dispatched_with_package": 0, "missing_package": 0,
+    assert c == {"eligible_orders": 0,
+                 "dispatched_orders": 0, "dispatched_with_package": 0, "missing_package": 0,
                  "dispatched_without_package": 0, "days_since_last_package": None,
                  "dispatched_status_unknown": False, "degraded": False}
+
+
+def test_source_coverage_reports_the_eligible_count_the_blind_spot_triggers_on():
+    """`dispatched_status_unknown` triggers on the number of ELIGIBLE orders in the window, but
+    that number was never returned — so the ERROR log had to approximate it, and the only
+    approximation available (missing_package + dispatched_orders) collapses in exactly the branch
+    that fires: with dispatched == 0 it counts numberless orders ONLY, so a window of six eligible
+    orders that all carry a number logs „v okne je 0 objednávok, ale ANI JEDNA nemá stav
+    Vybavená" — self-contradictory, and the one number the reader needs is the one that is wrong.
+    The alarm must publish the count it actually triggers on."""
+    rows = [(2, "Prijatá", f"EF5000000{i}SK", "Kuriér") for i in range(6)]
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_status_unknown"] is True
+    assert c["eligible_orders"] == 6
+    # the old approximation, pinned as the wrong answer it was
+    assert c["missing_package"] + c["dispatched_orders"] == 0
 
 
 def test_source_coverage_uses_the_same_eligibility_as_the_shipment_source():

@@ -6,6 +6,7 @@ ever sent), the orders export is a fixture CSV, and every store path is
 redirected to tmp. Mirrors the test_webreview.py import pattern.
 """
 import json
+import logging
 import os
 import sys
 from datetime import date, timedelta
@@ -36,13 +37,13 @@ D = (TODAY - timedelta(days=3)).isoformat()          # order date inside the 30-
 ORDERS_CSV = (
     "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
     f"2026100;{D} 10:00:00;Vybavená;jan@example.com;+421900111222;Ján Vzor;EF000000002SK;1/M\r\n"
-    f"2026101;{D} 09:00:00;Vybavená;eva@example.com;;Eva Testová;06565700348274;3/S\r\n"
+    f"2026101;{D} 09:00:00;Vybavená;eva@example.com;;Eva Testová;00000000000003;3/S\r\n"
     f"2026105;{D} 08:00:00;Vybavená;peter@example.com;;Peter Prevzatý;EF000000001SK;7/A\r\n"
 ).encode("cp1250")
 
 TRACKING = {
     "EF000000002SK": _fix("tracking_notified_znp.json"),     # uncollected → mail
-    "06565700348274": _fix("tracking_invalid_format.json"),  # the n8n-breaking class
+    "00000000000003": _fix("tracking_invalid_format.json"),  # the n8n-breaking class
     "EF000000001SK": _fix("tracking_delivered.json"),        # delivered → nothing
 }
 
@@ -138,7 +139,7 @@ def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
     assert u["packageNumber"] == "EF000000002SK"
     assert u["count"] == 1 and u["call_needed"] is False
     (i,) = st["invalid"]
-    assert i["packageNumber"] == "06565700348274"    # surfaced, never silent
+    assert i["packageNumber"] == "00000000000003"    # surfaced, never silent
     assert st["errors"] == []
     # the tab endpoint serves the same data
     c = authed_client()
@@ -241,6 +242,36 @@ def test_posta_run_flags_a_dead_shipment_source(iso, monkeypatch):
     # to the shipment list the manager is looking at.
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert st["stats"]["source_degraded"] is True
+
+
+def _renamed_status_csv():
+    """The blind spot itself: six eligible orders in the window, every one of them carrying a
+    package number, and NOT ONE in a status the code recognises as dispatched (Shoptet renamed
+    „Vybavená")."""
+    rows = [f"{7200 + i};{(TODAY - timedelta(days=i)).isoformat()} 10:00:00;Odoslaná;"
+            f"c{i}@example.com;;Zákazník C{i};EF00000000{i}SK;1/M" for i in range(6)]
+    return ("code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+            + "\r\n".join(rows) + "\r\n").encode("cp1250")
+
+
+def test_posta_blind_spot_log_states_the_true_order_count(iso, monkeypatch, caplog):
+    """The ERROR that fires when the dispatched-status vocabulary moves must not contradict
+    itself. It logged `missing_package + dispatched_orders`, but in the only branch that fires
+    (dispatched == 0) that counts orders WITHOUT a package number only — so a window of six
+    eligible orders that all carry one reported „v okne je 0 objednávok, ale ANI JEDNA nemá stav
+    Vybavená". Zero orders and none-of-them are the same statement; the reader learns nothing and
+    is told a falsehood about the one number that matters."""
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _renamed_status_csv)
+    # every one of them already delivered — the run itself is a no-op, so the only ERROR this
+    # test can see is the blind-spot one it is about
+    monkeypatch.setattr(webapp, "_fetch_tracking", lambda pkg: _fix("tracking_delivered.json"))
+    with caplog.at_level(logging.ERROR):
+        stats = webapp.run_posta_uncollected()
+    assert stats["dispatched_status_unknown"] is True
+    blind = [r.getMessage() for r in caplog.records if "ANI JEDNA" in r.getMessage()]
+    assert len(blind) == 1, blind
+    assert "v okne je 6 objednávok" in blind[0]
+    assert "v okne je 0 objednávok" not in blind[0]
 
 
 def test_posta_source_alarm_never_widens_what_gets_mailed(iso, monkeypatch):
@@ -418,7 +449,7 @@ def test_an_uncollected_shipment_is_never_cached_as_terminal(iso):
     webapp.run_posta_uncollected()
     st = json.loads((iso["tmp"] / "posta_uncollected.json").read_text())
     assert "EF000000002SK" not in (st.get("terminal") or {})
-    assert "06565700348274" not in (st.get("terminal") or {})   # invalid_format is not final
+    assert "00000000000003" not in (st.get("terminal") or {})   # invalid_format is not final
 
 
 def test_terminal_cache_is_pruned_when_the_shipment_leaves_the_window(iso):

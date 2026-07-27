@@ -44,7 +44,7 @@ def test_tab_renders_seeded_data_default_stopped(page, automations_server):
 
     # the invalid-format package (the class that broke n8n) is flagged, not hidden
     inv = page.locator('[data-testid="posta-invalid"]')
-    assert "06565700348274" in inv.inner_text()
+    assert "00000000000003" in inv.inner_text()
     assert "nesledovateľným" in inv.inner_text()
 
     # sidebar nav badge counts the uncollected shipments
