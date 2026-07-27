@@ -67,7 +67,8 @@ def _truth():
 # Shoptet export's encoding and is used for NOTHING else in this tree, so „opened as
 # cp1250" is exactly „reads the catalogue export".
 def test_every_catalogue_export_reader_opens_the_file_with_newline_disabled():
-    tree = ast.parse(open(APP_PY, encoding="utf-8").read())
+    source = open(APP_PY, encoding="utf-8").read()
+    tree = ast.parse(source)
     offenders = []
     seen = 0
     for node in ast.walk(tree):
@@ -82,7 +83,14 @@ def test_every_catalogue_export_reader_opens_the_file_with_newline_disabled():
         nl = kw.get("newline")
         if not (isinstance(nl, ast.Constant) and nl.value == ""):
             offenders.append(node.lineno)
-    assert seen >= 5, f"expected every cp1250 export reader to be found, saw {seen}"
+    # Cross-check the AST walk against the raw text, so the guard cannot pass by
+    # silently matching NOTHING (a helper wrapping `open`, a renamed kwarg, an ast
+    # shape this walk does not cover). Deliberately not a hard-coded count: routing a
+    # reader away is a legitimate refactor and must not fail this test spuriously —
+    # what must never happen is the walk MISSING one that is still there.
+    assert seen == source.count('encoding="cp1250"'), (
+        f"the AST walk found {seen} cp1250 open() calls but the file text has "
+        f"{source.count('encoding=\"cp1250\"')} — the guard is no longer seeing them all")
     assert offenders == [], (
         "webreview/app.py opens the catalogue export without newline=\"\" at line(s) "
         f"{offenders} — csv then silently rewrites \\r\\n and \\r inside quoted "
