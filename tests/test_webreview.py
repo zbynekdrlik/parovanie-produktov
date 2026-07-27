@@ -287,15 +287,25 @@ def test_turning_a_status_flag_OFF_clears_nothing_else(monkeypatch, tmp_path, pa
     c = _client()
     key, other = "20261045|61247/L", "20261045|OTHER"
     c.post("/api/ordered", json={"key": key, "ordered": True})
-    for p, f in _STATUS:
-        c.post(p, json={"key": other, f: True})       # a DIFFERENT row keeps its flags
+    # A DIFFERENT row, carrying the LEGAL maximum: axis A + exactly one axis-B flag.
+    # (Seeding all three on it would be seeding a state the server now refuses to hold.)
+    c.post("/api/ordered", json={"key": other, "ordered": True})
+    c.post(path, json={"key": other, field: True})
     c.post(path, json={"key": key, field: False})
     assert c.get("/api/ordered").get_json()["ordered"][key] is True
+    assert c.get("/api/ordered").get_json()["ordered"][other] is True
+    assert other in c.get(path).get_json()[field]
+    # …and the OTHER two stores of the row being switched off stay as they were: empty,
+    # because nothing ever put a flag there. Turning one off reaches into no store but its own.
     for p, f in _STATUS:
-        assert other in c.get(p).get_json()[f], p
+        if p != path:
+            assert c.get(p).get_json()[f] == {}, p
 
 
-@pytest.mark.parametrize("path, field", _STATUS + [("/api/ordered", "ordered")])
+_ALL_FLAGS = {"ordered", "waiting", "instock", "unavailable"}
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
 def test_the_write_answers_with_the_resulting_flags(monkeypatch, tmp_path, path, field):
     """The server is the authority on the row's state, so it says what the state now IS —
     the client only reflects it."""
@@ -305,9 +315,26 @@ def test_the_write_answers_with_the_resulting_flags(monkeypatch, tmp_path, path,
     c.post("/api/waiting", json={"key": key, "waiting": True})
     flags = c.post(path, json={"key": key, field: True}).get_json()["flags"]
     assert flags[field] is True
-    assert set(flags) == {"ordered", "waiting", "instock", "unavailable"}
+    assert set(flags) == _ALL_FLAGS
     for p, f in _STATUS:
         assert flags[f] is (f == field), (f, flags)
+
+
+def test_the_objednane_write_answers_with_the_flags_it_did_not_touch(monkeypatch, tmp_path):
+    """„objednané" answers in the SAME shape (one thing for the client to mirror) but it is
+    axis A: the „čaká sa" standing on that row is still there afterwards. Folding this case
+    into the axis-B test above asserted the opposite — that marking a line ordered wipes its
+    status — which is exactly the four-way exclusivity #211 rejected."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "20261045|61247/L"
+    c.post("/api/waiting", json={"key": key, "waiting": True})
+    flags = c.post("/api/ordered", json={"key": key, "ordered": True}).get_json()["flags"]
+    assert set(flags) == _ALL_FLAGS
+    assert flags["ordered"] is True
+    assert flags["waiting"] is True                      # untouched — the other axis
+    assert flags["instock"] is False and flags["unavailable"] is False
+    assert c.get("/api/waiting").get_json()["waiting"] == {key: True}
 
 
 def test_a_status_flag_only_touches_the_row_it_names(monkeypatch, tmp_path):
