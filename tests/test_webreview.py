@@ -252,7 +252,7 @@ _STATUS = [("/api/waiting", "waiting"), ("/api/instock", "instock"),
 def test_setting_a_status_flag_clears_the_other_two(monkeypatch, tmp_path, path, field):
     _flag_paths(monkeypatch, tmp_path)
     c = _client()
-    key = "20261045|61247/L"
+    key = "90000001|TESTKOD-A"
     for p, f in _STATUS:            # start from every other status already set
         if p != path:
             c.post(p, json={"key": key, f: True})
@@ -270,7 +270,7 @@ def test_a_status_flag_never_clears_objednane(monkeypatch, tmp_path, path, field
     it here would delete markings he made on purpose."""
     _flag_paths(monkeypatch, tmp_path)
     c = _client()
-    key = "20261045|61247/L"
+    key = "90000001|TESTKOD-A"
     c.post("/api/ordered", json={"key": key, "ordered": True})
     c.post(path, json={"key": key, field: True})
     assert c.get("/api/ordered").get_json()["ordered"][key] is True
@@ -285,7 +285,7 @@ def test_turning_a_status_flag_OFF_clears_nothing_else(monkeypatch, tmp_path, pa
     just makes the line unhandled again — it must not reach into the other stores."""
     _flag_paths(monkeypatch, tmp_path)
     c = _client()
-    key, other = "20261045|61247/L", "20261045|OTHER"
+    key, other = "90000001|TESTKOD-A", "90000001|TESTKOD-B"
     c.post("/api/ordered", json={"key": key, "ordered": True})
     # A DIFFERENT row, carrying the LEGAL maximum: axis A + exactly one axis-B flag.
     # (Seeding all three on it would be seeding a state the server now refuses to hold.)
@@ -311,7 +311,7 @@ def test_the_write_answers_with_the_resulting_flags(monkeypatch, tmp_path, path,
     the client only reflects it."""
     _flag_paths(monkeypatch, tmp_path)
     c = _client()
-    key = "20261045|61247/L"
+    key = "90000001|TESTKOD-A"
     c.post("/api/waiting", json={"key": key, "waiting": True})
     flags = c.post(path, json={"key": key, field: True}).get_json()["flags"]
     assert flags[field] is True
@@ -327,7 +327,7 @@ def test_the_objednane_write_answers_with_the_flags_it_did_not_touch(monkeypatch
     status — which is exactly the four-way exclusivity #211 rejected."""
     _flag_paths(monkeypatch, tmp_path)
     c = _client()
-    key = "20261045|61247/L"
+    key = "90000001|TESTKOD-A"
     c.post("/api/waiting", json={"key": key, "waiting": True})
     flags = c.post("/api/ordered", json={"key": key, "ordered": True}).get_json()["flags"]
     assert set(flags) == _ALL_FLAGS
