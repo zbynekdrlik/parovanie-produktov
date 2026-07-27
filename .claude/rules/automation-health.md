@@ -37,6 +37,33 @@ git log --oneline --diff-filter=A -- tests/fixtures/<cesta>   # vznikla s featur
 - Anonymizuj: čísla zásielok drž zjavne fiktívne, ale TVAR odpovede reálny. Do fixtúry NIKDY
   meno, e-mail, telefón ani adresu zákazníka.
 
+### Fiktívnu hodnotu treba DOKÁZAŤ grepom, nie „vyzerá vymyslene"
+
+Repozitár je VEREJNÝ. „Toto číslo vyzerá ako testovacie" nie je dôkaz — v tomto repe takto
+prežilo v testoch reálne, v tej chvíli sledovateľné podacie číslo (3× v `orders_cache.csv`,
+naviazané na objednávku s menom, e-mailom, telefónom a mestom zákazníka), a druhé sa k nemu
+pridalo o issue neskôr, lebo ho niekto skopíroval z toho istého bloku.
+
+Než pridáš do `tests/` akúkoľvek hodnotu, ktorá by mohla pochádzať zo živých dát (podacie číslo,
+kód objednávky, meno, e-mail, telefón, adresa), over ju:
+
+```bash
+# POZOR: LC_ALL=C — export je cp1250 a v UTF-8 locale grep časť riadkov ticho preskočí
+LC_ALL=C grep -ac "<hodnota>" data/out/orders_cache.csv     # musí byť 0
+```
+
+- **`0` nestačí, ak hodnota vyzerá reálne.** Cache je kĺzavé 30-dňové okno — hodnota z mája v nej
+  dnes nie je. Pozri sa aj na PREFIX (blok dopravcu): keď `LC_ALL=C grep -aoE '\b0[0-9]{13}\b'
+  data/out/orders_cache.csv | cut -c1-10 | sort | uniq -c` ukáže ten istý blok medzi živými
+  číslami, hodnota sa nedá vyhlásiť za vymyslenú → anonymizuj ju.
+- **Voľ hodnotu, ktorá nemôže kolidovať:** `00000000000001`, `EF000000002SK` — zachovaj len TVAR
+  (dĺžka, číselnosť), na ktorom test naozaj stojí. Žiadny kód u nás formát podacieho čísla
+  nevaliduje (dopravca sa určuje z `SHIPPING` položky), takže anonymizácia nič nerozbije.
+- **Plošná kontrola** (oplatí sa pri každom väčšom PR): načítaj z `orders_cache.csv` stĺpce
+  `packageNumber/code/email/phone/bill*/delivery*` a hľadaj ich ako podreťazce v celom `tests/`.
+  Zásah v mene/e-maile/telefóne je vždy únik; mesto, ulica či PSČ býva náhoda (v HTML fixtúrach
+  dodávateľov ide o ich vlastné kontakty) — ale musíš to vedieť zdôvodniť, nie predpokladať.
+
 ## 2. Prah alarmu kalibruj na REÁLNEJ histórii, nie od oka
 
 Pri `source_coverage` (#282) sa prahy dali zmerať za pár minút read-only prepočtom nad živou
