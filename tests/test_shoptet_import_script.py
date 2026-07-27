@@ -277,3 +277,45 @@ def test_run_browser_feeds_the_preflight_row_count_into_the_import(monkeypatch, 
     assert rc == 2
     written = list(tmp_path.glob("shoptet_import_*.log"))
     assert written and OURS_35 in written[0].read_text(encoding="utf-8")
+
+
+def test_read_result_survives_a_last_read_that_never_rendered_the_log():
+    """MINOR (revízia PR #271) — the final `reload(wait_until="networkidle")` can
+    return BEFORE Shoptet renders the Log table, so the LAST read of the poll window
+    sees no rows at all. Every read that COULD see the Log had settled on our own
+    entry, yet that one empty read made the verdict None → the chunk was booked
+    UNREADABLE (exit 2) → `break` skipped the rest of the night's chunks and the
+    manager was told the result „sa nepodarilo prečítať" for a run that succeeded.
+    It fails closed (the rows are simply re-sent next run), but the whole remaining
+    batch is lost to one transient render."""
+    for tail in ([], ["Dátum Výsledok"]):        # nothing rendered / page chrome only
+        page = FakePage([[OURS_35, BASELINE],
+                         [OURS_35, BASELINE],
+                         [OURS_35, BASELINE],
+                         tail])
+        assert script._read_result(page, baseline=BASELINE, expected_rows=35,
+                                   retries=4, wait_s=0) == OURS_35
+
+
+def test_read_result_still_fails_closed_when_the_last_read_is_ambiguous():
+    """The other half of that distinction, and the reason the empty-read fallback may
+    NOT simply drop the `row is not None` clause: on a LATE ambiguity (a second
+    same-sized entry appears at the end of the window) pick_result_row returns None
+    WITHOUT adding anything to `seen`, so `len(seen) == 1` alone still holds from the
+    earlier reads and would credit a run Shoptet never confirmed. A read that really
+    rendered log rows and still could not attribute them stays fatal."""
+    twin = ("#12703 26.07.2026 21:00 Upozornenie Import skončil s chybou. "
+            "Spracované: 35. Upravené: 4. Zlyhanie variantov: 1.")
+    page = FakePage([[OURS_35, BASELINE],
+                     [OURS_35, BASELINE],
+                     [twin, OURS_35, BASELINE]])
+    assert script._read_result(page, baseline=BASELINE, expected_rows=35,
+                               retries=3, wait_s=0) is None
+
+
+def test_read_result_stays_none_when_the_log_never_rendered_at_all():
+    """A window in which NO read ever saw a log row proves nothing — there is no
+    earlier verdict to fall back to, so the result stays unreadable."""
+    page = FakePage([[], ["Dátum Výsledok"], []])
+    assert script._read_result(page, baseline=BASELINE, expected_rows=35,
+                               retries=3, wait_s=0) is None

@@ -11,6 +11,7 @@ two n8n endpoints, so the existing endpoint tests in test_webreview.py stay
 green (one place for the logic, NEkopíruj logiku).
 """
 import csv as _csv
+import inspect
 import json
 import os
 import subprocess
@@ -741,6 +742,18 @@ def test_export_confirmation_still_credits_a_fresh_export(tmp_path, monkeypatch)
 
     assert (webapp._codes_confirmed_in_export([["1/M", "P1", "https://supplier/x"]])
             == {"1/M"})
+
+
+def test_export_confirmation_cannot_be_handed_notes_that_skip_the_freshness_check():
+    """MINOR (revízia PR #271) — the credit may only ever be computed from an export
+    whose AGE was checked. `_codes_confirmed_in_export` also accepted a pre-read
+    `notes=` mapping; no caller ever passed one, but that parameter was the single
+    entry point through which the natural future optimisation („read the export once,
+    hand it down") would have silently deleted the guard the two tests above add.
+    There must be no such entry point: the notes are read INSIDE, after the age check,
+    or not at all."""
+    params = inspect.signature(webapp._codes_confirmed_in_export).parameters
+    assert "notes" not in params
 
 
 def test_timed_out_chunk_is_reported_as_uncertain_not_as_zero_imported(iso, monkeypatch):

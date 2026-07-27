@@ -9,6 +9,7 @@ from parovanie.shoptet_import import (
     chunk_outcome,
     classify_row,
     hard_error_detail,
+    has_log_entries,
     load_credentials,
     log_entry_id,
     parse_import_log,
@@ -476,3 +477,16 @@ def test_chunk_outcome_never_credits_rc0_whose_counts_disagree():
     assert chunk_outcome(0, parse_import_log(""), rows_sent=300) == "ok"
     assert chunk_outcome(0, parse_import_log("VÝSLEDOK: spracované=300 upravené=298"),
                          rows_sent=300) == "ok"
+
+
+def test_has_log_entries_tells_an_unrendered_table_from_a_real_one():
+    """The read-back needs to know WHY a read produced nothing: a page that had not
+    rendered the Log yet (retry-able) vs. a rendered Log whose entries could not be
+    attributed (fatal). Only rows shaped like a real Shoptet log ENTRY count — the
+    header row and empty page chrome do not."""
+    assert has_log_entries([ROW_OURS_35, ROW_BASELINE]) is True
+    assert has_log_entries(["Dátum Výsledok", ROW_BASELINE]) is True
+    assert has_log_entries([]) is False
+    assert has_log_entries(None) is False
+    assert has_log_entries(["Dátum Výsledok"]) is False
+    assert has_log_entries(["", None]) is False
