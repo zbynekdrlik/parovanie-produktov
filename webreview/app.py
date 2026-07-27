@@ -802,7 +802,10 @@ def _load_catalog(path, review_keys):
     if not os.path.exists(path):
         return code2pair, code2variant, {}
     csv.field_size_limit(10**9)
-    with open(path, encoding="cp1250", errors="replace") as _f:
+    # newline="" — REQUIRED by the csv module (#279). Without it the text layer
+    # rewrites \r\n and lone \r to \n before csv sees them, INSIDE quoted fields too,
+    # where they are data (a multi-line description / size label), not a separator.
+    with open(path, encoding="cp1250", errors="replace", newline="") as _f:
         reader = csv.DictReader(_f, delimiter=";")
         # the variant AXIS columns are `variant:<name>` (colon) — NOT `variantVisibility`.
         variant_cols = [c for c in (reader.fieldnames or []) if c.startswith("variant:")]
@@ -2316,7 +2319,9 @@ def _current_for_entry(ce: dict) -> dict:
         return {}
     csv.field_size_limit(10**9)
     try:
-        with open(SRC, encoding="cp1250", errors="replace") as f:
+        # newline="" — see _load_catalog (#279): the availability label is free text
+        # the shop owner writes, so a multi-line one must reach `current` verbatim.
+        with open(SRC, encoding="cp1250", errors="replace", newline="") as f:
             for r in csv.DictReader(f, delimiter=";"):
                 rpc = (r.get("pairCode") or "").strip()
                 rc = (r.get("code") or "").strip()
@@ -2400,7 +2405,8 @@ def _ensure_nedostupne_catalog():
         if os.path.exists(SRC):
             csv.field_size_limit(10**9)
             try:
-                with open(SRC, encoding="cp1250", errors="replace") as f:
+                # newline="" — see _load_catalog (#279).
+                with open(SRC, encoding="cp1250", errors="replace", newline="") as f:
                     for r in csv.DictReader(f, delimiter=";"):
                         code = (r.get("code") or "").strip()
                         pc = (r.get("pairCode") or "").strip()
@@ -5585,7 +5591,10 @@ def run_shoptet_sync() -> dict:
         _CODE2URL = None
 
     rows = []
-    with open(SRC, encoding="cp1250", errors="replace") as f:
+    # newline="" — see _load_catalog (#279). resync_current joins the export to
+    # review_data.json on (supplier, NAME): a rewritten name breaks that join, so the
+    # card silently goes `stale` and its price/stock stop refreshing.
+    with open(SRC, encoding="cp1250", errors="replace", newline="") as f:
         for row in csv.DictReader(f, delimiter=";"):
             rows.append(row)
     with _lock:
