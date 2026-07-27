@@ -348,3 +348,110 @@ def test_unknown_state_is_never_treated_as_terminal():
     assert pu.terminal_state({}) == ""
     assert pu.terminal_state(None) == ""
     assert pu.terminal_state([]) == ""
+
+
+# ── source_coverage: the „zdroj prestal dávať zásielky" alarm (#282 part 1) ────
+# The automation's only source of shipments is the `packageNumber` column of the orders export.
+# When that column stopped being filled (2026-07-02) the run kept reporting a healthy `ok` with a
+# quietly shrinking `checked` — 21 → 13 → 9 → 6 → 4 over five days — and the tab read „0
+# nevyzdvihnutých" while a real parcel sat at the post office until its deadline. These tests pin
+# the alarm that makes that state impossible to miss, and — just as importantly — pin that it
+# stays QUIET on the healthy history it was calibrated against.
+def _orders(rows, base=date(2026, 7, 27)):
+    """rows = (days_ago, statusName, packageNumber, carrier) → orders export CSV (str)."""
+    out = ["code;date;statusName;email;phone;billFullName;packageNumber;itemCode;itemName"]
+    for i, (days_ago, status, pkg, carrier) in enumerate(rows):
+        d = (base - timedelta(days=days_ago)).isoformat()
+        out.append(f"{9000 + i};{d} 10:00:00;{status};k{i}@example.com;;Zákazník {i};"
+                   f"{pkg};1/M;Topánky")
+        if carrier:
+            out.append(f"{9000 + i};{d} 10:00:00;{status};k{i}@example.com;;Zákazník {i};"
+                       f"{pkg};SHIPPING1;{carrier}")
+    return "\r\n".join(out) + "\r\n"
+
+
+def test_source_coverage_fires_on_the_live_failure_shape():
+    """Tonight's real numbers, measured read-only off the live orders export (27.7. 21:02): in the
+    30-day window 4 Pošta-eligible orders carry a package number and 87 dispatched ones do not,
+    and the newest order carrying one is 26 days old. Both rules trip; the run must be degraded."""
+    rows = ([(26, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(4)]
+            + [(d % 30, "Vybavená", "", "Kuriér") for d in range(87)]
+            + [(d % 20, "Vybavuje sa", "", "Kuriér") for d in range(48)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 91
+    assert c["dispatched_without_package"] == 87
+    assert c["missing_package"] == 135          # incl. the 48 not-yet-dispatched ones
+    assert c["days_since_last_package"] == 26
+    assert c["degraded"] is True
+
+
+def test_source_coverage_quiet_on_a_healthy_window():
+    """The healthy baseline the thresholds were calibrated on: a rolling 30-day window in May/June
+    never dropped below 73.2 % coverage of dispatched orders and never went more than 3 days
+    without a new package number. That must NOT raise an alarm — an alarm that cries on normal
+    trading is one the manager learns to ignore."""
+    rows = ([(d % 30, "Vybavená", f"EF10000{i:03d}SK", "Kuriér")
+             for i, d in enumerate(range(115))]                     # 115 dispatched WITH a number
+            + [(d % 30, "Vybavená", "", "Kuriér") for d in range(42)]  # 42 without → 73.2 %
+            + [(d % 10, "Vybavuje sa", "", "Kuriér") for d in range(30)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 157
+    assert c["dispatched_without_package"] == 42
+    assert c["days_since_last_package"] == 0
+    assert c["degraded"] is False
+
+
+def test_source_coverage_staleness_alone_degrades():
+    """The sharper of the two rules. Every dispatched order in the window carries a number, so
+    coverage is perfect — but nothing new has arrived for 7 days. In the healthy two months the
+    longest gap was 3 days, so this is the rule that would have caught the real outage on 8.7.,
+    19 days before the deadline that was missed."""
+    rows = [(7 + d, "Vybavená", f"EF20000{d:03d}SK", "Kuriér") for d in range(10)]
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_without_package"] == 0     # coverage is 100 %…
+    assert c["days_since_last_package"] == 7
+    assert c["degraded"] is True                    # …and it is still degraded
+
+
+def test_source_coverage_low_coverage_alone_degrades():
+    """The other direction: numbers are still arriving (gap 0), but only a third of the dispatched
+    orders get one — a half-broken source, which the staleness rule alone would never see."""
+    rows = ([(d, "Vybavená", f"EF30000{d:03d}SK", "Kuriér") for d in range(5)]
+            + [(d % 20, "Vybavená", "", "Kuriér") for d in range(15)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["days_since_last_package"] == 0        # fresh numbers still coming in…
+    assert c["degraded"] is True                    # …but 5/20 = 25 % coverage
+
+
+def test_source_coverage_pending_orders_never_degrade():
+    """An order still being picked („Vybavuje sa") has no package number yet and that is entirely
+    normal — counting those into the rule would light the alarm up every single day."""
+    rows = [(d, "Vybavuje sa", "", "Kuriér") for d in range(40)]
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 0
+    assert c["missing_package"] == 40
+    assert c["degraded"] is False
+
+
+def test_source_coverage_empty_window_never_degrades():
+    """No eligible orders at all (shop closed, fresh install, export not pulled yet) is not
+    evidence of a broken source — no orders can prove nothing."""
+    c = pu.source_coverage(_orders([]), today=date(2026, 7, 27))
+    assert c == {"dispatched_orders": 0, "dispatched_with_package": 0, "missing_package": 0,
+                 "dispatched_without_package": 0, "days_since_last_package": None,
+                 "degraded": False}
+
+
+def test_source_coverage_uses_the_same_eligibility_as_the_shipment_source():
+    """The alarm must count exactly the orders the automation would have chased — otherwise it
+    reports a gap that was never its job. Cancelled orders, non-Pošta couriers and orders outside
+    the 30-day window are excluded here exactly as they are in shipments_from_orders_csv."""
+    rows = [(2, "Stornovaná", "", "Kuriér"),          # cancelled → not our shipment
+            (2, "Vybavená", "", "DPD kuriér"),        # DPD → different carrier entirely
+            (45, "Vybavená", "", "Kuriér"),           # older than the 30-day window
+            (2, "Vybavená", "", "Kuriér")]            # the only one that counts
+    csv_text = _orders(rows)
+    c = pu.source_coverage(csv_text, today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 1 and c["missing_package"] == 1
+    # and the two functions really do agree on what is eligible
+    assert pu.shipments_from_orders_csv(csv_text, today=date(2026, 7, 27)) == []
