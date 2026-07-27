@@ -11,7 +11,7 @@ paths:
 
 # Automatizácie — ako nezomrieť potichu (a ako neveriť fixtúram)
 
-Tri veci, ktoré tento repozitár už stáli reálnu škodu. Prečítaj ich skôr, než pridáš alebo
+Štyri veci, ktoré tento repozitár už stáli reálnu škodu. Prečítaj ich skôr, než pridáš alebo
 zmeníš automatizáciu, jej `stats`, alebo fixtúru odpovede z cudzieho API.
 
 ## 1. Fixtúra, ktorá vznikla v tom istom commite ako feature, nedokazuje NIČ o tvare API
@@ -122,3 +122,33 @@ nefunkčný odznak vyššie.
 Alarm musí ostať **iba počítadlom**: nesmie nič odoslať ani rozšíriť množinu zásielok, ktoré idú
 do eskalácie — pripni to testom (`test_posta_source_alarm_never_widens_what_gets_mailed`). Pri
 Pošte je to kritické: keď sa zdroj opraví, 130 doteraz neviditeľných zásielok sa objaví naraz.
+
+## 4. Hodnota, ktorá ide zákazníkovi do mailu — typuj ju, neprepisuj ju „fail-soft"
+
+Pri `retainedTill` (#283) sa neznáma hodnota držala „radšej ukázať než zahodiť". To je pri DÁTUME
+zlé hneď dvakrát a oboje sa ukázalo až v review:
+
+- **Šablóna má natvrdo predponu.** „Prosím vyzdvihnite si ju **do** {hodnota}" spraví z čohokoľvek,
+  čo nie je dátum, nezmysel priamo v maile zákazníkovi („do do odvolania", „do True").
+- **Neparsovateľná hodnota obíde KAŽDÚ kontrolu, ktorá ju parsuje.** Strážca „termín už uplynul"
+  používal ten istý `_parse_date`, takže `'20.07.2026'` (týždeň po termíne) prešiel ako budúci.
+
+Pravidlá, ktoré z toho platia pre každé pole idúce do zákazníckeho textu:
+
+1. **Fail-soft pri poli s typom = ZAHOĎ hodnotu a použi bezhodnotovú formuláciu** („čo najskôr"),
+   nikdy neprepisuj neznámy reťazec. Bezhodnotová veta je vždy pravdivá; neznámy reťazec nie.
+2. **Kontroluj to aj v builderi, nielen v čítačke.** `build_email` má druhého volajúceho — preview
+   endpoint mu podáva hodnotu priamo z `posta_uncollected.json`, takže pokazený zápis staršieho
+   behu by prešiel aj s opravenou čítačkou. A rob to BEZPODMIENEČNE (nie `if hodnota:`), aby typ
+   z pokazeného storu nespadol v `escape()` a nezobral so sebou celý denný beh.
+3. **Nezúž fail-soft na „čo nepoznám, to je prázdne".** ISO **basic** tvar (`20260803`) je platný
+   dátum a `date.fromisoformat` ho číta jednoznačne — pripni ho testom, nech ho nikto nezahodí.
+4. **Zákazník číta po slovensky: `3. 8. 2026`, nie `2026-08-03`.** ISO drž interne (tvar API,
+   JSON store, tabuľka na webe) a prekladaj až pri renderovaní mailu. Pozor na tichý prípad: kým
+   bolo pole vždy prázdne, ISO tvar sa nikdy reálne neodoslal — „veď to tak bolo vždy" neplatí.
+
+**A ešte jedno, z toho istého review:** alarm musí VRACAŤ to číslo, na ktorom sa spúšťa.
+`dispatched_status_unknown` sa spúšťal na počte eligible objednávok, ale ten sa nevracal — log si
+ho preto aproximoval (`missing_package + dispatched_orders`) a v jedinej vetve, ktorá vôbec
+nastane, to spadlo na nulu: „v okne je 0 objednávok, ale ANI JEDNA nemá stav Vybavená". Keď
+pridávaš príznak, pridaj vedľa neho aj surové číslo, ktorým sa dá napísať pravdivá veta.
