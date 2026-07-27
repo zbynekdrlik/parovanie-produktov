@@ -3813,18 +3813,18 @@ const _PAROVANIA_STATUS = {
   ok: ['✅ OK', 'ok'], blocked: ['⚠️ Časť zablokovaná', 'warn'],
   failed: ['❌ Zlyhalo', 'bad'],
 };
-// #270 — „eshop taký kód nemá". A variant code that is missing from the eshop's
-// own catalogue export can never be imported: Shoptet rejects that row on EVERY
-// run (the same „Zlyhanie variantov: 2" every night since 24. 7. 2026), and the
-// manager saw only a red count with no way to learn WHICH code or WHY. The push
+// #270/#275 — „eshop taký kód nemá". A variant code that is missing from the
+// eshop's own catalogue export can never be imported: Shoptet rejects that row on
+// EVERY run (the same „Zlyhanie variantov: 2" every night since 24. 7. 2026), and
+// the manager saw only a red count with no way to learn WHICH code or WHY. The push
 // now holds those rows back and names them here, with the value it wanted to
 // write, so the code can be fixed. `p`/`s` are the pairings/suppliers halves of
 // last_result; returns null when there is nothing to report (the normal night).
+// Since #275 BOTH halves hold, so a listed code means the same thing either way —
+// the per-row „(dodávateľ — zapisuje sa ďalej)" caveat is gone with the asymmetry.
 // Pure enough to unit-test in the browser realm — see tests/e2e/test_shell.py.
 function missingCodesBox(p, s) {
-  const rows = [];
-  for (const m of (p.missing_in_eshop || [])) rows.push({ ...m, held: true });
-  for (const m of (s.missing_in_eshop || [])) rows.push({ ...m, held: false });
+  const rows = [...(p.missing_in_eshop || []), ...(s.missing_in_eshop || [])];
   const total = (Number(p.missing_count) || 0) + (Number(s.missing_count) || 0);
   if (!total) return null;
   // own class (styled FROM .autoerr): `.autoerr` means „the last run failed" and sits
@@ -3838,8 +3838,7 @@ function missingCodesBox(p, s) {
   for (const m of rows) {
     const li = document.createElement('li');
     // free text out of the manager's stores — textContent only, never innerHTML
-    li.textContent = m.code + (m.value ? ' → ' + m.value : '')
-      + (m.held ? '' : ' (dodávateľ — zapisuje sa ďalej)');
+    li.textContent = m.code + (m.value ? ' → ' + m.value : '');
     ul.appendChild(li);
   }
   box.appendChild(ul);

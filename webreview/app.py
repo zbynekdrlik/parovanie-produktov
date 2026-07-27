@@ -4926,41 +4926,54 @@ def _do_upload_suppliers(dry):
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
-    # #270: the same "the eshop has no such code" rows that doom the pairings push
-    # also sit here (145/3XL is both an inline pairing and a supplier assignment).
-    # This path only REPORTS them — deliberately asymmetric: a supplier row can only
-    # ADD a name where the eshop has none, and PR #213 decided a present-but-partial
-    # export must never drop a legitimate fill-in assignment. So the manager sees the
-    # bad code from both sides of the push, and the write behaviour is untouched.
-    # The report carries the same weight as the pairings verdict (it turns the pairings
-    # half of the nightly row orange), so it needs the same gates: stale bytes must not
-    # accuse a code the eshop has had for days. The SIZE gate already ran above — an
-    # implausibly small export never gets this far — so only freshness is left here.
+    # #270/#275: the same "the eshop has no such code" rows that doom the pairings push
+    # also sit here (145/3XL is both an inline pairing and a supplier assignment). Such
+    # a row can NEVER import — Shoptet rejects it on every single run, so it is never
+    # recorded in uploaded_suppliers.json, stays „new" for ever and turns the whole
+    # nightly run red every night. It is therefore HELD BACK here exactly as the
+    # pairings half has held it since #270, and reported by name with the value we
+    # wanted to write.
+    #
+    # This does NOT reverse PR #213: that decision was that a present-but-partial export
+    # must never DROP a legitimate fill-in assignment, and holding is not dropping. The
+    # assignment stays in supplier_assignments.json, is never credited as uploaded, and
+    # goes up on the first run after the code appears in the catalogue — bounded and
+    # self-healing, while sending it costs a red run every night for ever.
+    #
+    # Withholding a row is a WRITE condition, so it may only stand on bytes we believe:
+    # the same gates as the pairings verdict. The SIZE gate (now the #277 ratio floor)
+    # already ran above — an implausible export never gets this far and blocks the whole
+    # upload — so only freshness is left here. An untrusted export yields no missing
+    # codes at all, i.e. nothing is held and behaviour falls back to sending.
     export_age = _export_age_s()
     export_trusted = (len(export_codes) >= min_codes
                       and (export_age is None or export_age <= EXPORT_MAX_AGE_S))
     missing_codes = sorted(c for c in new_codes if c not in export_codes) if export_trusted else []
     if missing_codes:
-        log.warning("n8n suppliers: %d kódov eshop v katalógu vôbec nemá "
-                    "(zapisujem ich ďalej, len ich hlásim): %s",
+        log.warning("n8n suppliers: %d kódov eshop v katalógu vôbec nemá — "
+                    "zadržiavam ich (Shoptet by ich zakaždým odmietol): %s",
                     len(missing_codes), missing_codes[:10])
 
-    # BUG 1: never overwrite a supplier the eshop already has — exclude codes whose
-    # product carries its own supplier in the current export (read in the single
-    # streaming pass above).
+    # Two exclusions, one pass:
+    #   own_supplier   BUG 1 — never overwrite a supplier the eshop already has
+    #   missing_codes  #275  — never send a code the catalogue does not carry
     rows = import_builder.supplier_rows(
-        {c: assigns[c] for c in new_codes}, CODE2PAIR, exclude_codes=own_supplier)
+        {c: assigns[c] for c in new_codes}, CODE2PAIR,
+        exclude_codes=own_supplier | set(missing_codes))
     if not rows:
         log.warning("n8n suppliers: %d new codes but 0 import rows "
-                    "(%d already have their own eshop supplier)",
-                    len(new_codes), len(own_supplier & set(new_codes)))
+                    "(%d already have their own eshop supplier, %d held as absent "
+                    "from the catalogue)",
+                    len(new_codes), len(own_supplier & set(new_codes)), len(missing_codes))
         return {"ok": True, "count": 0, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
                 **_missing_report(missing_codes, assigns),
                 **_supplier_summary(uploaded, assigns)}, 200
 
     # supplier_rows is 1:1 with codes (no product→variant indirection), but codes with
-    # their own eshop supplier are excluded — so written_codes ⊆ new_codes.
+    # their own eshop supplier — and, since #275, codes the catalogue does not carry —
+    # are excluded, so written_codes ⊆ new_codes. A held code therefore never enters
+    # `success` and so is never recorded uploaded: it is simply retried next run.
     written_codes = {r[0] for r in rows}
 
     if not _import_lock.acquire(blocking=False):
@@ -5836,10 +5849,10 @@ def run_parovania_eshop() -> dict:
             "total_assigned": suppliers.get("total_assigned", 0),
             "remaining": suppliers.get("remaining", 0),
             "blocked": _blocked(suppliers),
-            # #270 report-only on this side — the row IS still written (see
-            # _do_upload_suppliers), so in practice Shoptet rejects it and the run is
-            # already „failed"; this term only decides the status in the rare case the
-            # import came back clean anyway. The manager sees the same bad code here too.
+            # #270/#275: codes the eshop's CATALOGUE does not carry at all. Since #275
+            # this half HOLDS them like the pairings half, instead of sending them for
+            # Shoptet to refuse — which is what stops the run being red every night and
+            # makes this term the one that (correctly) turns it orange instead.
             "missing_count": _missing(suppliers),
             "missing_in_eshop": suppliers.get("missing_in_eshop") or [],
             "ok": s_ok,
