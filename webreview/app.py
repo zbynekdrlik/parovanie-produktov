@@ -2036,7 +2036,39 @@ def _fetch_export_csv() -> bytes:
                            "(URL skrytá — over SHOPTET_EXPORT_URL)") from None
     if not r.content:
         raise RuntimeError("stiahnutý export katalógu je prázdny")
+    _refuse_implausible_export_download(len(r.content))
     return r.content
+
+
+def _refuse_implausible_export_download(size: int) -> None:
+    """#277 — a truncated download must not silently replace a good export.
+
+    Raising here happens BEFORE `run_shoptet_sync`'s atomic swap, so the bytes already
+    on disk survive (the fetch-then-swap contract that function documents) and the
+    hourly sync goes red instead of degrading quietly.
+
+    Bounded by construction, so it can never deadlock a genuine catalogue shrink: it
+    only defends an export that is still USABLE. Once the on-disk copy is older than
+    EXPORT_MAX_AGE_S, `_export_row_verdicts` refuses to trust it anyway, so there is
+    nothing left worth protecting and the smaller download is let through — which is
+    what lets the watermark window then observe the new, smaller reality.
+
+    Bytes vs bytes: comparing a downloaded LINE count against a code-count watermark
+    would mix units (multi-line HTML descriptions make lines far exceed codes)."""
+    try:
+        have = os.path.getsize(SRC)
+    except OSError:
+        return                              # nothing on disk yet — first ever sync
+    age = _export_age_s()
+    if not have or age is None or age > EXPORT_MAX_AGE_S:
+        return                              # what we hold is stale/empty — let it land
+    floor = int(EXPORT_FETCH_MIN_RATIO * have)
+    if size < floor:
+        # NEvkladaj URL ani `e` do hlášky (partner hash) — same rule as above.
+        raise RuntimeError(
+            f"stiahnutý export katalógu je nepravdepodobne malý ({size} B oproti "
+            f"{have} B na disku, limit {floor} B) — vyzerá useknuto, nechávam na disku "
+            "ten predošlý")
 
 
 def _fetch_customers_csv() -> bytes:
@@ -4280,6 +4312,101 @@ MISSING_CODES_SHOWN = 50
 # batch consists only of the doomed rows.
 EXPORT_MIN_CODES = 1000
 
+# …but 1000 against a ~14 000-code catalogue leaves a WIDE band of false confidence:
+# a truncated export carrying 1200 codes cleared it, and the app then declared the
+# other ~12 800 codes „missing from the eshop" — holding their rows and accusing them
+# on the automation card (#277: measured, 12 866 such codes). The real floor is a
+# RATIO of how big the catalogue actually is.
+#
+# The reference has to be its OWN persisted store: `len(CODE2PAIR)` is rebuilt from
+# the SAME export, so a broken feed would poison the reference too, and a ratio of the
+# BATCH disarms itself once the batch is only the doomed rows (#270). So: the largest
+# code count seen in the last EXPORT_WATERMARK_WINDOW_DAYS, kept in daily buckets. A
+# bad export can only fail to RAISE it (the buckets fold with max()), never lower it.
+EXPORT_WATERMARK = _store("export_watermark.json")
+EXPORT_WATERMARK_WINDOW_DAYS = 7
+EXPORT_WATERMARK_RATIO = 0.5
+# How much smaller than what we already hold a DOWNLOAD may be before we refuse to
+# swap it in (bytes vs bytes — never lines vs codes: multi-line HTML descriptions make
+# a line count far exceed the code count, so a ratio calibrated for codes would reject
+# perfectly healthy exports).
+EXPORT_FETCH_MIN_RATIO = 0.5
+
+
+def _watermark_days(state) -> dict:
+    """The {day: count} buckets, defensively typed. Junk buckets are dropped rather
+    than raising: this store is DERIVED state that the next sync rebuilds, so the safe
+    degradation is „we do not know the catalogue size" (→ the absolute floor, i.e. the
+    pre-#277 behaviour), never taking the nightly push down over a cache file."""
+    days = state.get("days") if isinstance(state, dict) else None
+    if not isinstance(days, dict):
+        return {}
+    return {k: v for k, v in days.items()
+            if isinstance(k, str) and isinstance(v, int)
+            and not isinstance(v, bool) and v > 0}
+
+
+def _watermark_window(today=None) -> tuple:
+    """(oldest day still inside the window, today) — both ISO, INCLUSIVE.
+
+    Bounded from BOTH sides on purpose. A bucket dated in the FUTURE (a corrupt write,
+    a clock skew) compared only against the lower cutoff would sit inside the window
+    for ever, so a stale high reading would keep the floor high and the supplier
+    write-back blocked with no way out — the same trap the playbook already records
+    for `at` (posta terminal cache) and `claimed_at` (the reminder claim)."""
+    today = today or datetime.now(timezone.utc).date()
+    return (today - timedelta(days=EXPORT_WATERMARK_WINDOW_DAYS - 1)).isoformat(), \
+        today.isoformat()
+
+
+def _export_watermark(today=None) -> int:
+    """The largest catalogue size observed inside the window, or 0 when we have never
+    observed one (a fresh deploy, or a window that has aged out entirely)."""
+    lo, hi = _watermark_window(today)
+    live = [v for k, v in _watermark_days(_read_json_store(EXPORT_WATERMARK, {})).items()
+            if lo <= k <= hi]
+    return max(live) if live else 0
+
+
+def _export_watermark_observe(codes: int, today=None) -> int:
+    """Record `codes` as today's reading and prune the window. Called from EXACTLY one
+    place — `run_shoptet_sync`, on the index just rebuilt from freshly downloaded bytes
+    (the freshest ground truth there is). Deliberately NOT hidden inside
+    `_export_note_index`/`_export_supplier_index`: a write on a read path would turn
+    „read the export" into a mutation, and would let a STALE on-disk export keep
+    re-asserting the old size for ever — which is precisely what would break the
+    self-healing below.
+
+    The day bucket keeps the LARGEST reading, so one bad hour cannot overwrite the good
+    reading taken an hour earlier."""
+    lo, hi = _watermark_window(today)
+    with _lock:
+        days = _watermark_days(_read_json_store(EXPORT_WATERMARK, {}))
+        days = {k: v for k, v in days.items() if lo <= k <= hi}
+        if codes > 0:
+            days[hi] = max(days.get(hi, 0), int(codes))
+        _atomic_write_json(EXPORT_WATERMARK, {"days": days}, indent=None)
+    return max(days.values()) if days else 0
+
+
+def _export_min_codes(today=None) -> int:
+    """How many codes an export must carry to be believed — ONE threshold for BOTH
+    gates (`_export_row_verdicts`'s trust check and `_do_upload_suppliers`'s write
+    check), so they can never drift apart (playbook, TEST-PASCA 2).
+
+    Recovery is by TIME and is bounded in both directions:
+      • no watermark yet (fresh deploy, corrupt store, a window that aged out) → the
+        absolute floor, i.e. exactly the pre-#277 behaviour: the first sync can never
+        be blocked out of the box;
+      • a catalogue that GENUINELY shrinks below the ratio is accepted with no human
+        action once the old readings leave the window (≤ EXPORT_WATERMARK_WINDOW_DAYS).
+        Until then the state is SAFE, not lossy: supplier assignments are HELD (never
+        recorded uploaded) and the pairings half simply falls back to sending its rows.
+    Repetition cannot shorten that on purpose — a persistently broken feed produces the
+    same repeated reading as a genuine shrink, so „N agreeing observations" would accept
+    the very thing this gate exists to reject."""
+    return max(EXPORT_MIN_CODES, int(EXPORT_WATERMARK_RATIO * _export_watermark(today)))
+
 
 def _missing_report(codes, values) -> dict:
     """The „eshop taký kód nemá" block both halves of the nightly push return (#270):
@@ -4343,13 +4470,14 @@ def _export_row_verdicts(rows, note_col=2) -> dict:
                     age / 3600, EXPORT_MAX_AGE_S / 3600)
         return none
     notes, codes = _export_note_index()
-    if len(codes) < EXPORT_MIN_CODES:
+    floor = _export_min_codes()
+    if len(codes) < floor:
         # no export, an export with no product rows, or an implausibly small one: we
         # do not know the catalogue, so nothing may be credited AND nothing may be
         # called missing
         if codes:
             log.warning("export nesie len %d kódov (limit %d) — vyzerá neúplne, "
-                        "nepotvrdzujem ani nezadržiavam nič", len(codes), EXPORT_MIN_CODES)
+                        "nepotvrdzujem ani nezadržiavam nič", len(codes), floor)
         return none
     confirmed = {r[0] for r in rows
                  if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
@@ -4787,10 +4915,11 @@ def _do_upload_suppliers(dry):
     # A PLAUSIBLE-but-partial export that merely lacks a given code is still fine — that
     # code is simply not excluded and gets written (unchanged behaviour, PR #213).
     own_supplier, export_codes, export_present = _export_supplier_index()
-    if not export_present or len(export_codes) < EXPORT_MIN_CODES:
+    min_codes = _export_min_codes()          # #277: ONE threshold, shared with the verdicts
+    if not export_present or len(export_codes) < min_codes:
         log.warning("n8n suppliers: export missing/empty/implausibly small (%d codes < %d) "
                     "— supplier upload BLOCKED (%d new assignments held, no eshop write)",
-                    len(export_codes), EXPORT_MIN_CODES, len(new_codes))
+                    len(export_codes), min_codes, len(new_codes))
         return {"ok": True, "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
@@ -4808,7 +4937,7 @@ def _do_upload_suppliers(dry):
     # accuse a code the eshop has had for days. The SIZE gate already ran above — an
     # implausibly small export never gets this far — so only freshness is left here.
     export_age = _export_age_s()
-    export_trusted = (len(export_codes) >= EXPORT_MIN_CODES
+    export_trusted = (len(export_codes) >= min_codes
                       and (export_age is None or export_age <= EXPORT_MAX_AGE_S))
     missing_codes = sorted(c for c in new_codes if c not in export_codes) if export_trusted else []
     if missing_codes:
@@ -5589,6 +5718,11 @@ def run_shoptet_sync() -> dict:
         # nedostupné resolver rebuilds them from the new products.csv on next tab open.
         _NEDOSTUPNE_CAT = None
         _CODE2URL = None
+        # #277 — the ONE place the catalogue-size watermark is observed: the index we
+        # have just rebuilt from freshly downloaded bytes. Feeding a persistent
+        # max-over-7-days store is NOT the „compare against len(CODE2PAIR)" the ticket
+        # rules out: a broken feed can only fail to raise the watermark, never lower it.
+        _export_watermark_observe(len(CODE2PAIR))
 
     rows = []
     # newline="" — see _load_catalog (#279). resync_current joins the export to
