@@ -1320,7 +1320,8 @@ viď classic-Project gotcha nižšie; `requests.patch`, nie post).
 - **`_export_note_index()` / `_export_supplier_index()` = jeden prechod, viac faktov** —
   `{code: internalNote}` + množina VŠETKÝCH kódov, resp. kódy s vlastným `supplier` + všetky
   kódy + „mal súbor vôbec nejaký obsah". Keď potrebuješ ďalší fakt z exportu, PRIDAJ ho do
-  existujúceho prechodu, nerob druhý.
+  prechodu, ktorý v TEJ ISTEJ funkcii už beží — nerob druhý. (Dva prechody za nočný beh sú
+  v poriadku: párovania a dodávatelia sú dva nezávislé vstupné body, každý si číta sám.)
 
 **`_export_row_verdicts(rows)` (#270) = `{"confirmed", "absent"}` z toho jedného prechodu.**
 `absent` = kód, ktorý eshop v katalógu VÔBEC nemá → riadok sa NEPOŠLE (Shoptet by ho
@@ -1332,7 +1333,14 @@ zapísať; beh je oranžový (`blocked`), nie falošne zelený. Tri veci, ktoré
   kód v katalógu objaví, najbližší beh ho pošle. Preto stačia dve brány — a **NEROB pomerovú
   „vyzerá to na neúplný export" bránu**: sama sa vyradí vo chvíli, keď v dávke ostanú už LEN
   tie doomed riadky (100 % „absent" → brána ich zase pustí), a nočné odmietanie sa vráti.
-- **Brány: čerstvosť (`EXPORT_MAX_AGE_S`) + neprázdna množina kódov.** Chýbajúci/prázdny/
+- **Brány: čerstvosť (`EXPORT_MAX_AGE_S`) + `EXPORT_MIN_CODES` (1000).** Katalóg má
+  ~14 000 kódov, takže čerstvý neprázdny export s hŕstkou kódov je pokazený feed
+  (useknuté stiahnutie, zabudnutý filter), nie malý obchod — veril by mu a zadržal by
+  riadky kódov, ktoré eshop má. Absolútny prah sa (na rozdiel od pomerového) nevie sám
+  vyradiť. Testy si ho znižujú vo fixture; produkčnú hodnotu pinuje
+  `test_an_implausibly_small_export_is_not_trusted`. Rovnaké brány platia aj pre
+  hlásenie na dodávateľskej strane (oranžový beh je tvrdenie, nech stojí na overených
+  bajtoch). Chýbajúci/prázdny/
   starý export nesmie ani potvrdiť, ani zadržať — `absent` je NOVÁ podmienka na zápis do
   ostrého eshopu, takže nesie tú istú bránu ako potvrdzovanie z exportu.
 - **Dodávateľský write-back tie kódy LEN HLÁSI a ďalej ich zapisuje — zámerná asymetria.**

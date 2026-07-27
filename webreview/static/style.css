@@ -469,8 +469,13 @@ body[data-theme=dark] .pill.on{background:#064e3b;color:#6ee7b7}
 .autoerr{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
   border-radius:8px;padding:8px 10px;word-break:break-word}
 body[data-theme=dark] .autoerr{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
-/* #270 — codes the eshop's catalogue does not carry, listed inside the .autoerr box
-   (kód → čo sme chceli zapísať); free text, so it must wrap rather than stretch. */
+/* #270 — codes the eshop's catalogue does not carry (kód → čo sme chceli zapísať).
+   Looks like .autoerr but has its OWN class: .autoerr means „the last run failed" and
+   is always a direct child of the tab section, so a nested second match would break
+   the unscoped `.autoerr` locators in the e2e suite. Free text → wrap, never stretch. */
+.automiss{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
+  border-radius:8px;padding:8px 10px;word-break:break-word}
+body[data-theme=dark] .automiss{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
 .misscodes{margin:6px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:2px}
 .misscodes li{word-break:break-word}
 /* #109 „Párovania → eshop" — per-run result box coloured by outcome (ok/blocked/failed) */

@@ -365,6 +365,7 @@ def test_missing_eshop_codes_are_listed_with_what_we_wanted_to_write(page, live_
       return {quiet: missingCodesBox({}, {}),
               text: box.textContent,
               bolds: box.querySelectorAll('b').length,
+              cls: box.className,
               items: box.querySelectorAll('.misscodes li').length};
     }""")
 
@@ -373,6 +374,9 @@ def test_missing_eshop_codes_are_listed_with_what_we_wanted_to_write(page, live_
     assert "15813/110 → https://x/<b>y</b>" in out["text"]
     assert "145/3XL → FOREST (dodávateľ — zapisuje sa ďalej)" in out["text"]
     assert out["bolds"] == 0                         # free text, never markup
+    # its OWN class — `.autoerr` means „the last run failed" and every unscoped
+    # `.autoerr` locator in the e2e suite would break on a second, nested match
+    assert out["cls"] == "automiss"
     assert out["items"] == 2 and "a ďalších 2" in out["text"]
 
     assert console == [], f"console not clean: {console}"

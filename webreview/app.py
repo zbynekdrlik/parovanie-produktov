@@ -4081,7 +4081,7 @@ def _import_rows_chunked(all_rows, header, dry, prefix, csv_safe=False, timeout=
     2026-07-22). Its codes go to ``partial_codes``, NOT to ``success_codes``: the Shoptet
     log reports aggregate counts only and never says WHICH rows failed, so no individual
     row of that chunk may be claimed uploaded on the strength of the log alone (the
-    caller proves them from the eshop's own export instead — _export_internal_notes).
+    caller proves them from the eshop's own export instead — _export_row_verdicts).
 
     Returns a dict:
       ok             True iff EVERY chunk was fully clean (dry-run all-ok counts as ok)
@@ -4266,6 +4266,14 @@ EXPORT_MAX_AGE_S = 6 * 3600
 # them one by one — a runaway list must not bloat automations.json.
 MISSING_CODES_SHOWN = 50
 
+# The catalogue is ~14 000 variant codes. An export carrying FAR fewer is not a small
+# catalogue, it is a broken feed (a changed export pattern, a filter left on, a
+# truncated download) — and believing it would accuse codes the eshop really has, and
+# withhold their rows. A floor two orders of magnitude below reality never fires on a
+# genuine catalogue, and (unlike a RATIO of the batch) it cannot disarm itself once the
+# batch consists only of the doomed rows.
+EXPORT_MIN_CODES = 1000
+
 
 def _missing_report(codes, values) -> dict:
     """The „eshop taký kód nemá" block both halves of the nightly push return (#270):
@@ -4329,9 +4337,13 @@ def _export_row_verdicts(rows, note_col=2) -> dict:
                     age / 3600, EXPORT_MAX_AGE_S / 3600)
         return none
     notes, codes = _export_note_index()
-    if not codes:
-        # no export / an export with no product rows: we know NOTHING about the
-        # catalogue, so nothing may be credited AND nothing may be called missing
+    if len(codes) < EXPORT_MIN_CODES:
+        # no export, an export with no product rows, or an implausibly small one: we
+        # do not know the catalogue, so nothing may be credited AND nothing may be
+        # called missing
+        if codes:
+            log.warning("export nesie len %d kódov (limit %d) — vyzerá neúplne, "
+                        "nepotvrdzujem ani nezadržiavam nič", len(codes), EXPORT_MIN_CODES)
         return none
     confirmed = {r[0] for r in rows
                  if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
@@ -4568,6 +4580,8 @@ def _do_upload_pairings(dry):
     # the moment the code appears in the catalogue it is written.
     verdicts = _export_row_verdicts(all_rows)
     confirmed = verdicts["confirmed"]
+    # (the two sets are disjoint by construction — confirmed ⊆ notes ⊆ codes, absent is
+    # „not in codes" — the subtraction is belt-and-braces against a future verdict change)
     absent = verdicts["absent"] - confirmed
     send_rows = [r for r in all_rows if r[0] not in confirmed and r[0] not in absent]
     missing = _missing_report(sorted(absent), {r[0]: r[2] for r in all_rows})
@@ -4576,6 +4590,12 @@ def _do_upload_pairings(dry):
                  "ich poslali — potvrdené z exportu, neposielam znova",
                  len(confirmed), len(all_rows))
     if absent:
+        # A review key with SEVERAL variant codes, one of them absent, can never be
+        # recorded uploaded (its landed codes get confirmed, the absent one never
+        # enters `success`, and a key is credited only when ALL its written codes did
+        # — the #49 rule). It therefore stays „new" and reports +0 nových every night
+        # until the code is fixed. That is the safe direction, and the card names the
+        # exact offending code below, which is what the manager has to act on.
         log.warning("n8n pairings: %d kódov eshop v katalógu vôbec nemá — "
                     "neposielam ich (Shoptet by ich zakaždým odmietol): %s",
                     len(absent), sorted(absent)[:10])
@@ -4722,19 +4742,6 @@ def _export_supplier_index() -> tuple[set, set, bool]:
     return own, codes, seen_content
 
 
-def _codes_with_own_supplier() -> set:
-    """Forestshop variant codes whose product ALREADY carries its own `supplier`
-    in the current catalog export (data/products.csv). A per-product manual
-    assignment is meant to FILL IN a supplier for an order line that arrived
-    WITHOUT one — it must NEVER overwrite a real eshop supplier. So the nightly
-    write-back excludes any code the export already shows a supplier for. An empty
-    set means "no code is protected", which is only safe when the export is KNOWN
-    to be present — so any WRITE caller must fail CLOSED on an empty export BEFORE
-    relying on this (see _do_upload_suppliers); here a missing export still yields
-    an empty set."""
-    return _export_supplier_index()[0]
-
-
 def _do_upload_suppliers(dry):
     """Core of the nightly supplier write-back — the SINGLE place the logic lives
     (NEkopíruj logiku). Reads the supplier assignments, builds code;pairCode;supplier
@@ -4778,7 +4785,13 @@ def _do_upload_suppliers(dry):
     # ADD a name where the eshop has none, and PR #213 decided a present-but-partial
     # export must never drop a legitimate fill-in assignment. So the manager sees the
     # bad code from both sides of the push, and the write behaviour is untouched.
-    missing_codes = sorted(c for c in new_codes if c not in export_codes) if export_codes else []
+    # The report carries the same weight as the pairings verdict (it turns the whole
+    # nightly row orange), so it needs the same gate: stale bytes must not accuse a code
+    # the eshop has had for days, and an implausibly small export is a broken feed.
+    export_age = _export_age_s()
+    export_trusted = (len(export_codes) >= EXPORT_MIN_CODES
+                      and (export_age is None or export_age <= EXPORT_MAX_AGE_S))
+    missing_codes = sorted(c for c in new_codes if c not in export_codes) if export_trusted else []
     if missing_codes:
         log.warning("n8n suppliers: %d kódov eshop v katalógu vôbec nemá "
                     "(zapisujem ich ďalej, len ich hlásim): %s",
@@ -5668,7 +5681,9 @@ def run_parovania_eshop() -> dict:
             "remaining": suppliers.get("remaining", 0),
             "blocked": _blocked(suppliers),
             # #270 report-only on this side — the row IS still written (see
-            # _do_upload_suppliers); the manager just sees the same bad code here too
+            # _do_upload_suppliers), so in practice Shoptet rejects it and the run is
+            # already „failed"; this term only decides the status in the rare case the
+            # import came back clean anyway. The manager sees the same bad code here too.
             "missing_count": _missing(suppliers),
             "missing_in_eshop": suppliers.get("missing_in_eshop") or [],
             "ok": s_ok,
@@ -5814,7 +5829,11 @@ def _iter_export_lines():
     translation), which is exactly what `csv.reader`/`csv.DictReader` need: a
     quoted field spanning several lines is reassembled from the yielded lines
     byte-for-byte, so parsing over this iterator gives the same values as parsing
-    over `io.StringIO(whole_text)` did. A missing file yields nothing and never
+    over `io.StringIO(whole_text)` did for every well-formed export. One deliberate
+    difference: a BARE carriage return in an UNQUOTED field used to raise
+    `_csv.Error: new-line character seen in unquoted field` (the whole nightly push
+    died); it now splits the record, which is exactly why the csv docs mandate
+    `newline=""`. It can only ADD codes, never invent an absent one. A missing file yields nothing and never
     raises — same contract as `_read_export_for_links`.
 
     Measured on the live 57.4 MB export: peak allocation 346.6 MB → 3.0 MB

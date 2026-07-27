@@ -3825,9 +3825,12 @@ function missingCodesBox(p, s) {
   const rows = [];
   for (const m of (p.missing_in_eshop || [])) rows.push({ ...m, held: true });
   for (const m of (s.missing_in_eshop || [])) rows.push({ ...m, held: false });
-  const total = (p.missing_count || 0) + (s.missing_count || 0);
+  const total = (Number(p.missing_count) || 0) + (Number(s.missing_count) || 0);
   if (!total) return null;
-  const box = el('div', 'autoerr');
+  // own class (styled FROM .autoerr): `.autoerr` means „the last run failed" and sits
+  // as a direct child of the tab section — a second, NESTED match would break every
+  // unscoped `.autoerr` locator in the e2e suite.
+  const box = el('div', 'automiss');
   box.appendChild(el('div', '',
     `⛔ Eshop tieto kódy v katalógu nemá (${total}) — oprav kód v eshope alebo `
     + 'párovanie na záložke „Na objednanie".'));

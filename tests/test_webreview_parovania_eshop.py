@@ -12,8 +12,10 @@ green (one place for the logic, NEkopíruj logiku).
 """
 import csv as _csv
 import inspect
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,13 +35,21 @@ def _product(variant_codes=("1/M",)):
             "ai_chosen_url": "", "ai_reason": "", "candidates": [], "current": {}}
 
 
+# The production reader splits on \n, \r and \r\n and on NOTHING else. `str.splitlines`
+# also splits on \x0b \x0c \x1c \x1d \x1e \x85 \u2028 \u2029, so a fixture using it would
+# parse under different rules than production (verified: unquoted "a\x0cb" is ONE record
+# in production, two through splitlines).
+_LINE_SPLIT = re.compile(r"(?<=\n)|(?<=\r)(?!\n)")
+
+
 def _export_lines(text):
     """monkeypatch value for `webapp._iter_export_lines` — the nightly push STREAMS
     the catalog export line by line (#272), so THIS is the seam a test feeds a fake
     export through (patching the whole-text `_read_export_for_links` no longer
     reaches the push: it is defined in terms of this one). Returns a fresh iterator
     on every call, exactly like the real generator."""
-    return lambda: iter(text.splitlines(keepends=True))
+    lines = [ln for ln in _LINE_SPLIT.split(text) if ln]
+    return lambda: iter(lines)
 
 
 @pytest.fixture
@@ -64,6 +74,11 @@ def iso(tmp_path, monkeypatch):
     # reads an empty export and the supplier upload is blocked.
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines("code;pairCode;supplier\r\n"))
+    # #270: production refuses to trust an export carrying fewer than EXPORT_MIN_CODES
+    # (1000) codes — a fake export here has a handful, so the floor is lowered for the
+    # fixtures and pinned SEPARATELY at its real value by
+    # test_an_implausibly_small_export_is_not_trusted.
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 1)
     return {"tmp": tmp_path, "products": products}
 
 
@@ -231,7 +246,7 @@ def test_do_upload_suppliers_emits_code_absent_from_export(iso, monkeypatch):
               "5/A;555;REAL_SUPPLIER\r\n")
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(export))
     # the exclusion helper does NOT flag 9/Z (it is absent from the export)
-    assert "9/Z" not in webapp._codes_with_own_supplier()
+    assert "9/Z" not in webapp._export_supplier_index()[0]
     fake_run, calls = _ok_import()
     monkeypatch.setattr(webapp, "run_import", fake_run)
 
@@ -750,6 +765,7 @@ def test_export_confirmation_still_credits_a_fresh_export(tmp_path, monkeypatch)
     p = tmp_path / "products.csv"
     _write_export(p, {"1/M": "https://supplier/x"})
     monkeypatch.setattr(webapp, "SRC", str(p))
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 1)   # tiny fixture export
 
     assert (webapp._export_row_verdicts([["1/M", "P1", "https://supplier/x"]])["confirmed"]
             == {"1/M"})
@@ -838,6 +854,15 @@ def test_the_streamed_index_parses_exactly_like_a_whole_text_parse(tmp_path, mon
 
     notes, codes = webapp._export_note_index()
 
+    # the reference: what a whole-text parse (the pre-#272 path) makes of the same bytes
+    ref = {}
+    for r in _csv.DictReader(io.StringIO(text), delimiter=";"):
+        c = (r.get("code") or "").strip()
+        if c:
+            ref[c] = (r.get("internalNote") or "").strip()
+    assert set(codes) == set(ref)
+    assert {c: v for c, v in notes.items()} == {c: v for c, v in ref.items() if c != "4/M"}
+
     assert codes == {"1/M", "2/M", "3/M", "4/M", "5/M"}
     assert notes["1/M"] == "https://s/x"
     assert "novým riadkom" in notes["2/M"]
@@ -925,6 +950,7 @@ def test_a_stale_export_never_holds_a_row_back(tmp_path, monkeypatch):
     p = tmp_path / "products.csv"
     _write_export(p, {"9/Z": ""}, age_s=webapp.EXPORT_MAX_AGE_S + 60)
     monkeypatch.setattr(webapp, "SRC", str(p))
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 1)   # tiny fixture export
 
     v = webapp._export_row_verdicts([["1/M", "P1", "https://supplier/x"]])
     assert v["absent"] == set() and v["confirmed"] == set()
@@ -934,11 +960,16 @@ def test_a_fresh_export_reports_both_verdicts_in_one_pass(tmp_path, monkeypatch)
     p = tmp_path / "products.csv"
     _write_export(p, {"1/M": "https://supplier/x", "2/M": ""})
     monkeypatch.setattr(webapp, "SRC", str(p))
+    monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 1)   # tiny fixture export
+    reads, real = [], webapp._iter_export_lines
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        lambda: (reads.append(1), real())[1])
 
     v = webapp._export_row_verdicts([["1/M", "P1", "https://supplier/x"],
                                      ["2/M", "P1", "https://supplier/y"],
                                      ["3/M", "P1", "https://supplier/z"]])
 
+    assert len(reads) == 1                    # ONE pass over the ~57 MB export, not two
     assert v["confirmed"] == {"1/M"}          # already exactly as we would write it
     assert v["absent"] == {"3/M"}             # the eshop has no such code at all
     # 2/M exists but carries a different note → still sent (unchanged behaviour)
@@ -950,6 +981,10 @@ def test_the_verdicts_cannot_be_handed_notes_that_skip_the_freshness_check():
     checked, so there must be no parameter through which pre-read bytes can enter."""
     params = inspect.signature(webapp._export_row_verdicts).parameters
     assert "notes" not in params and "text" not in params and "codes" not in params
+    # and the index UNDER it is where pre-read bytes would actually be injected — it
+    # must take nothing at all, so the read can only happen after the age check
+    assert inspect.signature(webapp._export_note_index).parameters == {}
+    assert inspect.signature(webapp._export_supplier_index).parameters == {}
 
 
 def test_a_missing_code_turns_the_run_orange_and_reaches_the_tab(iso, monkeypatch):
@@ -988,3 +1023,40 @@ def test_supplier_codes_absent_from_the_catalogue_are_reported_but_still_written
     assert {r[0] for r in sup["rows"]} == {"9/Z"}          # still written
     assert s["missing_in_eshop"] == [{"code": "9/Z", "value": "BETALOV"}]
     assert s["missing_count"] == 1
+
+
+def test_an_implausibly_small_export_is_not_trusted(tmp_path, monkeypatch):
+    """The catalogue is ~14 000 variant codes. A fresh, non-empty export carrying a
+    handful is a BROKEN feed (truncated download, a filter left on), not a small shop —
+    trusting it would accuse codes the eshop really has and withhold their rows. Pinned
+    at the PRODUCTION value of EXPORT_MIN_CODES, so lowering it in a fixture cannot
+    disarm this."""
+    p = tmp_path / "products.csv"
+    _write_export(p, {f"{i}/M": "" for i in range(webapp.EXPORT_MIN_CODES - 1)})
+    monkeypatch.setattr(webapp, "SRC", str(p))
+
+    v = webapp._export_row_verdicts([["nope/M", "P1", "https://supplier/x"]])
+    assert v["absent"] == set() and v["confirmed"] == set()
+
+    # one more code and the very same export IS trusted
+    _write_export(p, {f"{i}/M": "" for i in range(webapp.EXPORT_MIN_CODES)})
+    v = webapp._export_row_verdicts([["nope/M", "P1", "https://supplier/x"]])
+    assert v["absent"] == {"nope/M"}
+
+
+def test_the_supplier_report_is_gated_on_the_same_export_trust(iso, monkeypatch):
+    """The supplier half only REPORTS missing codes, but that report turns the whole
+    nightly row orange — so it needs the same gates as the pairings verdict. A stale
+    export must not accuse a code the eshop has had for days."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines",
+                        _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "_export_age_s",
+                        lambda: webapp.EXPORT_MAX_AGE_S + 60)
+
+    s, _st = webapp._do_upload_suppliers(dry=False)
+
+    assert s["missing_count"] == 0 and s["missing_in_eshop"] == []

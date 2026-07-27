@@ -67,7 +67,8 @@ def test_summary_shows_remaining_and_recomputes_live(page, toorder_server):
     # reload in that window re-reads the old server state and the „still 6 of 7 after a
     # reload" assertion reads 7 of 7 (CI failure 2026-07-27: the POST /api/instock
     # landed in the test's TEARDOWN log). Same rule as the /api/decision races.
-    with page.expect_response("**/api/instock"):
+    with page.expect_response(lambda r: r.request.method == "POST"
+                              and "/api/instock" in r.url):
         page.locator(".toorder-row[data-code='C1'] .to-instock").click()
     page.wait_for_function(
         "() => /Ostáva vybaviť 6 položiek z 7/.test("

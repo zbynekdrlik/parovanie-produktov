@@ -210,14 +210,19 @@ def test_every_nav_key_has_an_icon():
     def _keys(var):
         m = re.search(var + r"\s*=\s*\[(.*?)\];", appjs, re.S)
         assert m, f"{var} not found in app.js"
-        return set(re.findall(r"\[\s*'([a-z_]+)'\s*,", m.group(1)))
+        return set(re.findall(r"\[\s*'(\w+)'\s*,", m.group(1)))
 
     m = re.search(r"const NAV_ICONS\s*=\s*\{(.*?)\n\};", appjs, re.S)
     assert m, "NAV_ICONS not found in app.js"
-    icons = set(re.findall(r"^\s{2}([a-z_]+):", m.group(1), re.M))
+    icons = set(re.findall(r"^\s*(\w+)\s*:", m.group(1), re.M))
 
+    # the standalone items (Užívatelia, Vývoj) are not in any TABS array — take them
+    # from the CALL SITES instead of hard-coding a list that silently goes stale when a
+    # third standalone nav button appears
+    standalone = set(re.findall(r"_navButton\(\s*'(\w+)'", appjs))
     nav_keys = (_keys("const TABS") | _keys("const AUTOMATION_TABS")
-                | _keys("const SYSTEM_TABS") | {"users", "dev"})
+                | _keys("const SYSTEM_TABS") | standalone)
+    assert {"users", "dev"} <= nav_keys, f"standalone nav keys not found: {sorted(nav_keys)}"
     assert nav_keys <= icons, (
         "nav keys without a NAV_ICONS entry (they render the literal 'undefined' "
         f"inside the <svg>): {sorted(nav_keys - icons)}")
