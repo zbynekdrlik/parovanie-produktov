@@ -203,3 +203,36 @@ def test_stale_blocked_names_the_codes_that_have_been_stuck_for_three_runs():
                          blocked={"A": "not-in-catalog"}, now=t)
     assert ob.stale_blocked(p) == ["A"]
     assert ob.stale_blocked(p, min_attempts=99) == []
+
+
+def test_settle_returned_table_does_not_share_nested_dicts_with_the_input():
+    # Same guarantee queue_fields already has (see the mirror test above):
+    # a later in-place mutation of one snapshot must never leak into a table
+    # someone else is still holding.
+    before = _pending_group_of_two()
+    after, _ = ob.settle(before, success_codes=set(), blocked={}, now="T2")
+    assert after["A"]["fields"] is not before["A"]["fields"]
+    assert after["A"]["fields"]["internalNote"] is not before["A"]["fields"]["internalNote"]
+
+
+def test_stale_blocked_ignores_unconfirmed_runs_that_were_never_blocked():
+    # attempts counts every unconfirmed run, blocked or not. stale_blocked
+    # must count only CONSECUTIVE blocked runs — four unblocked runs (so
+    # attempts=4) followed by a single blocked run must NOT read as "stuck
+    # for 3+ runs".
+    p = _pending_group_of_two()
+    for t in ("T2", "T3", "T4", "T5"):
+        p, _ = ob.settle(p, success_codes=set(), blocked={}, now=t)
+    assert p["A"]["attempts"] == 4
+    p, _ = ob.settle(p, success_codes=set(),
+                     blocked={"A": "not-in-catalog"}, now="T6")
+    assert ob.stale_blocked(p) == []
+
+
+def test_blocked_since_is_preserved_across_repeated_blocked_runs():
+    p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
+                     blocked={"A": "not-in-catalog"}, now="T2")
+    assert p["A"]["blocked"]["since"] == "T2"
+    p, _ = ob.settle(p, success_codes=set(),
+                     blocked={"A": "not-in-catalog"}, now="T3")
+    assert p["A"]["blocked"]["since"] == "T2"

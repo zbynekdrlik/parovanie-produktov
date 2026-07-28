@@ -104,6 +104,19 @@ def settle(pending, success_codes, blocked, now=""):
     A producer's uploaded-store is written HERE — after the import log confirmed
     the rows — never by the producer before the fact. That is the #257 lesson in
     one place: the app used to mark work as uploaded on its own say-so.
+
+    `pending` must be the WHOLE table, never a slice — group membership is
+    computed from the table passed in, so calling this over a subset would
+    credit a group off only part of its codes (the #257 bug in a new shape).
+
+    When a group's queued codes carry different credit values, the value that
+    wins depends on dict iteration order over `pending` — callers must queue
+    the same value for every code within one group.
+
+    Copy guarantee (same as `queue_fields`): the returned table never shares
+    a mutable object with `pending` down to two levels — each entry, its
+    `fields` dict, and every individual field dict are fresh copies; a field's
+    own `credit` dict may still be shared, since `settle` only ever reads it.
     """
     out, credits = {}, {}
     groups = {}
@@ -122,20 +135,29 @@ def settle(pending, success_codes, blocked, now=""):
         if code in success_codes:
             continue
         e = dict(entry)
+        e["fields"] = {fk: dict(fv) for fk, fv in (entry.get("fields") or {}).items()}
         if code in blocked:
             prev = e.get("blocked") or {}
             e["blocked"] = {"reason": blocked[code],
                             "since": prev.get("since") or now}
+            e["blocked_runs"] = int(e.get("blocked_runs") or 0) + 1
         else:
             e["blocked"] = None
+            e["blocked_runs"] = 0
         e["attempts"] = int(e.get("attempts") or 0) + 1
         out[code] = e
     return out, credits
 
 
 def stale_blocked(pending, min_attempts=3):
-    """Codes stuck blocked for at least `min_attempts` runs — the silent-death
-    guard for the table itself: a held-back row must never wait forever unseen.
+    """Codes stuck blocked for at least `min_attempts` CONSECUTIVE runs — the
+    silent-death guard for the table itself: a held-back row must never wait
+    forever unseen.
+
+    Reads `blocked_runs` (resets to 0 the moment a code clears), never
+    `attempts` (which counts every unconfirmed run, blocked or not, so a code
+    that spent runs merely unconfirmed and only just became blocked must not
+    read as long-stuck).
     """
     return sorted(c for c, e in pending.items()
-                  if (e.get("blocked") and int(e.get("attempts") or 0) >= min_attempts))
+                  if (e.get("blocked") and int(e.get("blocked_runs") or 0) >= min_attempts))
