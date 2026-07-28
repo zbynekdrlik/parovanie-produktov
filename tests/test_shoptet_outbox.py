@@ -159,40 +159,53 @@ def _pending_group_of_two():
         credit_value={"A": "u", "B": "u"}, now="T")[0]
 
 
+def _sent_from(pending, codes):
+    """The `sent_fields` snapshot for `codes` that matches whatever `pending`
+    currently holds for them — the "nothing changed since it was sent" case
+    most tests below want. A test that needs the OTHER case (something
+    changed mid-import) builds its own `sent_fields` by hand — see the C1
+    regression tests further down."""
+    return {c: {col: f["value"]
+                for col, f in (pending.get(c) or {}).get("fields", {}).items()}
+            for c in codes}
+
+
 def test_a_confirmed_code_leaves_the_table():
-    p, credits = ob.settle(_pending_group_of_two(), success_codes={"A"},
-                           blocked={}, now="T2")
-    assert set(p) == {"B"}
+    p = _pending_group_of_two()
+    settled, credits = ob.settle(p, success_codes={"A"}, blocked={},
+                                 sent_fields=_sent_from(p, {"A"}), now="T2")
+    assert set(settled) == {"B"}
 
 
 def test_a_group_is_credited_only_when_ALL_its_codes_are_confirmed():
-    _, half = ob.settle(_pending_group_of_two(), success_codes={"A"},
-                        blocked={}, now="T2")
+    p = _pending_group_of_two()
+    _, half = ob.settle(p, success_codes={"A"}, blocked={},
+                        sent_fields=_sent_from(p, {"A"}), now="T2")
     assert half == {}
-    _, full = ob.settle(_pending_group_of_two(), success_codes={"A", "B"},
-                        blocked={}, now="T2")
+    _, full = ob.settle(p, success_codes={"A", "B"}, blocked={},
+                        sent_fields=_sent_from(p, {"A", "B"}), now="T2")
     assert full == {"parovania_eshop": {"K": "u"}}
 
 
 def test_an_unconfirmed_code_stays_and_counts_an_attempt():
     p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
-                     blocked={}, now="T2")
+                     blocked={}, sent_fields={}, now="T2")
     assert p["A"]["attempts"] == 1
-    p2, _ = ob.settle(p, success_codes=set(), blocked={}, now="T3")
+    p2, _ = ob.settle(p, success_codes=set(), blocked={}, sent_fields={}, now="T3")
     assert p2["A"]["attempts"] == 2
 
 
 def test_a_blocked_code_records_its_reason_and_since_but_is_never_dropped():
     p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
-                     blocked={"A": "not-in-catalog"}, now="T2")
+                     blocked={"A": "not-in-catalog"}, sent_fields={}, now="T2")
     assert p["A"]["blocked"] == {"reason": "not-in-catalog", "since": "T2"}
     assert p["A"]["fields"]["internalNote"]["value"] == "u"
 
 
 def test_a_code_that_stops_being_blocked_clears_its_flag():
     p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
-                     blocked={"A": "not-in-catalog"}, now="T2")
-    p, _ = ob.settle(p, success_codes=set(), blocked={}, now="T3")
+                     blocked={"A": "not-in-catalog"}, sent_fields={}, now="T2")
+    p, _ = ob.settle(p, success_codes=set(), blocked={}, sent_fields={}, now="T3")
     assert p["A"]["blocked"] is None
 
 
@@ -200,7 +213,7 @@ def test_stale_blocked_names_the_codes_that_have_been_stuck_for_three_runs():
     p = _pending_group_of_two()
     for t in ("T2", "T3", "T4"):
         p, _ = ob.settle(p, success_codes=set(),
-                         blocked={"A": "not-in-catalog"}, now=t)
+                         blocked={"A": "not-in-catalog"}, sent_fields={}, now=t)
     assert ob.stale_blocked(p) == ["A"]
     assert ob.stale_blocked(p, min_attempts=99) == []
 
@@ -210,7 +223,8 @@ def test_settle_returned_table_does_not_share_nested_dicts_with_the_input():
     # a later in-place mutation of one snapshot must never leak into a table
     # someone else is still holding.
     before = _pending_group_of_two()
-    after, _ = ob.settle(before, success_codes=set(), blocked={}, now="T2")
+    after, _ = ob.settle(before, success_codes=set(), blocked={},
+                         sent_fields={}, now="T2")
     assert after["A"]["fields"] is not before["A"]["fields"]
     assert after["A"]["fields"]["internalNote"] is not before["A"]["fields"]["internalNote"]
 
@@ -222,17 +236,58 @@ def test_stale_blocked_ignores_unconfirmed_runs_that_were_never_blocked():
     # for 3+ runs".
     p = _pending_group_of_two()
     for t in ("T2", "T3", "T4", "T5"):
-        p, _ = ob.settle(p, success_codes=set(), blocked={}, now=t)
+        p, _ = ob.settle(p, success_codes=set(), blocked={}, sent_fields={}, now=t)
     assert p["A"]["attempts"] == 4
     p, _ = ob.settle(p, success_codes=set(),
-                     blocked={"A": "not-in-catalog"}, now="T6")
+                     blocked={"A": "not-in-catalog"}, sent_fields={}, now="T6")
     assert ob.stale_blocked(p) == []
 
 
 def test_blocked_since_is_preserved_across_repeated_blocked_runs():
     p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
-                     blocked={"A": "not-in-catalog"}, now="T2")
+                     blocked={"A": "not-in-catalog"}, sent_fields={}, now="T2")
     assert p["A"]["blocked"]["since"] == "T2"
     p, _ = ob.settle(p, success_codes=set(),
-                     blocked={"A": "not-in-catalog"}, now="T3")
+                     blocked={"A": "not-in-catalog"}, sent_fields={}, now="T3")
     assert p["A"]["blocked"]["since"] == "T2"
+
+
+# ── #299 review C1 — a value queued WHILE the import is in flight must never ─ #
+# ── be treated as sent, and must never be credited on someone else's say-so ── #
+
+def test_settle_keeps_a_field_that_changed_WHILE_the_import_was_in_flight_and_withholds_its_credit():
+    """The exact review probe: pending is read once to BUILD the import
+    (`sent_fields` below is what that snapshot actually put on the wire —
+    "https://OLD"), then a producer queues a NEW value for the SAME code
+    before `settle` runs (the table `settle` actually receives). Shoptet only
+    ever confirmed OLD: NEW must stay queued for the next hour, and the
+    group's credit — which the OLD value earned — must NOT fire, because by
+    the time settle runs the group's live value is NEW, which Shoptet has
+    never seen."""
+    sent, _ = ob.queue_fields(
+        {}, source="parovania_eshop", header="code;pairCode;internalNote",
+        rows=[["A", "P", "https://OLD"]],
+        credit_group={"A": "g"}, credit_value={"A": "https://OLD"}, now="T1")
+    sent_fields = {"A": {"internalNote": "https://OLD"}}   # what build_import sent
+
+    fresh, _ = ob.queue_fields(               # queued DURING the import
+        sent, source="parovania_eshop", header="code;pairCode;internalNote",
+        rows=[["A", "P", "https://NEW"]],
+        credit_group={"A": "g"}, credit_value={"A": "https://NEW"}, now="T2")
+
+    settled, credits = ob.settle(fresh, success_codes={"A"}, blocked={},
+                                 sent_fields=sent_fields, now="T3")
+
+    assert settled["A"]["fields"]["internalNote"]["value"] == "https://NEW", (
+        "the value queued mid-import must stay in the table — Shoptet never saw it")
+    assert credits == {}, "must never credit a value Shoptet never confirmed"
+
+
+def test_settle_drops_a_field_whose_value_is_still_the_one_that_was_sent():
+    # the ordinary case — nothing changed after the import was built — must
+    # keep working exactly as before the C1 fix.
+    p = _pending_group_of_two()
+    settled, credits = ob.settle(p, success_codes={"A", "B"}, blocked={},
+                                 sent_fields=_sent_from(p, {"A", "B"}), now="T2")
+    assert settled == {}
+    assert credits == {"parovania_eshop": {"K": "u"}}

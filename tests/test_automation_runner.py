@@ -193,6 +193,46 @@ def test_run_now_unknown_key_raises(tmp_path):
         _runner(tmp_path).run_now("neexistuje")
 
 
+# ── synchronous run (#299 review I3 — the hourly cycle must WAIT) ────────────
+def test_run_sync_runs_in_the_calling_thread_and_the_result_is_already_recorded(tmp_path):
+    ran = []
+    r = _runner(tmp_path, run_fn=lambda: (ran.append(1), {"ok": 1})[1])
+    assert r.run_sync("demo") is True
+    # unlike run_now, there is no background thread to join — the run (and its
+    # state-file record) must already be done by the time run_sync returns.
+    assert ran == [1]
+    assert "demo" not in r._threads
+    st = r.status()[0]
+    assert st["last_status"] == "ok"
+    assert st["running"] is False
+
+
+def test_run_sync_reports_the_run_s_own_failure_without_raising(tmp_path):
+    def boom():
+        raise RuntimeError("boom")
+    r = _runner(tmp_path, run_fn=boom)
+    assert r.run_sync("demo") is True          # the RUN was attempted, not "it succeeded"
+    st = r.status()[0]
+    assert st["last_status"] == "error"
+    assert "boom" in st["last_error"]
+
+
+def test_run_sync_refuses_a_parallel_run_the_same_way_run_now_does(tmp_path):
+    gate = threading.Event()
+    r = _runner(tmp_path, run_fn=lambda: gate.wait(10) or {})
+    assert r.run_now("demo") is True            # background run holds the claim
+    try:
+        assert r.run_sync("demo") is False       # sync call must not also run it
+    finally:
+        gate.set()
+        r._threads["demo"].join(timeout=10)
+
+
+def test_run_sync_unknown_key_raises(tmp_path):
+    with pytest.raises(KeyError):
+        _runner(tmp_path).run_sync("neexistuje")
+
+
 # ── corrupt state fails CLOSED ────────────────────────────────────────────────
 def test_corrupt_state_file_fails_closed_instead_of_being_rewritten(tmp_path):
     """REPLACES `test_corrupt_state_file_tolerated`, which asserted the defect itself:

@@ -1,4 +1,6 @@
 import json
+import logging
+
 import pytest
 from webreview import app as webapp
 
@@ -114,10 +116,10 @@ def test_the_claim_is_released_even_when_the_body_raises(claim):
 def cycle(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending.json"))
     monkeypatch.setattr(webapp, "CYCLE_CLAIM", str(tmp_path / ".cycle.lock"))
-    calls = {"import": [], "run_now": []}
+    calls = {"import": [], "run_sync": []}
     monkeypatch.setattr(webapp, "_import_rows_chunked",
-                        lambda rows, header, dry, prefix, timeout=900: (
-                            calls["import"].append((header, [list(r) for r in rows]))
+                        lambda rows, header, dry, prefix, csv_safe=False, timeout=900: (
+                            calls["import"].append((header, [list(r) for r in rows], csv_safe))
                             or {"ok": True, "partial": False,
                                 "success_codes": {r[0] for r in rows},
                                 "partial_codes": set(), "partial_failed": 0,
@@ -127,8 +129,10 @@ def cycle(tmp_path, monkeypatch):
                                 "stdout_tail": "", "err": "", "unreadable": False}))
     monkeypatch.setattr(webapp, "_export_row_verdicts",
                         lambda rows, note_col=2: {"confirmed": set(), "absent": set()})
-    monkeypatch.setattr(webapp.RUNNER, "run_now",
-                        lambda key: calls["run_now"].append(key) or True)
+    # #299 review I3: the cycle now runs everything through the SYNCHRONOUS
+    # RUNNER.run_sync (never the fire-and-forget run_now) — see automation_runner.py.
+    monkeypatch.setattr(webapp.RUNNER, "run_sync",
+                        lambda key: calls["run_sync"].append(key) or True)
     monkeypatch.setattr(webapp.RUNNER, "status", lambda: [])
     return calls
 
@@ -139,7 +143,8 @@ def test_an_empty_table_uploads_nothing_and_skips_the_second_download(cycle):
     assert res["sent"] == 0
     assert cycle["import"] == []
     assert res["skipped_second_sync"] is True
-    assert cycle["run_now"].count("shoptet_sync") == 1
+    assert cycle["run_sync"].count("shoptet_sync") == 1
+    assert res["resynced"] == 1
 
 
 def test_a_queued_change_goes_up_in_ONE_import_and_leaves_the_table(cycle):
@@ -150,13 +155,15 @@ def test_a_queued_change_goes_up_in_ONE_import_and_leaves_the_table(cycle):
                                 [["B", "P2", "Skladom"]])
     res = webapp.run_shoptet_upload()
     assert len(cycle["import"]) == 1, "the whole table must ride in ONE import"
-    header, rows = cycle["import"][0]
+    header, rows, csv_safe = cycle["import"][0]
     assert header == "code;pairCode;availabilityInStock;internalNote"
     assert sorted(r[0] for r in rows) == ["A", "B"]
+    assert csv_safe is True, "M3 — the combined import must keep the formula-injection guard"
     assert res["sent"] == 2 and res["confirmed"] == 2
     assert webapp._load_pending() == {}
     assert res["skipped_second_sync"] is False
-    assert cycle["run_now"].count("shoptet_sync") == 2
+    assert cycle["run_sync"].count("shoptet_sync") == 2
+    assert res["resynced"] == 2
 
 
 def test_a_code_missing_from_the_catalogue_is_blocked_and_kept(cycle, monkeypatch):
@@ -174,8 +181,20 @@ def test_the_cycle_refuses_to_run_twice_at_once(cycle):
     with webapp._shoptet_cycle_claim():
         res = webapp.run_shoptet_upload()
     assert res["ok"] is False
-    assert res["error"] == "cycle-busy"
-    assert cycle["run_now"] == []
+    assert res["error"] == "cyklus už beží"          # #299 review M2 — Slovak, like the rest
+    assert cycle["run_sync"] == []
+
+
+def test_resynced_reflects_run_sync_s_ACTUAL_return_value_not_a_hard_coded_guess(cycle, monkeypatch):
+    """#299 review I3 — `run_now`'s fire-and-forget True made `resynced` a lie the
+    moment two hourly automations with the same interval overlapped (shoptet_sync
+    already running for its own schedule). run_sync can genuinely return False
+    (another run of the SAME automation already in flight) — resynced must reflect
+    that, both for the first download and (when it happens) the second."""
+    monkeypatch.setattr(webapp.RUNNER, "run_sync", lambda key: False)
+    res = webapp.run_shoptet_upload()
+    assert res["resynced"] == 0
+    assert res["skipped_second_sync"] is True   # nothing was sent -> no 2nd sync attempted
 
 
 # ── review carry-overs (Task 4 M2 / Task 5 minor / brief note on note_col) ──── #
@@ -210,7 +229,7 @@ def test_a_claim_file_that_cannot_be_opened_skips_the_run_instead_of_crashing(
 
     res = webapp.run_shoptet_upload()          # must not raise either
     assert res["ok"] is False
-    assert cycle["run_now"] == []               # nothing was even attempted
+    assert cycle["run_sync"] == []              # nothing was even attempted
 
 
 def test_the_import_is_skipped_when_another_import_is_already_running(cycle, monkeypatch):
@@ -252,3 +271,78 @@ def test_note_col_none_asks_only_whether_the_code_is_in_the_catalogue(tmp_path, 
         [["A", "P", "Skladom"], ["B", "P2", "Skladom"]], note_col=None)
 
     assert v == {"confirmed": set(), "absent": {"B"}}
+
+
+# ── #299 review I1 — the producer half of the cycle had ZERO tests: the ────── #
+# ── `cycle` fixture stubs RUNNER.status to [], so CYCLE_PRODUCERS never ran, ── #
+# ── and no queued row ever carried a credit_group, so _credit_producer was ─── #
+# ── never even called. Three mutations survived a green suite because of it. ─ #
+
+def test_only_an_ENABLED_and_QUEUE_MIGRATED_producer_runs_and_producers_reflects_it(
+        cycle, monkeypatch):
+    """Kills the mutation that deletes `if key not in enabled: continue` — without
+    it the cycle would start DISABLED automations that write to the live eshop
+    every single hour, a direct hole in the #93 contract."""
+    monkeypatch.setattr(webapp, "QUEUE_MIGRATED",
+                        ("parovania_eshop", "grube_externalcode"))
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: [
+        {"key": "parovania_eshop", "enabled": True},
+        {"key": "grube_externalcode", "enabled": False},
+    ])
+    res = webapp.run_shoptet_upload()
+    assert cycle["run_sync"].count("parovania_eshop") == 1
+    assert "grube_externalcode" not in cycle["run_sync"]
+    assert res["producers"] == {"parovania_eshop": True}
+
+
+def test_a_producer_not_yet_migrated_to_the_queue_never_runs_even_when_enabled(
+        cycle, monkeypatch):
+    """#299 review I2 — every one of CYCLE_PRODUCERS still writes straight to the
+    live eshop today (QUEUE_MIGRATED stays empty until Tasks 8-10 migrate them one
+    by one, in the SAME commit that switches each one over). The cycle must NEVER
+    start one just because a manager enabled it in the meantime — that would turn
+    a 1x/day automation into 24x/day writes to forestshop.sk. Kills the mutation
+    that deletes the `QUEUE_MIGRATED` membership check."""
+    monkeypatch.setattr(webapp.RUNNER, "status",
+                        lambda: [{"key": "parovania_eshop", "enabled": True}])
+    res = webapp.run_shoptet_upload()
+    assert "parovania_eshop" not in cycle["run_sync"]
+    assert res["producers"] == {}
+
+
+def test_a_confirmed_credit_for_parovania_eshop_actually_writes_PAIRINGS_STATE(
+        cycle, tmp_path, monkeypatch):
+    """Kills the mutation that empties `_credit_producer`'s body — without it a
+    confirmed group would never be recorded and the producer would re-upload the
+    same link forever."""
+    state = tmp_path / "uploaded_pairings.json"
+    monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(state))
+    webapp.queue_shoptet_fields(
+        "parovania_eshop", "code;pairCode;internalNote",
+        [["A", "P", "https://dodavatel.sk/x"]],
+        credit_group={"A": "FOREST|60648"},
+        credit_value={"A": "https://dodavatel.sk/x"})
+
+    res = webapp.run_shoptet_upload()
+
+    assert res["confirmed"] == 1
+    d = json.loads(state.read_text(encoding="utf-8"))
+    assert d["FOREST|60648"] == "https://dodavatel.sk/x"
+
+
+def test_a_credit_for_an_unknown_store_is_dropped_with_a_log_not_a_crash(
+        cycle, caplog):
+    """The credit map only knows `parovania_eshop` today — a group credited by
+    any of the other four producers must be discarded with a log line, not crash
+    the cycle (a silent loss for 4 of 5 future producers otherwise)."""
+    webapp.queue_shoptet_fields(
+        "restock_skladom", "code;pairCode;availabilityInStock",
+        [["A", "P", "Skladom"]],
+        credit_group={"A": "G"}, credit_value={"A": "Skladom"})
+
+    with caplog.at_level(logging.WARNING, logger="webreview"):
+        res = webapp.run_shoptet_upload()
+
+    assert res["ok"] is True
+    assert res["confirmed"] == 1
+    assert any("neznámy kredit store" in r.message for r in caplog.records)
