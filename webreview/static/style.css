@@ -543,6 +543,14 @@ body[data-theme=dark] .autoresult.bad{background:#2a0f0f;border-color:#7f1d1d;co
 .pendblocked{font-size:13px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
   border-radius:8px;padding:8px 10px;word-break:break-word;margin-top:6px}
 body[data-theme=dark] .pendblocked{background:#2a1f07;border-color:#78350f;color:#fcd34d}
+/* #299 Task 11 — same amber warning look as `.autowarn`, but its OWN class: the
+   shoptet_sync tab's card already renders `.autowarn` (unscoped) and both tab
+   sections can sit in the DOM at once (hidden, not removed), so a second
+   `.autowarn` here would make an unscoped Playwright locator ambiguous between
+   the two tabs — exactly the #209 collision this file avoids for .autoerr too. */
+.uploadwarn{font-size:13px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
+  border-radius:8px;padding:8px 10px;word-break:break-word;margin-top:6px}
+body[data-theme=dark] .uploadwarn{background:#2a1f07;border-color:#78350f;color:#fcd34d}
 .muted{font-size:13px;color:var(--muted)}
 .empty2{margin-top:16px;text-align:center;color:var(--muted);font-size:14px;padding:26px 10px;
   background:var(--panel);border:1px dashed var(--border);border-radius:var(--radius)}

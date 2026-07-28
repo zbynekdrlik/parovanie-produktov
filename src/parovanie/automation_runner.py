@@ -268,10 +268,22 @@ class AutomationRunner:
         Runs `_execute(key, claimed=False)` in the CALLING thread: same
         bookkeeping as `run_now` (state file, `last_run`/`last_status`,
         `_running` guard), never raises (`_execute` records any exception as
-        `last_status='error'` and returns True), and returns False without
-        running anything when a run of this automation is already in flight —
-        the caller must treat that exactly like `run_now`'s False: this
-        specific run did not happen, try again next time."""
+        `last_status='error'`), and returns False without running anything
+        when a run of this automation is already in flight — the caller must
+        treat that exactly like `run_now`'s False: this specific run did not
+        happen, try again next time.
+
+        #299 Task 11 finding 1 — the return value is whether the run
+        SUCCEEDED (`last_status == 'ok'`), not merely whether it was
+        attempted. It used to be an unconditional `True` the moment `_execute`
+        ran at all, even for a run that raised and recorded `last_status=
+        'error'` — so the hourly Shoptet cycle's `resynced =
+        int(bool(RUNNER.run_sync("shoptet_sync")))` counted a FAILED download
+        as a successful one (a shopping trip that never happened reported as
+        "went and came back"). `_execute`'s return is consumed ONLY here
+        (`run_now`/`tick_once` both discard it — see `_execute`'s own
+        docstring), so tightening it to the true outcome is safe everywhere
+        else and fixes `resynced` at its actual source."""
         if key not in self.automations:
             raise KeyError(key)
         return self._execute(key, claimed=False)
@@ -300,7 +312,15 @@ class AutomationRunner:
     def _execute(self, key: str, claimed: bool = False) -> bool:
         """Run one automation now (in the calling thread) and persist the
         outcome. Full context is logged — a failed 3am run must be debuggable
-        from the log + state file alone."""
+        from the log + state file alone.
+
+        Returns whether the run actually SUCCEEDED (`status == 'ok'`), or
+        `False` when it never ran at all (already in flight). #299 Task 11
+        finding 1: this used to be an unconditional `True` the instant a run
+        was attempted, success or not — `run_now` (fire-and-forget thread)
+        and `tick_once` (scheduler tick) both discard this return value, so
+        only `run_sync`'s caller ever saw it, and it silently told that
+        caller every run "succeeded", including ones that raised."""
         a = self.automations[key]
         if not claimed:
             with self._lock:
@@ -349,7 +369,7 @@ class AutomationRunner:
         finally:
             # a dict item assignment needs no lock — and must never be inside one that raises
             self._running[key] = False
-        return True
+        return status == "ok"
 
     def tick_once(self, now: datetime | None = None) -> None:
         """One scheduler pass: run every ENABLED automation whose next_run is

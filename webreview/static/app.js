@@ -599,8 +599,22 @@ function navError(key) {
   // wrongly flip this badge on — a REAL collision, not a hypothetical one.
   // Before touching this comparison, re-grep every `run_*()` for an `ok` key
   // (`grep -n '"ok"' webreview/app.py`) and check what each one MEANS.
+  //
+  // #299 Task 11 — two MORE ways `shoptet_upload` specifically can be degraded
+  // without `last_status`/`last_result.ok` ever saying so:
+  //   * `last_result.degraded` — a run that itself reports `ok: true` (nothing
+  //     THIS cycle attempted failed) but found something wrong upstream (a
+  //     producer's empty streak, a skipped second download while something was
+  //     on the wire). Named DIFFERENTLY from `source_degraded` above on purpose
+  //     — that one is Pošta/shoptet_sync's own established flag; conflating the
+  //     two would make an unrelated automation's degrade light THIS tab's badge.
+  //   * `queue_stale_warning` — lives on `a` itself, NOT inside `last_result`,
+  //     because it must fire even when `shoptet_upload` has NEVER run at all
+  //     (the cycle deploys disabled — see `_queue_stale_while_disabled_warning`
+  //     in app.py). last_result-only checks can never see this one.
   return !!(a && (a.last_status === 'error' || (a.last_result || {}).source_degraded
-    || (a.last_result || {}).ok === false));
+    || (a.last_result || {}).ok === false || (a.last_result || {}).degraded
+    || a.queue_stale_warning));
 }
 
 // `defaultLbl` = the built-in name; an admin-set override in UI_LABELS (#173)
@@ -4380,11 +4394,17 @@ function renderShoptetUpload() {
   // renderShoptetSync does) would never show these three states — read
   // `last_result.ok`/`last_result.error` instead, and feed the same verdict into
   // `lastRunLabel` so "Posledný beh" does not claim ✅ OK for them either.
+  //
+  // #299 Task 11 — `lr.degraded` widens this: a run can be `ok: true` (nothing
+  // THIS cycle attempted failed) and still be degraded (e.g. a producer's source
+  // looks frozen — the problem is upstream, not in this cycle's own import). Both
+  // feed the SAME verdict, never a separate fourth state to keep in sync.
   const lr = a.last_result || {};
   const failed = lr.ok === false;
+  const degraded = failed || !!lr.degraded;
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
-  bits.push('Posledný beh: ' + lastRunLabel(a, failed));
+  bits.push('Posledný beh: ' + lastRunLabel(a, degraded));
   if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
   meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
   st.appendChild(meta);
@@ -4392,6 +4412,35 @@ function renderShoptetUpload() {
     st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
   } else if (a.last_run && failed && lr.error) {
     st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(lr.error)));
+  }
+
+  // #299 Task 11 — the NAJDÔLEŽITEJŠIA POŽIADAVKA: the cycle deploys DISABLED
+  // and is now the ONLY path anything reaches the eshop by, so a manager who
+  // forgets to turn it on must not be able to miss it. `queue_stale_warning` is
+  // computed server-side straight off the pending table + `enabled` — it is
+  // truthy even when this automation has NEVER run (last_run empty), which is
+  // exactly the "forgot to start it" case this exists for. Own class
+  // (`.uploadwarn`, styled identically to `.autowarn`) rather than a SECOND
+  // `.auto*` element on this tab — `.autowarn` already appears (unscoped) on the
+  // shoptet_sync tab's own card, and both cards can be in the DOM (hidden, not
+  // removed) at once; a shared class would make an unscoped `.autowarn` locator
+  // ambiguous between the two tabs (the exact #209 collision this file's own
+  // header comment warns about).
+  if (a.queue_stale_warning) {
+    const w = el('div', 'uploadwarn', '');
+    w.dataset.testid = 'shoptet-upload-stale-disabled';
+    w.textContent = '⚠️ ' + a.queue_stale_warning;
+    st.appendChild(w);
+  }
+  // …and the run's OWN warnings (Task 11's `warnings: []` — unconfirmed rows,
+  // stale-blocked codes, a producer's empty streak, a skipped second download).
+  // Same `.uploadwarn` class, one block per sentence — `warnings` is already a
+  // list of complete, ready-to-read Slovak sentences.
+  for (const w of (lr.warnings || [])) {
+    const wd = el('div', 'uploadwarn', '');
+    wd.dataset.testid = 'shoptet-upload-warning';
+    wd.textContent = '⚠️ ' + w;
+    st.appendChild(wd);
   }
 
   // #299 review decision 4 — the two Task 8 producers (grube_externalcode,
