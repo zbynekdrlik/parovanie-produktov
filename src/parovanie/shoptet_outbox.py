@@ -98,7 +98,7 @@ def build_import(pending, absent_codes=frozenset()):
     return header, rows, blocked
 
 
-def settle(pending, success_codes, blocked, now=""):
+def settle(pending, success_codes, blocked, sent_fields, now=""):
     """Drop what Shoptet confirmed, keep the rest, and hand back the credits.
 
     A producer's uploaded-store is written HERE — after the import log confirmed
@@ -108,6 +108,21 @@ def settle(pending, success_codes, blocked, now=""):
     `pending` must be the WHOLE table, never a slice — group membership is
     computed from the table passed in, so calling this over a subset would
     credit a group off only part of its codes (the #257 bug in a new shape).
+
+    `sent_fields` is what THIS import actually put on the wire —
+    ``{code: {col: value}}``, built by the caller from the `rows` `build_import`
+    returned (never re-derived from `pending`). `pending` is loaded again right
+    before `settle` runs, so a producer can legitimately queue a NEW value for a
+    code WHILE the import is still in flight (#299 review C1). A field only
+    leaves the table when its CURRENT value still equals what was actually
+    sent — a field that changed mid-flight, or a field that was never sent at
+    all, is KEPT and goes out again next hour, and so does the whole code entry
+    the moment it has anything left to say (`attempts` still grows for it, same
+    as any other unconfirmed code). A credit group fires only when EVERY one of
+    its codes is both confirmed AND unchanged since it was sent — a single
+    dirty code in the group withholds the whole group's credit, never just its
+    own field, because the group's credited value came from ONE of those codes
+    and there is no way to tell which one without re-introducing the #257 bug.
 
     When a group's queued codes carry different credit values, the value that
     wins depends on dict iteration order over `pending` — callers must queue
@@ -119,6 +134,22 @@ def settle(pending, success_codes, blocked, now=""):
     own `credit` dict may still be shared, since `settle` only ever reads it.
     """
     out, credits = {}, {}
+
+    # What is left of each success-code's fields once anything confirmed-AND-
+    # unchanged is dropped, plus which success codes are "dirty" — carrying at
+    # least one field that either was never sent or has since moved on.
+    remaining_fields, dirty = {}, set()
+    for code in success_codes:
+        fields = (pending.get(code) or {}).get("fields") or {}
+        sent = sent_fields.get(code) or {}
+        keep = {}
+        for col, field in fields.items():
+            if col in sent and field.get("value") == sent[col]:
+                continue
+            keep[col] = field
+            dirty.add(code)
+        remaining_fields[code] = keep
+
     groups = {}
     for code, entry in pending.items():
         for field in (entry.get("fields") or {}).values():
@@ -129,10 +160,20 @@ def settle(pending, success_codes, blocked, now=""):
                                   {"value": c["value"], "codes": set()})
             g["codes"].add(code)
     for (store, group), g in groups.items():
-        if g["codes"] <= set(success_codes):
+        if g["codes"] <= set(success_codes) and not (g["codes"] & dirty):
             credits.setdefault(store, {})[group] = g["value"]
+
     for code, entry in pending.items():
         if code in success_codes:
+            keep = remaining_fields.get(code) or {}
+            if not keep:
+                continue                              # fully confirmed, unchanged
+            e = dict(entry)
+            e["fields"] = {fk: dict(fv) for fk, fv in keep.items()}
+            e["blocked"] = None
+            e["blocked_runs"] = 0
+            e["attempts"] = int(e.get("attempts") or 0) + 1
+            out[code] = e
             continue
         e = dict(entry)
         e["fields"] = {fk: dict(fv) for fk, fv in (entry.get("fields") or {}).items()}

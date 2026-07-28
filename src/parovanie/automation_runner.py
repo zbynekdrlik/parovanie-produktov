@@ -257,6 +257,25 @@ class AutomationRunner:
         t.start()
         return True
 
+    def run_sync(self, key: str) -> bool:
+        """#299 review I3 — the SYNCHRONOUS counterpart of `run_now`, for a
+        caller that must WAIT for the automation to actually finish before it
+        looks at what the run did (the hourly Shoptet cycle: download, THEN
+        read the export; let a producer queue, THEN read the pending table).
+        `run_now`'s background thread makes that ordering only apparent — the
+        caller gets control back before anything really happened.
+
+        Runs `_execute(key, claimed=False)` in the CALLING thread: same
+        bookkeeping as `run_now` (state file, `last_run`/`last_status`,
+        `_running` guard), never raises (`_execute` records any exception as
+        `last_status='error'` and returns True), and returns False without
+        running anything when a run of this automation is already in flight —
+        the caller must treat that exactly like `run_now`'s False: this
+        specific run did not happen, try again next time."""
+        if key not in self.automations:
+            raise KeyError(key)
+        return self._execute(key, claimed=False)
+
     def status(self) -> list[dict]:
         st = self._load()
         out = []

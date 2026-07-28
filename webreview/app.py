@@ -7198,6 +7198,13 @@ def run_shoptet_sync() -> dict:
 # supplier link in the same cycle is already linked when it goes on sale.
 CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links",
                    "restock_skladom", "stock_skladom")
+# #299 review I2 — producers already switched from their OLD direct-to-eshop
+# import onto `queue_shoptet_fields` (Tasks 8-10 add one each here, in the SAME
+# commit that switches it). Until a producer is in here the cycle must NEVER
+# run it: today ALL of CYCLE_PRODUCERS still write straight to the live eshop,
+# so running them hourly would turn a 1x/day automation into 24x/day writes to
+# forestshop.sk the moment a manager clicks ▶ Štart on "Sync do Shoptetu".
+QUEUE_MIGRATED: tuple[str, ...] = ()
 SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 
 
@@ -7210,9 +7217,28 @@ def run_shoptet_upload() -> dict:
     settle → download again.
 
     It writes nothing to the eshop itself: producers queue into pending_shoptet,
-    and only rows the import log confirmed are credited and dropped. The second
+    and only rows the import log confirmed AND still hold their sent value are
+    credited and dropped (see `sent_fields` below — #299 review C1). The second
     download is skipped when nothing went up (most hours) — it would re-fetch the
     57 MB catalogue for no reason.
+
+    Every step below waits for its automation to actually finish
+    (`RUNNER.run_sync`, #299 review I3) — the download really is on disk before
+    the export is read, and a queue-migrated producer really has queued before
+    the pending table is read; `RUNNER.run_now`'s background thread only made
+    that ordering look true. `resynced` counts the REAL outcome of each
+    `run_sync` call (0, 1 or 2), never a hard-coded guess — a `shoptet_sync`
+    already in flight from its own hourly schedule returns False and must not
+    be reported as "downloaded".
+
+    #299 review C1 — `pending` is read once here to build the import, then read
+    AGAIN under `_lock` right before `settle`: a producer can legitimately queue
+    a NEW value for the same code while the import is still running (up to 15
+    min/chunk). `sent_fields` is what THIS import actually put on the wire, built
+    from the very `rows` handed to `_import_rows_chunked` — never re-derived from
+    `pending` — so `settle` can tell a field Shoptet confirmed from a field that
+    merely happens to belong to a code Shoptet confirmed. A field that changed
+    mid-flight is kept and goes out again next hour; its credit does not fire.
 
     #299 review (Task 4 minor, deferred to Task 6 — M2): the drain reads the table
     through `_load_pending`, which DEGRADES a corrupt/unreadable file to `{}` —
@@ -7231,27 +7257,35 @@ def run_shoptet_upload() -> dict:
     hour; that is exactly why it is never skipped."""
     with _shoptet_cycle_claim() as got:
         if not got:
-            return {"ok": False, "error": "cycle-busy", "queued": 0, "sent": 0,
+            return {"ok": False, "error": "cyklus už beží", "queued": 0, "sent": 0,
                     "confirmed": 0, "blocked": 0, "stale_blocked": [],
                     "producers": {}, "resynced": 0,
                     "skipped_second_sync": True, "unconfirmed": 0}
 
-        RUNNER.run_now("shoptet_sync")
-        resynced = 1
+        resynced = int(bool(RUNNER.run_sync("shoptet_sync")))
 
         enabled = _enabled_automations()
         producers = {}
         for key in CYCLE_PRODUCERS:
-            if key not in enabled:
+            if key not in QUEUE_MIGRATED or key not in enabled:
                 continue
-            producers[key] = bool(RUNNER.run_now(key))
+            producers[key] = bool(RUNNER.run_sync(key))
 
+        # M5: build_import(pending) once — not once for the verdict pass and
+        # once more for the actual send — and filter `absent` over the result
+        # instead of re-walking the whole table a second time.
         pending = _load_pending()
-        header_all, rows_all, _ = shoptet_outbox.build_import(pending)
+        header, rows_all, _ = shoptet_outbox.build_import(pending)
         verdicts = _export_row_verdicts(rows_all, note_col=None) if rows_all else \
             {"confirmed": set(), "absent": set()}
-        header, rows, blocked = shoptet_outbox.build_import(
-            pending, absent_codes=verdicts["absent"])
+        absent = verdicts["absent"]
+        rows = [r for r in rows_all if r[0] not in absent]
+        blocked = {c: "not-in-catalog" for c in sorted(pending) if c in absent}
+        # What THIS import is about to put on the wire, per code+column — the
+        # snapshot `settle` compares against later, never `pending` itself (C1).
+        cols = header.split(";")[len(shoptet_outbox.KEY_COLUMNS):]
+        sent_fields = {r[0]: dict(zip(cols, r[len(shoptet_outbox.KEY_COLUMNS):]))
+                       for r in rows}
 
         # _import_rows_chunked's own contract (its docstring): the caller MUST hold
         # _import_lock across the call and release it in a `finally` — every other
@@ -7270,15 +7304,20 @@ def run_shoptet_upload() -> dict:
                            "sa preskakuje, riadky ostávajú v tabuľke na ďalší beh")
             else:
                 try:
+                    # M3: three of the five (still direct-import) producers this
+                    # cycle will eventually replace already send csv_safe=True —
+                    # the combined import must not lose that formula-injection guard.
                     res = _import_rows_chunked(rows, header, False,
-                                               prefix="import_sync_", timeout=900)
+                                               prefix="import_sync_", csv_safe=True,
+                                               timeout=900)
                 finally:
                     _import_lock.release()
         success = set(res["success_codes"]) if res else set()
         now = datetime.now().isoformat(timespec="seconds")
         with _lock:
             fresh = _load_pending()
-            settled, credits = shoptet_outbox.settle(fresh, success, blocked, now=now)
+            settled, credits = shoptet_outbox.settle(fresh, success, blocked,
+                                                      sent_fields, now=now)
             _save_pending(settled, prev=fresh)
         for store, entries in credits.items():
             _credit_producer(store, entries)
@@ -7287,8 +7326,7 @@ def run_shoptet_upload() -> dict:
         unconfirmed = sent - confirmed
         skipped = SECOND_SYNC_SKIP_WHEN_NOTHING_SENT and confirmed == 0
         if not skipped:
-            RUNNER.run_now("shoptet_sync")
-            resynced = 2
+            resynced += int(bool(RUNNER.run_sync("shoptet_sync")))
 
         stale = shoptet_outbox.stale_blocked(settled)
         ok = (not import_busy) and (res is None or (res["ok"] and not res["partial"])) \
@@ -8727,10 +8765,15 @@ AUTOMATION_DESCRIPTIONS = {
         "review kartách. Zmaže pritom značky pri riadkoch tých objednávok, ktoré sú už "
         "vybavené a na tabe sa nedajú zobraziť — nič iné z tvojej práce nemení.",
     "shoptet_upload":
-        "Každú hodinu stiahne čerstvý stav zo Shoptetu, nechá zapnuté automatizácie "
-        "zapísať ich zmeny do tabuľky čakajúcich zmien, všetko naraz nahrá do eshopu "
-        "jedným importom a potom stav stiahne znova. Nahraté označí až vtedy, keď to "
-        "Shoptet potvrdí; čo eshop v katalógu nemá, ostane čakať a je to tu vidieť.",
+        # #299 review I2: zapisovanie automatizácií do tabuľky čakajúcich zmien
+        # ešte len pribúda (Tasky 8-10, jedna za druhou) — dnes tabuľka zostáva
+        # prázdna a tento popis nesmie tvrdiť, že ju niekto napĺňa, kým to tak
+        # naozaj nie je.
+        "Každú hodinu stiahne čerstvý stav zo Shoptetu, jedným importom nahrá do "
+        "eshopu všetko, čo je zapísané v tabuľke čakajúcich zmien, a potom stav "
+        "stiahne znova. Nahraté označí až vtedy, keď to Shoptet potvrdí; čo eshop "
+        "v katalógu nemá, ostane čakať a je to tu vidieť. Automatizácie do tejto "
+        "tabuľky zatiaľ nezapisujú — prechádzajú na ňu postupne, jedna po druhej.",
     "parovania_eshop":
         "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
         "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
