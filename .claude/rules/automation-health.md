@@ -259,6 +259,26 @@ neposiela nič, čiže účinná množina je PRÁZDNA a celý kandidát je nový
   exportu, ohranič čakanie (`AbortController`) a napíš do karty, že pracuješ — inak manažér
   pozerá na mŕtve tlačidlo.
 
+### `ok: False` bez `raise` necháva `last_status` na „ok" — čítaj `last_result`, nie len ju (#299)
+
+`AutomationRunner._execute` má JEDNU podmienku pre zlyhanie: `run_fn` VYHODÍ výnimku →
+`last_status='error'`. Keď `run_fn` namiesto toho normálne VRÁTI `{"ok": False, "error": …}`
+(napr. `run_shoptet_upload` pri „cyklus už beží" / „iný import práve beží" / nepotvrdené
+či zablokované riadky), runner to zapíše ako `last_status='ok'` — presne tak, ako keby beh
+prešiel čisto. Je to ten istý tvar ako `source_degraded` (beh, ktorý „neprešiel", ale
+nevyhodil), len o úroveň nižšie: tu je celý VÝSLEDOK zlyhaný, nielen jeden jeho zdroj.
+
+- **Karta aj bočný ⚠ odznak (`navError()`) musia čítať `last_result.ok`/`last_result.error`**,
+  nikdy len `last_status`/`last_error` — kopírovanie `if (a.last_status === 'error' &&
+  a.last_error)` z inej karty (napr. `renderShoptetSync`) na automatizáciu s týmto tvarom
+  necháva TRI reálne zlyhania vyzerať ako zdravú hodinu, navždy.
+- **Rozšírenie `navError()` o `(a.last_result || {}).ok === false` je bezpečné len vtedy, keď
+  ŽIADNA iná automatizácia nepoužíva kľúč `"ok"` vo svojom výsledku s iným významom** — over si
+  to `grep`-om cez všetky `run_*()` funkcie predtým, než zdieľanú funkciu takto rozšíriš.
+- **Test na to musí mutovať PRÁVE `last_status`, nie `last_result`** — fixtúra/`page.evaluate`
+  nastaví `last_status: 'ok'` A ZÁROVEŇ `last_result.ok: false`, inak sa nedá odlíšiť „karta
+  číta last_result" od „karta číta last_status a náhodou to vyšlo".
+
 ## 4. Hodnota, ktorá ide zákazníkovi do mailu — typuj ju, neprepisuj ju „fail-soft"
 
 Pri `retainedTill` (#283) sa neznáma hodnota držala „radšej ukázať než zahodiť". To je pri DÁTUME
