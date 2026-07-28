@@ -260,11 +260,13 @@ def test_a_refused_prune_marks_the_run_degraded_and_returns_its_numbers(iso, mon
     It rides the SAME `source_degraded` flag #282 introduced, which `navError()` already
     reads, rather than inventing a second predicate the sidebar would have to learn."""
     old_day = (date.today() - timedelta(days=120)).isoformat()
-    # a plausible export in which NOTHING is open: the open literal has been renamed
-    rows = ("".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
-                    for i in range(60)))
+    # a plausible export in which NOTHING is open: the open literal has been renamed. Built
+    # WITHOUT the fixture's own open order, which is the whole point of this shape.
+    head = ORDERS_CSV.decode("cp1250").splitlines(keepends=True)[0]
+    rows = "".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+                   for i in range(60))
     monkeypatch.setattr(webapp, "_fetch_orders_csv",
-                        lambda: (ORDERS_CSV.decode("cp1250") + rows).encode("cp1250"))
+                        lambda: (head + rows).encode("cp1250"))
 
     result = webapp.run_shoptet_sync()
 
@@ -295,7 +297,7 @@ def test_a_healthy_run_is_NOT_marked_degraded_and_reports_the_unknown_statuses(
     assert "flags_prune_skipped" not in result, result
     assert "source_degraded" not in result, result
     assert result["flags_unknown_statuses"] == ["Osob. odber"], result
-    assert result["flags_orders_open"] == 1, result
+    assert result["flags_orders_open"] == 2, result   # 99002001 + the fixture's own
 
 
 # ── customer export: secret hygiene (same rule as the catalog export) ──────────

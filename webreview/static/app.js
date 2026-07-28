@@ -4095,6 +4095,39 @@ function renderPosta() {
 
 // ---- Automatizácie (#119): tab „Sync zo Shoptetu" -------------------------- //
 // Plain status-only tab (no per-item table like posta — a sync run has nothing
+// #293 — the prune refused, and the refusal is PERMANENT until someone fixes the export.
+// Every reason gets its OWN sentence because they send the manager to different places, and
+// every one carries the number it fired on: „your export is wrong" with no number leaves him
+// nothing to go and look at (`.claude/rules/automation-health.md` §3, store-prune §7).
+function flagPruneBlockedWarning(lr) {
+  const seen = Number(lr.flags_orders_seen ?? 0);
+  const open = Number(lr.flags_orders_open ?? 0);
+  const why = {
+    'no-open-orders':
+      `export nesie ${seen} objednávok, ale ani jednu v stave „Vybavuje sa" — v Shoptete sa `
+      + 'pravdepodobne premenoval stav objednávky, alebo je v nastaveniach prehodená adresa '
+      + 'exportu',
+    'no-status-column':
+      'export vôbec nemá stĺpec so stavom objednávky — zmenila sa jeho šablóna v Shoptete, '
+      + `alebo je prehodená adresa exportu (načítalo sa z neho ${seen} objednávok)`,
+    'unparsable-source':
+      'stiahnutý export sa nedá prečítať — namiesto tabuľky prišlo niečo iné (chybová '
+      + 'stránka, prázdny alebo poškodený súbor)',
+    'implausible-source':
+      `export nesie len ${seen} objednávok, čo je príliš málo na to, aby bol úplný — `
+      + 'sťahovanie pravdepodobne skončilo v polovici',
+  }[lr.flags_prune_skipped]
+    // an unexpected reason (the housekeeping try/except passes the exception through) must
+    // still reach him — silently rendering nothing is the exact failure this banner fixes
+    || `neočakávaná chyba: ${lr.flags_prune_skipped}`;
+  return el('div', 'autoerr',
+    `⛔ Upratovanie starých značiek pri riadkoch objednávok je zastavené: ${why}. `
+    + 'Značky „objednané u dodávateľa" / „čaká sa" / „skladom" / „nedostupné" sa zatiaľ '
+    + 'nemažú, takže ich bude stále pribúdať. Nič sa nestratilo — skontroluj v Shoptete '
+    + 'export objednávok'
+    + (open ? '.' : ' a názvy stavov objednávok.'));
+}
+
 // to list, just counts) — status/controls come straight from AUTOMATIONS
 // (last_result), no dedicated display endpoint needed.
 function renderShoptetSync() {
@@ -4125,10 +4158,19 @@ function renderShoptetSync() {
   st.appendChild(head);
   if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
+  const lr = a.last_result || {};
+  // #293 — a run whose prune REFUSED must not read „✅ OK". Nothing crashed (orders,
+  // catalogue and review all landed), so `last_status` is legitimately 'ok'; what failed is
+  // the one part of this automation that DELETES data, and its refusal reasons are
+  // PERMANENT — until the export is fixed the prune never runs once and the flag stores grow
+  // exactly as they did before #212. Same flag and same wording as Pošta (#282), so the
+  // sidebar ⚠ (navError) lights from it with no second predicate to keep in sync.
+  const degraded = !!lr.source_degraded;
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
   bits.push('Posledný beh: ' + (a.last_run
-    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
+    ? `${fmtDt(a.last_run)} — ${a.last_status !== 'ok' ? '❌ CHYBA'
+        : (degraded ? '⚠️ DEGRADOVANÝ' : '✅ OK')}`
     : 'zatiaľ nikdy'));
   if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
   meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
@@ -4136,13 +4178,28 @@ function renderShoptetSync() {
   if (a.last_status === 'error' && a.last_error) {
     st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
   }
-  const lr = a.last_result || {};
   if (a.last_run && a.last_status === 'ok') {
     st.appendChild(el('div', 'muted',
       `Objednávky: ${(lr.orders_bytes || 0).toLocaleString('sk-SK')} B stiahnuté`
       + ` · katalóg: ${lr.catalog_products ?? 0} produktov (${lr.catalog_codes ?? 0} kódov)`
       + ` · zosynchronizované review karty: ${lr.review_synced ?? 0}`
-      + (lr.review_stale ? ` (nenájdených v exporte: ${lr.review_stale})` : '')));
+      + (lr.review_stale ? ` (nenájdených v exporte: ${lr.review_stale})` : '')
+      // #212/#293 — the prune is the ONE thing here that removes the manager's markings, so
+      // its count belongs in front of him, not only in the log. Reported even when it is 0:
+      // „0" is the normal, reassuring answer, and it was the ABSENCE of this line that let a
+      // permanently refused prune look identical to a healthy hour.
+      + (lr.flags_prune_skipped ? ''
+         : ` · vyčistené osirelé značky: ${Number(lr.flags_pruned ?? 0)}`)));
+    // an added or renamed status silently narrows what the prune considers finished — the
+    // honest cost of the terminal-status allow-list. Informational, NOT a warning: these
+    // statuses are legitimate and permanent, so a banner here would be noise for ever.
+    const unknown = lr.flags_unknown_statuses || [];
+    if (unknown.length) {
+      st.appendChild(el('div', 'muted',
+        'Stavy objednávok, ktoré nepoznám, a preto ich nepovažujem za vybavené (značky '
+        + 'pri nich ostávajú): ' + escapeHtml(unknown.join(', '))));
+    }
+    if (lr.flags_prune_skipped) st.appendChild(flagPruneBlockedWarning(lr));
     // #280 review — a NON-FATAL degradation has to be VISIBLE. Both of these leave
     // last_status = ok on purpose (the critical refresh did land), so without a line
     // here a degraded hour reads exactly like a healthy one: the „quietly dead

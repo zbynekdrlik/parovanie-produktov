@@ -6347,9 +6347,26 @@ def run_shoptet_sync() -> dict:
         # one thing in this automation that REMOVES his markings, so it is reported next
         # to the rest rather than living only in the log.
         "flags_pruned": prune["pruned"],
+        # …and the numbers any refusal fired on. A refusal that returns a bare 0 tells the
+        # operator „your export is wrong" with nothing to go and look at
+        # (`.claude/rules/automation-health.md` §3, and store-prune §7).
+        "flags_orders_seen": prune["orders_seen"],
+        "flags_orders_open": prune["orders_open"],
+        # the honest cost of the terminal-status allow-list: a status nobody taught it about
+        # quietly stops being pruned, so the run names it instead of hiding it
+        "flags_unknown_statuses": prune["unknown_statuses"],
     }
     if prune["skipped"]:
         result["flags_prune_skipped"] = prune["skipped"]
+        # #293 — the refusal is SAFE but PERMANENT: `no-open-orders` / `no-status-column`
+        # hold until the export is fixed, so the prune never runs once and the flag stores
+        # grow exactly as they did before #212. Everything else in this run legitimately
+        # succeeded, so `last_status` stays `ok` — which is precisely how the „quietly dead
+        # automation" looks. It rides the SAME `source_degraded` flag #282 introduced (a run
+        # that cannot read its own input has failed, whether or not it threw), because
+        # `navError()` already lights the sidebar ⚠ from it; a second predicate would be one
+        # more branch every future automation has to remember to hit.
+        result["source_degraded"] = True
     if export_error:
         result["export_error"] = export_error
     if customers_error:
@@ -7719,7 +7736,12 @@ AUTOMATION_DESCRIPTIONS = {
     "shoptet_sync":
         "Každú hodinu stiahne objednávky (posledných 90 dní) a celý katalóg zo "
         "Shoptetu a podľa toho prestaví vyhľadávací index aj naše ceny/sklad na "
-        "review kartách. Nemení žiadne manažérove rozhodnutia, len obnovuje dáta.",
+        # #212 corrected `run_shoptet_sync`'s docstring but not THIS string, which is the
+        # one the manager actually reads on the card — and it promised the very thing the
+        # prune stopped being true: it does now remove his markings, just only the ones the
+        # tab could never show him again.
+        "review kartách. Rozhodnutia nemení — len upratuje značky pri riadkoch objednávok, "
+        "ktoré sú už vybavené a na tabe sa nedajú zobraziť.",
     "parovania_eshop":
         "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
         "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
