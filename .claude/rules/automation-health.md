@@ -206,6 +206,20 @@ zriedkavý názov, a podmienka je nesplniteľná navždy. Namerané: 100 objedn�
 - **Hláška musí ísť s tým** — keď signál po zovšeobecnení pokrýva aj 1–4 rozpoznaných, veta
   „ANI JEDNA nemá stav…" je nepravdivá práve v novej vetve (bod 4, posledný odsek).
 
+### Test na FALLBACK musí mať vo fixtúre riadok v tej PREDVOLENEJ hodnote
+
+Z tej istej revízie (B-F1), a je to všeobecnejšie než jeden test. Test menom
+„…lights_the_blind_spot_instead_of_falling_back" mal brániť tichému návratu na zabudované
+„Vybavená" — a jeho fixtúra niesla len riadky `Zrušená`. Pri fallbacku sa teda nezhodovalo
+nič, výsledok bol IDENTICKÝ a celý balík 126 testov prešiel aj s vrátenou chybou
+(`return out or default`).
+
+**Pravidlo: fixtúra musí obsahovať hodnotu, ktorú by fallback DOSADIL** — inak test meria
+dve rôzne cesty, ktoré náhodou vracajú to isté. Over to mutáciou (store-prune §6): zruš
+opravu, pusti presne ten test a pozri sa, či spadne a NA ČOM. Tu to je `1 == 0` na
+`dispatched_orders`. „Prejde 126 testov" nie je dôkaz, že niektorý z nich stráži práve túto
+vetvu.
+
 ### Druhá cesta zákazníckeho mailu musí byť fail-closed ROVNAKO ako prvá
 
 Odsek vyššie („Fail-closed pre MAZANIE ešte neznamená fail-closed pre MAIL") uzavrel

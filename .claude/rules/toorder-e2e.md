@@ -369,3 +369,28 @@ bol mäkší, ostal by zelený a odvtedy by testoval CANCEL vetvu.
   niečo spýtalo, ale nie že to povedalo správne číslo.
 - Skloňovanie počtu v tej hláške ide cez `pluralWord` (bod 3): assertuj `„2 objednávky"`,
   nie len prítomnosť čísla.
+
+## 16. Klientsky TIMEOUT testuj routou, ktorá NIKDY neodpovie — nie `sleep`-om v handleri
+
+Keď má klient vlastnú hranicu čakania (`AbortController`, #298), treba v teste request, ktorý
+sa nevráti. **`time.sleep()` v `page.route` handleri je pasca**: handler beží na tom istom
+Python vlákne ako test, takže zablokuje aj dialógový handler a `wait_for_*` volania — test
+neskončí timeoutom, ale zavesí sa.
+
+```python
+page.route("**/api/order-statuses/impact", lambda route: None)   # zámerne bez odpovede
+```
+
+Handler, ktorý request ani nesplní, ani nepustí ďalej, ho nechá visieť na sieti a **nič
+neblokuje**: stránka beží ďalej, klientsky `AbortController` po svojom čase vyhodí a test
+overí, na ktorej vetve to skončilo. Čakanie na následok daj s explicitným `timeout=` väčším
+než tá klientska hranica (5 s hranica → `timeout=15000`).
+
+Zvyšné dva tvary tej istej rodiny:
+
+- **`route.fulfill(status=500, …)`** na overenie vetvy „server odpovedal chybou". Chrome to
+  zaloguje ako konzolovú chybu — filtruj presne ten riadok (bod 14), nevypínaj kontrolu celú.
+- **`route.fulfill` s VYMYSLENÝM telom** je najlacnejší spôsob, ako pripnúť VYKRESLENIE čísel,
+  ktoré server posiela: fixtúra sa nedá vždy prehovoriť, aby vyrobila tri RÔZNE hodnoty
+  (`orders` / `mailable` / `customers`), a s tromi rovnakými test nedokáže, že sa zobrazujú
+  tie správne. Serverovú stranu pritom pokrýva jednotkový test, takže sa nič nestráca.
