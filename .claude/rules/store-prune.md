@@ -41,6 +41,27 @@ objednávka zmizne, a čo zmizlo, sa nemaže. Poškodený zdroj tak vie prune le
 Ten istý tvar má aj starší `_prune_orphan_decisions` — „NEVER prunes against an EMPTY
 product list", lebo prázdny `PRODUCTS` by označil za osirelé úplne všetko.
 
+### Prázdny store nie je dôkaz — over, či sa naozaj PREČÍTAL (revízia PR #295)
+
+Bod 1 hovorí „maž na pozitívny dôkaz". Existuje ale druhý, tichší spôsob, ako sa dá dôkaz
+predstierať: podmienka `c not in <evidencia>` nad úložiskom, ktoré `_read_json_store`
+degradoval na `{}`. Chýbajúci, poškodený aj zle otypovaný súbor vrátia to isté ako
+legitímne prázdny — a `{}` spraví z „toto sme nikdy nezapísali" pravdu o KAŽDOM kľúči.
+Celý store odsúdený v jednom behu, na nulovom dôkaze.
+
+Nie je to teória: `uploaded_suppliers.json` na živom stroji NEEXISTUJE, takže #215 bolo
+jedno objavenie sa kódu v exporte od vymazania všetkých priradení.
+
+- **Loader musí vedieť povedať, ODKIAĽ hodnota je**: `_read_json_store_state(path, default)`
+  vracia `(value, from_disk)` a `_read_json_store` je jeho prvý prvok (jeden čítač, žiadna
+  skopírovaná logika). `from_disk=False` na KAŽDEJ degradovanej vetve.
+- **Mazacia vetva sa pýta na `from_disk` a bez neho sa NEVYKONÁ** — kandidátov nahlás
+  (`obsolete_held`, na každej návratovej vetve) a zaloguj ERROR. Prázdny súbor NA DISKU je
+  naopak plnohodnotný dôkaz, takže pravidlo po prvom úspešnom behu funguje ďalej.
+- **Testová predpríprava**: fixtúra, ktorá takú vetvu testuje, musí evidenciu na disk
+  naozaj položiť (`_save_uploaded_suppliers({})`). Test, ktorý prešiel bez nej, testoval
+  fail-open.
+
 ## 1a. „Pozitívny dôkaz" musí platiť aj pre STAV, nielen pre PRÍTOMNOSŤ
 
 Bod 1 ustráži, že sa nemaže to, čo v zdroji NEVIDÍME. Nič v ňom ale nebráni tomu, aby sa
@@ -113,6 +134,37 @@ NEUKONČENÉ a značky prežijú. Zoznam nehádaj — over ho na živých dátac
   - **Hláška odmietnutia menuje NASTAVENÉ stavy, nie literál.** Beh vracia `open_statuses`;
     banner „ani jedna otvorená" bez toho posiela manažéra hľadať názov, ktorý obchod už
     nepoužíva.
+  - **Čo endpoint PRIJME, to musí appka aj POUŽIŤ (revízia PR #295).** Validovať payload
+    „ako prišiel" nestačí: loader súbor znovu prečíta a za každú množinu, ktorú považuje za
+    nepoužiteľnú, dosadí PREDVOLBU — a tá sa vie biť s množinami, ktoré manažér naozaj
+    napísal. Prienik pritom zahadzuje konfiguráciu CELÚ. Karta potom napíše „✅ Uložené.
+    Platí to hneď pre celú appku.", premenovanie sa potichu vráti, maily nechodia nikomu a
+    prune je odzbrojený pod bannerom, ktorý menuje „protirečivý zoznam", čo panel vykresľuje
+    ako PRÁZDNY — stav neopraviteľný z tej istej obrazovky, ktorá ho spôsobila. Preto:
+    **rozhodovaciu logiku vyčleň do čistej funkcie (`_resolve_status_sets`) a pusti ju v
+    POSTe na KANDIDÁTSKY súbor** (v tom istom `with _lock:`, tesne pred zápisom); čokoľvek
+    by neprežilo, odmietni vetou pre človeka. „Prijaté a potom zahodené" je jediná odpoveď,
+    ktorá nesmie existovať.
+  - **„Chýba" a „vyprázdnené naschvál" sú RÔZNE odpovede.** Čistič, ktorý vracia `None` aj
+    pre `[]`, ich zlieva — a `known_open: []` (endpoint ho výslovne povoľuje, znamená
+    „hlás mi KAŽDÝ nezaradený stav") sa tichom vráti na štyri predvolby, čiže presný opak.
+    Vracaj `[]` ako `[]` a nech o povolenej prázdnote rozhoduje volajúci
+    (`ORDER_STATUS_REQUIRED`). Pozor aj na TEST, ktorý taký `[]` posiela: ten náš prechádzal
+    len preto, že jeho sonda náhodou nebola v obnovených predvolbách — netestoval nič.
+  - **Porovnávaj v JEDNOM tvare (NFC + strip), na oboch stranách.** Meno stavu je voľný text
+    z dvoch nezávislých vstupov (panel manažéra a stĺpec `statusName`); rozložený zápis je
+    bajtovo iný, na obrazovke identický a nesedí s ničím — a pri `to_order` to NIČ
+    nezasignalizuje, len sa vyprázdni záložka aj maily. Normalizátor patrí do zdieľaného
+    modulu (`export_helpers.norm_status`), lebo ho musia použiť všetci traja konzumenti.
+    A **vracaj do API aj stavy, ktoré export REÁLNE nesie** — inak sa meno, čo nesedí s
+    ničím, nedá odhaliť; panel na ne upozorní pokojnou (nie červenou) hláškou.
+  - **Meno stavu je text, ktorý ide do LOGU** — zakáž riadiace znaky (endpoint 400,
+    loader ich zahodí s ERROR riadkom), inak sa cez API alebo ručnú úpravu dá do logu
+    podvrhnúť celý riadok.
+  - **`_read_json_store` na nečitateľnom (nie pokazenom) súbore ZÁMERNE prepúšťa `OSError`.**
+    Pri väčšine úložísk to zhodí jednu záložku; tento súbor ale čítajú `/api/orders`,
+    `/api/nedostupne`, `/api/nedostupne/<code>` aj prune — teda štyri cesty naraz. Chyť ho a
+    použi tú istú odpoveď, ktorú funkcia už má pre „je tu, ale nedá sa použiť".
 
 ### A test na ÚPLNÉ premenovanie NEPOKRÝVA čiastočné
 
@@ -195,6 +247,26 @@ stave}`. Štyri veci, na ktorých to celé stojí:
   aspoň jeden kľúč v značkových úložiskách, a zaniká s jej posledným kľúčom. Store je tak
   veľký ako „čo má manažér označené" (namerané: 66 objednávok pri 176 kľúčoch), nie ako okno
   exportu.
+
+**STRATIŤ store a VERIŤ store sú dve rôzne otázky (revízia PR #295).** Argument
+„`protect=False`, lebo strata vie mazanie len ODLOŽIŤ" platí pre store, ktorý ZMIZOL —
+a je nepravdivý pre store, ktorý je POKAZENÝ. Krok hodín dozadu (oprava NTP, obnova VM zo
+snapshotu, ručná úprava) zapíše dnešný záznam s dátumom v minulosti a hneď NASLEDUJÚCI
+zdravý beh ho prečíta ako „odklad dávno uplynul" a maže s nulovým odkladom. Veková podlaha
+to nechytí — objednávka naozaj JE stará.
+
+Formuluj preto podmienku, ktorú skutočné pozorovanie nemôže porušiť: **záznam nesmie byť
+starší než samotná objednávka** (nemohli sme ju vidieť zatvorenú skôr, než vznikla).
+Pokazený záznam = ŽIADNY záznam, čiže odmietnutie. A ten istý predikát (`_closed_seen_day`)
+používa aj ZAPISOVAČ, inak sa odmietnutý záznam nikdy neopraví a kľúč ostane nezmazateľný
+navždy. Rovnaká pasca s inou osou: **odklad je per OBJEDNÁVKA, ale prácu pridáva manažér
+per ZNAČKA.** Záznam vzniká len keď žiadny nie je, takže značka spravená AŽ POTOM zdedí
+zvyšok cudzích hodín — a ten môže byť nulový (objednávka sa zatvorila pred 30 dňami, medzi
+dvoma hodinovými behmi sa znovu otvorila a zavrela, alebo mal manažér otvorenú starú
+záložku). Riešenie bez prekľúčovania storu: **zapnutie príznaku ruší záznam tej objednávky**
+— v tom istom `with _lock:`, na VŠETKÝCH zapisovacích cestách (`_write_status_flag`,
+`/api/ordered`, `/api/ordered/bulk`), len pri zapnutí, bez zápisu keď niet čo zmazať a ako
+housekeeping (klik manažéra nesmie spadnúť na 500 kvôli nášmu účtovníctvu).
 
 **`protect=` daj podľa toho, ČIA práca v store je.** Tento nesie NAŠE pozorovanie, nie prácu
 manažéra, a jeho strata vie mazanie iba ODLOŽIŤ, nikdy spôsobiť → `protect=False` a nepatrí

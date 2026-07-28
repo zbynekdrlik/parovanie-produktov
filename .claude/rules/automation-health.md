@@ -141,6 +141,29 @@ Keď pridávaš automatizáciu alebo nový spôsob, akým môže oslepnúť, uro
    (mapa `NAV_AUTOMATION_KEY`). Keď pridávaš signál do bočného menu, over ho E2E testom — táto
    chyba prežila len preto, že ju nikdy nikto neklikol.
 
+### Fail-closed pre MAZANIE ešte neznamená fail-closed pre MAIL (revízia PR #295)
+
+Najzradnejší tvar tichej smrti: jedno spoločné nastavenie, dvaja konzumenti a KAŽDÝ má inú
+cenu za omyl. `_order_statuses_state()` počítal dôvod `bad-status-config`, prune ho čítal a
+odmietal mazať — a `_order_statuses()` ten istý dôvod ZAHADZOVAL, takže pripomienkové maily
+sa potichu vrátili na predvolené „Vybavuje sa", čiže presne tým zákazníkom, ktorých manažér
+zúžením zoznamu vyradil. Ani stat, ani banner, ani ⚠ odznak.
+
+- **Keď loader vracia `(hodnota, dôvod)`, wrapper bez dôvodu je nová fail-open cesta.**
+  Konzument, ktorý niečo ODOSIELA alebo MAŽE, musí volať verziu s dôvodom. Zobrazovacia
+  cesta smie kresliť na predvolbách — ale musí dôvod NIESŤ ĎALEJ (pridaj ho do `/api/*`
+  odpovede), inak sa manažér o stave dozvie len z automatizácie, ktorú práve neotvoril.
+- **Nová zábrana pri odosielaní kopíruje tvar existujúcich** (`have_key`, `bcc_missing`):
+  lacná kontrola pred drahým volaním, žiadny claim, žiadne OpenAI, dôvod na KAŽDOM
+  dotknutom riadku — a daj ju za tie existujúce, nech si `ai_unavailable`/`bcc_missing`
+  ďalej hlásia vlastnú medzeru pravdivo.
+- **Odznak: prihlás sa do `source_degraded`, nezakladaj druhý príznak.** `navError()` sa
+  pýta práve naň; vlastný nový kľúč znamená, že si ho každá budúca automatizácia musí
+  pamätať (a `autoByKey('posta')` ukázal, ako to dopadne). Vlastný kľúč (`bad_status_config`)
+  pridaj NAVYŠE — na text bannera.
+- **Nový prvok na týchto kartách nesmie nosiť triedu `.auto*`** — druhý `.autoerr` na
+  záložke rozbije prísne E2E lokátory (#209). Vlastná trieda, štýlovaná z `.autoerr`.
+
 **Každý takýto stav si zaslúži E2E test.** Celý prínos alarmu je to, ČO manažér uvidí; jednotkový
 test na `stats` dokazuje len polovicu. Vzor: fixture server so zaseknutým `last_result`
 (`posta_degraded_server` v `tests/e2e/conftest.py` — nový server treba pridať aj do
