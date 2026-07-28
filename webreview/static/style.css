@@ -536,6 +536,13 @@ body[data-theme=dark] .statuscfgerr{background:#2a0f0f;border-color:#7f1d1d;colo
 body[data-theme=dark] .autoresult.ok{background:#052e21;border-color:#065f46;color:#6ee7b7}
 body[data-theme=dark] .autoresult.warn{background:#2a1e05;border-color:#78350f;color:#fcd34d}
 body[data-theme=dark] .autoresult.bad{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
+/* #299 Task 7 — „Sync do Shoptetu" card. Own class names, not .auto* (#209):
+   this tab already has .autostatus/.autometa/.autodesc/.autoerr for the
+   automation controls, and these two are a SECOND, tab-own block below them. */
+.pendcount{font-size:13px;color:var(--text);margin-top:6px}
+.pendblocked{font-size:13px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
+  border-radius:8px;padding:8px 10px;word-break:break-word;margin-top:6px}
+body[data-theme=dark] .pendblocked{background:#2a1f07;border-color:#78350f;color:#fcd34d}
 .muted{font-size:13px;color:var(--muted)}
 .empty2{margin-top:16px;text-align:center;color:var(--muted);font-size:14px;padding:26px 10px;
   background:var(--panel);border:1px dashed var(--border);border-radius:var(--radius)}

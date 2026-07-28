@@ -70,7 +70,8 @@ _SERVER_FIXTURES = ("live_server", "matched_server",
                     "sync_prune_blocked_server", "imgfail_server",
                     "imgflood_server", "dev_server",
                     "nedostupne_server", "vystavy_server", "toorder_server",
-                    "toorder_wide_server", "bad_status_config_server")
+                    "toorder_wide_server", "bad_status_config_server",
+                    "shoptet_upload_server")
 
 
 @pytest.fixture(autouse=True)
@@ -870,6 +871,66 @@ def toorder_server(tmp_path_factory):
         "99000890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
         "99000001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
         encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(out / "no_products_here.csv"),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def shoptet_upload_server(tmp_path_factory):
+    """Isolated webreview instance for the „Sync do Shoptetu" tab E2E (#299 Task 7).
+
+    Seeds `pending_shoptet.json` (the ONE table between our decisions and the eshop,
+    read-only over `/api/pending-shoptet`) with two codes carrying one waiting field
+    each (2 changes total) and a third code held `blocked` (eshop's catalogue does
+    not carry it yet) carrying one field of its own. Product codes, not order codes —
+    `automation-health.md` §1's `9900…` convention is for ORDER codes; these are
+    public catalogue identifiers with no customer link, so any obviously-fake shape
+    is fine. `automations.json` is deliberately absent: the tab must render its
+    default 'Zastavené' state (#93 SAFETY contract) with no file on disk at all,
+    same as every other fresh-install automation fixture."""
+    out = tmp_path_factory.mktemp("wr_shoptet_upload_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "pending_shoptet.json").write_text(json.dumps({
+        "TESTUP1": {
+            "pairCode": "", "blocked": None, "attempts": 0,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/a",
+                                        "source": "test_source",
+                                        "queued_at": "2026-07-28T09:00:00+02:00"}},
+        },
+        "TESTUP2": {
+            "pairCode": "", "blocked": None, "attempts": 0,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/b",
+                                        "source": "test_source",
+                                        "queued_at": "2026-07-28T09:05:00+02:00"}},
+        },
+        "TESTUP3": {
+            "pairCode": "",
+            "blocked": {"reason": "not-in-catalog", "since": "2026-07-27T09:00:00+02:00"},
+            "blocked_runs": 3, "attempts": 3,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/c",
+                                        "source": "test_source",
+                                        "queued_at": "2026-07-26T09:00:00+02:00"}},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
         **_AUTH_ENV,

@@ -9161,18 +9161,16 @@ def _shoptet_cycle_claim():
 # the nav key). Keep this set in sync with app.js's TABS/AUTOMATION_TABS keys
 # whenever a nav tab is added/renamed-in-code.
 #
-# "shoptet_upload" (#299) is DELIBERATELY absent here even though it is a full
-# Automation — same reason the three vystavy_* chains above are absent: it has
-# NO nav tab of its own yet. test_nav_keys_match_appjs (test_webreview_ui_labels.py)
-# cross-checks this exact set against app.js's TABS/AUTOMATION_TABS/SYSTEM_TABS
-# arrays and fails on ANY key present on only one side — adding it here without
-# app.js's matching #tab-shoptet_upload card, NAV_ICONS entry and PAGE_TITLE (the
-# plan's own Task 7) would 400 every rename attempt at the SAME key from the UI
-# and break that drift guard immediately. Add it here in the SAME commit that adds
-# the app.js card, never before.
+# "shoptet_upload" (#299 Task 7) now HAS its own nav tab (SYSTEM_TABS in app.js,
+# alongside "shoptet_sync") — added here in the SAME commit as app.js's
+# #tab-shoptet_upload card, NAV_ICONS entry and PAGE_TITLE, per the comment this
+# replaced: test_nav_keys_match_appjs (test_webreview_ui_labels.py) cross-checks
+# this exact set against app.js's TABS/AUTOMATION_TABS/SYSTEM_TABS arrays and
+# fails on ANY key present on only one side.
 NAV_KEYS = {
     "toorder", "nedostupne", "vystavy", "search", "notes", "review",     # TABS
-    "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
+    "shoptet_sync", "shoptet_upload",                                    # SYSTEM_TABS
+    "posta", "orders_reminder", "parovania_eshop",
     "grube_externalcode", "split_links",
     "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom", "stock_skladom",
     "image_health",                                                      # AUTOMATION_TABS
@@ -9192,6 +9190,25 @@ def api_automations():
     # `scheduler` — see `_scheduler_state`: without it a blocked / switched-off / dead
     # instance is indistinguishable from a healthy one in the UI.
     return jsonify({"automations": out, "scheduler": _scheduler_state()})
+
+
+@app.route("/api/pending-shoptet")
+def api_pending_shoptet():
+    """What the next hourly `shoptet_upload` will send, and what it cannot send yet
+    (#299 Task 7 — the „Sync do Shoptetu" card). Read-only over `pending_shoptet.json`;
+    writes nothing, triggers nothing. Session-gated like every other endpoint."""
+    pending = _load_pending()
+    waiting, blocked = [], []
+    for code in sorted(pending):
+        e = pending[code]
+        for field, f in sorted((e.get("fields") or {}).items()):
+            item = {"code": code, "field": field, "value": f.get("value", ""),
+                    "source": f.get("source", ""), "queued_at": f.get("queued_at", "")}
+            if e.get("blocked"):
+                blocked.append({**item, "reason": e["blocked"].get("reason", "")})
+            else:
+                waiting.append(item)
+    return jsonify({"pending": waiting, "blocked": blocked})
 
 
 @app.route("/api/ui-labels")
