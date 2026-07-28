@@ -5258,16 +5258,14 @@ function renderRestockSkladom() {
   wrap.appendChild(st);
 
   const r = RESTOCK || {};
-  // import outcome of the last run (naskladnené = upravené v Shoptete)
-  if (r.status === 'error') {
-    st.appendChild(el('div', 'autoerr',
-      '❌ Import zlyhal — nič sa nenaskladnilo. ' + escapeHtml(r.error_detail || '')));
-  } else if (r.status === 'busy') {
-    st.appendChild(el('div', 'muted', '⏳ Iný import práve bežal — beh sa preskočil, skús neskôr.'));
-  } else if (r.last_check && (r.candidates || []).length) {
+  // #299 Task 9 — this producer only QUEUES field values into the shared
+  // pending_shoptet table now; the hourly „Sync do Shoptetu" drain does the
+  // actual write, so there is no import outcome (processed/updated/failed) to
+  // show here any more — just how many field values THIS run queued.
+  if (r.last_check && (r.candidates || []).length) {
     st.appendChild(el('div', 'muted',
-      `Naskladnených: ${r.updated ?? 0} · spracované: ${r.processed ?? 0}`
-      + (r.failed ? ` · zlyhania: ${r.failed}` : '')));
+      `📦 Zaradené do frontu: ${r.queued ?? 0} — nahranie prebehne pri najbližšom `
+      + '„Sync do Shoptetu" (do hodiny).'));
   }
 
   if (!r.has_supplier_data) {
@@ -5352,15 +5350,12 @@ function renderStockSkladom() {
   wrap.appendChild(st);
 
   const r = STOCK_SKLADOM || {};
-  if (r.status === 'error') {
-    st.appendChild(el('div', 'autoerr',
-      '❌ Import zlyhal — nič sa neprepolo. ' + escapeHtml(r.error_detail || '')));
-  } else if (r.status === 'busy') {
-    st.appendChild(el('div', 'muted', '⏳ Iný import práve bežal — beh sa preskočil, skús neskôr.'));
-  } else if (r.last_check && (r.candidates || []).length) {
+  // #299 Task 9 — same change as renderRestockSkladom above: this producer only
+  // QUEUES now, so there is no import outcome to show — just what THIS run queued.
+  if (r.last_check && (r.candidates || []).length) {
     st.appendChild(el('div', 'muted',
-      `Prepnutých na Skladom: ${r.updated ?? 0} · spracované: ${r.processed ?? 0}`
-      + (r.failed ? ` · zlyhania: ${r.failed}` : '')));
+      `📦 Zaradené do frontu: ${r.queued ?? 0} — nahranie prebehne pri najbližšom `
+      + '„Sync do Shoptetu" (do hodiny).'));
   }
 
   const cands = r.candidates || [];

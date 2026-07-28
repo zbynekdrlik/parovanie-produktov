@@ -7185,15 +7185,17 @@ def run_shoptet_sync() -> dict:
 CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links",
                    "restock_skladom", "stock_skladom")
 # #299 review I2 — producers already switched from their OLD direct-to-eshop
-# import onto `queue_shoptet_fields` (Tasks 8-10 add one here per producer, in the
-# SAME commit that switches it). Until a producer is in here the cycle must NEVER
-# run it: a producer NOT yet in this tuple still writes straight to the live eshop
-# on its OWN daily schedule, so running it hourly TOO would turn a 1x/day
-# automation into 24x/day writes to forestshop.sk the moment a manager clicks
-# ▶ Štart on "Sync do Shoptetu". Task 8 (#299) moved grube_externalcode and
-# split_links onto the queue — both start DISABLED (#93 contract), so this is
-# zero live-write risk until a manager opts either one in.
-QUEUE_MIGRATED: tuple[str, ...] = ("grube_externalcode", "split_links")
+# import onto `queue_shoptet_fields` (each task adds one here, in the SAME commit
+# that switches it — only "parovania_eshop" is still pending, a later task). Until
+# a producer is in here the cycle must NEVER run it: a producer NOT yet in this
+# tuple still writes straight to the live eshop on its OWN daily schedule, so
+# running it hourly TOO would turn a 1x/day automation into 24x/day writes to
+# forestshop.sk the moment a manager clicks ▶ Štart on "Sync do Shoptetu". Task 8
+# (#299) moved grube_externalcode and split_links onto the queue; Task 9 adds
+# restock_skladom and stock_skladom. All four start DISABLED (#93 contract), so
+# this is zero live-write risk until a manager opts one in.
+QUEUE_MIGRATED: tuple[str, ...] = ("grube_externalcode", "split_links",
+                                   "restock_skladom", "stock_skladom")
 SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 # #299 review N3 — shoptet_sync and shoptet_upload share the SAME 60-minute
 # schedule, so their scheduler ticks synchronize: without this, the cycle's own
@@ -7856,14 +7858,15 @@ def run_riziko_vypadku() -> dict:
 
 # --------------------------------------------------------------------------- #
 # #108 — „Vypredané → Skladom": daily restock (in-app migration of the LIVE n8n
-# workflow „Forestshop — Vypredané → Skladom v2" KN1BE18HLdM8mfTc). WRITES to the
-# live eshop: JOINS our catalog export (Vypredané + visible products, state 2)
-# against #106's ALREADY-SCRAPED supplier_stock.json and, for every product whose
-# supplier now has FRESH confirmed stock, builds the restock rows (both availability
-# fields → Skladom, visible, stock) and pushes them through the SAME careful Shoptet
-# import path the n8n endpoint uses (import_builder.restock_rows → run_import →
-# #23-hardened read-back). Detection logic lives in parovanie.restock_skladom; this
-# wires it to the store + the import + the display endpoint.
+# workflow „Forestshop — Vypredané → Skladom v2" KN1BE18HLdM8mfTc). JOINS our
+# catalog export (Vypredané + visible products, state 2) against #106's
+# ALREADY-SCRAPED supplier_stock.json and, for every product whose supplier now has
+# FRESH confirmed stock, builds the restock rows (both availability fields →
+# Skladom, visible, stock). Since #299 Task 9 it no longer writes to the eshop
+# itself — it QUEUES the rows into the shared pending_shoptet table
+# (`queue_shoptet_fields`); the hourly „Sync do Shoptetu" drain (`run_shoptet_upload`)
+# does the actual write. Detection logic lives in parovanie.restock_skladom; this
+# wires it to the store + the queue + the display endpoint.
 # --------------------------------------------------------------------------- #
 RESTOCK_STATE = _store("restock_skladom.json")
 
@@ -7881,27 +7884,19 @@ def _save_restock(d: dict) -> None:
     _atomic_write_json(RESTOCK_STATE, d, mode=0o600)
 
 
-def run_restock_skladom() -> dict:
-    """One restock run (daily ~06:00 or „Spustiť teraz"): join OUR catalog export
-    (Vypredané + visible products, state 2) against the „Dodávateľský sklad" scraper's
-    LAST result (data/out/supplier_stock.json) and flip back to Skladom every product
-    whose supplier now has FRESH confirmed stock — by building the restock import rows
-    (both availability fields → Skladom, visible, stock 5 via
-    import_builder.restock_rows) and pushing them through the SAME careful chunked
-    Shoptet import path the n8n endpoints use (_import_rows_chunked → run_import →
-    parse_import_log read-back — #158: a large restock batch has the same 120s
-    browser-redirect-timeout risk #156 fixed for the pairings/suppliers pushes).
-    WRITES to the live eshop.
+def _restock_candidates() -> tuple:
+    """The Vypredané+visible × fresh-supplier-confirmed JOIN (#108's own detection —
+    unchanged by the #299 Task 9 queueing migration below). Returns
+    `(candidates, has_supplier_data, stock)`.
 
-    Safe by construction: no supplier data (scraper never ran) → flips NOTHING and
-    surfaces has_supplier_data=False; a candidate needs ok+available+FRESH (checkedAt
-    within 48h), so a stale or negative supplier confirmation never flips a product.
-    Idempotent — only state-2 (Vypredané) products are candidates, so a product already
-    Skladom is never re-flipped once the export refreshes. A failed import is detected
-    via the #23-hardened read-back and recorded status='error', not a silent success
-    (the run itself never raises on an import failure — it degrades to a red row, like
-    parovania_eshop). Reads ONLY its own store + the export + supplier_stock; never
-    touches the manager's decision stores."""
+    Two existing safeguards against stale data survive here exactly as before:
+    `has_supplier_data=False` (the #106 scraper never ran, or its store is empty) —
+    the whole JOIN is skipped and `candidates` stays `[]` rather than guessing; and
+    the per-row FRESHNESS check (`restock_skladom.MAX_PAIR_AGE_H` / `_is_fresh`,
+    48h) INSIDE `compute_candidates` itself — a supplier confirmation older than
+    that is never trusted, however recent the export. Neither of those two gates
+    changed by this task; only WHAT happens with a resulting candidate did (queue,
+    not import)."""
     with _lock:
         stock = _load_supplier_stock()
     supplier_rows = stock.get("rows") or []
@@ -7910,53 +7905,84 @@ def run_restock_skladom() -> dict:
     now = datetime.now(timezone.utc).astimezone()
     candidates = (restock_skladom.compute_candidates(csv_text, supplier_rows, now)
                   if has_data else [])
-    rows = import_builder.restock_rows(candidates, CODE2PAIR)
+    return candidates, has_data, stock
 
-    status = "ok"
-    processed = updated = failed = None
-    error_detail = ""
+
+def _restock_candidate_rows() -> list:
+    """This run's restock CSV rows, `import_builder.RESTOCK_COLS` order — the ONE
+    place `run_restock_skladom` gets what to queue. Extracted #299 Task 9,
+    zero-arg on purpose: a test can substitute the WHOLE detection→row pipeline in
+    one call to isolate the queueing contract (must not import, must not credit,
+    must skip empty cells) from the JOIN logic (`_restock_candidates`, exercised
+    on its own by test_webreview_restock_skladom.py). Recomputes the JOIN via a
+    fresh `_restock_candidates()` call independent of whatever
+    `run_restock_skladom` already computed for the review-tab store below — a
+    second full CSV/JSON read over data already read once this run, negligible
+    next to a once-a-day automation (the same trade every other #106/#107/#108
+    automation already makes by independently re-reading the whole export)."""
+    candidates, _has_data, _stock = _restock_candidates()
+    return import_builder.restock_rows(candidates, CODE2PAIR)
+
+
+def run_restock_skladom() -> dict:
+    """One restock run (daily ~06:00 or „Spustiť teraz"): join OUR catalog export
+    (Vypredané + visible products, state 2) against the „Dodávateľský sklad" scraper's
+    LAST result (data/out/supplier_stock.json) and, for every product whose supplier
+    now has FRESH confirmed stock, build the restock rows (both availability fields →
+    Skladom, visible, stock 5 via import_builder.restock_rows) — same JOIN as before
+    (`_restock_candidates`, unchanged).
+
+    Since #299 Task 9 this does NOT import directly: it QUEUES the rows into the
+    shared pending_shoptet table (`queue_shoptet_fields`) for the next hourly „Sync do
+    Shoptetu" drain to actually write to the eshop — no `_import_lock`, no chunked
+    import, no busy/error-from-import status here any more (that whole class of
+    failure moved to the drain, `run_shoptet_upload`). This producer never credits
+    itself and needs no dedup store (unlike grube_externalcode/split_links): a
+    candidate is entirely state-driven (Vypredané+visible in the LIVE export), so once
+    Shoptet confirms the flip and the export next refreshes, the product's own state
+    changes to Skladom and `_restock_candidates` simply stops selecting it — no
+    separate "already uploaded" bookkeeping needed, and none is written.
+
+    Two DELIBERATELY DIFFERENT counts are returned/stored, named unambiguously (#299
+    Task 8 review finding: the sibling `_do_upload_externalcodes`/
+    `_do_upload_variant_links`'s `would_queue` conflated a ROW count in its dry-run
+    preview with a FIELD count in its real run, invisibly, because every one of
+    THEIR rows carries exactly one writable column — restock rows carry FOUR
+    (productVisibility/availabilityInStock/availabilityOutOfStock/stock), so the
+    same conflation here would be visibly wrong): `candidates` is the number of
+    PRODUCTS (rows) the JOIN selected; `queued` is `queue_shoptet_fields`'s own
+    return value — the number of individual FIELD VALUES actually written into
+    pending_shoptet (empty cells are skipped by `queue_fields`, so `queued` can be
+    less than `4 * candidates`, never more).
+
+    Safe by construction: no supplier data (scraper never ran) → flips NOTHING and
+    surfaces has_supplier_data=False; a candidate needs ok+available+FRESH (checkedAt
+    within 48h), so a stale or negative supplier confirmation never flips a product.
+    Idempotent — only state-2 (Vypredané) products are candidates, so a product already
+    Skladom is never re-flipped once the export refreshes. Reads ONLY its own store +
+    the export + supplier_stock; never touches the manager's decision stores."""
+    candidates, has_data, stock = _restock_candidates()
+    now = datetime.now(timezone.utc).astimezone()
+    rows = _restock_candidate_rows()
+
+    queued = 0
     if rows:
-        if not _import_lock.acquire(blocking=False):
-            log.warning("restock_skladom: iný import práve beží — beh preskočený")
-            status, error_detail = "busy", "iný import práve beží"
-        else:
-            try:
-                # #158: chunked import (like #156) so a large restock batch never
-                # overruns the browser redirect timeout. A chunk that times out is
-                # caught INSIDE _import_rows_chunked (never raises) and treated as
-                # a failed chunk — the lock is always released.
-                res = _import_rows_chunked(rows, import_builder.RESTOCK_COLS, False,
-                                           prefix="restock_", timeout=900)
-            finally:
-                _import_lock.release()
-            processed, updated, failed = res["processed"], res["updated"], res["failed"]
-            if res["ok"]:
-                status = "ok"
-            else:
-                status = "error"
-                # _chunk_error_msg already carries res["error_detail"]; add the
-                # stderr tail only when there is no Shoptet reason to show
-                tail = "" if res["error_detail"] else (res["err"] or "")[-300:]
-                error_detail = _chunk_error_msg(res, len(rows)) + (f": {tail}" if tail else "")
-                log.error("restock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                          res["rc"], res["chunks_ok"], res["chunks_total"],
-                          (res["err"] or "")[-400:])
+        queued = queue_shoptet_fields("restock_skladom",
+                                      ";".join(import_builder.RESTOCK_COLS), rows)
 
-    # `candidates` are always stored (what WOULD be flipped) so the tab shows them
-    # even on a failed import; on success they ARE what was flipped.
+    # `candidates` are always stored (what this run found/queued) so the tab shows
+    # them even when nothing ended up queued (e.g. every cell happened to be empty).
     with _lock:
         _save_restock({
             "last_check": now.isoformat(timespec="seconds"),
             "has_supplier_data": has_data,
             "supplier_last_check": stock.get("last_check", ""),
-            "status": status,
+            "status": "ok",
             "candidates": candidates,
-            "processed": processed, "updated": updated, "failed": failed,
-            "error_detail": error_detail,
+            "queued": queued,
         })
-    stats = {"candidates": len(candidates), "imported_rows": len(rows),
-             "status": status, "processed": processed, "updated": updated,
-             "failed": failed, "has_supplier_data": has_data}
+    stats = {"ok": True, "candidates": len(candidates), "queued": queued,
+             "status": "ok", "has_supplier_data": has_data}
     log.info("restock_skladom: run done %s", stats)
     return stats
 
@@ -7966,10 +7992,12 @@ def run_restock_skladom() -> dict:
 # Distinct from #108 restock_skladom (which triggers on a scraped SUPPLIER
 # confirmation): this finds OUR products that physically HAVE stock (stock>0 — the
 # green „máme" bars in the Shoptet admin) yet are still shown as Vypredané (state 2,
-# visible), and flips them back to Skladom by importing the rows to Shoptet. It
-# needs NO supplier data. Detection lives in parovanie.stock_skladom; the write is
-# import_builder.skladom_rows (visible + both availability Skladom; the real stock
-# is NEVER overwritten) through the SAME careful chunked import path.
+# visible). It needs NO supplier data. Detection lives in parovanie.stock_skladom;
+# the row shape is import_builder.skladom_rows (visible + both availability
+# Skladom; the real stock is NEVER overwritten). Since #299 Task 9 it no longer
+# writes to the eshop itself — it QUEUES the rows into the shared pending_shoptet
+# table (`queue_shoptet_fields`); the hourly „Sync do Shoptetu" drain does the
+# actual write.
 # --------------------------------------------------------------------------- #
 STOCK_SKLADOM_STATE = _store("stock_skladom.json")
 
@@ -7987,68 +8015,81 @@ def _save_stock_skladom(d: dict) -> None:
     _atomic_write_json(STOCK_SKLADOM_STATE, d, mode=0o600)
 
 
+def _stock_skladom_candidates() -> list:
+    """The have-real-stock+still-Vypredané JOIN (#98's own detection — unchanged by
+    the #299 Task 9 queueing migration below). Needs no supplier data (unlike
+    restock_skladom) — the trigger is Shoptet's own export stock column, so the
+    ONLY existing safeguard against stale data is reading the CURRENT on-disk
+    export (refreshed hourly by „Sync zo Shoptetu") — there is no separate
+    freshness window to preserve here (no supplier confirmation involved)."""
+    csv_text = _read_export_for_links()          # same cp1250 export reader as #106
+    return stock_skladom.compute_candidates(csv_text)
+
+
+def _stock_skladom_candidate_rows() -> list:
+    """This run's auto-skladom CSV rows, `import_builder.SKLADOM_COLS` order —
+    mirrors `_restock_candidate_rows`'s #299 Task 9 extraction: zero-arg so a test
+    can substitute the whole detection→row pipeline to isolate the queueing
+    contract from the JOIN logic (`_stock_skladom_candidates`, exercised on its
+    own by test_webreview_stock_skladom.py). Recomputes the JOIN via a fresh
+    `_stock_skladom_candidates()` call — a second export read over data already
+    read once this run; see `_restock_candidate_rows`'s docstring for why that
+    trade is acceptable for a once-a-day automation."""
+    candidates = _stock_skladom_candidates()
+    return import_builder.skladom_rows(candidates, CODE2PAIR)
+
+
 def run_stock_skladom() -> dict:
     """One auto-skladom run (daily or „Spustiť teraz"): read OUR catalog export and
-    flip back to Skladom every product that PHYSICALLY has stock (stock>0) but is
-    still shown as Vypredané (state 2, visible) — the manager's „máme skladom" bars
-    in Shoptet — by building the rows (both availability fields → Skladom, visible,
-    stock left untouched via import_builder.skladom_rows) and pushing them through
-    the SAME careful chunked Shoptet import path the n8n endpoints use
-    (_import_rows_chunked → run_import → #23-hardened read-back). WRITES to the live
-    eshop.
+    find every product that PHYSICALLY has stock (stock>0) but is still shown as
+    Vypredané (state 2, visible) — the manager's „máme skladom" bars in Shoptet — by
+    building the rows (both availability fields → Skladom, visible, stock left
+    untouched via import_builder.skladom_rows) — same JOIN as before
+    (`_stock_skladom_candidates`, unchanged).
 
-    Needs no supplier data (unlike restock_skladom) — the trigger is Shoptet's own
-    stock. Safe by construction: a conscious-off product (detailOnly/discontinued/
+    Since #299 Task 9 this does NOT import directly: it QUEUES the rows into the
+    shared pending_shoptet table (`queue_shoptet_fields`) for the next hourly „Sync do
+    Shoptetu" drain to actually write to the eshop — no `_import_lock`, no chunked
+    import, no busy/error-from-import status here any more. This producer never
+    credits itself and needs no dedup store (unlike grube_externalcode/split_links):
+    a candidate is entirely state-driven (Vypredané+visible with real stock in the
+    LIVE export), so once Shoptet confirms the flip and the export next refreshes,
+    the product's own state changes to Skladom and `_stock_skladom_candidates`
+    simply stops selecting it — no separate "already uploaded" bookkeeping needed,
+    and none is written.
+
+    Two DELIBERATELY DIFFERENT counts, same naming discipline as
+    `run_restock_skladom` (see its docstring for the #299 Task 8 review finding this
+    fixes): `candidates` is the number of PRODUCTS (rows) the JOIN selected;
+    `queued` is `queue_shoptet_fields`'s own return value — the number of individual
+    FIELD VALUES actually written into pending_shoptet (up to THREE per candidate —
+    productVisibility/availabilityInStock/availabilityOutOfStock — fewer if a cell
+    was empty).
+
+    Safe by construction: a conscious-off product (detailOnly/discontinued/
     hidden = state 3) or an already-Skladom one (state 1) is never a candidate, so a
     residual unit on a discontinued product is never re-listed and a live product is
-    never re-flipped (idempotent). A failed import is detected via the #23-hardened
-    read-back and recorded status='error', not a silent success (the run never raises
-    on an import failure — it degrades to a red row, like parovania_eshop). Reads
-    ONLY its own store + the export; never touches the manager's decision stores."""
-    csv_text = _read_export_for_links()          # same cp1250 export reader as #106
+    never re-flipped (idempotent). Reads ONLY its own store + the export; never
+    touches the manager's decision stores."""
+    candidates = _stock_skladom_candidates()
     now = datetime.now(timezone.utc).astimezone()
-    candidates = stock_skladom.compute_candidates(csv_text)
-    rows = import_builder.skladom_rows(candidates, CODE2PAIR)
+    rows = _stock_skladom_candidate_rows()
 
-    status = "ok"
-    processed = updated = failed = None
-    error_detail = ""
+    queued = 0
     if rows:
-        if not _import_lock.acquire(blocking=False):
-            log.warning("stock_skladom: iný import práve beží — beh preskočený")
-            status, error_detail = "busy", "iný import práve beží"
-        else:
-            try:
-                res = _import_rows_chunked(rows, import_builder.SKLADOM_COLS, False,
-                                           prefix="skladom_", timeout=900)
-            finally:
-                _import_lock.release()
-            processed, updated, failed = res["processed"], res["updated"], res["failed"]
-            if res["ok"]:
-                status = "ok"
-            else:
-                status = "error"
-                # _chunk_error_msg already carries res["error_detail"]; add the
-                # stderr tail only when there is no Shoptet reason to show
-                tail = "" if res["error_detail"] else (res["err"] or "")[-300:]
-                error_detail = _chunk_error_msg(res, len(rows)) + (f": {tail}" if tail else "")
-                log.error("stock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                          res["rc"], res["chunks_ok"], res["chunks_total"],
-                          (res["err"] or "")[-400:])
+        queued = queue_shoptet_fields("stock_skladom",
+                                      ";".join(import_builder.SKLADOM_COLS), rows)
 
-    # `candidates` are always stored (what WOULD be flipped) so the tab shows them
-    # even on a failed import; on success they ARE what was flipped.
+    # `candidates` are always stored (what this run found/queued) so the tab shows
+    # them even when nothing ended up queued (e.g. every cell happened to be empty).
     with _lock:
         _save_stock_skladom({
             "last_check": now.isoformat(timespec="seconds"),
-            "status": status,
+            "status": "ok",
             "candidates": candidates,
-            "processed": processed, "updated": updated, "failed": failed,
-            "error_detail": error_detail,
+            "queued": queued,
         })
-    stats = {"candidates": len(candidates), "imported_rows": len(rows),
-             "status": status, "processed": processed, "updated": updated,
-             "failed": failed}
+    stats = {"ok": True, "candidates": len(candidates), "queued": queued, "status": "ok"}
     log.info("stock_skladom: run done %s", stats)
     return stats
 
@@ -8956,18 +8997,22 @@ AUTOMATIONS_REG = [
                run_fn=run_riziko_vypadku),
     # #108 — daily restock (products WE show as Vypredané but our supplier has stock
     # again → flip back to Skladom). SAFETY (#93 contract): starts DISABLED — this one
-    # WRITES to the live production eshop, so it runs ONLY after the manager clicks
-    # ▶ Štart; a deploy never auto-restocks on its own. Scheduled after the 05:00
-    # supplier scrape (fresh data) and the 06:15 riziko report brackets it.
+    # feeds the live production eshop (queues into pending_shoptet since #299 Task 9;
+    # the hourly „Sync do Shoptetu" drain does the actual write), so it runs ONLY
+    # after the manager clicks ▶ Štart; a deploy never auto-restocks on its own.
+    # Scheduled after the 05:00 supplier scrape (fresh data) and the 06:15 riziko
+    # report brackets it.
     Automation(key="restock_skladom",
                name="Vypredané → Skladom",
                schedule={"daily_at": "06:00", "tz": "Europe/Bratislava"},
                run_fn=run_restock_skladom),
     # #98 — daily auto-skladom from Shoptet's OWN physical stock (products we HAVE
     # stock of but that still show Vypredané → flip to Skladom). SAFETY (#93
-    # contract): starts DISABLED — this one WRITES to the live production eshop, so
-    # it runs ONLY after the manager clicks ▶ Štart; a deploy never auto-restocks on
-    # its own. Scheduled 06:45, after the hourly export sync + the 06:00 restock.
+    # contract): starts DISABLED — this one feeds the live production eshop (queues
+    # into pending_shoptet since #299 Task 9; the hourly „Sync do Shoptetu" drain
+    # does the actual write), so it runs ONLY after the manager clicks ▶ Štart; a
+    # deploy never auto-restocks on its own. Scheduled 06:45, after the hourly
+    # export sync + the 06:00 restock.
     Automation(key="stock_skladom",
                name="Máme skladom → Skladom",
                schedule={"daily_at": "06:45", "tz": "Europe/Bratislava"},
@@ -9867,10 +9912,13 @@ def api_riziko_vypadku_csv():
 @app.route("/api/restock-skladom")
 def api_restock_skladom():
     """Display data for the „Vypredané → Skladom" tab — the last restock run's
-    candidate products (kód, názov, naša cena vs cena dodávateľa, linky), the import
-    outcome (spracované / naskladnené / zlyhania), and whether the '#106 Dodávateľský
-    sklad' scraper has produced data at all (has_supplier_data=False → the tab shows
-    'najprv spusti Dodávateľský sklad', never a misleading empty list)."""
+    candidate products (kód, názov, naša cena vs cena dodávateľa, linky), how many
+    field values it QUEUED for the next hourly „Sync do Shoptetu" drain (#299 Task 9
+    — this producer no longer imports directly, so `processed`/`updated`/`failed`
+    from a completed import no longer apply and are gone from this response), and
+    whether the '#106 Dodávateľský sklad' scraper has produced data at all
+    (has_supplier_data=False → the tab shows 'najprv spusti Dodávateľský sklad',
+    never a misleading empty list)."""
     with _lock:
         st = _load_restock()
     return jsonify({
@@ -9879,28 +9927,24 @@ def api_restock_skladom():
         "supplier_last_check": st.get("supplier_last_check", ""),
         "status": st.get("status", ""),
         "candidates": st.get("candidates") or [],
-        "processed": st.get("processed"),
-        "updated": st.get("updated"),
-        "failed": st.get("failed"),
-        "error_detail": st.get("error_detail", ""),
+        "queued": st.get("queued", 0),
     })
 
 
 @app.route("/api/stock-skladom")
 def api_stock_skladom():
     """Display data for the „Máme skladom → Skladom" tab (#98) — the last run's
-    candidate products (kód, názov, naša cena, náš sklad, čo teraz zobrazujú), the
-    import outcome (spracované / naskladnené / zlyhania) and the run status."""
+    candidate products (kód, názov, naša cena, náš sklad, čo teraz zobrazujú), how
+    many field values it QUEUED for the next hourly „Sync do Shoptetu" drain (#299
+    Task 9 — no more `processed`/`updated`/`failed` from a completed import) and the
+    run status."""
     with _lock:
         st = _load_stock_skladom()
     return jsonify({
         "last_check": st.get("last_check", ""),
         "status": st.get("status", ""),
         "candidates": st.get("candidates") or [],
-        "processed": st.get("processed"),
-        "updated": st.get("updated"),
-        "failed": st.get("failed"),
-        "error_detail": st.get("error_detail", ""),
+        "queued": st.get("queued", 0),
     })
 
 
