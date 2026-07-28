@@ -1304,6 +1304,18 @@ git commit -m "refactor: pairings and suppliers queue; credit moves to the drain
 
 ### Task 11: Hlasné tiché smrti
 
+> **ZASTARANÉ (čiastočne) — opravné kolo 1 (#299 review C1, Critical) zrušilo
+> signál „3 hodinové behy po sebe s 0 poľami vo fronte" (`_note_empty_producers`
+> nižšie), ktorý táto sekcia zavádza.** Meraný nad reálnym systémom kričal na
+> KAŽDOM zdravom behu — producenti bežia denne, hodinový drain vyprázdni ich
+> polia takmer okamžite, takže „prázdna fronta" je normálny stav, nie príznak.
+> Nahradené `_stale_producer_warnings`/`_disabled_producer_names`
+> (`webreview/app.py`) — meria VÝHRADNE `RUNNER.status()` (enabled + last_run
+> proti vlastnému rozvrhu), nikdy frontu. Step 1/Step 3 nižšie sú PÔVODNÝ návrh
+> a v tejto podobe už NEZODPOVEDAJÚ skutočnému kódu — aktuálny stav je v
+> `docs/superpowers/specs/2026-07-28-sync-do-shoptetu-design.md` a priamo v
+> docstringoch `_stale_producer_warnings`/`_disabled_producer_names`.
+
 **Files:**
 - Modify: `webreview/app.py` (`run_shoptet_upload` výsledok), `webreview/static/app.js` (`navError`, banner na karte)
 - Modify: `tests/test_webreview_shoptet_upload.py`, `tests/e2e/test_shoptet_upload.py`
@@ -1312,7 +1324,7 @@ git commit -m "refactor: pairings and suppliers queue; credit moves to the drain
 - Consumes: `run_shoptet_upload` výsledok.
 - Produces: vo výsledku `degraded: bool` a `warnings: list[str]` (slovenské vety s číslami); `navError('shoptet_upload')` sa rozsvieti pri `last_status==='error' || last_result.degraded`.
 
-- [ ] **Step 1: Napísať padajúci test**
+- [ ] **Step 1: Napísať padajúci test** (ZASTARANÉ, viď poznámka vyššie — `_note_empty_producers`/„3 behy po sebe" nahradilo opravné kolo 1)
 
 ```python
 # doplniť do tests/test_webreview_shoptet_upload.py

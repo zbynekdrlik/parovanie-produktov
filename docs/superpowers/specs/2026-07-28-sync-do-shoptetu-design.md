@@ -186,9 +186,18 @@ NIKDY nespúšťa producentov**, viď poznámka nad diagramom v 3.:
 
 **#299 Task 11 — `degraded`/`warnings`.** Výsledok navyše nesie `degraded: bool`
 a `warnings: list[str]` (slovenské vety) pre stavy, ktoré `ok` samo nepokryje:
-producent, ktorého vlastný zdroj tri hodinové behy po sebe nezaradil do tabuľky
-nič (`_note_empty_producers`, počítadlo v `upload_empty_streak.json`), alebo
-druhé stiahnutie preskočené napriek tomu, že sa niečo posielalo. A samostatne,
+**producent, ktorý je ZAPNUTÝ, ale nebežal podstatne dlhšie, než je jeho vlastný
+rozvrh** (`_stale_producer_warnings`, meria sa VÝHRADNE z `RUNNER.status()` —
+`enabled` + `last_run` proti vlastnému `interval_minutes`/`daily_at`, nikdy z
+frontu), alebo druhé stiahnutie preskočené napriek tomu, že sa niečo posielalo.
+Producent, ktorý je VYPNUTÝ, je vlastná kategória — nie chyba, ale nech je to
+vidieť: `producers_disabled: list[str]` na tom istom výsledku
+(`_disabled_producer_names`), mimo `warnings`/`degraded`. (Opravné kolo 1 —
+pôvodná verzia merala „3 hodinové behy po sebe s 0 poľami vo fronte"
+(`_note_empty_producers`, `upload_empty_streak.json`); to sa ukázalo ako
+poplach, ktorý kričí VŽDY na zdravom systéme — producenti bežia denne, drain
+hodinovo, takže prázdna fronta je normálny stav. Signál aj jeho store sú preč.)
+A samostatne,
 mimo tohto výsledku úplne — pretože táto automatizácia sa nasadzuje **vypnutá**
 a je JEDINOU cestou do eshopu (opravné kolo 1 vyššie): `/api/automations`
 dopočíta `queue_stale_warning` (`_queue_stale_while_disabled_warning`) z tabuľky
