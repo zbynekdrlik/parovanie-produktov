@@ -921,7 +921,7 @@ def test_a_BROKEN_status_config_sends_no_posta_escalation_mail_either(iso, tmp_p
     assert stats["status_config_broken"] is True
     assert stats["source_degraded"] is True             # never a green ✅ over a blind run
     assert stats["uncollected"] == 1                    # …but the row stays on the tab
-    assert any("nastavenie stavov" in r.message % r.args for r in caplog.records
+    assert any("nastavenie stavov" in r.getMessage() for r in caplog.records
                if r.levelname == "ERROR")
 
 

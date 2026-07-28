@@ -2155,15 +2155,24 @@ def _order_statuses() -> dict:
 
 
 def _posta_statuses() -> tuple:
-    """`(cancelled, dispatched)` for the Pošta automation (#296).
+    """`(cancelled, dispatched, reason)` for the Pošta automation (#296).
 
     „Dispatched" is DERIVED as `terminal − cancelled` and deliberately has no box of its own.
     A fourth editable list would turn ONE rename into TWO edits, and the second one would not
     be on the card where the manager is told a new status appeared — which is precisely the
     silent death #209 removed. Deriving it means the box the prune already forces him to keep
-    correct is the only one he has to touch."""
-    st = _order_statuses()
-    return st["cancelled"], st["terminal"] - st["cancelled"]
+    correct is the only one he has to touch.
+
+    The REASON comes with it (PR #298 review, A2). This used to call `_order_statuses()`, the
+    wrapper that drops it — the very fail-open shape automation-health §3 names: „when the
+    loader returns (value, reason), a wrapper without the reason is a NEW fail-open path, and
+    a consumer that SENDS or DELETES must call the version that carries it". `run_orders_reminder`
+    was closed against this in PR #295's review; this is the same configuration, the same
+    customer and the same kind of escalation, one path further along — and worse, because a
+    manager who correctly reconfigured a renamed cancelled status gets the built-in default
+    back, which puts cancelled orders into the set the escalation chases."""
+    st, reason = _order_statuses_state()
+    return st["cancelled"], st["terminal"] - st["cancelled"], reason
 
 
 def _dispatched_status_blind_message(eligible: int, dispatched_statuses,
@@ -6731,11 +6740,21 @@ def run_posta_uncollected() -> dict:
     today_iso = today.isoformat()
     # #296 — the two status names this automation used to carry as literals now come from the
     # manager's configuration, and „dispatched" is derived rather than given a box of its own.
-    cancelled_statuses, dispatched_statuses = _posta_statuses()
+    # …with the REASON (PR #298 review, A2): an unusable configuration makes every set below a
+    # built-in default, and these mails go to real customers. Same answer the prune and the
+    # reminders give — count, render, do NOT act (automation-health §3).
+    cancelled_statuses, dispatched_statuses, status_reason = _posta_statuses()
+    bad_status_config = bool(status_reason)
+    if bad_status_config:
+        log.error("posta: nastavenie stavov objednávok sa nedá použiť (%s) — NEPOSIELAM "
+                  "žiadne upozornenia zákazníkom, lebo appka práve beží na PREDVOLENÝCH "
+                  "názvoch stavov a nevie, ktoré objednávky sú zrušené; zásielky nechávam "
+                  "vypísané na karte a čakám na opravu zoznamov na karte „Sync zo Shoptetu“",
+                  status_reason)
     shipments = posta_uncollected.shipments_from_orders_csv(
         csv_bytes, today, cancelled_statuses=cancelled_statuses)
     uncollected, invalid, errors = [], [], []
-    sent = failed = api_skipped = 0
+    sent = failed = api_skipped = blocked = 0
     # Is the SOURCE still alive (#282)? `checked` above only ever counts orders that DID carry a
     # package number, so an export that stops carrying them reads as a calm day. This is the one
     # stat that can tell those two apart. Pure counting over the same export — no send, no API.
@@ -6831,7 +6850,15 @@ def run_posta_uncollected() -> dict:
                 "orderCode", "packageNumber", "name", "admin_link")})
             continue
         if r["send"]:
-            if not r["email"]:
+            if bad_status_config:
+                # Fail-CLOSED, and placed BEFORE the other two disqualifiers so each of them
+                # keeps reporting its own gap truthfully (automation-health §3). It is not
+                # counted as `emails_failed`: nothing was attempted and nothing will be
+                # retried until the configuration is repaired, and inflating a failure counter
+                # would hide the real cause behind a number that looks like an SMTP problem.
+                blocked += 1
+                mail_ok = False
+            elif not r["email"]:
                 log.error("posta: obj. %s (%s) nemá e-mail — upozornenie nemožno poslať",
                           r["orderCode"], r["packageNumber"])
                 mail_ok = False
@@ -6864,7 +6891,8 @@ def run_posta_uncollected() -> dict:
                               "v ďalšom behu; skontroluj ručne",
                               r["orderCode"], r["packageNumber"], e)
             else:
-                failed += 1          # state NOT bumped → retried next run
+                if not bad_status_config:
+                    failed += 1      # state NOT bumped → retried next run
                 prev_count, prev_last = posta_uncollected.parse_notified(
                     esc.get(r["orderCode"], ""))
                 r["count"] = prev_count
@@ -6899,7 +6927,14 @@ def run_posta_uncollected() -> dict:
              # is nothing to check at all, and `checked` shrinking towards zero looks exactly like
              # a quiet week. These four make the difference visible; `source_degraded` is what
              # turns the card red instead of leaving a green „✅ OK" over a blind automation.
-             "source_degraded": coverage["degraded"],
+             # …and a run that may not send anything is not a healthy run either (PR #298
+             # review, A2). automation-health §3 is explicit that a new blind state signs up
+             # to `source_degraded` rather than inventing a second flag `navError()` would
+             # have to learn about; `status_config_broken` is the extra key that gives the
+             # banner its text, and `emails_blocked` the number to put in it.
+             "source_degraded": bool(coverage["degraded"] or bad_status_config),
+             "status_config_broken": bad_status_config,
+             "emails_blocked": blocked,
              "dispatched_orders": coverage["dispatched_orders"],
              "dispatched_without_package": coverage["dispatched_without_package"],
              "missing_package": coverage["missing_package"],
@@ -8904,8 +8939,20 @@ def api_order_statuses_impact():
     body = request.get_json(silent=True)
     body = body if isinstance(body, dict) else {}
     candidate = frozenset(_clean_status_list(body.get("to_order")) or ())
-    added = sorted(candidate - _order_statuses()["to_order"])
-    out = {"ok": True, "added": added, "orders": 0, "mailable": 0, "customers": 0}
+    # Measure against what is EFFECTIVE, not against what the loader renders (PR #298 review,
+    # A3). On an unusable configuration `_order_statuses()` answers with the DEFAULTS — but
+    # `run_orders_reminder` is fail-closed on that same reason and sends nothing at all, so the
+    # set that is actually reaching customers right now is EMPTY and every status in the
+    # candidate is newly reachable. Subtracting the defaults reported „nothing new" for the
+    # single largest wave this app can release, which is the class of blindness the ticket is
+    # about: measured on a corrupt store, preview 0 vs 37 orders mail-eligible the moment the
+    # file was repaired. `unknown` would be the wrong answer here too — the number IS knowable,
+    # and hiding it exactly when it is biggest is the same failure wearing a different label.
+    current_sets, status_reason = _order_statuses_state()
+    current = frozenset() if status_reason else current_sets["to_order"]
+    added = sorted(candidate - current)
+    out = {"ok": True, "added": added, "orders": 0, "mailable": 0, "customers": 0,
+           "config_broken": bool(status_reason)}
     if not added:
         return jsonify(out)
     try:
@@ -9012,12 +9059,25 @@ def api_order_statuses_save():
             % ", ".join(clash))}), 400
     # #296 — `cancelled` refines `terminal`, so a name in one and not the other is the drift
     # this set exists to prevent („moved it, forgot to delete it from the other box" — the
-    # likeliest mis-edit of copy-pasteable lists). Checked ONLY when this request actually
-    # carries `cancelled`, which the panel always does: a partial API call, and an install
-    # upgrading from a stored configuration written before this set existed, must not be
-    # refused for a state they did not create.
+    # likeliest mis-edit of copy-pasteable lists).
+    #
+    # It is checked on the RESULTING configuration whenever the request touches either side of
+    # the invariant (PR #298 review, A6). Keying it on `"cancelled" in body` alone left the
+    # other half of the same mis-edit wide open: a call narrowing `terminal` produced exactly
+    # the drift — „Stornovaná" stays cancelled while dropping out of terminal, `terminal −
+    # cancelled` subtracts nothing, and cancelled orders return to the set the escalation
+    # chases.
+    #
+    # The upgrade exemption survives, and is now stated in terms of what it was always about:
+    # a `cancelled` NOBODY EVER CONFIGURED — no key in the payload and none in the stored file,
+    # so the value is this version's built-in default. Refusing a `terminal` edit over a set
+    # the manager has never seen would red-banner an install for a state it did not create
+    # (which the loader, deliberately, does not do either). Once the set exists — and the panel
+    # writes all four boxes on every save — both edits are checked.
+    cancelled_configured = "cancelled" in body or "cancelled" in stored
+    touches_invariant = "cancelled" in body or "terminal" in body
     stray = (_cancelled_outside_terminal({k: set(v) for k, v in out.items()})
-             if "cancelled" in body else [])
+             if touches_invariant and cancelled_configured else [])
     if stray:
         return jsonify({"ok": False, "error": (
             "stav %s je v zozname „%s“, ale nie je medzi ukončenými — zrušená objednávka je "
