@@ -617,3 +617,354 @@ def test_a_hand_edited_control_character_is_DROPPED_by_the_loader(iso):
 
     assert webapp._order_statuses()["known_open"] == frozenset({"Dobrý stav"}), \
         webapp._order_statuses()["known_open"]
+
+
+# ── #296: the Pošta automation's two remaining literals ────────────────────────
+# `posta_uncollected.DISPATCHED_STATUS` („vybavená") and its `== "stornovaná"` filter stayed
+# outside #209's configuration. They live on the TERMINAL side, which the `terminal` set owns
+# — so a fourth set names the CANCELLED half of it and „dispatched" is what is left over.
+# Deriving it is the load-bearing decision: a fourth EDITABLE box would make one rename need
+# TWO edits, and the second one is not on the card where the manager is told about the new
+# status — which is the silent death #209 removed.
+
+def test_cancelled_defaults_to_the_measured_live_status(iso):
+    """A fresh install keeps behaving exactly as v0.103.0 did: „Stornovaná" is the cancelled
+    status, and it is one of the four the default `terminal` set already carries."""
+    st = webapp._order_statuses()
+    assert st["cancelled"] == frozenset({"Stornovaná"})
+    assert st["cancelled"] <= st["terminal"]
+
+
+def test_dispatched_is_DERIVED_as_terminal_minus_cancelled(iso):
+    """No fourth editable box. Renaming a dispatched status is ONE edit — of `terminal`, the
+    box the prune already forces the manager to keep correct."""
+    cancelled, dispatched, reason = webapp._posta_statuses()
+    assert cancelled == frozenset({"Stornovaná"})
+    assert dispatched == frozenset({"Vybavená", "Vybavená výmena", "Vybavený Dobropis"})
+    assert reason == ""
+    c = _client_as(ADMIN).post("/api/order-statuses", json={
+        "terminal": ["Expedovaná", "Zrušená"], "cancelled": ["Zrušená"]})
+    assert c.status_code == 200, c.get_json()
+    assert webapp._posta_statuses() == (frozenset({"Zrušená"}), frozenset({"Expedovaná"}), "")
+
+
+def test_a_cancelled_status_OUTSIDE_terminal_is_REFUSED_by_the_endpoint(iso):
+    """The invariant that stops the two boxes drifting apart. „Zrušená is cancelled but is not
+    a finished status" is not a configuration anybody means — and left unchecked it is exactly
+    the silent drift #296 is about, one box further along."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json={
+        "terminal": ["Vybavená", "Stornovaná"], "cancelled": ["Zrušená"]})
+    assert r.status_code == 400
+    assert "Zrušená" in r.get_json()["error"]
+
+
+def test_an_EMPTIED_cancelled_is_refused_like_the_other_load_bearing_sets(iso):
+    """With nothing cancelled, `dispatched` becomes the whole `terminal` set — so cancelled
+    orders land in the alarm's denominator (they never carry a package number) and, if one
+    ever did, its customer gets chased with escalation mails."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"cancelled": []})
+    assert r.status_code == 400
+    assert "zrušen" in r.get_json()["error"].lower()
+
+
+def test_a_config_written_BEFORE_this_set_existed_is_not_broken_by_the_upgrade(iso):
+    """The invariant is an endpoint rule, NOT a loader rule, and this is why. Every stored
+    configuration predating #296 has no `cancelled` key, so the default steps in — and if that
+    default is not inside a `terminal` the manager had legitimately narrowed, a loader-level
+    check would red-banner it and DISARM the prune on upgrade, for a state nobody caused.
+    Nothing dangerous follows from the mismatch: `dispatched` is `terminal − cancelled`, so a
+    name that is not in `terminal` simply subtracts nothing."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená"], "known_open": []})
+    sets, reason = webapp._order_statuses_state()
+    assert reason == ""                                   # prune stays armed
+    assert sets["cancelled"] == frozenset({"Stornovaná"})
+    assert webapp._posta_statuses() == (frozenset({"Stornovaná"}), frozenset({"Vybavená"}), "")
+
+
+def test_a_PARTIAL_payload_that_never_mentions_cancelled_is_not_refused(iso):
+    """Same reason, on the write path: a caller editing only `to_order` must not be rejected
+    over a set it did not touch. The panel always posts all four boxes, so the mis-edit the
+    rule exists for is still fully covered."""
+    r = _client_as(ADMIN).post("/api/order-statuses",
+                               json={"to_order": ["Spracúva sa"], "terminal": ["Hotová"]})
+    assert r.status_code == 200, r.get_json()
+
+
+def test_an_ABSENT_cancelled_key_is_a_fresh_install_not_a_broken_config(iso):
+    """Every config file written before this change has no `cancelled` key at all. That must
+    read as „not configured" → the default, with no reason and no banner."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Stornovaná"],
+                 "known_open": []})
+    sets, reason = webapp._order_statuses_state()
+    assert reason == ""
+    assert sets["cancelled"] == frozenset({"Stornovaná"})
+
+
+def test_the_posta_run_passes_the_CONFIGURED_sets_to_the_automation(iso, tmp_path,
+                                                                   monkeypatch):
+    """The wiring itself: without it every test above pins a helper nobody calls."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Expedovaná", "Zrušená"],
+                 "known_open": [], "cancelled": ["Zrušená"]})
+    monkeypatch.setattr(webapp, "POSTA_STATE", str(tmp_path / "posta.json"))
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: b"")
+    seen = {}
+
+    def _ship(csv_bytes, today=None, cancelled_statuses=None):
+        seen["cancelled"] = cancelled_statuses
+        return []
+
+    def _cov(csv_bytes, today=None, cancelled_statuses=None, dispatched_statuses=None):
+        seen["cov_cancelled"] = cancelled_statuses
+        seen["dispatched"] = dispatched_statuses
+        return {"eligible_orders": 0, "dispatched_orders": 0, "dispatched_with_package": 0,
+                "dispatched_without_package": 0, "missing_package": 0,
+                "days_since_last_package": None, "dispatched_status_unknown": False,
+                "degraded": False}
+
+    monkeypatch.setattr(webapp.posta_uncollected, "shipments_from_orders_csv", _ship)
+    monkeypatch.setattr(webapp.posta_uncollected, "source_coverage", _cov)
+    webapp.run_posta_uncollected()
+    assert seen["cancelled"] == frozenset({"Zrušená"})
+    assert seen["cov_cancelled"] == frozenset({"Zrušená"})
+    assert seen["dispatched"] == frozenset({"Expedovaná"})
+
+
+def test_the_blind_spot_ERROR_names_the_CONFIGURED_statuses_not_a_constant(iso, caplog):
+    """store-prune §7 / automation-health §3: a refusal that names a literal the shop no
+    longer uses sends the manager looking for something that does not exist. The old line
+    told him to edit `DISPATCHED_STATUS` — a name only the source code has."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Expedovaná", "Zrušená"],
+                 "known_open": [], "cancelled": ["Zrušená"]})
+    msg = webapp._dispatched_status_blind_message(12, webapp._posta_statuses()[1])
+    assert "12" in msg and "Expedovaná" in msg
+    assert "DISPATCHED_STATUS" not in msg
+
+
+def test_the_blind_spot_ERROR_stops_claiming_ANI_JEDNA_when_a_few_survive(iso):
+    """PR #298 review, A1: the signal now also fires with 1-4 recognised orders (a renamed main
+    status whose rare siblings survive), so the line may not keep asserting that not a single
+    order carries one of the names — it would be false about the only number the manager can
+    act on, which is how the previous version of this message ended up saying „v okne je 0
+    objednávok"."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Expedovaná", "Zrušená"],
+                 "known_open": [], "cancelled": ["Zrušená"]})
+    msg = webapp._dispatched_status_blind_message(102, webapp._posta_statuses()[1],
+                                                  dispatched=2)
+    assert "102" in msg and "2" in msg and "Expedovaná" in msg
+    assert "ANI JEDNA" not in msg
+    # …and with a genuinely empty count it still says exactly that
+    assert "ANI JEDNA" in webapp._dispatched_status_blind_message(
+        102, webapp._posta_statuses()[1], dispatched=0)
+
+
+# ── #297: widening `to_order` silently widens the customer mailing list ────────
+# `to_order` drives three things at once — the „Na objednanie" tab, „Nedostupné" AND the
+# reminder mails (deliberately: one notion of „open", not four). The sharp edge is that adding
+# a status makes EVERY order in it older than 4 days instantly mail-eligible, with no preview,
+# no count and no cap on the first run. Measured on the live export (28.7.2026): adding
+# „Kompletná" reaches 2 more orders, „Osob. odber" 3 — and „Vybavená" 387 orders, of which
+# 250 carry a note and an address = 237 distinct customers, in one wave, under a card that
+# answers „✅ Uložené". (370 is the same count WITHOUT the note filter; PR #298 review, B-F2.)
+_IMPACT_HEAD = ("code;date;statusName;email;phone;billFullName;itemCode;itemName;"
+                "itemAmount;totalPriceWithVat;shopRemark\r\n")
+
+
+def _impact_row(status, code, note="volať zákazníka", email="k@example.com", days_old=9):
+    d = (datetime.now() - timedelta(days=days_old)).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{code};{d};{status};{email};;Zákazník;A1;Bunda;1;10;{note}\r\n"
+
+
+def _impact_export(monkeypatch, rows):
+    monkeypatch.setattr(webapp, "_orders_csv_cached",
+                        lambda: (_IMPACT_HEAD + "".join(rows)).encode("cp1250"))
+
+
+def test_widening_to_order_REPORTS_how_many_customers_it_newly_reaches(iso, monkeypatch):
+    """The whole ticket in one call: before saving, the manager must be able to see the size
+    of the wave he is about to release."""
+    _impact_export(monkeypatch, [
+        _impact_row("Vybavuje sa", "99003001"),                       # already in scope
+        _impact_row("Kompletná", "99003002", email="a@example.com"),  # newly reachable
+        _impact_row("Kompletná", "99003003", email="b@example.com"),
+        _impact_row("Kompletná", "99003004", email="a@example.com"),  # same customer twice
+    ])
+    r = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Vybavuje sa", "Kompletná"]})
+    assert r.status_code == 200, r.get_json()
+    j = r.get_json()
+    assert j["added"] == ["Kompletná"]
+    assert j["orders"] == 3
+    assert j["mailable"] == 3
+    assert j["customers"] == 2                 # DISTINCT e-mails, not orders
+    assert j.get("unknown") is not True
+
+
+def test_an_unchanged_or_NARROWED_set_reaches_nobody_new(iso, monkeypatch):
+    """No added status → no wave → nothing to confirm. Narrowing is the safe direction and
+    must never put a scary number in front of the manager."""
+    _impact_export(monkeypatch, [_impact_row("Vybavuje sa", "99003005"),
+                                 _impact_row("Kompletná", "99003006")])
+    c = _client_as(ADMIN)
+    for payload in ({"to_order": ["Vybavuje sa"]}, {"to_order": []}):
+        j = c.post("/api/order-statuses/impact", json=payload).get_json()
+        assert j["added"] == [] and j["orders"] == 0 and j["customers"] == 0, (payload, j)
+
+
+def test_orders_that_could_never_be_mailed_are_counted_apart(iso, monkeypatch):
+    """`orders` is what the app starts watching; `mailable` is the honest upper bound on the
+    wave. An order with no internal note only ever surfaces as the red „nikto sa jej nedotkol"
+    alert and one with no e-mail address can never be mailed at all — counting either as a
+    pending mail would cry wolf, and a preview that exaggerates is one he stops reading."""
+    _impact_export(monkeypatch, [
+        _impact_row("Kompletná", "99003007"),                       # note + e-mail → mailable
+        _impact_row("Kompletná", "99003008", note=""),              # no note → red alert only
+        _impact_row("Kompletná", "99003009", email=""),             # nobody to mail
+    ])
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Kompletná"]}).get_json()
+    assert j["orders"] == 3
+    assert j["mailable"] == 1
+    assert j["customers"] == 1
+
+
+def test_an_order_already_resolved_is_not_counted_as_a_pending_mail(iso, tmp_path,
+                                                                   monkeypatch):
+    """The dedup store is what stops a second mail, so an order it already holds is not part
+    of the wave. Without this the preview would over-count exactly the orders that are already
+    safe — and a number he can prove wrong once is a number he ignores forever."""
+    monkeypatch.setattr(webapp, "ORDERS_REMINDER_STATE", str(tmp_path / "rem.json"))
+    (tmp_path / "rem.json").write_text(json.dumps({"orders": {
+        "99003010": {"status": "emailed"}, "99003011": {"status": "skipped_contacted"}}}),
+        encoding="utf-8")
+    _impact_export(monkeypatch, [_impact_row("Kompletná", "99003010"),
+                                 _impact_row("Kompletná", "99003011"),
+                                 _impact_row("Kompletná", "99003012")])
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Kompletná"]}).get_json()
+    assert j["orders"] == 3
+    assert j["mailable"] == 1
+
+
+def test_an_unreadable_export_says_UNKNOWN_rather_than_a_reassuring_zero(iso, monkeypatch):
+    """A preview that cannot be computed must SAY so. Answering 0 would be the worst of both
+    worlds: the card would wave the change through silently, on no evidence at all."""
+    def _boom():
+        raise OSError("export not there")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _boom)
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Vybavuje sa", "Kompletná"]}).get_json()
+    assert j["unknown"] is True
+    assert j["added"] == ["Kompletná"]          # what he changed is still knowable
+
+
+def test_the_preview_is_READ_ONLY_and_admin_only(iso, monkeypatch):
+    """It runs on a candidate the manager has NOT saved yet, so it must not touch the stored
+    configuration — and it reads the orders export, which is not public reading."""
+    _impact_export(monkeypatch, [_impact_row("Kompletná", "99003013")])
+    before = webapp._order_statuses()
+    assert _client_as(ADMIN).post("/api/order-statuses/impact",
+                                  json={"to_order": ["Kompletná"]}).status_code == 200
+    assert webapp._order_statuses() == before
+    assert not os.path.exists(os.fspath(webapp.ORDER_STATUSES))
+    assert _client_as(USER).post("/api/order-statuses/impact",
+                                 json={"to_order": ["Kompletná"]}).status_code == 403
+    assert webapp.app.test_client().post("/api/order-statuses/impact",
+                                         json={"to_order": ["X"]}).status_code == 401
+
+
+# ── PR #298 review: the SECOND customer-mail path, and previews of a broken config ─────────
+# `run_orders_reminder` was made fail-CLOSED on `bad-status-config` in PR #295's review
+# (automation-health §3): an unusable file must not silently restore the built-in „Vybavuje sa"
+# and re-arm mails to the very customers the manager excluded. The Pošta escalation is the same
+# kind of mail on the same configuration — and it was left fail-OPEN, because `_posta_statuses`
+# went through `_order_statuses()`, the wrapper that throws the reason away.
+_BROKEN = {"to_order": ["Vybavuje sa"], "terminal": ["Vybavuje sa", "Vybavená"],
+           "known_open": [], "cancelled": ["Stornovaná"]}       # one status in two lists
+
+
+def _posta_shipment_run(iso, tmp_path, monkeypatch):
+    """One shipment that WOULD be escalated, with the tracking round-trip stubbed out.
+    Returns (stats, mails) — `mails` is every _send_mail_html call the run made."""
+    monkeypatch.setattr(webapp, "POSTA_STATE", str(tmp_path / "posta.json"))
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: b"")
+    ship = {"code": "99004001", "packageNumber": "EF000000901SK"}
+    monkeypatch.setattr(webapp.posta_uncollected, "shipments_from_orders_csv",
+                        lambda *a, **k: [ship])
+    monkeypatch.setattr(webapp.posta_uncollected, "source_coverage", lambda *a, **k: {
+        "eligible_orders": 40, "dispatched_orders": 30, "dispatched_with_package": 30,
+        "dispatched_without_package": 0, "missing_package": 0,
+        "days_since_last_package": 1, "dispatched_status_unknown": False, "degraded": False})
+    monkeypatch.setattr(webapp, "_fetch_tracking", lambda pkg: {})
+    monkeypatch.setattr(webapp.posta_uncollected, "terminal_state", lambda tj: "")
+    monkeypatch.setattr(webapp.posta_uncollected, "evaluate_shipment", lambda s, tj, esc: {
+        "invalid": False, "send": True, "uncollected": True,
+        "orderCode": s["code"], "packageNumber": s["packageNumber"],
+        "email": "k@example.com", "email_subject": "Zásielka čaká", "email_body": "<p>x</p>",
+        "new_state_value": "1|2026-07-27", "count": 1, "last_sent": "", "call_needed": False,
+        "name": "Zákazník", "phone": "", "office_name": "Pošta 1", "office_addr": "Ulica 1",
+        "retained_till": "2026-08-03", "notified_since": "2026-07-20", "days_at_post": 3,
+        "tracking_link": "https://x/", "admin_link": "https://y/"})
+    mails = []
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda *a, **k: (mails.append(a[0]), True)[1])
+    return webapp.run_posta_uncollected(), mails
+
+
+def test_a_BROKEN_status_config_sends_no_posta_escalation_mail_either(iso, tmp_path,
+                                                                     monkeypatch, caplog):
+    """The whole finding: with an unusable configuration the reminders stop (PR #295 review)
+    while Pošta went on mailing REAL CUSTOMERS off the built-in defaults. Both are the same
+    escalation to the same person on the same file, so both get the prune's answer — render,
+    do not act. Worse than a wasted mail: if the manager had correctly reconfigured a renamed
+    cancelled status, the defaults put cancelled orders back into the chased set."""
+    _write(iso, _BROKEN)
+    stats, mails = _posta_shipment_run(iso, tmp_path, monkeypatch)
+    assert mails == []                                  # not one customer heard from us
+    assert stats["status_config_broken"] is True
+    assert stats["source_degraded"] is True             # never a green ✅ over a blind run
+    assert stats["uncollected"] == 1                    # …but the row stays on the tab
+    assert any("nastavenie stavov" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_a_HEALTHY_status_config_still_mails_the_customer(iso, tmp_path, monkeypatch):
+    """The control the fix above must not break: fail-closed is only worth anything if the
+    open path still works. A „never send" patch would be indistinguishable without it."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Stornovaná"],
+                 "known_open": [], "cancelled": ["Stornovaná"]})
+    stats, mails = _posta_shipment_run(iso, tmp_path, monkeypatch)
+    assert mails == ["k@example.com"]
+    assert stats["status_config_broken"] is False
+    assert stats["source_degraded"] is False
+
+
+def test_the_preview_measures_against_what_is_EFFECTIVE_not_what_the_loader_renders(
+        iso, monkeypatch):
+    """The preview's blind spot on the BIGGEST wave there is. With an unusable configuration
+    the reminders send NOTHING, so the effective open set is empty — but the preview subtracted
+    the DEFAULTS the loader renders, reported „nothing new" and let the whole backlog go out in
+    one wave the moment the manager repaired the file. Measured by the reviewer on a corrupt
+    store: preview 0, actually mail-eligible right after saving 37."""
+    _write(iso, _BROKEN)
+    _impact_export(monkeypatch, [_impact_row("Vybavuje sa", "99003020", email="a@example.com"),
+                                 _impact_row("Vybavuje sa", "99003021", email="b@example.com")])
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Vybavuje sa"]}).get_json()
+    assert j["added"] == ["Vybavuje sa"]        # nothing is effective today, so all of it is new
+    assert j["orders"] == 2
+    assert j["customers"] == 2
+    assert j["config_broken"] is True           # so the dialog can say WHY the number is large
+
+
+def test_a_PARTIAL_payload_that_narrows_terminal_alone_is_still_cross_checked(iso):
+    """The cross-check ran only `if "cancelled" in body`, so an API call editing `terminal`
+    alone produced exactly the drift the check exists for: „Stornovaná" stays cancelled while
+    dropping out of terminal, `terminal − cancelled` subtracts nothing, and cancelled orders
+    return to the set the escalation chases."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Stornovaná"],
+                 "known_open": [], "cancelled": ["Stornovaná"]})
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"terminal": ["Vybavená"]})
+    assert r.status_code == 400, r.get_json()
+    assert "Stornovaná" in r.get_json()["error"]
+    # and the stored configuration is untouched by the refusal
+    assert webapp._order_statuses()["terminal"] == frozenset({"Vybavená", "Stornovaná"})

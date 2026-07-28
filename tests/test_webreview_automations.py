@@ -121,6 +121,11 @@ def test_posta_run_sends_first_mail_and_surfaces_invalid(iso):
                      # #282 — all three orders in this window are dispatched AND carry a package
                      # number, and the newest is 3 days old, so the source is healthy and the run
                      # is NOT degraded. The alarm has to be quiet here or it is worthless.
+                     # PR #298 review, A2 — the Pošta escalation is fail-CLOSED on an unusable
+                     # status configuration, like the reminders already were. This fixture's
+                     # configuration is healthy, so both keys report the open path: nothing was
+                     # blocked and the run is not degraded for that reason either.
+                     "status_config_broken": False, "emails_blocked": 0,
                      "source_degraded": False, "dispatched_orders": 3,
                      "dispatched_without_package": 0, "missing_package": 0,
                      "days_since_last_package": 3, "dispatched_status_unknown": False}

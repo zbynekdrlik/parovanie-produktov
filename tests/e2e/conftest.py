@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -668,9 +669,18 @@ def sync_prune_blocked_server(tmp_path_factory):
                             "flags_unknown_statuses": [], "source_degraded": True},
         },
     }, ensure_ascii=False), encoding="utf-8")
+    # #297 — two orders in a status that is NOT „being processed" today, each older than the
+    # reminder's 4-day gate and carrying an internal note + an address, so ADDING that status
+    # to `to_order` really would put customer mail in flight. Dated RELATIVE to now: a
+    # hard-coded date would quietly drift past the gate and turn the impact preview into a
+    # silent 0, i.e. the test would stop testing anything.
+    _old = (datetime.now() - timedelta(days=9)).strftime("%Y-%m-%d %H:%M:%S")
     (out / "orders_cache.csv").write_text(
-        "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
-        "99002000;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
+        "code;date;statusName;email;phone;billFullName;packageNumber;itemCode;itemName;"
+        "itemAmount;totalPriceWithVat;shopRemark\r\n"
+        "99002000;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M;Bunda;1;9;\r\n"
+        f"99002010;{_old};Čaká na dodávateľa;a@example.com;;Zákazník A;;9/M;Bunda;1;9;volať\r\n"
+        f"99002011;{_old};Čaká na dodávateľa;b@example.com;;Zákazník B;;9/M;Bunda;1;9;volať\r\n",
         encoding="cp1250")
     env = {
         **os.environ,

@@ -1943,7 +1943,19 @@ ORDER_STATUS_DEFAULTS = {
     # lives in `to_order`; the effective „known" set is the union of all three (see
     # `_order_statuses`), so nothing changes for a shop that never edits the config.
     "known_open": tuple(sorted(ORDERS_KNOWN_OPEN_STATUSES - ORDERS_OPEN_STATUSES)),
+    # #296 — the CANCELLED half of `terminal`. „Finished" is not one thing to the Pošta
+    # automation: a dispatched order MUST already carry a package number (it is the alarm's
+    # denominator), a cancelled one must never be chased at all — mailing „vyzdvihnite si
+    # zásielku" to somebody who cancelled is the one thing #93 deliberately never does.
+    # Measured on the live export (28.7.2026): renaming „Stornovaná" put 16 cancelled orders
+    # back into the chased set (144 → 160), and renaming „Vybavená" flipped the coverage
+    # alarm from red to GREEN over a source that was genuinely dead.
+    "cancelled": ("Stornovaná",),
 }
+# The three sets that PARTITION the shop's statuses — no status may be in two of them.
+# `cancelled` is deliberately excluded: it REFINES `terminal` (it is required to be a subset
+# of it), so overlapping with it is the whole point rather than a contradiction.
+ORDER_STATUS_EXCLUSIVE = ("to_order", "terminal", "known_open")
 # Same two axes, and the same reason, as `ORDERS_UNKNOWN_STATUS_MAX/MAXLEN`: a status is
 # untrusted text that ends up in the log, in `automations.json` and on the card. A shop with
 # more than 50 order statuses does not exist; a broken paste does.
@@ -1954,12 +1966,18 @@ ORDER_STATUS_LABELS = {
     "to_order": "objednávka sa spracúva",
     "terminal": "objednávka je ukončená",
     "known_open": "ostatné známe stavy (nie sú ukončené)",
+    "cancelled": "objednávka je zrušená",
 }
 # The two sets that must never be empty: without `to_order` the tab, „Nedostupné" and the
 # customer reminders show nothing, and without `terminal` nothing is ever finished, so the
 # prune silently stops. `known_open` may legitimately be empty — it only decides which
 # statuses are reported as unclassified.
-ORDER_STATUS_REQUIRED = ("to_order", "terminal")
+#
+# `cancelled` is load-bearing for the same reason (#296): emptied, „dispatched" becomes the
+# WHOLE `terminal` set, so cancelled orders join the coverage alarm's denominator — where they
+# can never carry a package number — and any that did would have their customer chased with
+# escalation mails.
+ORDER_STATUS_REQUIRED = ("to_order", "terminal", "cancelled")
 
 
 # A status name is free text the shop owner types, and it lands in `log.info(...)`, in the
@@ -2020,16 +2038,30 @@ def _status_overlap(sets) -> list:
     * `to_order` ∩ `known_open` — harmless in effect, but it means the manager thinks one
       of the two boxes does something it does not."""
     seen, dupes = set(), set()
-    for key in ORDER_STATUS_DEFAULTS:
+    for key in ORDER_STATUS_EXCLUSIVE:
         for v in sets[key]:
             (dupes if v in seen else seen).add(v)
     return sorted(dupes)
 
 
+def _cancelled_outside_terminal(sets) -> list:
+    """Statuses called CANCELLED that the configuration does not also call FINISHED (#296).
+
+    `cancelled` refines `terminal` — it names which of the finished statuses mean „this order
+    was called off" rather than „this order went out". Letting the two drift apart is the very
+    failure #296 is about, one box further along: the manager renames „Stornovaná" in
+    `terminal` (which he must, or the prune stops recognising it), the stale name lingers here,
+    and cancelled orders silently rejoin the set the Pošta automation chases.
+
+    Used by the SAVE endpoint only, and deliberately not by the loader — see the note in
+    `_resolve_status_sets` for why a loader-level check would break an upgrade."""
+    return sorted(sets["cancelled"] - sets["terminal"])
+
+
 def _order_statuses_state() -> tuple:
-    """`({"to_order": frozenset, "terminal": frozenset, "known_open": frozenset}, reason)`
-    — the EFFECTIVE sets, plus `""` or the reason the STORED configuration could not be
-    used. Resolved PER CALL (a module-level dict would freeze at import and stop seeing an
+    """`({"to_order": …, "terminal": …, "known_open": …, "cancelled": …}, reason)` — the
+    EFFECTIVE sets (each a frozenset), plus `""` or the reason the STORED configuration could
+    not be used. Resolved PER CALL (a module-level dict would freeze at import and stop seeing an
     edit until the service restarts, the same trap `_line_flag_stores` avoids).
 
     „Nothing configured" and „configured, but unreadable" get DIFFERENT answers, and that
@@ -2105,12 +2137,63 @@ def _resolve_status_sets(raw, missing=False) -> tuple:
     if clash:
         why = "stav %s je naraz vo viacerých zoznamoch" % ", ".join(clash)
         out = {k: frozenset(v) for k, v in ORDER_STATUS_DEFAULTS.items()}
+    # NOTE — `cancelled ⊄ terminal` is deliberately NOT a reason here, only at the endpoint
+    # (#296). Two things decided that. It is not DANGEROUS: „dispatched" is `terminal −
+    # cancelled`, so a stray name simply subtracts nothing, and the cancelled filter keeps
+    # working off the names it was given. And treating it as a reason would turn a
+    # configuration that was valid yesterday — a stored `terminal` narrowed below the built-in
+    # default, with no `cancelled` key at all because this version had not shipped yet — into a
+    # red banner with the prune disarmed, on upgrade, for a state nobody caused. The endpoint
+    # catches the mis-edit where the manager can act on it; the card's „this name is not in the
+    # export" warning covers the rest without ever disarming anything.
     return out, why
 
 
 def _order_statuses() -> dict:
     """The effective status sets, for every caller that does not decide about DELETING."""
     return _order_statuses_state()[0]
+
+
+def _posta_statuses() -> tuple:
+    """`(cancelled, dispatched, reason)` for the Pošta automation (#296).
+
+    „Dispatched" is DERIVED as `terminal − cancelled` and deliberately has no box of its own.
+    A fourth editable list would turn ONE rename into TWO edits, and the second one would not
+    be on the card where the manager is told a new status appeared — which is precisely the
+    silent death #209 removed. Deriving it means the box the prune already forces him to keep
+    correct is the only one he has to touch.
+
+    The REASON comes with it (PR #298 review, A2). This used to call `_order_statuses()`, the
+    wrapper that drops it — the very fail-open shape automation-health §3 names: „when the
+    loader returns (value, reason), a wrapper without the reason is a NEW fail-open path, and
+    a consumer that SENDS or DELETES must call the version that carries it". `run_orders_reminder`
+    was closed against this in PR #295's review; this is the same configuration, the same
+    customer and the same kind of escalation, one path further along — and worse, because a
+    manager who correctly reconfigured a renamed cancelled status gets the built-in default
+    back, which puts cancelled orders into the set the escalation chases."""
+    st, reason = _order_statuses_state()
+    return st["cancelled"], st["terminal"] - st["cancelled"], reason
+
+
+def _dispatched_status_blind_message(eligible: int, dispatched_statuses,
+                                     dispatched: int = 0) -> str:
+    """The ERROR line for the alarm's own blind spot — naming the CONFIGURED statuses.
+
+    store-prune §7: a refusal that names a literal the shop no longer uses sends the manager
+    looking for something that does not exist. The old line told him to fill the new name into
+    `DISPATCHED_STATUS`, a name only the source code has.
+
+    Since PR #298's review (A1) the signal also fires with 1-4 recognised orders — a renamed
+    main status whose rare siblings survive — so the sentence may no longer assert that not one
+    order carries the names. automation-health §4: the flag has to report the number it actually
+    triggered on, or the ERROR is false about the only figure the manager can act on."""
+    names = ", ".join(sorted(dispatched_statuses)) or "zoznam je prázdny"
+    found = ("ANI JEDNA nemá" if not dispatched
+             else "len %d z nich má" % dispatched)
+    return ("posta: v okne je %d objednávok, ale %s niektorý zo stavov, ktoré "
+            "znamenajú „odoslaná“ (%s) — stavy sa v Shoptete zrejme premenovali; kontrola "
+            "pokrytia podacích čísel je odteraz slepá, kým sa nové názvy nedoplnia do "
+            "nastavenia stavov na karte „Sync zo Shoptetu“" % (eligible, found, names))
 # a blank status is not falsy-therefore-ignorable: it is an unreadable one, and dropping it
 # would narrow the prune with no trace anywhere. It gets a name instead.
 ORDERS_BLANK_STATUS_LABEL = "(prázdny stav)"
@@ -6655,26 +6738,43 @@ def run_posta_uncollected() -> dict:
     # calls that each defaulted to date.today() on their own.
     today = datetime.now().date()
     today_iso = today.isoformat()
-    shipments = posta_uncollected.shipments_from_orders_csv(csv_bytes, today)
+    # #296 — the two status names this automation used to carry as literals now come from the
+    # manager's configuration, and „dispatched" is derived rather than given a box of its own.
+    # …with the REASON (PR #298 review, A2): an unusable configuration makes every set below a
+    # built-in default, and these mails go to real customers. Same answer the prune and the
+    # reminders give — count, render, do NOT act (automation-health §3).
+    cancelled_statuses, dispatched_statuses, status_reason = _posta_statuses()
+    bad_status_config = bool(status_reason)
+    if bad_status_config:
+        log.error("posta: nastavenie stavov objednávok sa nedá použiť (%s) — NEPOSIELAM "
+                  "žiadne upozornenia zákazníkom, lebo appka práve beží na PREDVOLENÝCH "
+                  "názvoch stavov a nevie, ktoré objednávky sú zrušené; zásielky nechávam "
+                  "vypísané na karte a čakám na opravu zoznamov na karte „Sync zo Shoptetu“",
+                  status_reason)
+    shipments = posta_uncollected.shipments_from_orders_csv(
+        csv_bytes, today, cancelled_statuses=cancelled_statuses)
     uncollected, invalid, errors = [], [], []
-    sent = failed = api_skipped = 0
+    sent = failed = api_skipped = blocked = 0
     # Is the SOURCE still alive (#282)? `checked` above only ever counts orders that DID carry a
     # package number, so an export that stops carrying them reads as a calm day. This is the one
     # stat that can tell those two apart. Pure counting over the same export — no send, no API.
-    coverage = posta_uncollected.source_coverage(csv_bytes, today)
+    coverage = posta_uncollected.source_coverage(
+        csv_bytes, today, cancelled_statuses=cancelled_statuses,
+        dispatched_statuses=dispatched_statuses)
     if coverage["dispatched_status_unknown"]:
         # The alarm's own blind spot, logged rather than assumed away: every count above hangs off
-        # one hard-coded status string. Orders in the window of which NOT ONE is recognised as
-        # dispatched means that vocabulary moved — and this alarm would then sit green forever,
-        # exactly like the automation it was built to watch.
-        # `eligible_orders` and not `missing_package + dispatched_orders`: this branch fires only
-        # when dispatched_orders is 0, so that sum degenerates to „orders WITHOUT a number", and a
-        # window whose orders all carry one reported „v okne je 0 objednávok, ale ANI JEDNA…" —
-        # self-contradictory, and wrong about the only number the reader can act on.
-        log.error("posta: v okne je %d objednávok, ale ANI JEDNA nemá stav Vybavená — stavy sa v "
-                  "Shoptete zrejme premenovali; kontrola pokrytia podacích čísel je odteraz "
-                  "slepá, kým sa nový názov stavu nedoplní do DISPATCHED_STATUS",
-                  coverage["eligible_orders"])
+        # the dispatched status NAMES — configuration since #296, but a name can still be edited
+        # WRONG. Orders in the window of which NOT ONE is recognised as dispatched means that
+        # vocabulary moved — and this alarm would then sit green forever, exactly like the
+        # automation it was built to watch.
+        # `eligible_orders` and not `missing_package + dispatched_orders`: that sum degenerates
+        # to „orders WITHOUT a number", and a window whose orders all carry one reported „v okne
+        # je 0 objednávok, ale ANI JEDNA…" — self-contradictory, and wrong about the only number
+        # the reader can act on. The recognised COUNT goes with it since PR #298's review: the
+        # branch no longer implies zero (1-4 survivors fire it too).
+        log.error("%s", _dispatched_status_blind_message(
+            coverage["eligible_orders"], dispatched_statuses,
+            coverage["dispatched_orders"]))
     if coverage["degraded"]:
         log.error("posta: ZDROJ ZÁSIELOK JE DEGRADOVANÝ — %d z %d odoslaných objednávok v okne "
                   "nemá podacie číslo, posledné pribudlo pred %s dňami; automatizácia z nich "
@@ -6750,7 +6850,15 @@ def run_posta_uncollected() -> dict:
                 "orderCode", "packageNumber", "name", "admin_link")})
             continue
         if r["send"]:
-            if not r["email"]:
+            if bad_status_config:
+                # Fail-CLOSED, and placed BEFORE the other two disqualifiers so each of them
+                # keeps reporting its own gap truthfully (automation-health §3). It is not
+                # counted as `emails_failed`: nothing was attempted and nothing will be
+                # retried until the configuration is repaired, and inflating a failure counter
+                # would hide the real cause behind a number that looks like an SMTP problem.
+                blocked += 1
+                mail_ok = False
+            elif not r["email"]:
                 log.error("posta: obj. %s (%s) nemá e-mail — upozornenie nemožno poslať",
                           r["orderCode"], r["packageNumber"])
                 mail_ok = False
@@ -6783,7 +6891,8 @@ def run_posta_uncollected() -> dict:
                               "v ďalšom behu; skontroluj ručne",
                               r["orderCode"], r["packageNumber"], e)
             else:
-                failed += 1          # state NOT bumped → retried next run
+                if not bad_status_config:
+                    failed += 1      # state NOT bumped → retried next run
                 prev_count, prev_last = posta_uncollected.parse_notified(
                     esc.get(r["orderCode"], ""))
                 r["count"] = prev_count
@@ -6818,7 +6927,14 @@ def run_posta_uncollected() -> dict:
              # is nothing to check at all, and `checked` shrinking towards zero looks exactly like
              # a quiet week. These four make the difference visible; `source_degraded` is what
              # turns the card red instead of leaving a green „✅ OK" over a blind automation.
-             "source_degraded": coverage["degraded"],
+             # …and a run that may not send anything is not a healthy run either (PR #298
+             # review, A2). automation-health §3 is explicit that a new blind state signs up
+             # to `source_degraded` rather than inventing a second flag `navError()` would
+             # have to learn about; `status_config_broken` is the extra key that gives the
+             # banner its text, and `emails_blocked` the number to put in it.
+             "source_degraded": bool(coverage["degraded"] or bad_status_config),
+             "status_config_broken": bad_status_config,
+             "emails_blocked": blocked,
              "dispatched_orders": coverage["dispatched_orders"],
              "dispatched_without_package": coverage["dispatched_without_package"],
              "missing_package": coverage["missing_package"],
@@ -8784,6 +8900,87 @@ def api_order_statuses():
     })
 
 
+@app.route("/api/order-statuses/impact", methods=["POST"])
+def api_order_statuses_impact():
+    """#297 — how many customers a CANDIDATE `to_order` set would newly reach with a
+    reminder mail.
+
+    It runs on a candidate the manager has NOT saved, so it writes no configuration, touches
+    none of his stores and sends nothing. It is NOT literally side-effect-free, and saying so
+    would be the kind of comment that outlives its truth: `_orders_csv_cached` refreshes the
+    shared orders cache when that copy has aged out, exactly as `/api/orders` does on any page
+    load. That is our own copy of Shoptet's data on the ordinary read path, not a write to
+    anything the manager made.
+
+    `to_order` drives three things at once — the „Na objednanie" tab, „Nedostupné" AND
+    `run_orders_reminder`. That is deliberate (#209: one notion of „open", not four, so a
+    rename cannot silently kill the mailing automation), but it leaves a sharp edge: adding a
+    status makes EVERY order in it older than `MIN_DAYS` instantly mail-eligible, and the
+    dedup store only stops the SECOND mail, never the first wave. Measured on the live export
+    (28.7.2026): adding „Kompletná" reaches 2 more orders, „Osob. odber" 3 — and „Vybavená"
+    387 orders, 250 of them with a note and an address = 237 distinct customers, all at once,
+    under a card that answers „✅ Uložené". (370 is the address count WITHOUT the note filter
+    — the over-count this endpoint's three numbers exist to avoid; PR #298 review, B-F2.)
+
+    Three numbers rather than one, because they answer different questions and a preview that
+    exaggerates is one the manager stops reading:
+
+    * `orders`   — how many orders the app would start watching;
+    * `mailable` — the honest UPPER BOUND on the wave: of those, the ones that carry an
+      internal note (a note-less order only ever surfaces as the red „nikto sa jej nedotkol"
+      alert — see orders_reminder's clean state machine), have an address to mail, and are
+      not already resolved in the dedup store. It cannot be exact: whether a noted order is
+      mailed is the AI classifier's verdict, which is not knowable without paying for it.
+    * `customers` — distinct addresses among those, which is what „how many people hear from
+      us" actually means.
+
+    An export we cannot read answers `unknown`, never a reassuring 0 — a zero would wave the
+    change through on no evidence at all, which is the opposite of the point."""
+    if not _admin_or_none():
+        return _forbidden()
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    candidate = frozenset(_clean_status_list(body.get("to_order")) or ())
+    # Measure against what is EFFECTIVE, not against what the loader renders (PR #298 review,
+    # A3). On an unusable configuration `_order_statuses()` answers with the DEFAULTS — but
+    # `run_orders_reminder` is fail-closed on that same reason and sends nothing at all, so the
+    # set that is actually reaching customers right now is EMPTY and every status in the
+    # candidate is newly reachable. Subtracting the defaults reported „nothing new" for the
+    # single largest wave this app can release, which is the class of blindness the ticket is
+    # about: measured on a corrupt store, preview 0 vs 37 orders mail-eligible the moment the
+    # file was repaired. `unknown` would be the wrong answer here too — the number IS knowable,
+    # and hiding it exactly when it is biggest is the same failure wearing a different label.
+    current_sets, status_reason = _order_statuses_state()
+    current = frozenset() if status_reason else current_sets["to_order"]
+    added = sorted(candidate - current)
+    out = {"ok": True, "added": added, "orders": 0, "mailable": 0, "customers": 0,
+           "config_broken": bool(status_reason)}
+    if not added:
+        return jsonify(out)
+    try:
+        csv_bytes = _orders_csv_cached()
+    except Exception as e:  # noqa: BLE001 — a preview must never be the reason a save fails
+        log.warning("náhľad dosahu stavov: objednávky sa nedajú prečítať (%r)", e)
+        return jsonify({**out, "unknown": True})
+    try:
+        # ONLY the added statuses: `select_orders` filters per status, so the orders it
+        # returns for them ARE the difference against the current set — no need to run it
+        # twice and subtract, which would also double the cost of reading the export. (It is
+        # the ~1.1 MB ORDERS export here, not the ~55 MB catalog one — PR #298 review, B-F5.)
+        newly = orders_reminder.select_orders(csv_bytes, statuses=added)
+        with _lock:
+            done = _load_orders_reminder().get("orders") or {}
+    except Exception as e:  # noqa: BLE001 — same reason; an unreadable dedup store included
+        log.warning("náhľad dosahu stavov: nedá sa spočítať (%r)", e)
+        return jsonify({**out, "unknown": True})
+    resolved = {c for c, v in done.items() if isinstance(v, dict)
+                and v.get("status") in REMINDER_TERMINAL_STATUSES}
+    mailable = [o for o in newly if o["has_note"] and o["email"]
+                and o["code"] not in resolved]
+    return jsonify({**out, "orders": len(newly), "mailable": len(mailable),
+                    "customers": len({o["email"] for o in mailable})})
+
+
 @app.route("/api/order-statuses", methods=["POST"])
 def api_order_statuses_save():
     """Save all three sets at once. Admin-only.
@@ -8863,6 +9060,33 @@ def api_order_statuses_save():
             "stav %s je uvedený naraz vo viacerých zoznamoch — to sa navzájom vylučuje "
             "a pri mazaní starých značiek by to zmazalo prácu pri živých objednávkach"
             % ", ".join(clash))}), 400
+    # #296 — `cancelled` refines `terminal`, so a name in one and not the other is the drift
+    # this set exists to prevent („moved it, forgot to delete it from the other box" — the
+    # likeliest mis-edit of copy-pasteable lists).
+    #
+    # It is checked on the RESULTING configuration whenever the request touches either side of
+    # the invariant (PR #298 review, A6). Keying it on `"cancelled" in body` alone left the
+    # other half of the same mis-edit wide open: a call narrowing `terminal` produced exactly
+    # the drift — „Stornovaná" stays cancelled while dropping out of terminal, `terminal −
+    # cancelled` subtracts nothing, and cancelled orders return to the set the escalation
+    # chases.
+    #
+    # The upgrade exemption survives, and is now stated in terms of what it was always about:
+    # a `cancelled` NOBODY EVER CONFIGURED — no key in the payload and none in the stored file,
+    # so the value is this version's built-in default. Refusing a `terminal` edit over a set
+    # the manager has never seen would red-banner an install for a state it did not create
+    # (which the loader, deliberately, does not do either). Once the set exists — and the panel
+    # writes all four boxes on every save — both edits are checked.
+    cancelled_configured = "cancelled" in body or "cancelled" in stored
+    touches_invariant = "cancelled" in body or "terminal" in body
+    stray = (_cancelled_outside_terminal({k: set(v) for k, v in out.items()})
+             if touches_invariant and cancelled_configured else [])
+    if stray:
+        return jsonify({"ok": False, "error": (
+            "stav %s je v zozname „%s“, ale nie je medzi ukončenými — zrušená objednávka je "
+            "vždy aj ukončená, takže doplň ten istý názov aj do zoznamu „%s“"
+            % (", ".join(stray), ORDER_STATUS_LABELS["cancelled"],
+               ORDER_STATUS_LABELS["terminal"]))}), 400
     with _lock:
         d = _read_json_store(ORDER_STATUSES, {})
         d.update(out)
@@ -8874,8 +9098,9 @@ def api_order_statuses_save():
                 "takto uložené nastavenie by appka nevedela použiť (%s) — oprav zoznamy a "
                 "skús to znova" % why)}), 400
         _atomic_write_json(ORDER_STATUSES, d, protect=True)
-    log.info("order-statuses: %s set to_order=%s terminal=%s known_open=%s",
-             me["email"], out["to_order"], out["terminal"], out["known_open"])
+    log.info("order-statuses: %s set to_order=%s terminal=%s known_open=%s cancelled=%s",
+             me["email"], out["to_order"], out["terminal"], out["known_open"],
+             out["cancelled"])
     return jsonify({"ok": True, "statuses": {k: sorted(v) for k, v in out.items()},
                     "export_statuses": _export_status_names()})
 

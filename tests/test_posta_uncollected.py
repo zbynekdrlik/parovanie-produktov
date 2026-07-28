@@ -14,6 +14,7 @@ unnoticed, so the fixture now mirrors the real response (result-level
 """
 import json
 import os
+import unicodedata
 from datetime import date, timedelta
 
 from parovanie import posta_uncollected as pu
@@ -632,3 +633,203 @@ def test_build_email_renders_a_slovak_date_not_iso():
     # no zero padding — „03. 08. 2026" is not how it is written either
     _, body = pu.build_email(1, "Ján Vzor", "EF1SK", "Skalica 1", "", "2026-08-03", today=TODAY)
     assert "03. 08. 2026" not in body
+
+
+# ── #296: the two status literals are CONFIGURATION, not code ──────────────────
+# `DISPATCHED_STATUS = "vybavená"` and the `== "stornovaná"` filter stayed outside the
+# configurable sets #209 introduced, so a rename in the Shoptet admin still reaches this
+# module. Measured read-only on the live export (28.7.2026, 1961 rows, 144 eligible orders).
+def test_a_renamed_dispatched_status_must_not_blind_the_coverage_alarm():
+    """Renaming „Vybavená" took `dispatched_orders` from 89 to 0 on the live export — and,
+    far worse, flipped `degraded` from True to FALSE. The alarm built against silent death
+    went quietly GREEN over a source that was genuinely dead (4 of 89 dispatched orders
+    carried a number that night). The configured `terminal` set already knows the new name."""
+    rows = ([(26, "Expedovaná", f"EF00000{i:04d}SK", "Kuriér") for i in range(4)]
+            + [(d % 30, "Expedovaná", "", "Kuriér") for d in range(87)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           dispatched_statuses={"Expedovaná"})
+    assert c["dispatched_orders"] == 91
+    assert c["dispatched_with_package"] == 4
+    assert c["degraded"] is True
+    assert c["dispatched_status_unknown"] is False
+
+
+def test_a_renamed_cancelled_status_must_still_keep_cancelled_orders_OUT():
+    """The second literal, and the one that can actually mail somebody: renaming „Stornovaná"
+    put 16 cancelled orders back into the set this automation chases (live export: 144 → 160).
+    An escalation mail to a customer who cancelled is the one thing #93 never sends."""
+    csv_txt = _orders([(2, "Zrušená", "EF000000009SK", "Kuriér"),
+                       (2, "Vybavená", "EF000000010SK", "Kuriér")])
+    s = pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27),
+                                     cancelled_statuses={"Zrušená"})
+    assert [x["packageNumber"] for x in s] == ["EF000000010SK"]
+
+
+def test_the_configured_cancelled_set_no_longer_hard_codes_Stornovana():
+    """…and the flip side of the same call: once the shop has renamed it, the OLD literal is
+    just another status. Pinning this stops a „defensive" union of old-and-new creeping back
+    in, which would silently keep chasing whatever the manager deliberately reclassified."""
+    csv_txt = _orders([(2, "Stornovaná", "EF000000012SK", "Kuriér")])
+    s = pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27),
+                                     cancelled_statuses={"Zrušená"})
+    assert [x["packageNumber"] for x in s] == ["EF000000012SK"]
+
+
+def test_the_status_comparison_is_NFC_normalised_on_BOTH_sides():
+    """The trap #296 names explicitly: this module compared LOWERCASED names while the
+    configuration carries the exact ones the manager typed. A decomposed (NFD) name is
+    byte-different, renders identically and matches nothing — and for the dispatched side
+    that means the alarm silently reads zero dispatched orders."""
+    nfd = unicodedata.normalize("NFD", "Vybavená")
+    assert nfd != "Vybavená"                      # the two really are different bytes
+    c = pu.source_coverage(_orders([(1, nfd, "EF000000011SK", "Kuriér")]),
+                           today=date(2026, 7, 27), dispatched_statuses={"Vybavená"})
+    assert c["dispatched_orders"] == 1
+    s = pu.shipments_from_orders_csv(_orders([(1, nfd, "EF000000013SK", "Kuriér")]),
+                                     today=date(2026, 7, 27),
+                                     cancelled_statuses={unicodedata.normalize("NFD", "Vybavená")})
+    assert s == []                                # …and the same on the cancelled side
+
+
+def test_passing_NO_sets_keeps_the_module_standalone_on_its_own_literals():
+    """The app passes the configured sets; the module keeps working without them, so it stays
+    unit-testable on its own and a caller that never heard of #209 behaves exactly as before."""
+    csv_txt = _orders([(2, "Stornovaná", "EF000000014SK", "Kuriér"),
+                       (2, "Vybavená", "EF000000015SK", "Kuriér")])
+    assert [x["packageNumber"] for x in
+            pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))] \
+        == ["EF000000015SK"]
+    assert pu.source_coverage(csv_txt, today=date(2026, 7, 27))["dispatched_orders"] == 1
+
+
+# ── #287: personal pickup is not a shipment at all ────────────────────────────
+# The blocklist named foreign couriers (#126) but not personal pickup, so an „Osobný odber"
+# order was treated as a Pošta shipment. Measured read-only on the live export (28.7.2026):
+# the SHIPPING pseudo-item carries exactly four distinct names — `Kuriér` (444 orders, = Pošta),
+# `DPD doručenie na adresu` (53), `Osobný odber - len na predajni v POPRADE!` (24) and
+# `DPD kuriér` (1). In the 30-day window 8 personal-pickup orders sat inside the automation's
+# eligible set and 3 of them counted towards the coverage alarm's denominator — where a package
+# number can never appear, because there is no parcel.
+_PICKUP = "Osobný odber - len na predajni v POPRADE!"
+
+
+def test_personal_pickup_is_not_a_posta_shipment():
+    """The live label, verbatim. It reaches the eligible set today only because it has no
+    package number; the moment one is typed in by mistake the automation starts chasing a
+    parcel that does not exist and mails its customer about it."""
+    csv_txt = _orders([(2, "Vybavená", "EF000000020SK", _PICKUP),
+                       (2, "Vybavená", "EF000000021SK", "Kuriér")])
+    s = pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))
+    assert [x["packageNumber"] for x in s] == ["EF000000021SK"]
+
+
+def test_personal_pickup_is_out_of_the_coverage_alarms_denominator():
+    """The measured harm: 3 of the alarm's 89 dispatched orders were pickups that can never
+    carry a number, permanently dragging coverage down. Today the 50 % floor absorbs it; a
+    shop pushing pickup harder (a promotion, a second collection point) moves the baseline
+    towards a false alarm — which is the alarm being trained away."""
+    rows = ([(2, "Vybavená", "", _PICKUP) for _ in range(6)]
+            + [(2, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(6)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 6           # the six real ones only
+    assert c["dispatched_with_package"] == 6
+    assert c["degraded"] is False                # 100 % coverage, not 50 %
+
+
+def test_personal_pickup_matches_without_diacritics_too():
+    """`_is_non_posta_carrier` only lowercases — it folds no diacritics — and the shipping
+    label is free text the shop retypes. Both spellings are listed rather than assumed."""
+    csv_txt = _orders([(2, "Vybavená", "EF000000022SK", "Osobny odber na predajni")])
+    assert pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27)) == []
+
+
+def test_the_pickup_keyword_is_the_PHRASE_not_the_bare_word_odber():
+    """The caution #287 asks for (and #126 established): a blocklist excludes what we have
+    verified, never what merely looks similar. A bare „odber" would also swallow a delivery
+    service that IS a Pošta parcel — and a wrongly excluded shipment is a customer who is
+    never told their parcel is waiting, i.e. exactly the failure this automation exists for."""
+    assert "odber" not in pu.NON_POSTA_CARRIER_KEYWORDS
+    csv_txt = _orders([(2, "Vybavená", "EF000000023SK", "Doručenie na odberné miesto")])
+    assert [x["packageNumber"] for x in
+            pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))] \
+        == ["EF000000023SK"]
+
+
+def test_an_EMPTY_dispatched_set_lights_the_blind_spot_instead_of_falling_back():
+    """The edge the derivation creates: „dispatched" is `terminal − cancelled`, so a
+    configuration that calls EVERY finished status cancelled leaves it empty — and both sets
+    are non-empty, so nothing upstream refuses it. It must fire the alarm's own blind-spot
+    signal, never quietly fall back to the built-in „Vybavená" (a name the shop may have
+    renamed years ago), which would report a healthy green over a set nobody is watching."""
+    # The fixture MUST hold an order in the module's built-in default status. Without one the
+    # test proved nothing it claims: with the fallback restored (`return out or default`) the
+    # dispatched set becomes „Vybavená", the fixture holds no such row either way, and every
+    # count below is identical — the whole 126-test suite passes against the bug (PR #298
+    # review, B-F1). With this row the fallback is what makes `dispatched_orders` 1, not 0.
+    rows = ([(d % 20, "Zrušená", "", "Kuriér") for d in range(8)]
+            + [(3, "Vybavená", "EF000000099SK", "Kuriér")])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           cancelled_statuses=set(), dispatched_statuses=set())
+    assert c["eligible_orders"] == 9
+    assert c["dispatched_orders"] == 0
+    assert c["dispatched_status_unknown"] is True
+    assert c["degraded"] is False        # a pure counter: it never invents a shipment
+
+
+# ── PR #298 review, A1: the blind-spot signal assumed a ONE-NAME dispatched set ────────────
+# `dispatched` used to be the single literal „Vybavená", so „the shop renamed the status" and
+# „the set matches nothing" were THE SAME EVENT and `not dispatched` detected both. Deriving it
+# as `terminal − cancelled` (three live names) split them apart: one surviving rare name keeps
+# the set non-empty for ever, and 1-4 dispatched orders are ALSO below MIN_DISPATCHED_FOR_ALARM,
+# so `degraded` is not computed either. That interval was silent in BOTH directions — and the
+# rename lands exactly in it.
+_DISPATCHED_3 = frozenset({"Vybavená", "Vybavená výmena", "Vybavený Dobropis"})
+
+
+def test_a_renamed_MAIN_status_still_lights_the_blind_spot_when_rare_ones_survive():
+    """The reviewer's measured repro: the shop renames „Vybavená" → „Expedovaná" and forgets
+    the card; 100 dispatched orders vanish from the alarm's denominator while one dobropis and
+    one výmena keep the configured set non-empty. Before this fix the run reported
+    `dispatched_orders=2, dispatched_status_unknown=False, degraded=False` over a source that is
+    genuinely dead — on `main` the same shop got the alarm. Silencing the very guard the ticket
+    exists for is the regression."""
+    rows = ([(d % 25, "Expedovaná", "", "Kuriér") for d in range(100)]
+            + [(4, "Vybavený Dobropis", "", "Kuriér"), (6, "Vybavená výmena", "", "Kuriér")])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           cancelled_statuses={"Stornovaná"},
+                           dispatched_statuses=_DISPATCHED_3)
+    assert c["eligible_orders"] == 102
+    assert c["dispatched_orders"] == 2                  # the two rare survivors
+    assert c["dispatched_status_unknown"] is True       # …which is not enough to judge anything
+    assert c["degraded"] is False                       # below the evidence floor, by design
+
+
+def test_the_two_verdicts_together_cover_every_window_they_are_asked_about():
+    """The hole this closes stated as an invariant rather than a case: a window worth judging
+    is either JUDGED (`degraded` computed over >= MIN_DISPATCHED_FOR_ALARM dispatched orders)
+    or DECLARED BLIND. Nothing in between may be silently green — that gap is what a renamed
+    status fell into."""
+    for n in range(0, 9):
+        rows = ([(d % 25, "Expedovaná", "", "Kuriér") for d in range(40)]
+                + [(3, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(n)])
+        c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                               cancelled_statuses={"Stornovaná"},
+                               dispatched_statuses=_DISPATCHED_3)
+        judged = c["dispatched_orders"] >= pu.MIN_DISPATCHED_FOR_ALARM
+        assert judged or c["dispatched_status_unknown"] is True, (n, c)
+
+
+def test_a_SMALL_healthy_window_is_not_called_blind():
+    """The calibration control — it must pass BEFORE and AFTER, or „always report blind" would
+    be indistinguishable from the fix. Measured read-only over 120 rolling windows of the live
+    export: `dispatched/eligible` never fell below 0.63 (worst window 86 of 136) and not one
+    window had `eligible >= 5` with fewer than 5 dispatched. A quiet shop whose handful of
+    orders ARE recognised is short of evidence, not blind, so it stays quiet."""
+    rows = ([(d, "Vybavuje sa", "", "Kuriér") for d in range(5)]
+            + [(3, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(3)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           cancelled_statuses={"Stornovaná"},
+                           dispatched_statuses=_DISPATCHED_3)
+    assert c["eligible_orders"] == 8 and c["dispatched_orders"] == 3
+    assert c["dispatched_status_unknown"] is False
+    assert c["degraded"] is False
