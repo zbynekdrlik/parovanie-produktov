@@ -7339,12 +7339,14 @@ def run_shoptet_upload() -> dict:
 
         # _import_rows_chunked's own contract (its docstring): the caller MUST hold
         # _import_lock across the call and release it in a `finally` — every other
-        # of its 7 call sites in this module does exactly this, because it drives a
+        # of its call sites in this module does exactly this, because it drives a
         # single shared browser automation that cannot run twice at once. Not in
         # the brief's original sketch; added here because skipping it would let a
-        # manual "Spustiť teraz" of parovania_eshop/grube_externalcode/... (still on
-        # their OLD direct-import path — #299's producer migration is a later task)
-        # race this cycle's own import against the very same Shoptet session.
+        # manual "Spustiť teraz" of a producer still bypassing the queue — since
+        # #299 Task 10 that is only the raw n8n restock feed (n8n_shoptet_import,
+        # #158) and any future direct import; all five CYCLE_PRODUCERS are queue-
+        # migrated as of Task 10 — race this cycle's own import against the very
+        # same Shoptet session.
         res = None
         import_busy = False
         if rows:
