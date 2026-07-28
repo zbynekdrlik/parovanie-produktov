@@ -152,23 +152,27 @@ def test_run_requeues_the_same_link_until_it_is_actually_credited(iso, monkeypat
     assert d["60645/S"]["fields"]["internalNote"]["value"] == "https://trigona.sk/s"
 
 
-def test_grube_split_link_credit_is_RAW_not_normalized_and_is_not_requeued_once_credited(
+def test_run_split_links_grube_requeue_compares_the_raw_stored_url_not_the_normalized_cell(
         iso, monkeypatch):
-    """#299 review C1/I2 — the test above (`test_run_requeues_the_same_link_
-    until_it_is_actually_credited`) uses TRIGONA, a supplier whose URL is written
-    verbatim — normalization never enters the picture, so it could never have
-    caught C1 (the producer crediting the NORMALIZED `.de` cell value instead of
-    the RAW variant_links.json value `new_variant_link_keys` actually compares
-    against). Rewritten on GRUBE, the supplier where `link_rows`/`to_grube_de`
-    REBUILDS the URL, per the review's explicit instruction to base the
-    incremental test on the supplier where normalization changes the shape.
-
-    Two things are pinned: (1) crediting the RAW url (what a correct
-    `_credit_producer` write actually contains) makes the link genuinely skipped
-    on the next run — proving the credited-store COMPARISON side is healthy; (2)
-    crediting the NORMALIZED `.de` url (what the C1 bug wrote) does NOT stop the
-    requeue — the same link keeps coming back forever, exactly the review's own
-    probe (`SECOND RUN count: 1`, `total_uploaded: 0` — never confirmed)."""
+    """#299 Task 9 review finding (carried over from Task 8) — this test's PREVIOUS
+    name (`test_grube_split_link_credit_is_RAW_not_normalized_and_is_not_requeued_
+    once_credited`) claimed to pin that the QUEUED CREDIT VALUE is raw, but it never
+    once inspects `field["credit"]`, so a regression that credited the normalized
+    value would NOT turn this test red — it only manually seeds `VARIANT_LINKS_STATE`
+    (simulating what a write of either shape would leave behind) and checks whether
+    `run_split_links()` still treats the link as a candidate. That assertion — the
+    QUEUED credit is genuinely the raw value — is pinned separately, at the
+    `_do_upload_variant_links` unit level, by
+    `test_split_links_grube_credit_value_is_RAW_not_normalized` in
+    test_webreview_shoptet_upload.py. What THIS test actually is, and remains, the
+    ONLY exerciser of `run_split_links()` on a GRUBE (normalizing) link at all:
+    `new_variant_link_keys`'s incremental-requeue COMPARISON must key off the RAW
+    variant_links.json URL, never the normalized `.de` cell `link_rows` builds for
+    Shoptet — proven by (1) crediting the NORMALIZED `.de` url (what the historical
+    C1 bug wrote) does NOT stop the requeue — the same link keeps coming back
+    forever, exactly the original review's own probe (`SECOND RUN count: 1`,
+    `total_uploaded: 0` — never confirmed); (2) crediting the RAW url (what a
+    correct write contains) makes the link genuinely skipped on the next run."""
     monkeypatch.setattr(webapp, "_import_rows_chunked",
                         lambda *a, **k: pytest.fail("must not import — must queue"))
     raw = "https://www.grube.sk/p/grand-nord/154773/?q=a#itemId=1"
@@ -255,7 +259,9 @@ def test_a_corrupt_pending_table_makes_the_runner_record_error_not_crash(iso):
     it can fail now is `queue_shoptet_fields` refusing to write on top of an
     unreadable pending table (`StoreWipeRefused`). The runner must still survive
     that (records last_status='error'), same contract as an import raising used to
-    have."""
+    have. #299 Task 9 review finding — `last_error` is the ONLY place the manager
+    learns WHY a run failed; a test that stops at last_status='error' would pass
+    even if `last_error` were silently left empty."""
     _seed({"60645/S": "https://trigona.sk/s"})
     with open(webapp.PENDING_SHOPTET, "w", encoding="utf-8") as f:
         f.write("{ this is not json")
@@ -264,6 +270,8 @@ def test_a_corrupt_pending_table_makes_the_runner_record_error_not_crash(iso):
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "split_links"]
     assert st["last_status"] == "error"
     assert st["running"] is False
+    assert st["last_error"]                        # non-empty
+    assert "poškoden" in st["last_error"].lower() or "StoreWipeRefused" in st["last_error"]
 
 
 # ── disabled automation never runs on a scheduler tick ──────────────────────────

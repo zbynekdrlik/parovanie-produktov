@@ -469,9 +469,13 @@ def automations_server(tmp_path_factory):
         ],
     }, ensure_ascii=False), encoding="utf-8")
     # #108 — pre-existing „Vypredané → Skladom" restock result (one candidate that
-    # WAS flipped) so the tab's status + table + import-outcome render WITHOUT any
-    # network. The E2E never clicks Spustiť teraz (it WRITES to the live eshop) —
-    # same rationale as the parovania_eshop / supplier_stock fixtures.
+    # WAS QUEUED — #299 Task 9: this producer only queues into pending_shoptet now,
+    # the hourly „Sync do Shoptetu" drain does the actual eshop write) so the tab's
+    # status + table + queue-outcome render WITHOUT any network. The E2E never
+    # clicks Spustiť teraz (it feeds the live eshop) — same rationale as the
+    # parovania_eshop / supplier_stock fixtures. queued=4 — one field value per
+    # RESTOCK_COLS non-key column (productVisibility/availabilityInStock/
+    # availabilityOutOfStock/stock).
     (out / "restock_skladom.json").write_text(json.dumps({
         "last_check": "2026-07-22T06:00:05+02:00",
         "has_supplier_data": True,
@@ -484,12 +488,15 @@ def automations_server(tmp_path_factory):
              "link": "https://www.huntingshop.eu/p/bunda-restock",
              "checkedAt": "2026-07-22T05:00:03+02:00"},
         ],
-        "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
+        "queued": 4,
     }, ensure_ascii=False), encoding="utf-8")
     # #98 — pre-existing „Máme skladom → Skladom" result (one product we physically
-    # have but that still shows Vypredané, flipped) so the tab's status + table +
-    # import-outcome render WITHOUT any network. The E2E never clicks Spustiť teraz
-    # (it WRITES to the live eshop) — same rationale as the restock fixture above.
+    # have but that still shows Vypredané, QUEUED — #299 Task 9, same rationale as
+    # the restock fixture above) so the tab's status + table + queue-outcome render
+    # WITHOUT any network. The E2E never clicks Spustiť teraz (it feeds the live
+    # eshop). queued=3 — one field value per SKLADOM_COLS non-key column
+    # (productVisibility/availabilityInStock/availabilityOutOfStock — `stock` is
+    # deliberately absent from this producer's own columns).
     (out / "stock_skladom.json").write_text(json.dumps({
         "last_check": "2026-07-22T06:45:05+02:00",
         "status": "ok",
@@ -497,7 +504,7 @@ def automations_server(tmp_path_factory):
             {"code": "9/M", "pairCode": "P9", "name": "Fotopasca Máme Skladom Test",
              "ourPrice": "129.90", "stock": "5", "availabilityText": "Vypredané"},
         ],
-        "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
+        "queued": 3,
     }, ensure_ascii=False), encoding="utf-8")
     # #105 — pre-existing „Pripomienky objednávok" result (one red no-note order + one order
     # where a reminder WAS e-mailed) so the tab's status + both sections render WITHOUT any

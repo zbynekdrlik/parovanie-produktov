@@ -525,7 +525,7 @@ def test_split_links_producer_never_credits_itself(pend, monkeypatch):
     assert res["queued"] == 1
 
 
-def test_both_task8_producers_are_open_in_the_queue_migration_gate(cycle, monkeypatch):
+def test_all_four_migrated_producers_are_open_in_the_queue_migration_gate(cycle, monkeypatch):
     """#299 review m4 — the old version of this test asserted membership in the
     QUEUE_MIGRATED tuple directly (`assert "x" in webapp.QUEUE_MIGRATED`), which is
     an assert about a CONSTANT, not about BEHAVIOUR: a mutation that emptied
@@ -533,20 +533,27 @@ def test_both_task8_producers_are_open_in_the_queue_migration_gate(cycle, monkey
     real behaviour (a producer missing from the gate never runs even when enabled)
     was already independently pinned by
     `test_a_producer_not_yet_migrated_to_the_queue_never_runs_even_when_enabled`.
-    Rewritten to exercise `run_shoptet_upload` itself with BOTH Task 8 producers
-    ENABLED against the REAL (unmonkeypatched) QUEUE_MIGRATED — so a regression
-    that drops either key out of the gate leaves that producer's key missing from
-    `cycle["run_sync"]`/`res["producers"]`, which this test can actually observe.
-    Kills a regression that removes either producer from QUEUE_MIGRATED (verified
-    by mutation, not by inspection — see the report)."""
+    Rewritten to exercise `run_shoptet_upload` itself with all four migrated
+    producers (Task 8's grube_externalcode/split_links + Task 9's
+    restock_skladom/stock_skladom) ENABLED against the REAL (unmonkeypatched)
+    QUEUE_MIGRATED — so a regression that drops ANY of the four keys out of the
+    gate leaves that producer's key missing from `cycle["run_sync"]`/
+    `res["producers"]`, which this test can actually observe. Kills a regression
+    that removes any of the four from QUEUE_MIGRATED (verified by mutation, not by
+    inspection — see the report)."""
     monkeypatch.setattr(webapp.RUNNER, "status", lambda: [
         {"key": "grube_externalcode", "enabled": True},
         {"key": "split_links", "enabled": True},
+        {"key": "restock_skladom", "enabled": True},
+        {"key": "stock_skladom", "enabled": True},
     ])
     res = webapp.run_shoptet_upload()
     assert cycle["run_sync"].count("grube_externalcode") == 1
     assert cycle["run_sync"].count("split_links") == 1
-    assert res["producers"] == {"grube_externalcode": True, "split_links": True}
+    assert cycle["run_sync"].count("restock_skladom") == 1
+    assert cycle["run_sync"].count("stock_skladom") == 1
+    assert res["producers"] == {"grube_externalcode": True, "split_links": True,
+                                 "restock_skladom": True, "stock_skladom": True}
 
 
 def test_a_confirmed_credit_for_grube_externalcode_actually_writes_EXTERNALCODES_STATE(
@@ -658,3 +665,23 @@ def test_dry_run_previews_the_split_links_queue_count_without_queuing_anything(p
     assert res["queued"] == 0
     assert res["would_queue"] == 1
     assert webapp._load_pending() == {}
+
+
+# ── #299 Task 9 — restock_skladom / stock_skladom switch to the queue ────────── #
+# ── Neither producer imports directly any more, and neither credits itself — a ── #
+# ── candidate is entirely state-driven (Vypredané+visible in the LIVE export), ── #
+# ── so once Shoptet confirms the flip the product's own state stops it being a ── #
+# ── candidate again; no separate "already uploaded" bookkeeping exists or is ──── #
+# ── needed for either producer (unlike grube_externalcode/split_links). ──────── #
+
+def test_restock_queues_availability_and_stock_without_a_credit(pend, monkeypatch):
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda *a, **k: pytest.fail("producer must not import"))
+    monkeypatch.setattr(webapp, "_restock_candidate_rows",
+                        lambda: [["A", "P", "Skladom", "Skladom", "visible", "5"]])
+    res = webapp.run_restock_skladom()
+    assert res["queued"] == 4
+    f = webapp._load_pending()["A"]["fields"]
+    assert f["availabilityInStock"]["value"] == "Skladom"
+    assert f["stock"]["value"] == "5"
+    assert "credit" not in f["stock"]

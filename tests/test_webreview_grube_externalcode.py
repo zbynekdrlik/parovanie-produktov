@@ -163,7 +163,9 @@ def test_a_corrupt_pending_table_makes_the_runner_record_error_not_crash(iso):
     import to fail) — the ONE way it can fail now is `queue_shoptet_fields` refusing
     to write on top of an unreadable pending table (`StoreWipeRefused`). The runner
     must still survive that (records last_status='error'), same contract as an
-    import raising used to have."""
+    import raising used to have. #299 Task 9 review finding — `last_error` is the
+    ONLY place the manager learns WHY a run failed; a test that stops at
+    last_status='error' would pass even if `last_error` were silently left empty."""
     _seed_grube({"60645/L": "111"})
     with open(webapp.PENDING_SHOPTET, "w", encoding="utf-8") as f:
         f.write("{ this is not json")
@@ -172,6 +174,8 @@ def test_a_corrupt_pending_table_makes_the_runner_record_error_not_crash(iso):
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "grube_externalcode"]
     assert st["last_status"] == "error"
     assert st["running"] is False
+    assert st["last_error"]                        # non-empty
+    assert "poškoden" in st["last_error"].lower() or "StoreWipeRefused" in st["last_error"]
 
 
 # ── disabled automation never runs on a scheduler tick ──────────────────────────
