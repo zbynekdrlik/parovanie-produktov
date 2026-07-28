@@ -457,4 +457,4 @@ def test_the_dialog_says_when_the_number_is_large_because_NOTHING_is_running(
         ".textContent.includes('Neuložené')")
 
     assert len(seen) == 1, seen
-    assert "neposielajú" in seen[0], seen[0]
+    assert "NEPOSIELAJÚ" in seen[0], seen[0]     # …a prečo je to číslo také veľké

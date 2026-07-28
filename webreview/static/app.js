@@ -4331,17 +4331,59 @@ const ORDER_STATUS_BOXES = [
 // which would cost exactly the attention this exists to buy. An impact the server could not
 // compute asks ANYWAY: answering „0" on an unreadable export would wave the change through
 // on no evidence at all, which is the opposite of the point.
-async function confirmToOrderImpact(candidate) {
+// How long the preview may take before the card stops waiting for it. It is not a network
+// timeout guess (no-timeout-band-aids): the endpoint calls `_orders_csv_cached()`, which
+// re-downloads the whole orders export when the shared copy has aged past 30 minutes, with a
+// 60 s timeout of its own. That is a legitimate slow path — but it is not a slow path the
+// manager may be left staring at a dead button through, so the GATE gives up and asks him
+// instead. Giving up lands on the „could not work it out" branch, never on a silent save.
+const IMPACT_TIMEOUT_MS = 5000;
+
+// The answer for every case where the impact could not be established — a server error, an
+// expired session, a network failure, our own timeout above (PR #298 review, A4). It used to
+// be `return true`: the gate on a save that releases customer mail failed OPEN, silently, on
+// exactly the answers a broken app gives. #297 already decided this for the `unknown` case
+// („a 0 on no evidence would wave the change through, which is the opposite of the point");
+// an error is even less evidence than an unreadable export. The wording carries no numbers
+// because we genuinely have none — including which statuses were added, which is why this
+// one does not use the head line.
+function confirmImpactUnknown() {
+  return confirm('Meníš zoznam „objednávka sa spracúva“, podľa ktorého chodia pripomienkové '
+    + 'e-maily zákazníkom.\n\nKoľkým z nich môže hneď odísť e-mail, sa teraz nedá zistiť — '
+    + 'náhľad dopadu neodpovedal.\n\nUložiť?');
+}
+
+// #297 — ask the server what a CANDIDATE „objednávka sa spracúva" set would newly reach,
+// and let the manager confirm it before it is saved. Returns true when the save may proceed.
+//
+// It stays quiet when there is nothing to say (no status added, and therefore no new
+// customer reachable) — a dialog on every single save is one he clicks away without reading,
+// which would cost exactly the attention this exists to buy. An impact the server could not
+// compute asks ANYWAY: answering „0" on an unreadable export would wave the change through
+// on no evidence at all, which is the opposite of the point.
+//
+// `msg` is the card's own status line: the preview is not instant (see IMPACT_TIMEOUT_MS), and
+// it is awaited with the save button disabled, so without a word there the card just looks
+// broken for as long as it takes.
+async function confirmToOrderImpact(candidate, msg) {
   let j;
+  if (msg) {
+    msg.className = 'statuscfg-msg';
+    msg.textContent = 'Zisťujem dopad…';
+  }
+  const ctl = new AbortController();
+  const giveUp = setTimeout(() => ctl.abort(), IMPACT_TIMEOUT_MS);
   try {
     const r = await fetch('/api/order-statuses/impact', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ to_order: candidate }),
+      body: JSON.stringify({ to_order: candidate }), signal: ctl.signal,
     });
-    if (!r.ok) return true;          // not a gate — the save endpoint has its own refusals
+    if (!r.ok) return confirmImpactUnknown();
     j = await r.json();
   } catch (_) {
-    return true;
+    return confirmImpactUnknown();          // network error, or our own give-up above
+  } finally {
+    clearTimeout(giveUp);
   }
   if (!j || !(j.added || []).length) return true;
   const head = 'Pridávaš do „objednávka sa spracúva“: ' + j.added.join(', ') + '\n\n';
@@ -4350,11 +4392,25 @@ async function confirmToOrderImpact(candidate) {
       + 'teraz nedá zistiť — objednávky sa nedajú prečítať.\n\nUložiť?');
   }
   if (!j.orders) return true;
-  const lines = ['Appka tým začne sledovať ' + j.orders + ' '
-    + pluralWord(j.orders, 'objednávku', 'objednávky', 'objednávok') + '.'];
+  const lines = [];
+  // Why the figure is the whole backlog rather than a difference (PR #298 review, A3): with an
+  // unusable configuration nothing is being mailed at all, so everything in the candidate is
+  // newly reachable. Unexplained, that number reads as an exaggeration — and a preview he
+  // distrusts is one he clicks away, which costs the attention the dialog exists to buy.
+  if (j.config_broken) {
+    lines.push('Uložené nastavenie sa teraz nedá použiť, takže pripomienky sa NEPOSIELAJÚ '
+      + 'vôbec — po uložení sa rozbehnú na celom zozname naraz:');
+  }
+  lines.push('Appka tým začne sledovať ' + j.orders + ' '
+    + pluralWord(j.orders, 'objednávku', 'objednávky', 'objednávok') + '.');
+  // …and the honest upper bound, which used to be computed, sent and then dropped (review A5).
+  // Without it „387 orders" and „37 addresses" look unrelated and the wide number looks like
+  // the frightening one; `mailable` is what connects them — the orders that carry a note, have
+  // an address and are not already resolved, i.e. the most the first wave can be.
   lines.push(j.customers
-    ? 'Pripomienkový e-mail môže hneď odísť na ' + j.customers + ' '
-      + pluralWord(j.customers, 'adresu', 'adresy', 'adries') + '.'
+    ? 'Z toho ' + j.mailable + ' ' + pluralWord(j.mailable, 'má', 'majú', 'má')
+      + ' poznámku aj adresu, takže pripomienkový e-mail môže hneď odísť na '
+      + j.customers + ' ' + pluralWord(j.customers, 'adresu', 'adresy', 'adries') + '.'
     : 'Pripomienkový e-mail z nich zatiaľ nemôže odísť nikomu.');
   return confirm(head + lines.join('\n') + '\n\nUložiť?');
 }
@@ -4430,7 +4486,7 @@ function renderOrderStatusConfig() {
       // status to it releases a wave of first mails the dedup store cannot stop (it only ever
       // stops the SECOND one). Measured on the live export: adding „Vybavená" would reach 370
       // customers at once. Nothing is forbidden here — it just must not be a surprise.
-      if (!(await confirmToOrderImpact(payload.to_order))) {
+      if (!(await confirmToOrderImpact(payload.to_order, msg))) {
         msg.className = 'statuscfg-msg';
         msg.textContent = 'Neuložené — nechal si pôvodné stavy.';
         return;
