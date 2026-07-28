@@ -2,6 +2,7 @@
 paths:
   - "webreview/app.py"
   - "tests/test_webreview_flag_prune.py"
+  - "tests/test_webreview_shoptet_sync.py"
   - "tests/test_store_safety.py"
   - "tests/test_store_concurrency.py"
 ---
