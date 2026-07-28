@@ -170,3 +170,52 @@ def test_a_NON_ADMIN_sees_the_sets_but_cannot_edit_them(page, sync_prune_blocked
     assert "Vybavuje sa" in panel.inner_text()
     assert page.locator('[data-testid="order-statuses-to_order"]').count() == 0
     assert page.locator('[data-testid="order-statuses-save"]').count() == 0
+
+
+# ── PR #295 review B1 — an unusable configuration must be VISIBLE in all four places ──
+#    The loader falls back to the built-in defaults, so before this the app looked
+#    perfectly healthy while it was mailing customers on statuses the manager had removed.
+#    `automation-health.md` §3 asks for the stat, the ERROR line, the red banner AND the
+#    side ⚠ badge — the badge is the step that keeps being forgotten (`autoByKey('posta')`
+#    went unnoticed for a year), so it is checked here in the browser.
+
+def test_an_unusable_config_says_the_app_is_running_on_DEFAULTS(page,
+                                                                bad_status_config_server):
+    """The panel is the card the banners send him to, so it must not present the built-in
+    defaults as though he had typed them."""
+    console = _console(page)
+    _open_tab(page, bad_status_config_server)
+
+    panel = page.locator('[data-testid="order-statuses"]')
+    body = panel.inner_text()
+    assert "sa nedá použiť" in body, body
+    assert "PREDVOLENÝCH" in body, body
+    # …and the sets are still shown, so he can see what the app is going by meanwhile
+    assert page.locator('[data-testid="order-statuses-to_order"]').input_value() \
+        == "Vybavuje sa"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_an_unusable_config_stops_the_reminders_LOUDLY(page, bad_status_config_server):
+    """The card of the automation that would have mailed says so in red, and the side ⚠
+    badge lights — a run that cannot read its own configuration has failed even though it
+    ended `ok`."""
+    console = _console(page)
+    page.goto(bad_status_config_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    # the ⚠ badge, on the nav item, BEFORE he has opened anything
+    nav = page.locator(".tabs .tab", has_text="Pripomienky objednávok")
+    assert nav.locator(".navwarn").count() == 1, nav.inner_text()
+
+    page.get_by_role("button", name="Pripomienky objednávok").click()
+    page.wait_for_selector('[data-testid="ordrem-status"]')
+    banner = page.locator('[data-testid="tab-orders_reminder"] .autoerr, '
+                          '#tab-orders_reminder .autoerr')
+    assert banner.count() >= 1
+    text = banner.first.inner_text()
+    assert "NEPOSIELAJÚ" in text, text
+    assert "Stavy objednávok" in text, text
+
+    assert console == [], f"console not clean: {console}"

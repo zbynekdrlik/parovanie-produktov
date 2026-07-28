@@ -513,6 +513,12 @@ body[data-theme=dark] .autowarn{background:#2a1f07;border-color:#78350f;color:#f
 .automiss{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
   border-radius:8px;padding:8px 10px;word-break:break-word}
 body[data-theme=dark] .automiss{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
+/* PR #295 review — „the config could not be read, so what you see is the DEFAULTS".
+   Own class for the same reason .automiss has one: `.autoerr` is located strictly and
+   unscoped by the e2e suite, and this one appears on tabs that already have one. */
+.statuscfgerr{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
+  border-radius:8px;padding:8px 10px;word-break:break-word;margin-bottom:10px}
+body[data-theme=dark] .statuscfgerr{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
 .misscodes{margin:6px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:2px}
 .misscodes li{word-break:break-word}
 /* #109 „Párovania → eshop" — per-run result box coloured by outcome (ok/blocked/failed) */

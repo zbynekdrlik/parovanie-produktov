@@ -11,6 +11,7 @@ let INSTOCK = {};           // key -> true (skladom — máme/naskladnené)
 let UNAVAIL = {};           // key -> true (nedostupné — u dodávateľa)
 let ORDER_COMMENTS = {};    // orderCode -> comment (#101 per-order manager note)
 let NEDOSTUPNE = null;      // /api/nedostupne — flagged-unavailable products + customers (#100)
+let NEDOSTUPNE_BAD_CFG = false;   // …built on the DEFAULT statuses because the config broke
 let ND_PENDING = null;      // {code, type} — the send the preview modal is showing
 let VYSTAVY = null;         // /api/vystavy — poľovnícke výstavy (#111)
 let VY_OPEN = new Set();    // ids of výstavy whose detail/edit panel is expanded (transient)
@@ -1334,8 +1335,10 @@ async function markGroupOrdered(items, ordered) {
 // ── Nedostupné tovary (#100) ───────────────────────────────────────────────
 async function loadNedostupne() {
   try {
-    NEDOSTUPNE = (await (await fetch('/api/nedostupne')).json()).products || [];
-  } catch (_) { NEDOSTUPNE = []; }
+    const j = await (await fetch('/api/nedostupne')).json();
+    NEDOSTUPNE = j.products || [];
+    NEDOSTUPNE_BAD_CFG = !!j.bad_status_config;
+  } catch (_) { NEDOSTUPNE = []; NEDOSTUPNE_BAD_CFG = false; }
 }
 
 async function saveNdState(code, field, value) {
@@ -1360,6 +1363,13 @@ function renderNedostupne() {
   const sec = document.getElementById('tab-nedostupne');
   if (!sec) return;
   sec.innerHTML = '';
+  // The rows below were built from the DEFAULT statuses because the manager's file could
+  // not be read, so they may be the wrong rows — say so before he acts on them. Own class
+  // (styled from .autoerr): a second `.autoerr` on a tab breaks the strict e2e locators.
+  if (NEDOSTUPNE_BAD_CFG) sec.appendChild(el('div', 'statuscfgerr',
+    '⛔ Nastavenie stavov objednávok sa nedá prečítať — tento zoznam je zostavený podľa '
+    + 'PREDVOLENÝCH stavov, takže nemusí sedieť. Oprav to na karte „Stavy objednávok" '
+    + '(záložka Automatizácie).'));
   const list = NEDOSTUPNE || [];
   if (!list.length) {
     sec.appendChild(el('div', 'nd-empty',
@@ -3858,6 +3868,17 @@ function bccMissingWarning() {
     + 'žiadne e-maily zákazníkom, kým sa nedoplní konfigurácia.');
 }
 
+// PR #295 review — the loader answers an unusable `order_statuses.json` with the built-in
+// DEFAULTS, which is right for rendering a tab and wrong for anything that ACTS: the customer
+// reminders would go out on the default „Vybavuje sa" — i.e. to exactly the people the manager
+// may have excluded by narrowing that set. The run now refuses, and this is what says so.
+function badStatusConfigWarning() {
+  return el('div', 'autoerr', '⛔ Nastavenie stavov objednávok (data/out/order_statuses.json) '
+    + 'sa nedá prečítať, takže appka dočasne používa predvolené stavy — pripomienkové e-maily '
+    + 'sa preto NEPOSIELAJÚ, aby ich nedostal niekto, koho si zo zoznamu vyradil. Oprav to na '
+    + 'karte „Stavy objednávok" (záložka Automatizácie).');
+}
+
 // #282 — one step upstream of bcc_missing: the automation could still send, but it has nothing to
 // send ABOUT. Its only source of shipments is the export's „podacie číslo" column; that column
 // stopped being filled on 2.7. and every run since ended a healthy-looking `ok` with a shrinking
@@ -4299,6 +4320,14 @@ function renderOrderStatusConfig() {
   if (!ORDER_STATUSES) {
     box.appendChild(el('div', 'statuscfg-help', 'Nastavenie sa nepodarilo načítať.'));
     return box;
+  }
+  if (ORDER_STATUSES.reason) {
+    // This is the card he was sent to, so it must not present the built-in defaults as
+    // though he had typed them (PR #295 review).
+    box.appendChild(el('div', 'statuscfgerr',
+      '⛔ Uložené nastavenie sa nedá použiť, takže appka dočasne beží na PREDVOLENÝCH '
+      + 'stavoch nižšie: staré značky sa neupratujú a pripomienkové e-maily zákazníkom sa '
+      + 'neposielajú. Skontroluj zoznamy a ulož ich znova.'));
   }
   const admin = isAdmin();
   const fields = {};
@@ -5158,6 +5187,7 @@ function renderOrdersReminder() {
       + (lr.errors ? ` · chyby: ${lr.errors}` : '')));
   }
   if (a.last_run && lr.bcc_missing) st.appendChild(bccMissingWarning());
+  if (a.last_run && lr.bad_status_config) st.appendChild(badStatusConfigWarning());
   wrap.appendChild(st);
 
   if (d.store_corrupt) wrap.appendChild(storeCorruptWarning('orders_reminder.json'));

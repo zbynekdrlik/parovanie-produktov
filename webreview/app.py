@@ -3711,7 +3711,10 @@ def api_nedostupne():
     except Exception as e:  # noqa: BLE001 — degrade to empty, log the cause
         log.warning("nedostupne orders fetch failed: %r", e)
         return jsonify({"products": [], "error": str(e)})
-    return jsonify({"products": _nedostupne_view(csv_bytes)})
+    # The view still RENDERS (on the defaults) — but it says so, because the statuses it
+    # rendered by may not be the manager's (PR #295 review, B1).
+    return jsonify({"products": _nedostupne_view(csv_bytes),
+                    "bad_status_config": bool(_order_statuses_state()[1])})
 
 
 @app.route("/api/nedostupne/state", methods=["POST"])
@@ -4894,7 +4897,8 @@ def api_orders():
         r["assignedSupplier"] = assigns.get(r["itemCode"], "")
         # GRUBE per-size code chip + .de link (empty for every non-GRUBE / unmatched row)
         _attach_grube(r, grube)
-    return jsonify({"orders": rows})
+    return jsonify({"orders": rows,
+                    "bad_status_config": bool(_order_statuses_state()[1])})
 
 
 @app.route("/static/<path:p>")
@@ -7768,8 +7772,21 @@ def run_orders_reminder() -> dict:
     # #209 — the SAME configured „being processed" set the to-order tab uses. It is one
     # notion, not four: a renamed status must not leave this automation silently mailing
     # nobody while the tab is empty for the same reason (automation-health.md §3).
+    #
+    # …and the REASON comes with it (PR #295 review). The loader's „unusable set → measured
+    # default" is fail-CLOSED for the prune (it refuses to delete) and was fail-OPEN here:
+    # a corrupt file restored the built-in `to_order` and re-armed customer e-mails on
+    # exactly the statuses the manager may have narrowed it to exclude. This is a mail to a
+    # real customer, so it gets the prune's answer, not the tab's: render, but do not act.
+    status_sets, bad_status_config = _order_statuses_state()
+    bad_status_config = bool(bad_status_config)
     orders = orders_reminder.select_orders(
-        csv_bytes, statuses=_order_statuses()["to_order"])
+        csv_bytes, statuses=status_sets["to_order"])
+    if bad_status_config:
+        log.error("orders_reminder: nastavenie stavov objednávok sa nedá použiť "
+                  "(%s) — NEPOSIELAM žiadne pripomienky zákazníkom, aby nedostali mail "
+                  "kvôli stavu, ktorý manažér zo zoznamu vyradil; v zozname je teraz %d "
+                  "objednávok podľa PREDVOLENÝCH stavov", ORDER_STATUSES, len(orders))
     # Every code in the export (not just the >4d „Vybavuje sa" ones) — the window the dedup
     # store is pruned against at the final save (#220). Empty = export unreadable → no pruning.
     window_codes = orders_reminder.all_order_codes(csv_bytes)
@@ -7983,6 +8000,15 @@ def run_orders_reminder() -> dict:
             pending.append(_pending_row(
                 o, "chýba MAIL_BCC v data/.mail_env — pripomienka sa neodošle"))
             continue                                # no claim, no OpenAI call, nothing recorded
+        if bad_status_config:
+            # PR #295 review — the third config gate, and the only one whose failure would
+            # mail the WRONG PEOPLE rather than nobody. It is deliberately last of the
+            # three so `ai_unavailable` and `bcc_missing` keep reporting their own gaps
+            # honestly; like them it costs nothing, takes no claim and buys no OpenAI call.
+            pending.append(_pending_row(
+                o, "nastavenie stavov objednávok sa nedá prečítať — pripomienky sa "
+                   "neposielajú, kým sa to neopraví (karta „Stavy objednávok\")"))
+            continue
         # From here the run talks to OpenAI + SMTP for this order — claim it first so a manual
         # send clicked in that window is rejected (409) instead of mailing the customer twice.
         claimed = _claim(code, o["email"])
@@ -8114,7 +8140,15 @@ def run_orders_reminder() -> dict:
                  "emailed_now": emailed_now, "emailed_total": 0,
                  "skipped_now": skipped_now, "ai_unavailable": ai_unavailable,
                  "no_email": len(no_email), "errors": errors,
-                 "bcc_missing": bcc_missing}
+                 "bcc_missing": bcc_missing,
+                 # PR #295 review — a run that cannot read its own configuration has
+                 # FAILED even though it did not throw. `bad_status_config` names the
+                 # cause for the card's banner; `source_degraded` is the EXISTING flag the
+                 # ⚠ nav badge already reads, so the signal reaches the side menu without a
+                 # second path every future automation would have to remember
+                 # (automation-health §3, the `autoByKey('posta')` lesson).
+                 "bad_status_config": bad_status_config,
+                 "source_degraded": bad_status_config}
         stats["emailed_total"] = sum(1 for v in orders_map.values()
                                      if isinstance(v, dict) and v.get("status") == "emailed")
         st.update({
@@ -8654,12 +8688,16 @@ def api_order_statuses():
     defaults it falls back to. GET is open to every logged-in user (the card shows the sets
     next to the statuses a run did not recognise, and that is not admin-only reading); only
     the POST below is admin-gated, like /api/ui-label."""
-    st = _order_statuses()
+    st, reason = _order_statuses_state()
     return jsonify({
         "statuses": {k: sorted(v) for k, v in st.items()},
         "defaults": {k: sorted(v) for k, v in ORDER_STATUS_DEFAULTS.items()},
         "max_per_set": ORDER_STATUS_MAX,
         "max_len": ORDERS_UNKNOWN_STATUS_MAXLEN,
+        # PR #295 review — the sets alone cannot say „these are the DEFAULTS standing in
+        # for a file we could not read". Without it the panel renders the built-in list as
+        # though the manager had typed it, on the one card where he would go to fix it.
+        "reason": reason,
     })
 
 
