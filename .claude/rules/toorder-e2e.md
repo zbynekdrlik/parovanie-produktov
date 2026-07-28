@@ -264,3 +264,33 @@ kým druhý neskončí; server tak commitne B a potom A. Vzor:
 `await`-uje POST, ktorý obal drží, sa nezasekne na 30 s — visí, kým ho nezabije celý beh
 (u nás 600 s SIGTERM, bez jediného riadku výstupu). Testy, ktoré si svoje zápisy awaitujú,
 drž MIMO tej fixtúry (vlastný `page`), nie „len opatrne".
+
+### Čo z bodu 13 zistila až adversariálna revízia (PR #292)
+
+- **„Nedá sa usporiadať" NIE JE „musí sa ignorovať".** Prvý cut odmietal prijať KAŽDÚ
+  odpoveď bez `commitSeq` — a tým znova otvoril chybu z #290: `confirmed` zamrzol a
+  nasledujúci ODMIETNUTÝ zápis sa „vrátil" na hodnotu, ktorú server nedrží. Meraním
+  potvrdené, že `main` to nerobil, čiže to bola REGRESIA. Usporiadanie treba len vtedy,
+  keď je voči čomu usporadúvať: keď je zápis stále posledný vydaný pre svoju dvojicu
+  (príznak, riadok) a nič iné pre ňu neletí, je jediným pisateľom a jeho prijatie JE stav
+  servera. Prijmi ho — ale hodiny NEPOSÚVAJ (číslo, ktoré si nedostal, nesmie hýbať
+  poradím). Dvere k odpovedi bez čísla sú bežné: useknuté telo (appka beží cez tunel) a
+  karta, ktorá prežije rollback deploy.
+- **Wall-clock seed sám o sebe monotónnosť NEDÁVA.** `time.time()` je CLOCK_REALTIME:
+  reštart + korekcia času dozadu (NTP, snapshot VM, ručne prestavené hodiny) vydá čísla,
+  ktoré živá karta už videla — a tá potom odmieta všetko do konca svojho života. To isté
+  spraví DRUHÝ proces (každý si seeduje vlastný čítač; #262 zaznamenal druhú inštanciu
+  bežiacu štyri dni). Najvyššie vydané číslo preto REZERVUJ na disk (po blokoch, aby klik
+  nestál zápis) a seeduj `max(hodiny, rezervácia)`.
+- **Umiestnenie `_next_commit_seq()` V ZÁMKU sa e2e testom nedá pripnúť.** Presunutie
+  všetkých troch volaní MIMO ich `with _lock:` nechalo 50 e2e testov zelených — testy
+  vydávajú zápisy po sebe, takže čísla vyjdú rastúce tak či tak. Pripni to serverovým
+  testom, ktorý číta hĺbku zámku priamo (`webapp._lock._depth > 0`) v okamihu, keď sa
+  číslo berie.
+- **Vymyslené `commitSeq` v stube voľ VYSOKÉ.** `commitSeq: 1` funguje len dovtedy, kým je
+  záznam panenský; prvá úprava, ktorá pred neho vloží reálny zápis, ho zhodí ako
+  zastaraný — a test spadne z dôvodu, ktorý s jeho menom nemá nič spoločné.
+- **`__posts.done` (alebo hocijaký signál z `fetch().then()`) NIE JE „riadok je
+  prekreslený".** Fires skôr, než `postToOrder` dočíta telo, než sa prepíše účtovníctvo a
+  než `renderToOrder()` zbehne. Čakaj na DOM (triedu riadku), inak test prechádza na
+  náhode v časovaní.

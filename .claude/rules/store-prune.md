@@ -35,6 +35,38 @@ objednávka zmizne, a čo zmizlo, sa nemaže. Poškodený zdroj tak vie prune le
 Ten istý tvar má aj starší `_prune_orphan_decisions` — „NEVER prunes against an EMPTY
 product list", lebo prázdny `PRODUCTS` by označil za osirelé úplne všetko.
 
+## 1b. „Nič nie je otvorené" NIE JE odpoveď — je to signál, že čítaš iný zdroj
+
+Bod 1 odvodzuje zaniknuté ako `videné − stále_otvorené`. Tá formulácia má dieru, ktorú
+prah z bodu 2 NECHYTÍ a `protect` guard tiež nie (prune je legitímny read-modify-write):
+**čokoľvek, čo vyprázdni `stále_otvorené`, spraví zo VŠETKÉHO v okne „zaniknuté".**
+
+Reálne spúšťače, oba lacné:
+
+- **Premenovaný stav.** Stavy objednávok v Shoptete sú konfigurovateľný TEXT a literál
+  `"Vybavuje sa"` je v tomto repe zapečený na viacerých miestach. Premenovanie v admine =
+  nula otvorených.
+- **Iný / zmenený export.** Chýbajúci stĺpec `statusName` (zmenená šablóna, alebo URL v
+  creds prehodená na iný export, ktorý má tiež stĺpec `code`) → každý riadok číta `None`.
+
+Preto: **over stĺpec v HLAVIČKE** (skôr, než posúdiš čo i len jeden riadok) a **odmietni
+prune, keď je množina otvorených PRÁZDNA**. Na zdravom feede je to nemožné (namerané:
+57 otvorených z 521), takže to nie je tichý týždeň — je to iný zdroj. Obe odmietnutia
+pomenuj ZVLÁŠŤ (`no-status-column` vs `no-open-orders` vs `unparsable-source`): operátora
+posielajú na iné miesto.
+
+## 1c. Zánik ≠ koniec — nechaj odklad, lebo veci sa VRACAJÚ
+
+Objednávka „Vybavená" sa môže vrátiť do „Vybavuje sa" — tento repozitár si to sám píše
+tam, kde dedup store pripomienok vysvetľuje, prečo záznamy DRŽÍ. Keď prune zmaže značky
+v tú istú hodinu, riadok sa vráti bez manažérovho „objednané u dodávateľa" a objedná sa
+druhý raz. Zmazanie preto vyžaduje aj VEK: `ORDERS_PRUNE_MIN_AGE_DAYS` (30 dní) z dátumu
+objednávky, ktorý export aj tak nesie — žiadny nový store, nič, čo zastará.
+
+Skontroluj, že odklad a okno zdroja spolu **nenechajú kľúč trčať**: 30 dní odkladu proti
+90-dňovému oknu exportu = 60 dní hodinových behov, počas ktorých je každý kľúč ešte
+dosiahnuteľný. A **neznámy vek nie je „dosť starý"** — neprečítateľný dátum sa nemaže.
+
 ## 2. Fail-closed prah na ZDROJ, aj keď pravidlo z bodu 1 už drží
 
 Opasok k trakám, rovnaký tvar ako `EXPORT_MIN_CODES` pri katalógu: keď zdroj nesie
@@ -42,6 +74,18 @@ implauzibilne málo záznamov, **nemaž nič a zaloguj varovanie**. Prah kalibru
 histórii, nie od oka, a napíš do kódu, z čoho vznikol (`ORDERS_PRUNE_MIN_ORDERS = 50` proti
 nameraným 521 objednávkam v 90-dňovom okne). Absolútny prah, nie pomer z dávky — pomer sa
 odzbrojí, keď dávku tvoria už len odsúdené riadky (#270).
+
+### Useknutie: pravidlo z bodu 1 platí pre všetky riadky OKREM toho, v ktorom je rez
+
+„Useknutý export vie riadky iba ubrať" je pravda pre celé riadky. Riadok, do ktorého rez
+padne, ale `csv.DictReader` vráti — s useknutým alebo chýbajúcim stavom, takže naozaj
+OTVORENÁ objednávka číta ako zaniknutá. Telo, ktoré nekončí novým riadkom, je neúplné z
+definície: **posledný riadok zahoď.**
+
+A **`csv.Error` nie je ani `ValueError`, ani `OSError`.** Holý CR v neuvodzovkovanom poli
+(a `errors="replace"` zaručí, že sa k parseru dostane hocijaká bajtová kaša) ho vyhodí,
+a keď ho nechytíš, prejde cez housekeeping `except` volajúceho a zhodí celý hodinový beh —
+presne to, čo ten `except` sľubuje, že sa stať nemôže. Chytaj ho na oboch miestach.
 
 ## 3. Mechanika, bez ktorej sa `protect=True` odzbrojí
 
@@ -55,7 +99,8 @@ odzbrojí, keď dávku tvoria už len odsúdené riadky (#270).
 - **Kľúč, ktorý sa nedá priradiť** (chýba `|`, prázdny `orderCode`), sa NEPOSUDZUJE.
 - **Zaloguj konkrétne kľúče**, nielen počet — o tri týždne sa z počtu nedá nič obhájiť.
 - Volaj to ako **housekeeping v try/except** (`StoreLockTimeout, StoreWipeRefused, OSError,
-  ValueError`): zlyhaný prune nesmie zhodiť beh, ktorý ho hostí.
+  ValueError`, **a `csv.Error`** — viď vyššie): zlyhaný prune nesmie zhodiť beh, ktorý ho
+  hostí. Než ten `except` napíšeš, over si, že typy, ktoré parser naozaj hádže, sú v ňom.
 
 ## 4. Prune patrí k ČERSTVÉMU fetchu, nie na čítaciu cestu
 
