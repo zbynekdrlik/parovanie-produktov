@@ -926,6 +926,70 @@ def test_run_stats_do_not_flag_bcc_when_it_is_configured(iso):
     assert webapp.run_orders_reminder()["bcc_missing"] is False
 
 
+# ── PR #295 review B1 — an unusable status configuration is fail-CLOSED for the PRUNE
+#    and was fail-OPEN for the MAIL ──────────────────────────────────────────────────
+#    `_order_statuses_state()` computes the reason („bad-status-config") and
+#    `_order_statuses()` throws it away — so a corrupt `order_statuses.json` silently
+#    RESTORES the default `to_order` = {"Vybavuje sa"} and re-arms reminder e-mails to
+#    exactly the customers the manager excluded by narrowing that set. The prune refuses
+#    on the same reason; this one mailed, with no stat, no banner and no ⚠ badge
+#    (automation-health §3, on the SMTP path).
+
+@pytest.fixture
+def bad_status_config(iso, monkeypatch):
+    """A configuration file that IS there and cannot be used — the case that must not fall
+    back to the built-in defaults for anything that ACTS."""
+    p = iso["tmp"] / "order_statuses.json"
+    p.write_text("{ this is not json", encoding="utf-8")
+    monkeypatch.setattr(webapp, "ORDER_STATUSES", str(p))
+    return iso
+
+
+def test_an_unusable_status_config_sends_NO_reminder(bad_status_config):
+    """The harm in one line: the manager narrowed „objednávka sa spracúva" to keep these
+    customers out of the reminders, the file broke, and the default set put them straight
+    back in. Refusing is the same answer the prune gives to the same reason."""
+    stats = webapp.run_orders_reminder()
+
+    assert bad_status_config["sent"] == [], bad_status_config["sent"]
+    assert stats["emailed_now"] == 0, stats
+
+
+def test_an_unusable_status_config_is_VISIBLE_on_the_run(bad_status_config):
+    """automation-health §3: a run that cannot read its own configuration has failed even
+    though it did not throw, so it needs a stat, and it must ride the EXISTING degraded
+    path the ⚠ badge already reads (`source_degraded`) rather than inventing a second one
+    every future automation would have to remember."""
+    stats = webapp.run_orders_reminder()
+
+    assert stats["bad_status_config"] is True, stats
+    assert stats["source_degraded"] is True, stats
+    assert _store(bad_status_config)["stats"]["bad_status_config"] is True
+
+
+def test_a_healthy_status_config_flags_nothing(iso):
+    """The signal must be quiet in normal operation, or it is noise that hides the one
+    case it exists for."""
+    stats = webapp.run_orders_reminder()
+
+    assert stats["bad_status_config"] is False, stats
+    assert stats["source_degraded"] is False, stats
+
+
+def test_an_unusable_status_config_still_RENDERS_the_orders(bad_status_config):
+    """Refusing to SEND is not refusing to show: the rows stay on the tab (with the sets
+    falling back to the defaults, so the tab is not blank) — the manager has to be able to
+    see the state he is in and act on it by hand."""
+    webapp.run_orders_reminder()
+
+    st = _store(bad_status_config)
+    shown = {r["code"] for r in st["red"] + st["orange"] + st["skipped"] + st["no_email"]}
+    assert "99001000" in shown, st          # the >4d no-note order is still listed
+    # …and every order the run could not act on says WHY, on its own row
+    reasons = " ".join(r.get("pending", "") for r in st["skipped"])
+    assert "stav" in reasons.lower(), st["skipped"]
+
+
 # ═════════════════════════════════════════════════════════════════════════════════
 # DÁVKA B1 — three holes the PR #223 verification found in the run's claim path.
 # All three share one symptom: the tab shows a healthy-looking run while an order
