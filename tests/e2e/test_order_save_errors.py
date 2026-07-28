@@ -1077,13 +1077,19 @@ def test_the_client_adopts_the_flags_the_SERVER_answers_with(page, toorder_serve
     """The server is the authority, and it says what the row now IS in every answer. Two
     axis-B writes issued within one round-trip can commit on the server in the reverse
     order (each queues behind the other's `with _lock:`), so the client's own issue-order
-    bookkeeping is not by itself enough — the answered `flags` have to be mirrored."""
+    bookkeeping is not by itself enough — the answered `flags` have to be mirrored.
+
+    The fabricated answer carries a `commitSeq` because a real one always does (#291): the
+    client orders answers by the server's commit number, so a body without one says nothing
+    about WHEN it committed and is deliberately not adopted at all. The intent pinned here
+    — the answered `flags` win over what the client predicted — is unchanged."""
     _open(page, toorder_server)
     # the server answers OK, but with a state the client did not predict
     page.route("**/api/instock", lambda r: r.fulfill(
         status=200, content_type="application/json",
-        body=json.dumps({"ok": True, "flags": {"ordered": False, "waiting": True,
-                                               "instock": False, "unavailable": False}}))
+        body=json.dumps({"ok": True, "commitSeq": 1,
+                         "flags": {"ordered": False, "waiting": True,
+                                   "instock": False, "unavailable": False}}))
         if r.request.method == "POST" else r.continue_())
 
     page.locator(".toorder-row[data-code='C1'] .to-instock").click()

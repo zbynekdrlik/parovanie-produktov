@@ -1,17 +1,22 @@
-"""#211 — a per-(flag, row) sequence number may only ever be stamped by the flag itself.
+"""#211 — a flag's guard may only ever be stamped by a write that CLAIMED that flag.
 
 `_flagWrites` keeps an INDEPENDENT `seq` counter per (flag, row): „čaká sa" and „skladom"
-are separate writes on the same line and must not supersede each other. `confirmedSeq` is
-the guard built on that counter — a write's acceptance only counts if no LATER-issued
-write on the SAME (flag, row) has already been accepted.
+are separate writes on the same line and must not supersede each other. The guard built
+next to it decides whether a write's acceptance still counts, i.e. whether anything newer
+has already been accepted for that (flag, row).
 
 `_mirrorServerFlags` adopts the server's own account of all four flags. It was handed ONE
-number — the CLICKED flag's `seq` — and stamped it onto the `confirmedSeq` of every flag
-in the answer, including flags that write never claimed. Because the counters are
-independent, a flag whose own counter is behind got a FOREIGN, higher number written into
-its guard; from then on the guard rejected that flag's OWN accepted writes, `confirmed`
-(the last known SERVER value) froze on stale data, and the next REFUSED write "rolled
-back" to that stale value — i.e. did not roll back at all.
+number — the CLICKED flag's `seq` — and stamped it onto the guard of every flag in the
+answer, including flags that write never claimed. Because the counters are independent, a
+flag whose own counter is behind got a FOREIGN, higher number written into its guard; from
+then on the guard rejected that flag's OWN accepted writes, `confirmed` (the last known
+SERVER value) froze on stale data, and the next REFUSED write "rolled back" to that stale
+value — i.e. did not roll back at all.
+
+(That guard is `confirmedCommit` since #291, and holds the SERVER's commit number rather
+than the client's issue counter — issue order is not commit order. The claim rule this
+file pins is unchanged by that move; only the number is different. The `confirmedSeq` named
+in the paragraphs above is what it was called while the regressions below were live.)
 
 Both directions are reachable right after the manager has been told the save failed, which
 is exactly when he trusts the row least:
@@ -20,7 +25,7 @@ is exactly when he trusts the row least:
   S7  ordered stays ON on screen while the server refused it  -> the line is never ordered
 
 The divergence needs TWO clicks of one status button (that is what pushes the foreign
-`confirmedSeq` past the untouched `ordered.seq`), so the single-click
+number past the untouched `ordered.seq`), so the single-click
 `test_a_refused_exclusive_write_restores_BOTH_flags` cannot reach this path. S6 is the
 one-click control: it must agree both before and after the fix, so a change that merely
 papers over the symptom is not mistaken for the fix.
@@ -87,7 +92,7 @@ def test_a_refused_ordered_OFF_cannot_leave_the_row_looking_un_ordered(
         page, toorder_server, status_clicks):
     """S5 — the row IS ordered on the server; a refused „un-order" must not blank it.
 
-    Two clicks of „čaká sa" stamped `ordered.confirmedSeq = 2` while `ordered.seq` was
+    Two clicks of „čaká sa" stamped the `ordered` guard with 2 while `ordered.seq` was
     still 0, so the accepted „objednané" ZAP that followed was rejected by its own guard
     and `confirmed` stayed `false`. The refused „objednané" VYP then rolled back to that
     stale `false` — which is where the map already was, so nothing moved and the manager
@@ -119,7 +124,7 @@ def test_a_refused_ordered_ON_cannot_leave_the_row_looking_ordered(
 
     The row is seeded ordered through the API (no client click, so `ordered.seq` stays 0
     — the state a manager reaching a freshly loaded tab is in). Two „čaká sa" clicks stamp
-    `ordered.confirmedSeq = 2`; the accepted „objednané" VYP is then rejected by its own
+    the `ordered` guard with 2; the accepted „objednané" VYP is then rejected by its own
     guard and `confirmed` freezes on `true`; the refused „objednané" ZAP rolls back to
     that stale `true`, leaving the tick on a line nobody ordered.
     """
