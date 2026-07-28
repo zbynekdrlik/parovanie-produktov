@@ -145,7 +145,61 @@ v ľubovoľnom poradí — klientske poradie vydania teda NIE JE poradie commito
 `flags` cez tú istú bránu `confirmed`/`confirmedSeq` (staršia odpoveď neprebije novšiu) a
 mapu prepíš len keď na ňu nič iné neletí.
 
-## 9. Test, ktorý počíta `_flagWrites` záznamy, po zmene zápisu preráta inak
+## 9. `confirmedSeq` príznaku smie stampnúť LEN číslo, ktoré si TEN príznak nárokoval
+
+Pokračovanie bodu 8, a najdrahší nález revízie PR #290. `seq` v `_flagWrites` je
+**nezávislý čítač na dvojicu (príznak, riadok)** — presne tá nezávislosť je dôvod, prečo
+`_flagWrites` existuje (bod 8). Dôsledok, na ktorý sa ľahko zabudne: **čísla NIE SÚ
+porovnateľné naprieč príznakmi.** `waiting.seq == 2` a `ordered.seq == 2` spolu nemajú nič
+spoločné.
+
+Zrkadlenie serverovej odpovede (bod 8, posledný odsek) dostalo JEDNO číslo — `seqs[0]`,
+teda číslo KLIKNUTÉHO príznaku — a vpísalo ho do `confirmedSeq` **všetkých štyroch**
+príznakov z odpovede, aj tých, ktoré ten zápis vôbec nenárokoval. Príznak, ktorý bol vo
+svojom vlastnom čítaní pozadu, tak dostal CUDZIE, vyššie číslo; jeho vlastný strážca
+`seq >= st.confirmedSeq` potom odmietal jeho VLASTNÉ, serverom PRIJATÉ zápisy, `confirmed`
+zamrzol na zastaranom údaji a nasledujúci ODMIETNUTÝ zápis sa „vrátil" práve naň — čiže sa
+nevrátil vôbec. Web ukazoval neobjednaný riadok, ktorý server drží ako objednaný (objedná
+sa druhý raz), alebo objednaný riadok, ktorý server odmietol (neobjedná sa nikdy) — a to
+hneď po hláške, že uloženie zlyhalo, teda vtedy, keď riadku manažér verí najmenej.
+
+**Pravidlo:** do `confirmedSeq` príznaku sa smie zapísať iba poradové číslo, ktoré si ten
+príznak sám vzal. Zápis si preto postaví `claimed = {príznak: jeho vlastné seq}` a
+zrkadlenie preskočí (a ani si cez `_flagEntry` NEVYPÝTA — inak založí záznam pre príznak,
+ktorý nikdy nezapisoval) všetko, čo v mape nie je. Nič sa tým nestratí, lebo **žiadny
+koncový bod nezapisuje cez os**, takže zápis môže zmeniť len to, čo nárokoval:
+`/api/ordered` siaha na `ordered`, `_write_status_flag` na tri stavové úložiská, a
+zapnutie stavu osi B už nárokuje všetky tri. Kedykoľvek pridávaš ďalší optimisticky
+zapisovaný príznak, over si túto rovnicu — „čo endpoint MÔŽE zmeniť" sa musí rovnať „čo
+zápis nárokoval".
+
+**A testová časť toho istého nálezu: test s JEDNÝM klikom nemôže chytiť divergenciu, ktorá
+potrebuje DVA.** `test_a_refused_exclusive_write_restores_BOTH_flags` chodil presne po
+tejto ceste a bol zelený — diera sa otvorí až druhým klikom jedného stavového tlačidla
+(vytlačí cudzie `confirmedSeq` na 2, kým vlastný `seq` je stále 0). Keď testuješ
+bookkeeping s čítačom, **klikaj opakovane, nie raz**, a nechaj v súbore jednoklikovú
+KONTROLU, ktorá musí prejsť pred aj po oprave — inak sa zaplata na symptóm nedá odlíšiť od
+opravy. Vzor: `tests/e2e/test_order_flag_seq_guard.py` (S5 / S7 / S6-kontrola), plus tretí
+test, ktorý pripína priamo PRÍČINU na `_flagWrites`, aby budúci refaktor spadol s
+čitateľným dôvodom, nie ako záhadná divergencia príznakov.
+
+## 10. Surový bajt NUL v `.js` zdroji oslepí `grep` na CELÝ súbor
+
+Oddeľovač v zloženom kľúči (`field + NUL + key`, `s.kind + NUL + s.key`) sa píše ako
+**escape `'\u0000'`**, nikdy ako surový bajt. Surový NUL je platný JavaScript a všetko beží
+ďalej, ale `grep` taký súbor klasifikuje ako BINÁRNY a potom **ticho nevráti NIČ** na
+žiadny vzor — nie „no match", ale prázdno, exit 1. Revízia PR #290 na to narazila:
+vyhľadávanie nad 5240-riadkovým `app.js` vracalo prázdno a súbor vyzeral čisto, lebo bajt
+nie je vidieť. Ak sa `grep` nad známym vzorom správa nevysvetliteľne, over si
+`LC_ALL=C grep -c "" <súbor>` (u binárneho zlyhá) alebo prečítaj bajty Pythonom.
+
+**Šíri sa KOPÍROVANÍM a nevidíš to.** Pri písaní tohto bodu sa presne ten bajt preniesol
+z revízneho hlásenia cez schránku do TOHTO súboru a oslepil `grep` nad playbookom — tri
+minúty po tom, čo sa opravil v `app.js`. Keď o oddeľovači píšeš alebo ho odniekiaľ
+prenášaš, píš `\u0000` ručne, nikdy neprelepuj hodnotu. Pinnuté testom
+`tests/test_static_source_hygiene.py` nad `webreview/static/` **aj `.claude/rules/`.**
+
+## 11. Test, ktorý počíta `_flagWrites` záznamy, po zmene zápisu preráta inak
 
 `test_a_straggler_...` asertoval PRESNE JEDEN záznam. Klik na os B si legitímne nárokuje
 tri (flag, riadok) záznamy, takže assert padol na správnom kóde. Pravidlo „záznamy sa
