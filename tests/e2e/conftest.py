@@ -670,7 +670,7 @@ def sync_prune_blocked_server(tmp_path_factory):
     }, ensure_ascii=False), encoding="utf-8")
     (out / "orders_cache.csv").write_text(
         "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
-        "9900200;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
+        "99002000;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
         encoding="cp1250")
     env = {
         **os.environ,

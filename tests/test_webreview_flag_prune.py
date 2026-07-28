@@ -243,15 +243,19 @@ def test_an_unparsable_body_prunes_nothing_and_does_not_escape(stores):
         assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
 
 
-def test_a_freshly_closed_order_keeps_its_marks_for_a_while(stores):
-    """A closed order can be REOPENED — the repo says so itself where the reminder dedup
-    store explains why it keeps records („a »Vybavená« order can be reopened to »Vybavuje
-    sa« tomorrow"). Deleting its marks the same hour means the line comes back with the
-    manager's „objednané u dodávateľa" silently gone, and he orders it a second time.
+def test_a_freshly_PLACED_order_keeps_its_marks_for_a_while(stores):
+    """The order-age floor: a young ORDER keeps its keys even once the export shows it
+    finished.
 
-    So a closed order also has to be OLD before its keys go. Measured on the live export:
-    the manager's marks sit almost entirely on recent orders, and the export window is 90
-    days — so a 30-day grace still leaves 60 days of hourly runs to do the pruning."""
+    What it was reached for: a closed order can be REOPENED — the repo says so itself where
+    the reminder dedup store explains why it keeps records — and deleting its marks the same
+    hour means the line comes back with the manager's „objednané u dodávateľa" silently gone,
+    so he orders it a second time.
+
+    What it actually covers: only the common case where an order closes near the day it was
+    placed. The export has no status-change column, so an order PLACED 120 days ago and
+    closed today is pruned at once, with no grace — #294 is where that gets a real fix. This
+    pins the floor that does exist, not the grace that does not."""
     fresh = "99002002;{};Vybavená;B1;Ciapka\r\n".format(
         (date.today() - timedelta(days=3)).isoformat() + " 09:00:00")
 
@@ -287,6 +291,10 @@ _LIVE_STATUSES = {
     "Výmena tovaru": False,      # an exchange still being handled
     "Vratený tovar": False,      # goods came back, the credit note is not issued yet
     "Kompletná": False,          # both live ones are 2 and 5 days old with no tracking
+    # not a status the shop uses, but the shape a shifted or half-written export produces —
+    # and „unknown" must include „unreadable", or a blank column would prune everything
+    "": False,
+    "   ": False,
 }
 
 
@@ -329,13 +337,20 @@ def test_a_status_the_shop_ADDS_or_renames_into_is_never_pruned(stores):
         assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
 
 
-def test_one_unfinished_row_keeps_the_WHOLE_order(stores):
+@pytest.mark.parametrize("unfinished_first", [False, True])
+def test_one_unfinished_row_keeps_the_WHOLE_order(stores, unfinished_first):
     """`statusName` is the whole order's status repeated on every line, so a mixed order
     should not exist — but if one ever does, the answer must be the conservative one: a
-    single row that is not a finished status keeps every key of that order."""
+    single row that is not a finished status keeps every key of that order.
+
+    BOTH row orders, because one order alone does not pin it: with the finished row first, a
+    „later row overrides" bug is invisible (verified by mutation — a terminal row cancelling
+    an earlier unfinished one left the whole suite green)."""
     old = (date.today() - timedelta(days=120)).isoformat() + " 09:00:00"
     mixed = ["99002002;{};Vybavená;B1;Ciapka\r\n".format(old),
              "99002002;{};Osob. odber;B2;Rukavice\r\n".format(old)]
+    if unfinished_first:
+        mixed.reverse()
 
     res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW] + mixed))
 
@@ -354,6 +369,52 @@ def test_the_run_reports_the_statuses_it_did_not_RECOGNISE(stores):
     res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW, row]))
 
     assert res["unknown_statuses"] == ["Čaká na dodávateľa"], res
+
+
+def test_a_status_we_deliberately_classified_is_NOT_reported_as_unknown(stores):
+    """The signal only works while it is quiet. Every status in `_LIVE_STATUSES` was weighed
+    and deliberately left off the terminal list — reporting those four as „unknown" would put
+    a permanent four-item line on the card and in every hourly log, and the ONE thing the
+    signal exists for (a genuinely new status) would hide inside that noise."""
+    old = (date.today() - timedelta(days=120)).isoformat() + " 09:00:00"
+    rows = ["99002002;{};Osob. odber;B1;Ciapka\r\n".format(old),
+            "99002004;{};Výmena tovaru;E1;Vesta\r\n".format(old),
+            "99002005;{};Vratený tovar;F1;Nohavice\r\n".format(old),
+            "99002006;{};Kompletná;G1;Cepica\r\n".format(old)]
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW] + rows))
+
+    assert res["unknown_statuses"] == [], res
+    assert res["pruned"] == 0, res      # still not pruned — known does not mean finished
+
+
+def test_an_EMPTY_status_is_reported_rather_than_silently_narrowing_the_prune(stores):
+    """A blank `statusName` is not a status we know, so it keeps its keys — correct. But it
+    must not do so INVISIBLY: a partially empty status column would then narrow the prune
+    with no trace anywhere, which is exactly the silence the allow-list is supposed to end.
+    It gets a named sentinel instead of being dropped for being falsy."""
+    row = "99002002;{};;B1;Ciapka\r\n".format(
+        (date.today() - timedelta(days=120)).isoformat() + " 09:00:00")
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW, row]))
+
+    assert res["pruned"] == 0, res
+    assert res["unknown_statuses"] == ["(prázdny stav)"], res
+
+
+def test_the_unknown_status_list_is_BOUNDED_in_count_and_in_length(stores):
+    """`statusName` is an untrusted CSV cell, and a shifted or corrupt export puts arbitrary
+    row content in it — which this list then logs, persists into `automations.json` and
+    renders on the card. A corrupt export must not be able to dump its contents (possibly
+    customer data) into the manager's automation store for ever."""
+    old = (date.today() - timedelta(days=120)).isoformat() + " 09:00:00"
+    rows = ["9900{:04d};{};Neznamy {} {};H{};X\r\n".format(4000 + i, old, i, "x" * 200, i)
+            for i in range(40)]
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW] + rows))
+
+    assert len(res["unknown_statuses"]) <= 20, res["unknown_statuses"]
+    assert all(len(s) <= 90 for s in res["unknown_statuses"]), res["unknown_statuses"]
 
 
 def test_an_order_with_no_usable_date_is_never_pruned(stores):
