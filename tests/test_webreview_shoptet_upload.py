@@ -675,10 +675,19 @@ def test_dry_run_previews_the_split_links_queue_count_without_queuing_anything(p
 # ── needed for either producer (unlike grube_externalcode/split_links). ──────── #
 
 def test_restock_queues_availability_and_stock_without_a_credit(pend, monkeypatch):
+    # explicit freshness (#299 Task 9 review I2 gate) — this test is about the
+    # queueing contract, not the export-age check, so pin the export as fresh
+    # rather than depending on whatever WEBREVIEW_PRODUCTS happens to hold.
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 60.0)
     monkeypatch.setattr(webapp, "_import_rows_chunked",
                         lambda *a, **k: pytest.fail("producer must not import"))
+    # #299 Task 9 review I1 — the seam now takes the ALREADY-COMPUTED candidates
+    # (unused here, hence `_c`), never recomputes its own JOIN.
+    # RESTOCK_COLS order: code, pairCode, productVisibility, availabilityInStock,
+    # availabilityOutOfStock, stock (#299 Task 9 review m1 — the brief's own fixture
+    # had productVisibility/availabilityOutOfStock swapped).
     monkeypatch.setattr(webapp, "_restock_candidate_rows",
-                        lambda: [["A", "P", "Skladom", "Skladom", "visible", "5"]])
+                        lambda _c: [["A", "P", "visible", "Skladom", "Skladom", "5"]])
     res = webapp.run_restock_skladom()
     assert res["queued"] == 4
     f = webapp._load_pending()["A"]["fields"]

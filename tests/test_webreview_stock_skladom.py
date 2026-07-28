@@ -205,14 +205,73 @@ def test_run_never_touches_manager_stores(iso, monkeypatch):
 # ── #299 Task 9: an empty cell in a candidate row must be SKIPPED, never queued ─
 def test_a_candidate_row_with_an_empty_cell_never_queues_that_field(iso, monkeypatch):
     """Mirrors the sibling restock_skladom test — `queue_fields`'s own contract:
-    an empty cell means "leave this field alone" in a Shoptet import."""
+    an empty cell means "leave this field alone" in a Shoptet import.
+    #299 Task 9 review I1: the seam now takes the already-computed `candidates`
+    (unused here, hence `_c`) instead of recomputing its own JOIN."""
     monkeypatch.setattr(webapp, "_stock_skladom_candidate_rows",
-                        lambda: [["A", "P", "visible", "", "Skladom"]])
+                        lambda _c: [["A", "P", "visible", "", "Skladom"]])
     stats = webapp.run_stock_skladom()
     assert stats["queued"] == 2                  # 3 columns, 1 empty -> 2 queued
     f = webapp._load_pending()["A"]["fields"]
     assert set(f) == {"productVisibility", "availabilityOutOfStock"}
     assert "availabilityInStock" not in f         # the empty cell never landed
+
+
+# ── #299 Task 9 review I1 — candidates and rows must come from ONE export read ── #
+def test_run_reads_the_export_only_once(iso, monkeypatch):
+    """Before this fix, `_stock_skladom_candidate_rows` recomputed the whole JOIN
+    via its own `_stock_skladom_candidates()` call — a second full products.csv
+    read over data already read once this run. Pin the read count to ONE."""
+    calls = {"export": 0}
+    real_export = webapp._read_export_for_links
+
+    def counted_export():
+        calls["export"] += 1
+        return real_export()
+
+    monkeypatch.setattr(webapp, "_read_export_for_links", counted_export)
+    stats = webapp.run_stock_skladom()
+    assert stats["queued"] == 3                  # the run still did real work
+    assert calls["export"] == 1
+
+
+# ── #299 Task 9 review I2 — export-age gate: stale/unknown age must refuse ───── #
+# ── EVERYTHING (never a silent "0 candidates" success) ────────────────────────── #
+def test_run_refuses_everything_when_the_export_is_stale(iso, monkeypatch):
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 6 * 3600 + 1)   # > limit
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("must not queue on a stale export"))
+    stats = webapp.run_stock_skladom()
+    assert stats["ok"] is False
+    assert stats["queued"] == 0 and stats["candidates"] == 0
+    assert stats["status"] == "error"
+    assert "starý" in stats["error"] and "6.0 h" in stats["error"]
+    assert not os.path.exists(webapp.PENDING_SHOPTET)
+    st = json.loads(open(webapp.STOCK_SKLADOM_STATE, encoding="utf-8").read())
+    assert st["status"] == "error"
+    assert st["error"]
+
+
+def test_run_refuses_everything_when_the_export_age_is_unknown(iso, monkeypatch):
+    """Unknown age (file missing / unstat-able) is NEVER treated as fresh — same
+    fail-closed stance as every other EXPORT_MAX_AGE_S gate in this file."""
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("unknown age must not be treated as fresh"))
+    stats = webapp.run_stock_skladom()
+    assert stats["ok"] is False
+    assert stats["queued"] == 0
+    assert "nedá zistiť" in stats["error"]
+
+
+def test_run_still_queues_when_the_export_is_explicitly_fresh(iso, monkeypatch):
+    """Freshness is pinned explicitly (not left to the fixture's write-time mtime),
+    so this proves the GATE lets a fresh export through rather than being
+    fail-closed-always."""
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 60.0)
+    stats = webapp.run_stock_skladom()
+    assert stats["ok"] is True
+    assert stats["queued"] == 3
 
 
 # ── graceful degradation ─────────────────────────────────────────────────────── #

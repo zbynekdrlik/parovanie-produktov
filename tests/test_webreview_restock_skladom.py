@@ -244,14 +244,88 @@ def test_a_candidate_row_with_an_empty_cell_never_queues_that_field(iso, monkeyp
     keep. Exercised end-to-end through `run_restock_skladom` (not just at the
     `queue_shoptet_fields` unit level in test_webreview_shoptet_upload.py) via
     `_restock_candidate_rows`, mirroring the Step 1 fixture in
-    test_webreview_shoptet_upload.py but with ONE cell deliberately blank."""
+    test_webreview_shoptet_upload.py but with ONE cell deliberately blank.
+    #299 Task 9 review I1: the seam now takes the already-computed `candidates`
+    (unused here, hence `_c`) instead of recomputing its own JOIN."""
     monkeypatch.setattr(webapp, "_restock_candidate_rows",
-                        lambda: [["A", "P", "visible", "Skladom", "", "5"]])
+                        lambda _c: [["A", "P", "visible", "Skladom", "", "5"]])
     stats = webapp.run_restock_skladom()
     assert stats["queued"] == 3                  # 4 columns, 1 empty -> 3 queued
     f = webapp._load_pending()["A"]["fields"]
     assert set(f) == {"productVisibility", "availabilityInStock", "stock"}
     assert "availabilityOutOfStock" not in f      # the empty cell never landed
+
+
+# ── #299 Task 9 review I1 — candidates (audit/store) and rows (what actually ─── #
+# ── queues) must come from ONE read of the export + supplier_stock, never two ── #
+def test_run_reads_the_export_and_supplier_stock_only_once(iso, monkeypatch):
+    """Before this fix, `candidates` (the audit/store snapshot) and `rows` (what
+    actually gets queued) came from TWO independent `_restock_candidates()` calls —
+    a second full products.csv + supplier_stock.json read. Between the two reads
+    `run_shoptet_sync` could atomically swap products.csv (its own hourly schedule,
+    not mutually exclusive with this producer), so the queued rows could diverge
+    from what the card/store recorded. Pin the read count to ONE of each."""
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    calls = {"export": 0, "stock": 0}
+    real_export = webapp._read_export_for_links
+    real_stock = webapp._load_supplier_stock
+
+    def counted_export():
+        calls["export"] += 1
+        return real_export()
+
+    def counted_stock():
+        calls["stock"] += 1
+        return real_stock()
+
+    monkeypatch.setattr(webapp, "_read_export_for_links", counted_export)
+    monkeypatch.setattr(webapp, "_load_supplier_stock", counted_stock)
+    stats = webapp.run_restock_skladom()
+    assert stats["queued"] == 4                  # the run still did real work
+    assert calls["export"] == 1
+    assert calls["stock"] == 1
+
+
+# ── #299 Task 9 review I2 — export-age gate: stale/unknown age must refuse ───── #
+# ── EVERYTHING (never a silent "0 candidates" success) ────────────────────────── #
+def test_run_refuses_everything_when_the_export_is_stale(iso, monkeypatch):
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 6 * 3600 + 1)   # > limit
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("must not queue on a stale export"))
+    stats = webapp.run_restock_skladom()
+    assert stats["ok"] is False
+    assert stats["queued"] == 0 and stats["candidates"] == 0
+    assert stats["status"] == "error"
+    assert "starý" in stats["error"] and "6.0 h" in stats["error"]
+    assert not os.path.exists(webapp.PENDING_SHOPTET)
+    st = json.loads(open(webapp.RESTOCK_STATE, encoding="utf-8").read())
+    assert st["status"] == "error"
+    assert st["error"]
+
+
+def test_run_refuses_everything_when_the_export_age_is_unknown(iso, monkeypatch):
+    """Unknown age (file missing / unstat-able) is NEVER treated as fresh — same
+    fail-closed stance as every other EXPORT_MAX_AGE_S gate in this file."""
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("unknown age must not be treated as fresh"))
+    stats = webapp.run_restock_skladom()
+    assert stats["ok"] is False
+    assert stats["queued"] == 0
+    assert "nedá zistiť" in stats["error"]
+
+
+def test_run_still_queues_when_the_export_is_explicitly_fresh(iso, monkeypatch):
+    """The gate must not become fail-closed-always: an export inside the window
+    still queues normally. Freshness is pinned explicitly (not left to the
+    fixture's write-time mtime), so this proves the GATE lets it through."""
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 60.0)
+    stats = webapp.run_restock_skladom()
+    assert stats["ok"] is True
+    assert stats["queued"] == 4
 
 
 # ── graceful degradation ─────────────────────────────────────────────────────── #
