@@ -12,6 +12,8 @@ refused with `no-open-orders`, i.e. „a status was renamed".
 """
 import re
 
+from playwright.sync_api import expect
+
 
 def _console(page):
     msgs = []
@@ -205,15 +207,20 @@ def test_an_unusable_config_stops_the_reminders_LOUDLY(page, bad_status_config_s
     page.goto(bad_status_config_server)
     page.wait_for_selector('[data-testid="version"]')
 
-    # the ⚠ badge, on the nav item, BEFORE he has opened anything
+    # `[data-testid="version"]` is server-rendered markup and is present before ANY fetch
+    # runs, so it proves nothing about init()'s `await Promise.all([...])` → render() —
+    # which is what actually paints the badge. A bare count() right after it therefore
+    # races loadAutomations() and fails on a loaded runner while passing in isolation.
+    # expect() retries, so it waits for the state instead of sampling it once (same
+    # reasoning as test_automations.py::test_degraded_source_lights_the_nav_badge_from_any_page).
     nav = page.locator(".tabs .tab", has_text="Pripomienky objednávok")
-    assert nav.locator(".navwarn").count() == 1, nav.inner_text()
+    expect(nav.locator(".navwarn")).to_have_count(1, timeout=15000)
 
     page.get_by_role("button", name="Pripomienky objednávok").click()
     page.wait_for_selector('[data-testid="ordrem-status"]')
     banner = page.locator('[data-testid="tab-orders_reminder"] .autoerr, '
                           '#tab-orders_reminder .autoerr')
-    assert banner.count() >= 1
+    expect(banner).not_to_have_count(0, timeout=15000)
     text = banner.first.inner_text()
     assert "NEPOSIELAJÚ" in text, text
     assert "Stavy objednávok" in text, text
