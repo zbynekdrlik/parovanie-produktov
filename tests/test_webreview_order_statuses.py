@@ -737,3 +737,117 @@ def test_the_blind_spot_ERROR_names_the_CONFIGURED_statuses_not_a_constant(iso, 
     msg = webapp._dispatched_status_blind_message(12, webapp._posta_statuses()[1])
     assert "12" in msg and "Expedovaná" in msg
     assert "DISPATCHED_STATUS" not in msg
+
+
+# ── #297: widening `to_order` silently widens the customer mailing list ────────
+# `to_order` drives three things at once — the „Na objednanie" tab, „Nedostupné" AND the
+# reminder mails (deliberately: one notion of „open", not four). The sharp edge is that adding
+# a status makes EVERY order in it older than 4 days instantly mail-eligible, with no preview,
+# no count and no cap on the first run. Measured on the live export (28.7.2026): adding
+# „Kompletná" reaches 2 more orders, „Osob. odber" 3 — and „Vybavená" 387 orders / 370
+# distinct customers, in one wave, under a card that answers „✅ Uložené".
+_IMPACT_HEAD = ("code;date;statusName;email;phone;billFullName;itemCode;itemName;"
+                "itemAmount;totalPriceWithVat;shopRemark\r\n")
+
+
+def _impact_row(status, code, note="volať zákazníka", email="k@example.com", days_old=9):
+    d = (datetime.now() - timedelta(days=days_old)).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{code};{d};{status};{email};;Zákazník;A1;Bunda;1;10;{note}\r\n"
+
+
+def _impact_export(monkeypatch, rows):
+    monkeypatch.setattr(webapp, "_orders_csv_cached",
+                        lambda: (_IMPACT_HEAD + "".join(rows)).encode("cp1250"))
+
+
+def test_widening_to_order_REPORTS_how_many_customers_it_newly_reaches(iso, monkeypatch):
+    """The whole ticket in one call: before saving, the manager must be able to see the size
+    of the wave he is about to release."""
+    _impact_export(monkeypatch, [
+        _impact_row("Vybavuje sa", "99003001"),                       # already in scope
+        _impact_row("Kompletná", "99003002", email="a@example.com"),  # newly reachable
+        _impact_row("Kompletná", "99003003", email="b@example.com"),
+        _impact_row("Kompletná", "99003004", email="a@example.com"),  # same customer twice
+    ])
+    r = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Vybavuje sa", "Kompletná"]})
+    assert r.status_code == 200, r.get_json()
+    j = r.get_json()
+    assert j["added"] == ["Kompletná"]
+    assert j["orders"] == 3
+    assert j["mailable"] == 3
+    assert j["customers"] == 2                 # DISTINCT e-mails, not orders
+    assert j.get("unknown") is not True
+
+
+def test_an_unchanged_or_NARROWED_set_reaches_nobody_new(iso, monkeypatch):
+    """No added status → no wave → nothing to confirm. Narrowing is the safe direction and
+    must never put a scary number in front of the manager."""
+    _impact_export(monkeypatch, [_impact_row("Vybavuje sa", "99003005"),
+                                 _impact_row("Kompletná", "99003006")])
+    c = _client_as(ADMIN)
+    for payload in ({"to_order": ["Vybavuje sa"]}, {"to_order": []}):
+        j = c.post("/api/order-statuses/impact", json=payload).get_json()
+        assert j["added"] == [] and j["orders"] == 0 and j["customers"] == 0, (payload, j)
+
+
+def test_orders_that_could_never_be_mailed_are_counted_apart(iso, monkeypatch):
+    """`orders` is what the app starts watching; `mailable` is the honest upper bound on the
+    wave. An order with no internal note only ever surfaces as the red „nikto sa jej nedotkol"
+    alert and one with no e-mail address can never be mailed at all — counting either as a
+    pending mail would cry wolf, and a preview that exaggerates is one he stops reading."""
+    _impact_export(monkeypatch, [
+        _impact_row("Kompletná", "99003007"),                       # note + e-mail → mailable
+        _impact_row("Kompletná", "99003008", note=""),              # no note → red alert only
+        _impact_row("Kompletná", "99003009", email=""),             # nobody to mail
+    ])
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Kompletná"]}).get_json()
+    assert j["orders"] == 3
+    assert j["mailable"] == 1
+    assert j["customers"] == 1
+
+
+def test_an_order_already_resolved_is_not_counted_as_a_pending_mail(iso, tmp_path,
+                                                                   monkeypatch):
+    """The dedup store is what stops a second mail, so an order it already holds is not part
+    of the wave. Without this the preview would over-count exactly the orders that are already
+    safe — and a number he can prove wrong once is a number he ignores forever."""
+    monkeypatch.setattr(webapp, "ORDERS_REMINDER_STATE", str(tmp_path / "rem.json"))
+    (tmp_path / "rem.json").write_text(json.dumps({"orders": {
+        "99003010": {"status": "emailed"}, "99003011": {"status": "skipped_contacted"}}}),
+        encoding="utf-8")
+    _impact_export(monkeypatch, [_impact_row("Kompletná", "99003010"),
+                                 _impact_row("Kompletná", "99003011"),
+                                 _impact_row("Kompletná", "99003012")])
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Kompletná"]}).get_json()
+    assert j["orders"] == 3
+    assert j["mailable"] == 1
+
+
+def test_an_unreadable_export_says_UNKNOWN_rather_than_a_reassuring_zero(iso, monkeypatch):
+    """A preview that cannot be computed must SAY so. Answering 0 would be the worst of both
+    worlds: the card would wave the change through silently, on no evidence at all."""
+    def _boom():
+        raise OSError("export not there")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", _boom)
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Vybavuje sa", "Kompletná"]}).get_json()
+    assert j["unknown"] is True
+    assert j["added"] == ["Kompletná"]          # what he changed is still knowable
+
+
+def test_the_preview_is_READ_ONLY_and_admin_only(iso, monkeypatch):
+    """It runs on a candidate the manager has NOT saved yet, so it must not touch the stored
+    configuration — and it reads the orders export, which is not public reading."""
+    _impact_export(monkeypatch, [_impact_row("Kompletná", "99003013")])
+    before = webapp._order_statuses()
+    assert _client_as(ADMIN).post("/api/order-statuses/impact",
+                                  json={"to_order": ["Kompletná"]}).status_code == 200
+    assert webapp._order_statuses() == before
+    assert not os.path.exists(os.fspath(webapp.ORDER_STATUSES))
+    assert _client_as(USER).post("/api/order-statuses/impact",
+                                 json={"to_order": ["Kompletná"]}).status_code == 403
+    assert webapp.app.test_client().post("/api/order-statuses/impact",
+                                         json={"to_order": ["X"]}).status_code == 401
