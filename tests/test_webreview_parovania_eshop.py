@@ -101,6 +101,13 @@ def iso(tmp_path, monkeypatch):
     # test_an_implausibly_small_export_is_not_trusted (verdicts) and
     # test_an_implausibly_small_export_blocks_the_supplier_write_back (the write gate).
     monkeypatch.setattr(webapp, "EXPORT_MIN_CODES", 1)
+    # #215 fail-closed precondition (PR #295 review): the „the eshop overtook this
+    # assignment" removal now needs POSITIVE evidence that the write-back record was
+    # really read off disk — a missing or corrupt `uploaded_suppliers.json` degrades to
+    # `{}`, which reads as „nothing was ever written back" and would condemn every
+    # assignment at once. An on-disk empty record is the realistic state after the first
+    # run, and it is what the removal tests here mean by „never uploaded".
+    webapp._save_uploaded_suppliers({})
     return {"tmp": tmp_path, "products": products}
 
 
@@ -399,6 +406,78 @@ def test_an_assignment_ALREADY_uploaded_is_left_alone(iso, monkeypatch):
     assert result["obsolete_removed"] == [], result
 
 
+# ── PR #295 review — the removal rests on `c not in uploaded`, so a store that was
+#    never READ condemns EVERYTHING ──────────────────────────────────────────────────
+#    `_read_json_store` degrades a missing OR corrupt store to `{}`, and `{}` reads as
+#    „we have never written a single one of these back" — i.e. every assignment the
+#    export shows with its own supplier becomes obsolete at once. It is not theoretical:
+#    on the live box `data/out/uploaded_suppliers.json` does not exist at all, so the
+#    whole store is one export appearance away from being wiped. store-prune §1: absence
+#    is never evidence — the removal needs POSITIVE proof that the record was read.
+@pytest.mark.parametrize("why,prepare", [
+    ("missing", lambda p: p.unlink(missing_ok=True)),
+    ("corrupt", lambda p: p.write_text('{"5/A": "BET', encoding="utf-8")),
+    ("wrong-type", lambda p: p.write_text('["5/A"]', encoding="utf-8")),
+])
+def test_an_upload_record_we_could_not_READ_condemns_nothing(iso, monkeypatch, why,
+                                                             prepare):
+    """Fail-CLOSED: without the record we cannot tell „never written back" (#215's case)
+    from „written back, and the manager has just edited the name" — and the second one is
+    the manager's correction, which this would throw away overnight."""
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGN"})
+    prepare(iso["tmp"] / "uploaded_suppliers.json")
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, _status = webapp._do_upload_suppliers(dry=False)
+
+    assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}, why
+    assert result["obsolete_removed"] == [], (why, result)
+    # …and it is SURFACED, not silent: the caller sees what was held back and why
+    assert result["obsolete_held"] == ["5/A"], (why, result)
+
+
+def test_an_UNREADABLE_upload_record_stops_the_run_instead_of_deleting(iso, monkeypatch):
+    """`_read_json_store` propagates an I/O error on a store that IS there, on purpose:
+    „unreadable" is not evidence that no work was done. The run therefore fails loudly —
+    and, crucially, without having removed anything."""
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGN"})
+    p = iso["tmp"] / "uploaded_suppliers.json"
+    p.write_text("{}", encoding="utf-8")
+    p.chmod(0o000)
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    try:
+        with pytest.raises(OSError):
+            webapp._do_upload_suppliers(dry=False)
+    finally:
+        p.chmod(0o600)
+
+    assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}
+
+
+def test_a_record_that_is_GENUINELY_EMPTY_still_condemns(iso, monkeypatch):
+    """The other side of the same coin — an on-disk `{}` is real evidence („nothing has
+    ever been written back"), not a degraded read, so #215 still does its job."""
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGN"})
+    (iso["tmp"] / "uploaded_suppliers.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, _status = webapp._do_upload_suppliers(dry=False)
+
+    assert webapp._load_supplier_assign() == {}
+    assert result["obsolete_removed"] == ["5/A"], result
+    assert result["obsolete_held"] == [], result
+
+
 def test_obsolete_removed_is_on_the_result_of_EVERY_path(iso, monkeypatch):
     """A caller must never have to tell „nothing was removed" from „this build does not
     report it" — including the two paths that return before the upload: nothing new to do,
@@ -408,6 +487,7 @@ def test_obsolete_removed_is_on_the_result_of_EVERY_path(iso, monkeypatch):
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "7/Y": "P1"})
     r1, _s = webapp._do_upload_suppliers(dry=False)
     assert r1["obsolete_removed"] == [], r1
+    assert r1["obsolete_held"] == [], r1
 
     # now there IS something new (a code the fixture export really lists, so the run gets
     # as far as the import), and another import is already running
@@ -419,6 +499,7 @@ def test_obsolete_removed_is_on_the_result_of_EVERY_path(iso, monkeypatch):
         webapp._import_lock.release()
     assert s2 == 409, r2
     assert r2["obsolete_removed"] == [], r2
+    assert r2["obsolete_held"] == [], r2
 
 
 def test_the_store_is_not_REWRITTEN_when_there_is_nothing_to_remove(iso, monkeypatch):
