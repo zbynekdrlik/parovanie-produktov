@@ -129,6 +129,12 @@ def cycle(tmp_path, monkeypatch):
                                 "stdout_tail": "", "err": "", "unreadable": False}))
     monkeypatch.setattr(webapp, "_export_row_verdicts",
                         lambda rows, note_col=2: {"confirmed": set(), "absent": set()})
+    # #299 review N3: the cycle now also asks `_export_age_s()` whether to skip
+    # the PRE-import download. Default to "unknown age" (never fresh) so every
+    # test below keeps its pre-N3 behaviour (PRE-import download always runs)
+    # regardless of the REAL data/products.csv on whatever machine runs this
+    # suite — a test that wants the freshness branch overrides this itself.
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
     # #299 review I3: the cycle now runs everything through the SYNCHRONOUS
     # RUNNER.run_sync (never the fire-and-forget run_now) — see automation_runner.py.
     monkeypatch.setattr(webapp.RUNNER, "run_sync",
@@ -195,6 +201,50 @@ def test_resynced_reflects_run_sync_s_ACTUAL_return_value_not_a_hard_coded_guess
     res = webapp.run_shoptet_upload()
     assert res["resynced"] == 0
     assert res["skipped_second_sync"] is True   # nothing was sent -> no 2nd sync attempted
+
+
+# ── #299 review N3 — shoptet_sync and shoptet_upload share the same 60-minute ─ #
+# ── schedule, so a tick that ran shoptet_sync moments ago must not re-fetch ─── #
+# ── the 57 MB catalogue a second time via the PRE-import download. ─────────── #
+
+def test_a_fresh_export_skips_the_PRE_import_download_but_not_the_POST_import_one(
+        cycle, monkeypatch):
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 5 * 60)  # 5 min old
+    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
+                                [["A", "P", "https://x"]])
+    res = webapp.run_shoptet_upload()
+    assert cycle["run_sync"].count("shoptet_sync") == 1, (
+        "only the POST-import download must have run")
+    assert res["resynced"] == 1
+    assert res["skipped_second_sync"] is False
+
+
+def test_a_stale_export_still_runs_the_PRE_import_download(cycle, monkeypatch):
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 20 * 60)  # 20 min old
+    res = webapp.run_shoptet_upload()
+    assert cycle["run_sync"].count("shoptet_sync") == 1, (
+        "the PRE-import download must have run")
+    assert res["resynced"] == 1
+    assert res["skipped_second_sync"] is True  # empty table -> nothing sent
+
+
+def test_an_unknown_export_age_is_never_treated_as_fresh(cycle, monkeypatch):
+    """No export on disk yet (or a test double that cannot stat it) must NEVER
+    be read as "fresh" — the fail-safe direction is always to download."""
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    res = webapp.run_shoptet_upload()
+    assert cycle["run_sync"].count("shoptet_sync") == 1
+    assert res["resynced"] == 1
+
+
+def test_the_freshness_boundary_itself_still_counts_as_stale(cycle, monkeypatch):
+    # exactly SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S old is NOT "younger
+    # than" the limit -> the download must still run.
+    monkeypatch.setattr(webapp, "_export_age_s",
+                        lambda: webapp.SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S)
+    res = webapp.run_shoptet_upload()
+    assert cycle["run_sync"].count("shoptet_sync") == 1
+    assert res["resynced"] == 1
 
 
 # ── review carry-overs (Task 4 M2 / Task 5 minor / brief note on note_col) ──── #
