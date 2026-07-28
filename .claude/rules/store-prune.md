@@ -35,6 +35,48 @@ objednávka zmizne, a čo zmizlo, sa nemaže. Poškodený zdroj tak vie prune le
 Ten istý tvar má aj starší `_prune_orphan_decisions` — „NEVER prunes against an EMPTY
 product list", lebo prázdny `PRODUCTS` by označil za osirelé úplne všetko.
 
+## 1a. „Pozitívny dôkaz" musí platiť aj pre STAV, nielen pre PRÍTOMNOSŤ
+
+Bod 1 ustráži, že sa nemaže to, čo v zdroji NEVIDÍME. Nič v ňom ale nebráni tomu, aby sa
+zaniknutosť odvodila NEGATÍVNE z druhej strany — `closed = videné − otvorené`, kde
+„otvorené" je členstvo v JEDNOM zapečenom literáli. Tá formulácia vyhlási za skončené
+**čokoľvek, čo nie je ten literál** — teda aj stav, ktorý kód nikdy nevidel. Je to presne
+tá istá chyba ako „nevidím to, tak to zmažem", len o jednu os ďalej.
+
+Strážca z bodu 1b (odmietni, keď je otvorených NULA) chytá len ÚPLNÉ premenovanie.
+**ČIASTOČNÁ zmena cezeň prejde:** premenovanie, pri ktorom jedna objednávka ostane na
+starom literáli, alebo pridanie nového otvoreného stavu. Otvorených je vtedy „nejako viac
+ako nula", takže všetko vyzerá zdravo — a zmažú sa značky živých objednávok. Namerané na
+#212: taký scenár zmazal **94 kľúčov** z objednávok, ktoré sú stále otvorené
+(`176/12/13/16 → 99/6/9/9`).
+
+**Pravidlo: maž na členstvo v EXPLICITNOM zozname koncových stavov, nikdy na „všetko, čo
+nie je ten otvorený literál".** Neznámy alebo novo pridaný stav tak automaticky znamená
+NEUKONČENÉ a značky prežijú. Zoznam nehádaj — over ho na živých dátach:
+
+- Živý export nie je dvojstavový. Pri #212 niesol **deväť** stavov: `Vybavená` 387,
+  `Stornovaná` 63, `Vybavuje sa` 57, `Vybavená výmena` 4, `Osob. odber` 3,
+  `Vybavený Dobropis` 3, `Kompletná` 2, `Vratený tovar` 1, `Výmena tovaru` 1. `Osob. odber`
+  aj `Výmena tovaru` sú ŽIVÉ stavy a staré pravidlo ich považovalo za skončené.
+- Hľadaj DVA nezávislé signály, ktoré sa zhodujú. Tu to bola menná konvencia obchodu
+  (dokončenie má predponu `Vybavená/Vybavený` — `Vybavená výmena` vs `Výmena tovaru`) a
+  podacie číslo, čiže „tovar naozaj odišiel": `Vybavená` 250/387, `Vybavená výmena` 4/4,
+  `Vybavený Dobropis` 3/3 — proti `Kompletná` 0/2, `Vratený tovar` 0/1, `Osob. odber` 0/3.
+- **Pri pochybnosti stav na zoznam NEDÁVAJ.** Asymetria je zdrvujúca: vynechaný stav stojí
+  pár kľúčov, ktoré chvíľu ostanú; mylne zaradený stav zmaže nenahraditeľnú prácu. Doplniť
+  stav neskôr s dôkazom sa dá, zmazanie sa vrátiť nedá.
+- **Zoznam sa nesmie zúžiť potichu.** Beh vráti a zaloguje stavy, ktoré NEPOZNÁ, a karta ich
+  ukáže — ako informáciu, nie ako poplach (sú legitímne a trvalé, banner by bol večný šum).
+
+### A test na ÚPLNÉ premenovanie NEPOKRÝVA čiastočné
+
+`test_an_export_with_NO_open_orders_at_all_prunes_nothing` bol zelený celý čas — premenoval
+stav vo VŠETKÝCH riadkoch, čím trafil presne ten strážca, ktorý už existoval. Dieru otvorí
+až export, kde je otvorených „nejako viac ako nula". Keď píšeš negatívny test na strážcu,
+napíš aj jeho ČIASTOČNÚ verziu; inak testuješ vetvu, ktorú si už ošetril.
+Vzor: `test_a_status_the_shop_ADDS_or_renames_into_is_never_pruned` a tabuľkový
+`test_only_a_status_that_MEANS_finished_prunes_its_keys` nad všetkými deviatimi stavmi.
+
 ## 1b. „Nič nie je otvorené" NIE JE odpoveď — je to signál, že čítaš iný zdroj
 
 Bod 1 odvodzuje zaniknuté ako `videné − stále_otvorené`. Tá formulácia má dieru, ktorú
@@ -60,12 +102,23 @@ posielajú na iné miesto.
 Objednávka „Vybavená" sa môže vrátiť do „Vybavuje sa" — tento repozitár si to sám píše
 tam, kde dedup store pripomienok vysvetľuje, prečo záznamy DRŽÍ. Keď prune zmaže značky
 v tú istú hodinu, riadok sa vráti bez manažérovho „objednané u dodávateľa" a objedná sa
-druhý raz. Zmazanie preto vyžaduje aj VEK: `ORDERS_PRUNE_MIN_AGE_DAYS` (30 dní) z dátumu
+druhý raz. Zmazanie preto vyžaduje aj VEK: `ORDERS_PRUNE_MIN_ORDER_AGE_DAYS` (30 dní) z dátumu
 objednávky, ktorý export aj tak nesie — žiadny nový store, nič, čo zastará.
 
 Skontroluj, že odklad a okno zdroja spolu **nenechajú kľúč trčať**: 30 dní odkladu proti
 90-dňovému oknu exportu = 60 dní hodinových behov, počas ktorých je každý kľúč ešte
 dosiahnuteľný. A **neznámy vek nie je „dosť starý"** — neprečítateľný dátum sa nemaže.
+
+**Pomenuj konštantu podľa toho, čo MERIA, nie podľa toho, čo si ňou chcel dosiahnuť.**
+Odklad má bežať od ZATVORENIA, lenže dátum v exporte je dátum VYTVORENIA objednávky (66
+stĺpcov a ani jeden so zmenou stavu či poslednou úpravou). Objednávka vytvorená pred 31
+dňami a zatvorená dnes sa teda zmaže hneď pri najbližšom behu, s NULOVÝM odkladom — a to
+práve pri dlhom čakaní na dodávateľa, čiže presne tam, kde tie značky najviac chýbajú. Kým
+to tak je, nevydávaj vek objednávky za odklad po zatvorení: konštanta sa volá podľa merania
+(`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`), komentár povie, čo dať NEVIE, a skutočné riešenie
+(store s dátumom prvého videného zatvorenia) má vlastný ticket (#294). Konštanta pomenovaná
+podľa zámeru klame o bezpečnosti, ktorú kód nemá — a klame práve toho, kto sa na ňu spoľahne
+pri ďalšej zmene.
 
 ## 2. Fail-closed prah na ZDROJ, aj keď pravidlo z bodu 1 už drží
 
@@ -144,4 +197,15 @@ predtým — s jediným riadkom v logu. To je „tichá smrť automatizácie" z
 - **Každý trvalý dôvod pomenuj zvlášť** a prejdi všetky štyri kroky z automation-health §3
   (stat → ERROR log → červený banner v karte → `navError()` odznak), vrátane E2E.
   Pri #212 to zostalo ako #293 — a to je práve tá časť, ktorú je najľahšie zabudnúť,
-  lebo „veď to nič nezmazalo".
+  lebo „veď to nič nezmazalo". Uzavreté v tej istej PR, s tromi vecami, ktoré sa oplatí
+  zopakovať:
+  - **Prihlás sa do EXISTUJÚCEJ degradovanej cesty, nezakladaj druhú.** Beh nastaví
+    `source_degraded`, na ktorý sa `navError()` už pýta — odznak sa rozsvieti bez ďalšej
+    vetvy, ktorú by musela každá nová automatizácia trafiť (tak vznikla chyba
+    `autoByKey('posta')`, `automation-health.md` §3).
+  - **Vypisuj aj ÚSPEŠNÝ výsledok, nielen odmietnutie** („vyčistené osirelé značky: 0").
+    Bola to práve NEPRÍTOMNOSŤ toho riadku, vďaka ktorej trvalé odmietnutie vyzeralo úplne
+    rovnako ako zdravá hodina.
+  - **Odlíš POPLACH od INFORMÁCIE.** Neznáme stavy (bod 1a) sú legitímne a trvalé, takže
+    idú ako pokojný riadok; červený banner patrí odmietnutiu, ktoré treba ísť opraviť.
+    Trvalý banner sa prestane čítať a zoberie so sebou aj ten, čo niečo znamená.
