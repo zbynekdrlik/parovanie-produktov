@@ -65,7 +65,8 @@ def _admin_session_cookie(base: str) -> str:
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
-                    "automations_server", "posta_degraded_server", "imgfail_server",
+                    "automations_server", "posta_degraded_server",
+                    "sync_prune_blocked_server", "imgfail_server",
                     "imgflood_server", "dev_server",
                     "nedostupne_server", "vystavy_server", "toorder_server",
                     "toorder_wide_server")
@@ -157,19 +158,19 @@ def live_server(tmp_path_factory):
     # Order codes are chronological (lower = older). 1/M maps to the fixture product
     # (pairable); 2/M and 77/X are NOT in the review set → unpaired (inline-pairing
     # field). Crafted so the NEWEST-first sort is observable: BETALOV holds the newest
-    # order (1/M = 20260900) so its group sorts ABOVE ORBIS (newest 20260700); within
-    # BETALOV 1/M (20260900) precedes 2/M (20260750).
+    # order (1/M = 99000900) so its group sorts ABOVE ORBIS (newest 99000700); within
+    # BETALOV 1/M (99000900) precedes 2/M (99000750).
     # shopRemark column (#101): the shop's own internal order note, surfaced read-only
-    # on the row. Only the ORBIS order (20260700) carries one → its row shows .to-shopnote.
+    # on the row. Only the ORBIS order (99000700) carries one → its row shows .to-shopnote.
     (out / "orders_cache.csv").write_text(
         "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20260900;2026-05-20 09:00:00;Vybavuje sa;;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
-        "20260750;2026-05-02 11:30:00;Vybavuje sa;;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
-        "20260700;2026-04-24 19:14:05;Vybavuje sa;chýba nám kus;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n"
+        "99000900;2026-05-20 09:00:00;Vybavuje sa;;Bunda Test ALFA;2;1/M;Veľkosť: M;BETALOV\r\n"
+        "99000750;2026-05-02 11:30:00;Vybavuje sa;;Ciapka Test;1;2/M;Veľkosť: M;BETALOV\r\n"
+        "99000700;2026-04-24 19:14:05;Vybavuje sa;chýba nám kus;Rukavice Test;1;77/X;Veľkosť: X;ORBIS\r\n"
         # 88/Z arrived WITHOUT a supplier (empty itemSupplier) → groups under '—' and
-        # shows the inline supplier-assign field; OLDEST order (20260001) so '—' sorts
+        # shows the inline supplier-assign field; OLDEST order (99000001) so '—' sorts
         # LAST and never disturbs the BETALOV-first / within-BETALOV ordering assertions.
-        "20260001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;88/Z;Veľkosť: Z;\r\n",
+        "99000001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;88/Z;Veľkosť: Z;\r\n",
         encoding="cp1250")
     # GRUBE per-size code store: attaches a copyable itemId chip + .de link onto the
     # 1/M order row (its itemCode matches), exercising the Task-10 renderOrderRow path.
@@ -501,51 +502,51 @@ def automations_server(tmp_path_factory):
     # network. The E2E never clicks Spustiť teraz (it SENDS real customer e-mails + costs OpenAI).
     (out / "orders_reminder.json").write_text(json.dumps({
         "last_check": "2026-07-22T08:00:05+02:00",
-        "orders": {"20261001": {"status": "emailed", "date": "2026-07-22T08:00:03+02:00",
+        "orders": {"99001001": {"status": "emailed", "date": "2026-07-22T08:00:03+02:00",
                                 "name": "Eva Nová", "email": "eva@example.com",
                                 "itemName": "Nohavice", "note": "volať zákazníka"},
-                   "20261002": {"status": "skipped_contacted", "date": "2026-07-22T08:00:04+02:00",
+                   "99001002": {"status": "skipped_contacted", "date": "2026-07-22T08:00:04+02:00",
                                 "name": "Iva Stará", "email": "iva@example.com",
                                 "itemName": "Čiapka", "note": "volané so zákazníkom"},
                    # #227 — resolved BY THE MANAGER (`manual`), not by the classifier
-                   "20261007": {"status": "skipped_contacted", "manual": True,
+                   "99001007": {"status": "skipped_contacted", "manual": True,
                                 "date": "2026-07-22T08:10:00+02:00",
                                 "name": "Ručne Vybavený", "email": "rucne@example.com",
                                 "itemName": "Termoska", "note": ""}},
-        "red": [{"code": "20261000", "billFullName": "Ján Bez", "phone": "+421900111222",
+        "red": [{"code": "99001000", "billFullName": "Ján Bez", "phone": "+421900111222",
                  "email": "jan@example.com", "itemName": "Bunda Test Red", "days": 9,
-                 "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261000&src=orders"}],
-        "orange": [{"code": "20261001", "billFullName": "Eva Nová", "email": "eva@example.com",
+                 "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=99001000&src=orders"}],
+        "orange": [{"code": "99001001", "billFullName": "Eva Nová", "email": "eva@example.com",
                     "itemName": "Nohavice Test Orange", "shopRemark": "volať zákazníka", "days": 8,
                     "sent_date": "2026-07-22T08:00:03+02:00",
-                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261001&src=orders"}],
-        # AI marked 20261002 already-contacted — the row an override can 'poslať teraz' anyway.
-        "skipped": [{"code": "20261002", "billFullName": "Iva Stará", "email": "iva@example.com",
+                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=99001001&src=orders"}],
+        # AI marked 99001002 already-contacted — the row an override can 'poslať teraz' anyway.
+        "skipped": [{"code": "99001002", "billFullName": "Iva Stará", "email": "iva@example.com",
                     "itemName": "Čiapka Test Skipped", "shopRemark": "volané so zákazníkom", "days": 7,
-                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261002&src=orders"},
+                    "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=99001002&src=orders"},
                     # B1 M2 — an order the RUN started but could not finish (its send failed).
                     # It used to vanish from the tab until the next run, with the override
                     # answering 404; now it is carried here WITH the reason, still actionable.
-                    {"code": "20261006", "billFullName": "Nedokončený Beh",
+                    {"code": "99001006", "billFullName": "Nedokončený Beh",
                      "email": "pending@example.com", "itemName": "Čelovka Test Pending",
                      "shopRemark": "volať zákazníka", "days": 5,
                      "pending": "odoslanie e-mailu zlyhalo — skúsim v ďalšom behu",
-                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261006&src=orders"},
+                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=99001006&src=orders"},
                     # #227 — an order the MANAGER resolved by hand. It shares the `skipped`
                     # list with the AI's verdicts (so the override endpoint finds them the same
                     # way) but means something completely different: here the classifier never
                     # ran at all (no note), so rendering it under „AI usúdilo…" would be a lie.
-                    {"code": "20261007", "billFullName": "Ručne Vybavený",
+                    {"code": "99001007", "billFullName": "Ručne Vybavený",
                      "email": "rucne@example.com", "itemName": "Termoska Test Manual",
                      "shopRemark": "", "days": 4, "manual": True,
                      "sent_date": "2026-07-22T08:10:00+02:00",
-                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261007&src=orders"}],
+                     "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=99001007&src=orders"}],
         # BUG 4 — an order whose customer has no e-mail on file: it can never be reminded, so
         # the run surfaces it here INSTEAD of paying for an AI classification on every run.
-        "no_email": [{"code": "20261004", "billFullName": "Bez Mailu", "phone": "+421900999888",
+        "no_email": [{"code": "99001004", "billFullName": "Bez Mailu", "phone": "+421900999888",
                       "email": "", "itemName": "Rukavice Test NoMail",
                       "shopRemark": "treba doriešiť", "days": 6,
-                      "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=20261004&src=orders"}],
+                      "admin_link": "https://www.forestshop.sk/admin/vyhladavanie/?string=99001004&src=orders"}],
         "stats": {"orders_4d": 4, "no_note": 1, "with_note": 3, "emailed_now": 0,
                   "emailed_total": 1, "skipped_now": 0, "ai_unavailable": 0,
                   "no_email": 1, "errors": 0},
@@ -625,6 +626,60 @@ def posta_degraded_server(tmp_path_factory):
         "SHOPTET_CRED": str(out / "no_creds_here"),
         "MAIL_HOST": "",
         "MAIL_BCC": "owner@example.com",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def sync_prune_blocked_server(tmp_path_factory):
+    """Isolated webreview instance whose LAST hourly sync could not prune (#293).
+
+    `no-open-orders` and `no-status-column` are PERMANENT states: until the export is fixed
+    the prune never runs once, the flag stores go on growing exactly as before #212, and the
+    only trace used to be a log line. The whole value of the refusal is what the manager
+    SEES, so it needs browser coverage — a unit test over the stats proves only half
+    (`.claude/rules/automation-health.md` §3).
+
+    Seeded through `automations.json` → `last_result`, which is what the card renders from;
+    the sync itself is never triggered here (creds point at a nonexistent file)."""
+    out = tmp_path_factory.mktemp("wr_sync_blocked_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    # the live shape: everything else about the run succeeded, only the prune refused
+    (out / "automations.json").write_text(json.dumps({
+        "shoptet_sync": {
+            "last_run": "2026-07-28T09:00:05+02:00",
+            "last_status": "ok",
+            "last_result": {"orders_bytes": 1234567, "catalog_products": 4321,
+                            "catalog_codes": 8765, "review_synced": 120, "review_stale": 0,
+                            "customers_bytes": 999, "flags_pruned": 0,
+                            "flags_prune_skipped": "no-open-orders",
+                            "flags_orders_seen": 521, "flags_orders_open": 0,
+                            "flags_unknown_statuses": [], "source_degraded": True},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+        "99002000;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),
+        "MAIL_HOST": "",
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
@@ -728,13 +783,13 @@ def toorder_server(tmp_path_factory):
     (out / "review_data.json").write_text("[]", encoding="utf-8")
     (out / "orders_cache.csv").write_text(
         "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20260910;2026-05-20 09:00:00;Vybavuje sa;;Bunda Cit Test;1;C1;Veľkosť: M;CITRADE\r\n"
-        "20260905;2026-05-19 09:00:00;Vybavuje sa;;Ciapka Cit Test;1;C2;Veľkosť: M;Citrade\r\n"
-        "20260904;2026-05-18 09:00:00;Vybavuje sa;;Rukavice Cit Test;1;C3;Veľkosť: M;CITRADE\r\n"
-        "20260903;2026-05-17 09:00:00;Vybavuje sa;;Nozik Cit Test;1;C4;Veľkosť: M;citrade\r\n"
-        "20260900;2026-05-16 09:00:00;Vybavuje sa;;Nohavice Orb Test;1;S1;Veľkosť: M;ORBIS\r\n"
-        "20260890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
-        "20260001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
+        "99000910;2026-05-20 09:00:00;Vybavuje sa;;Bunda Cit Test;1;C1;Veľkosť: M;CITRADE\r\n"
+        "99000905;2026-05-19 09:00:00;Vybavuje sa;;Ciapka Cit Test;1;C2;Veľkosť: M;Citrade\r\n"
+        "99000904;2026-05-18 09:00:00;Vybavuje sa;;Rukavice Cit Test;1;C3;Veľkosť: M;CITRADE\r\n"
+        "99000903;2026-05-17 09:00:00;Vybavuje sa;;Nozik Cit Test;1;C4;Veľkosť: M;citrade\r\n"
+        "99000900;2026-05-16 09:00:00;Vybavuje sa;;Nohavice Orb Test;1;S1;Veľkosť: M;ORBIS\r\n"
+        "99000890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
+        "99000001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
         encoding="cp1250")
     env = {
         **os.environ,
@@ -772,7 +827,7 @@ def toorder_wide_server(tmp_path_factory):
     itemCode plus a sibling variant of the same reviewed product.
 
     Seeded so that:
-      * 61247/L + 61247/XL belong to review product BETALOV|231 with a `good` decision
+      * TESTKOD/L + TESTKOD/XL belong to review product BETALOV|231 with a `good` decision
         → both rows render the reviewed 🔗 and must both become editable + propagate;
       * 99999/M is outside the review set → keeps the inline paste box (control);
       * N1 has no supplier → shows the inline supplier-assign editor (extra width);
@@ -793,7 +848,7 @@ def toorder_wide_server(tmp_path_factory):
         {
             "key": "BETALOV|231", "supplier": "BETALOV",
             "name": "Polokosela FOREST Single Jersey 180g panska dlhy rukav",
-            "pairCode": "231", "variant_codes": ["61247/L", "61247/XL"],
+            "pairCode": "231", "variant_codes": ["TESTKOD/L", "TESTKOD/XL"],
             "our_url": "https://www.forestshop.sk/polokosela-forest/",
             "our_images": [], "candidates": [], "current": {},
             "ai_status": "unmatched", "ai_chosen_url": "", "ai_reason": "",
@@ -825,18 +880,18 @@ def toorder_wide_server(tmp_path_factory):
     }), encoding="utf-8")
     (out / "orders_cache.csv").write_text(
         "code;date;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20261217;2026-05-20 09:00:00;Vybavuje sa;"
+        "99001217;2026-05-20 09:00:00;Vybavuje sa;"
         "nemame percussion tricko, zakaznik caka na potvrdenie terminu;"
-        "Polokosela FOREST Single Jersey 180g panska;1;61247/L;Velkost: L;BETALOV\r\n"
-        "20261218;2026-05-21 09:00:00;Vybavuje sa;;"
-        "Polokosela FOREST Single Jersey 180g panska;2;61247/XL;Velkost: XL;BETALOV\r\n"
-        "20261219;2026-05-22 09:00:00;Vybavuje sa;;"
+        "Polokosela FOREST Single Jersey 180g panska;1;TESTKOD/L;Velkost: L;BETALOV\r\n"
+        "99001218;2026-05-21 09:00:00;Vybavuje sa;;"
+        "Polokosela FOREST Single Jersey 180g panska;2;TESTKOD/XL;Velkost: XL;BETALOV\r\n"
+        "99001219;2026-05-22 09:00:00;Vybavuje sa;;"
         "Nohavice ORBIS Trophy zimne zateplene panske;1;99999/M;Velkost: M;ORBIS\r\n"
-        "20261220;2026-05-23 09:00:00;Vybavuje sa;;"
+        "99001220;2026-05-23 09:00:00;Vybavuje sa;;"
         "Ciapka bez dodavatela s dlhym nazvom produktu;1;N1;Velkost: uni;\r\n"
-        "20261221;2026-05-24 09:00:00;Vybavuje sa;;"
+        "99001221;2026-05-24 09:00:00;Vybavuje sa;;"
         "Rukavice CITRADE zimne panske;1;77777/S;Velkost: S;CITRADE\r\n"
-        "20261222;2026-05-25 09:00:00;Vybavuje sa;;"
+        "99001222;2026-05-25 09:00:00;Vybavuje sa;;"
         "Termopodvlecenie ORBIS po velkostiach;1;55555/M;Velkost: M;ORBIS\r\n",
         encoding="cp1250")
     env = {

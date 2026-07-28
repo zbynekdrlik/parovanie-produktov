@@ -64,6 +64,34 @@ LC_ALL=C grep -ac "<hodnota>" data/out/orders_cache.csv     # musí byť 0
   Zásah v mene/e-maile/telefóne je vždy únik; mesto, ulica či PSČ býva náhoda (v HTML fixtúrach
   dodávateľov ide o ich vlastné kontakty) — ale musíš to vedieť zdôvodniť, nie predpokladať.
 
+### Kód objednávky v testoch má TVAR, ktorý reálny mať nemôže (#289)
+
+Vyššie uvedené „over grepom" nestačí ako TRVALÉ riešenie — pri kóde objednávky sa dá
+kolízia vylúčiť raz a navždy tvarom. Shoptet ich tvorí ako `<rok><4-ciferné poradie>`
+(`2026nnnn`), takže testová konvencia je opačná: **kód objednávky v testoch začína `9900`**
+(`2026nnnn` → `9900nnnn`). To nie je rok, takže sa netrafí do žiadneho minulého ani
+budúceho exportu. Pripnuté testom `tests/test_orders_pii_hygiene.py` (kontroluje TVAR, nie
+zoznam známych únikov — zoznam zastará pri prvom ďalšom prilepení).
+
+- **Kontrola sa netýka len `tests/`.** Rovnaký únik bol aj v `.claude/rules/`, v
+  `.claude/skills/` a v `docs/` — všetko je to verejné. Guard preto skenuje `tests/**/*.py`,
+  `.claude/**/*.md` a `docs/**/*.{md,html}`. Jediná výnimka je `tests/fixtures/` (uložené
+  cudzie stránky; ich 8-ciferné čísla sú časové pečiatky obrázkov dodávateľa a prepis by
+  zabil presne to, čo fixtúra pripína — reálny tvar stránky).
+- **Pri KÓDE PRODUKTU je substring-grep šum, nie dôkaz.** Nad 57 MB `products.csv` má
+  ľubovoľné 5-ciferné číslo desiatky zásahov (`77777` = 18, `55555` = 81), takže „0 výskytov"
+  sa tam nedá dosiahnuť ani pre zjavne vymyslený kód. Kódy produktov sú navyše verejné
+  katalógové identifikátory bez väzby na zákazníka — nie sú to úniky. Anonymizuj len ten,
+  ktorý bol skopírovaný SPOLU s reálnym riadkom objednávky (konvencia `TESTKOD/…`), a
+  `SHIPPING11/23/26` nechaj tak: z nich sa určuje dopravca.
+- **Pozor na hodnotu, ktorá kódom objednávky len VYZERÁ.** V `test_posta_uncollected.py`
+  bol taký zásah DÁTUM (`retainedTill` v ISO-basic tvare `RRRRMMDD`), nie kód — ale kolízia
+  je štrukturálna: každý dátum v prevádzkovom roku sa trafí do číslovania kódov. Prepísaný
+  na `99000803` (= `9900-08-03`, stále platný ISO-basic dátum, `date.fromisoformat` ho číta
+  rovnako), takže test dokazuje presne to isté a sweep ostáva čistý. Nezdôvodňuj takú
+  hodnotu „veď je to dátum" — prepíš ju. (Guard nižšie ju chytí aj v tomto súbore; presne
+  tak sa na ňu prišlo pri písaní tejto poznámky.)
+
 ## 2. Prah alarmu kalibruj na REÁLNEJ histórii, nie od oka
 
 Pri `source_coverage` (#282) sa prahy dali zmerať za pár minút read-only prepočtom nad živou
@@ -141,7 +169,7 @@ Pravidlá, ktoré z toho platia pre každé pole idúce do zákazníckeho textu:
    endpoint mu podáva hodnotu priamo z `posta_uncollected.json`, takže pokazený zápis staršieho
    behu by prešiel aj s opravenou čítačkou. A rob to BEZPODMIENEČNE (nie `if hodnota:`), aby typ
    z pokazeného storu nespadol v `escape()` a nezobral so sebou celý denný beh.
-3. **Nezúž fail-soft na „čo nepoznám, to je prázdne".** ISO **basic** tvar (`20260803`) je platný
+3. **Nezúž fail-soft na „čo nepoznám, to je prázdne".** ISO **basic** tvar (`99000803`) je platný
    dátum a `date.fromisoformat` ho číta jednoznačne — pripni ho testom, nech ho nikto nezahodí.
 4. **Zákazník číta po slovensky: `3. 8. 2026`, nie `2026-08-03`.** ISO drž interne (tvar API,
    JSON store, tabuľka na webe) a prekladaj až pri renderovaní mailu. Pozor na tichý prípad: kým

@@ -108,7 +108,7 @@ def test_a_parked_snapshot_is_dropped_once_that_value_is_actually_STORED(page, t
     # the very same text becomes the STORED comment while the row is off screen
     page.evaluate("""() => fetch('/api/order-comment', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({orderCode: '20260910', comment: 'uz ulozena poznamka'})
+      body: JSON.stringify({orderCode: '99000910', comment: 'uz ulozena poznamka'})
     }).then(() => loadOrders()).then(() => render())""")
 
     _chip(page, "CITRADE").click()

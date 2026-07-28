@@ -580,12 +580,12 @@ UNPARSABLE_TILLS = ["2026-13-45", "20.07.2026", "do odvolania", True, {"date": "
 
 
 def test_classify_accepts_the_basic_iso_form():
-    """Counterpart to the hostile set: `20260803` is not junk — it is ISO-8601 BASIC form, which
+    """Counterpart to the hostile set: `99000803` is not junk — it is ISO-8601 BASIC form, which
     date.fromisoformat reads unambiguously, so it must be accepted (and normalised), not dropped.
     Pinned so the fail-soft above can never be widened into „anything I don't like is empty"."""
-    j = {"results": [{"status": "ok", "retainedTill": 20260803, "events": [
+    j = {"results": [{"status": "ok", "retainedTill": 99000803, "events": [
         {"stateCode": "notified", "detailCode": "ZNP1AN", "localDate": "2026-07-16T08:10:00"}]}]}
-    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "2026-08-03"
+    assert pu.classify_tracking(j, today=TODAY)["retained_till"] == "9900-08-03"
 
 
 def test_classify_drops_every_unrecognised_retained_till_shape():

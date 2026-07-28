@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 import zipfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import formataddr, make_msgid
 from urllib.parse import quote, urljoin
@@ -1654,6 +1654,82 @@ def _save_unavailable(d: dict) -> None:
     _atomic_write_json(UNAVAIL, d, protect=True)
 
 
+# #291 — WHEN a flag write committed, as a number the client can order answers by.
+#
+# The tab writes optimistically and keeps a per-(flag, row) counter so a stale answer can
+# never overwrite a newer one. That counter is taken when a write is ISSUED, but what
+# decides the bytes on disk is the order the server threads took `with _lock:` — the order
+# they COMMITTED. Two writes issued inside one round-trip go out on two connections, so
+# the two orders can diverge, and the client then stands on the answer that committed
+# EARLIER while the store holds the other one. No client-side bookkeeping can close that;
+# only the server knows its own commit order, so it says so.
+#
+# It must never go BACKWARDS, and the wall clock alone does not give that. A tab that is
+# open across a deploy holds numbers from the old process; hand it a LOWER one and it
+# rejects every answer for the rest of its life, its `confirmed` baseline frozen on stale
+# data — the #290 failure shape through a different door. `time.time()` is CLOCK_REALTIME,
+# so a restart plus an NTP correction (or a VM snapshot restore, or a hand-set clock) does
+# exactly that; so does a SECOND process, which each seed their own counter (#262 records
+# one running over this data dir for four days).
+#
+# So the highest number handed out is RESERVED on disk and the seed is
+# `max(wall clock, reservation)`. Reserved in BLOCKS so a click costs no disk write, and
+# the block is extended BEFORE the counter reaches it — a reservation the counter has
+# already overrun would protect nothing.
+COMMIT_SEQ = _store("flag_commit_seq.json")
+COMMIT_SEQ_BLOCK = 100_000     # ~one write per disk touch per 100k clicks
+_flag_commit_seq = 0
+_flag_commit_reserved = 0
+
+
+def _reserve_commit_seq(upto: int) -> None:
+    """Persist „numbers up to `upto` may have been handed out". Derived state, so an
+    unwritable file degrades to the wall-clock-only behaviour instead of refusing writes —
+    the same stance the export watermark takes."""
+    global _flag_commit_reserved
+    _flag_commit_reserved = upto
+    try:
+        _atomic_write_json(COMMIT_SEQ, {"reserved": upto}, indent=None)
+    except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
+        log.warning("commit-seq rezerváciu sa nepodarilo zapísať (%r) — poradie commitov "
+                    "ostáva chránené len systémovým časom", e)
+
+
+def _seed_commit_seq() -> int:
+    """Start (or restart) the clock above BOTH the wall clock and anything a previous
+    process may already have handed out.
+
+    Called LAZILY, from the first `_next_commit_seq()` — never at import. Seeding at import
+    made importing this module WRITE into OUT, which breaks the invariant the whole #261
+    story rests on: a script (or a dry run) that has not yet pointed `WEBREVIEW_OUT` at a
+    copy would touch the manager's live dir before its own guard could fire, and the import
+    would take the inter-process flock behind a running service."""
+    global _flag_commit_seq
+    state = _read_json_store(COMMIT_SEQ, {})
+    prev = state.get("reserved") if isinstance(state, dict) else None
+    if not isinstance(prev, int) or isinstance(prev, bool) or prev < 0:
+        prev = 0
+    _flag_commit_seq = max(int(time.time() * 1000), prev)
+    _reserve_commit_seq(_flag_commit_seq + COMMIT_SEQ_BLOCK)
+    return _flag_commit_seq
+
+
+def _next_commit_seq() -> int:
+    """The commit number for the write being made. MUST be called inside the writer's own
+    `with _lock:` block — called outside it, two writes could take the same number, or
+    take them in the opposite order to the one they committed in, which is precisely the
+    thing this number exists to make impossible. Pinned by
+    `test_every_endpoint_takes_its_commit_number_while_holding_the_store_lock`, because no
+    browser test can see it: writes issued one after another come out increasing either way."""
+    global _flag_commit_seq
+    if not _flag_commit_seq:          # first write of this process — seed it now, in-lock
+        _seed_commit_seq()
+    _flag_commit_seq += 1
+    if _flag_commit_seq >= _flag_commit_reserved:
+        _reserve_commit_seq(_flag_commit_seq + COMMIT_SEQ_BLOCK)
+    return _flag_commit_seq
+
+
 # #211 — the four to-order markers are TWO AXES, not four independent ticks. Decided from
 # the manager's own live stores: 27 rows carried a combination and EVERY one of them
 # involved „objednané", while „čaká sa"/„skladom"/„nedostupné" never once overlapped each
@@ -1685,11 +1761,12 @@ def _status_stores() -> dict:
             "unavailable": (_load_unavailable, _save_unavailable)}
 
 
-def _write_status_flag(field: str, key: str, on: bool) -> dict:
+def _write_status_flag(field: str, key: str, on: bool) -> tuple:
     """Write ONE axis-B flag and, when turning it ON, clear the other two for that key.
     Turning a flag OFF says nothing about the others and touches only its own store.
-    Returns the resulting state of all four flags, so the answer itself tells the client
-    what the row now IS.
+    Returns `(flags, commit_seq)`: the resulting state of all four flags — so the answer
+    itself tells the client what the row now IS — and WHEN that state committed (#291),
+    which is the only thing that can order two answers correctly.
 
     The whole read-modify-write sits in ONE `with _lock:` block (which is inter-process),
     so no other WRITER can interleave. It is NOT atomic across FILES, though — `os.replace`
@@ -1725,10 +1802,309 @@ def _write_status_flag(field: str, key: str, on: bool) -> dict:
                 stores[name][1](loaded[name])
         flags = {"ordered": bool(_load_ordered().get(key))}
         flags.update({name: bool(d.get(key)) for name, d in loaded.items()})
+        # …inside the SAME lock as the saves above, so the number really does order this
+        # write against every other one (#291).
+        commit_seq = _next_commit_seq()
     if dirty - {field}:
         log.info("status %s key=%s on=%s cleared=%s",
                  field, key, on, ",".join(sorted(dirty - {field})))
-    return flags
+    return flags, commit_seq
+
+
+# #212 — the four per-line flag stores, as (name, loader, saver). Named here so the prune
+# below cannot drift from the set it is supposed to cover; `order_comments.json` is
+# deliberately NOT in it (see its own comment — it is keyed per ORDER and is meant to
+# outlive the order), and neither is any per-PRODUCT store.
+def _line_flag_stores() -> tuple:
+    """Resolved PER CALL, for the same reason as `_status_stores`: a module-level tuple of
+    function objects would freeze at import and quietly stop reaching a later rebinding."""
+    return (("ordered_items.json", _load_ordered, _save_ordered),
+            ("waiting_items.json", _load_waiting, _save_waiting),
+            ("instock_items.json", _load_instock, _save_instock),
+            ("unavailable_items.json", _load_unavailable, _save_unavailable))
+
+
+# An orders export carrying FAR fewer orders than the shop makes is not a quiet quarter,
+# it is a broken feed — a changed export pattern, a filter left on, a truncated download.
+# Same shape and same reasoning as `EXPORT_MIN_CODES` for the catalogue: an absolute floor
+# far below reality, which cannot fire on a running shop and cannot disarm itself.
+#
+# Measured on the live 90-day export (2026-07-28): 521 distinct order codes, 57 of them
+# still „Vybavuje sa". 50 is an order of magnitude under that — a rate no month of this
+# shop has ever come near — while still catching „the export came back with three rows".
+ORDERS_PRUNE_MIN_ORDERS = 50
+ORDERS_PRUNE_LOG_KEYS = 20     # how many removed keys are named in the log line
+
+# The statuses that MEAN the order is finished. Closure is membership in THIS set — never
+# „everything that is not the one open literal", which is the same negative evidence this
+# whole prune exists to avoid, just applied to the status instead of to the presence.
+#
+# This is not a two-status shop. The live 90-day export (2026-07-28) carries nine:
+#   Vybavená 387 · Stornovaná 63 · Vybavuje sa 57 · Vybavená výmena 4 · Osob. odber 3
+#   Vybavený Dobropis 3 · Kompletná 2 · Vratený tovar 1 · Výmena tovaru 1
+# `Osob. odber` (waiting to be collected) and `Výmena tovaru` (an exchange being handled)
+# are LIVE states, and `seen - still_open` called all of them closed.
+#
+# Two independent signals in that same data pick out exactly the four below, which is why
+# the list can be trusted rather than guessed:
+#   * the shop's naming convention — the finished form carries a „Vybavená/Vybavený"
+#     prefix: „Vybavená výmena" against „Výmena tovaru", „Vybavený Dobropis" against
+#     „Vratený tovar";
+#   * the tracking number, i.e. the goods physically left: Vybavená 250/387,
+#     Vybavená výmena 4/4, Vybavený Dobropis 3/3 — against Kompletná 0/2, Vratený tovar
+#     0/1, Výmena tovaru 0/1, Osob. odber 0/3.
+# `Stornovaná` is the exception that proves the rule (1/63 — a cancelled order has nothing
+# to dispatch) and is unambiguously over.
+#
+# DELIBERATELY OFF the list, both against the review's suggested minimum:
+#   * `Vratený tovar` — by the convention above it is the in-progress counterpart of
+#     `Vybavený Dobropis` (the goods came back, the credit note is not issued yet). Two of
+#     today's 24 deletions sit on it.
+#   * `Kompletná` — both live ones are 2 and 5 days old with NO tracking number, i.e. fresh
+#     and not dispatched, which reads as „assembled, waiting to go", not as over.
+# The asymmetry decides both: leaving a status off costs a handful of keys that linger until
+# the order reaches a status we do recognise; putting one on wrongly deletes the manager's
+# irreplaceable marks from an order still being handled — and if it returns to „Vybavuje sa"
+# the line is ordered from the supplier a second time, the exact harm the marks prevent.
+# Promoting a status onto this list needs evidence; the reverse cannot be undone.
+ORDERS_TERMINAL_STATUSES = frozenset({
+    "Vybavená", "Vybavená výmena", "Vybavený Dobropis", "Stornovaná",
+})
+
+# The statuses we know about and have deliberately judged NOT finished. They are not
+# reported as „unknown": the unknown list exists so a genuinely NEW status is noticed, and a
+# signal that fires permanently on four expected values is noise that hides the one case it
+# was built for. Adding a status here is a claim that somebody weighed it — see the comment
+# above for how the four below were weighed.
+ORDERS_KNOWN_OPEN_STATUSES = frozenset({
+    "Vybavuje sa", "Osob. odber", "Výmena tovaru", "Vratený tovar", "Kompletná",
+})
+
+# `statusName` is an untrusted CSV cell: a shifted or corrupt export puts arbitrary row
+# content there, and whatever lands in the unknown list is logged, persisted into
+# `automations.json` and rendered on the card. Bound both axes so a broken export can never
+# dump its contents — possibly customer data — into the manager's automation store for good.
+ORDERS_UNKNOWN_STATUS_MAX = 20
+ORDERS_UNKNOWN_STATUS_MAXLEN = 80
+# a blank status is not falsy-therefore-ignorable: it is an unreadable one, and dropping it
+# would narrow the prune with no trace anywhere. It gets a name instead.
+ORDERS_BLANK_STATUS_LABEL = "(prázdny stav)"
+
+# A floor on the age of the ORDER ITSELF — and the name says that, because it is NOT the
+# reopen grace it was first written as, and cannot be one.
+#
+# What it was meant for: a „Vybavená" order can be REOPENED to „Vybavuje sa" — this repo
+# says so itself where the reminder dedup store explains why IT keeps records
+# (`orders_reminder.py`, DEDUP_RETENTION_DAYS). A line that comes back with the manager's
+# „objednané u dodávateľa" silently gone is a line he orders a second time, which is the
+# exact harm those marks exist to prevent.
+#
+# What it actually measures: days since the order was PLACED. The export carries 66 columns
+# and its only date is `date` = order creation; there is no status-change or last-modified
+# column anywhere in it, so the moment an order closed simply cannot be read from the source.
+# Be plain about the consequence: an order placed 31 days ago and closed TODAY is pruned on
+# the very next hourly run, with no grace at all — and that is precisely the long
+# supplier-wait order these marks exist for (live open flagged orders run up to 75 days old).
+# Measuring a real grace needs us to record when we first SAW an order closed, i.e. a new
+# store; that is #294, deliberately not smuggled in here.
+#
+# It is still worth keeping as what it is: a bound on how long a key can live. 30 days
+# against a 90-day export window (`ORDERS_EXPORT_WINDOW_DAYS`) leaves 60 days of hourly runs
+# in which every eligible key is still reachable, so nothing is ever stranded, and it does
+# cover the common case where an order closes near the day it was placed. The stores settle
+# at „the last month's work" instead of growing for ever, which is the actual ticket.
+ORDERS_PRUNE_MIN_ORDER_AGE_DAYS = 30
+
+
+def _orders_by_openness(orders_csv):
+    """`(seen, still_open, finished, first_date_per_order, unknown, reason)` — `reason` is
+    `""` when the export can be believed, and otherwise names WHY it cannot.
+
+    `finished` is the set the caller deletes against, and it is built by POSITIVE
+    membership in `ORDERS_TERMINAL_STATUSES`: an order is finished only when it has rows
+    and not one of them carries a status outside that list. A status this code has never
+    met — a renamed one, a newly added one — therefore keeps its keys instead of losing
+    them, which `seen - still_open` got exactly backwards. `unknown` collects those
+    statuses so an added one is reported rather than silently narrowing the prune.
+
+    `statusName` is the whole ORDER's status and is repeated on every one of its lines
+    (`build_to_order_rows` reads it per row for exactly that reason), so a mixed order
+    should not exist; if one ever does, one unfinished row keeps the whole order.
+
+    Three ways this refuses to answer, all fail-closed — the floor counts only `seen`, and
+    the `protect=True` shrink guard cannot fire on a prune because a prune IS a legitimate
+    read-modify-write, so a lying export has nothing else standing in its way:
+
+    * **no `statusName` column** — every row would read as an unknown status. A changed
+      export template does this, and so does a creds URL repointed at another export that
+      happens to have a `code` column too. Caught on the HEADER, before a row is judged.
+    * **a body that does not end in a newline** — it is incomplete by definition, and the
+      row the cut landed in comes back with a truncated or missing status, i.e. a genuinely
+      OPEN order reading as closed. The trailing partial row is dropped. (Where the cut
+      lands INSIDE a quoted field the slice can keep a partial row — but `code`, `date` and
+      `statusName` are the export's first three columns and every multi-line field
+      (`remark`, `shopRemark`) sits far past them, so the status is still whole. That
+      column ORDER is what makes it safe; a future export template that moves `statusName`
+      behind a free-text column would break it silently.)
+    * **`csv.Error`** — a bare CR in an unquoted field, or a field past
+      `csv.field_size_limit`. It is neither `ValueError` nor `OSError`, so left to escape it
+      would sail past the caller's housekeeping `except` and take the whole hourly sync
+      down; `errors="replace"` guarantees any byte soup reaches the parser.
+    """
+    text = (orders_csv.decode("cp1250", errors="replace")
+            if isinstance(orders_csv, bytes) else orders_csv or "")
+    # An incomplete last line is not data — see the docstring. `splitlines` would also cut
+    # a legitimate embedded newline inside a quoted field, so slice on the raw text.
+    if text and not text.endswith(("\n", "\r")):
+        cut = max(text.rfind("\n"), text.rfind("\r"))
+        text = text[:cut + 1] if cut >= 0 else ""
+    seen, still_open, unfinished, dates, unknown = set(), set(), set(), {}, set()
+    try:
+        rd = csv.DictReader(io.StringIO(text), delimiter=";")
+        if "statusName" not in (rd.fieldnames or []):
+            # count the orders anyway: an alarm has to return the number it fired on, or
+            # the operator is told „your export is wrong" with nothing to go and look at
+            # (`.claude/rules/automation-health.md` point 3)
+            got = {(r.get("code") or "").strip() for r in rd}
+            return {c for c in got if c}, set(), set(), {}, set(), "no-status-column"
+        for r in rd:
+            code = (r.get("code") or "").strip()
+            if not code:
+                continue
+            seen.add(code)
+            status = (r.get("statusName") or "").strip()
+            if status == "Vybavuje sa":
+                still_open.add(code)
+            if status not in ORDERS_TERMINAL_STATUSES:
+                unfinished.add(code)
+                if status not in ORDERS_KNOWN_OPEN_STATUSES:
+                    unknown.add(status[:ORDERS_UNKNOWN_STATUS_MAXLEN] if status
+                                else ORDERS_BLANK_STATUS_LABEL)
+            if code not in dates:
+                dates[code] = (r.get("date") or "").strip()[:10]
+    except csv.Error as e:
+        log.warning("orders export sa nedá rozparsovať (%r) — prune nemaže nič", e)
+        return set(), set(), set(), {}, set(), "unparsable-source"
+    return seen, still_open, seen - unfinished, dates, unknown, ""
+
+
+def _order_is_old_enough(day: str) -> bool:
+    """Is this order past the order-age floor (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`)? Note the
+    name: it is the age of the ORDER, not time since it closed, and it is therefore NOT the
+    reopen grace it was first written as — the export carries no status-change date, so that
+    needs a store of its own (#294).
+
+    An unreadable or missing date means we do NOT know its age — and an unknown age is never
+    „old enough" (the same stance `_parse_date`'s callers take for a date going to a
+    customer)."""
+    try:
+        placed = date.fromisoformat((day or "").strip())
+    except ValueError:
+        return False
+    return (date.today() - placed).days >= ORDERS_PRUNE_MIN_ORDER_AGE_DAYS
+
+
+def _prune_orphan_line_flags(orders_csv) -> dict:
+    """#212 — drop per-line flag keys whose ORDER the export positively shows as closed.
+
+    `orderCode` is transient: the tab only ever shows „Vybavuje sa" orders, so once an
+    order is dispatched its `<orderCode>|<itemCode>` keys can never be seen or cleared
+    again and the stores grow without bound (measured on the manager's live data: 141 of
+    217 keys were already orphans).
+
+    THE RULE IS POSITIVE EVIDENCE — on BOTH axes, which is the whole safety argument. A key
+    goes only when its order IS in the export (presence) AND every one of its rows carries a
+    status that MEANS finished (`ORDERS_TERMINAL_STATUSES`). „Not the open literal" is not
+    evidence of anything: the shop's status names are configurable text and it uses nine of
+    them, so an unknown or newly added one used to read as closed. An order the
+    export does not mention is not closed, it is UNSEEN — it may simply be older than
+    `ORDERS_EXPORT_WINDOW_DAYS`, or its rows may have been lost from a truncated download.
+    Because a cut export can only make rows DISAPPEAR (it cannot rewrite an order's status
+    onto its remaining lines), a damaged source can only ever make this prune remove FEWER
+    keys, never more. The ticket's own wording — „delete what is not among the open
+    orders" — would instead sweep away every key outside the window, which is live work we
+    merely cannot see.
+
+    On top of that, a fail-closed floor on the source (`ORDERS_PRUNE_MIN_ORDERS`): an
+    export carrying implausibly few orders prunes nothing at all.
+
+    Read-modify-write in ONE `with _lock:` block (inter-process, #264), removing IN PLACE
+    from the loaded map so the write is the legitimate tail of a read-modify-write and the
+    `protect=True` shrink guard (#261/#265) stays fully armed. A store with nothing to
+    remove is not written at all — a no-op write to a protected store burns its read
+    receipt and rewrites a file nothing asked to change (`_write_status_flag` follows the
+    same rule).
+
+    Returns `{"pruned": n, "skipped": reason, "orders_seen": n, "orders_open": n,
+    "unknown_statuses": [...], "per_store": {...}}` — counts the caller can put in front of
+    a human. `unknown_statuses` is the honest cost of the allow-list: a status nobody added
+    to it quietly stops being pruned, so the run names it instead of hiding it.
+
+    It deliberately takes NO commit number (#291), unlike every other writer of these
+    stores: those numbers order two answers to the SAME open row for a client that is
+    watching it, and a pruned key belongs to an order the tab can no longer display at
+    all, so there is no client state for it to order against."""
+    seen, still_open, finished, dates, unknown, reason = _orders_by_openness(orders_csv)
+    unknown_statuses = sorted(unknown)[:ORDERS_UNKNOWN_STATUS_MAX]
+    if reason:
+        log.error("prune riadkových príznakov PRESKOČENÝ (%s): export nesie %d objednávok "
+                  "— nemaže sa nič", reason, len(seen))
+        return {"pruned": 0, "skipped": reason, "orders_seen": len(seen),
+                "orders_open": 0, "unknown_statuses": unknown_statuses, "per_store": {}}
+    if len(seen) < ORDERS_PRUNE_MIN_ORDERS:
+        log.warning("prune riadkových príznakov PRESKOČENÝ: export nesie len %d objednávok "
+                    "(minimum %d) — vyzerá neúplne, nemaže sa nič",
+                    len(seen), ORDERS_PRUNE_MIN_ORDERS)
+        return {"pruned": 0, "skipped": "implausible-source", "orders_seen": len(seen),
+                "orders_open": len(still_open),
+                "unknown_statuses": unknown_statuses, "per_store": {}}
+    # An export in which NOTHING is open is a sign we are reading something other than what
+    # we think: a renamed open status (Shoptet's status names are shop-configurable TEXT and
+    # the literal is hard-coded here), a different export, a filter left on. On a healthy
+    # feed it is impossible — measured: 57 open of 521 — so it is not a quiet week.
+    #
+    # Since the allow-list above, this can no longer turn into a wipe on its own (closure
+    # needs positive membership, and a renamed status is simply not on the list), so it is
+    # now belt to that braces. It stays because it is still the cheapest signal that the
+    # source changed under us, and it names the failure instead of leaving the run to look
+    # healthy while pruning nothing.
+    if not still_open:
+        log.error("prune riadkových príznakov PRESKOČENÝ: v exporte s %d objednávkami nie "
+                  "je ani jedna so stavom Vybavuje sa — premenovaný stav alebo iný "
+                  "export? Nemaže sa nič", len(seen))
+        return {"pruned": 0, "skipped": "no-open-orders", "orders_seen": len(seen),
+                "orders_open": 0, "unknown_statuses": unknown_statuses, "per_store": {}}
+    # An added status narrows what gets pruned without anything failing — the honest cost of
+    # the allow-list, so it is logged and reported (rendered on the card) rather than hidden.
+    if unknown_statuses:
+        log.info("prune riadkových príznakov: export nesie stavy, ktoré nepoznám a preto "
+                 "ich nepovažujem za ukončené: %s", ", ".join(unknown_statuses))
+    closed = {c for c in finished if _order_is_old_enough(dates.get(c))}
+    per_store, total = {}, 0
+    with _lock:
+        for name, load, save in _line_flag_stores():
+            d = load()
+            # a key with no `<order>|<item>` shape cannot be attributed to an order, so it
+            # can never be SHOWN to be orphaned — it is left alone rather than guessed at
+            gone = sorted(k for k in d
+                          if "|" in k and k.split("|", 1)[0] in closed)
+            per_store[name] = len(gone)
+            if not gone:
+                continue
+            for k in gone:
+                d.pop(k, None)
+            save(d)
+            total += len(gone)
+            log.info("prune %s: odstránených %d osirelých kľúčov (objednávka je v exporte "
+                     "a jej stav znamená vybavené): %s%s", name, len(gone),
+                     ", ".join(gone[:ORDERS_PRUNE_LOG_KEYS]),
+                     " …" if len(gone) > ORDERS_PRUNE_LOG_KEYS else "")
+    if not total:
+        log.info("prune riadkových príznakov: nič na odstránenie (%d objednávok v exporte, "
+                 "%d otvorených)", len(seen), len(still_open))
+    return {"pruned": total, "skipped": "", "orders_seen": len(seen),
+            "orders_open": len(still_open), "unknown_statuses": unknown_statuses,
+            "per_store": per_store}
 
 
 def _flag_snapshot(key: str) -> dict:
@@ -2811,8 +3187,9 @@ def api_ordered():
         # so the client has ONE shape to mirror (#211). Snapshot INSIDE the same lock, or
         # the answer can describe a concurrent later write instead of this one.
         flags = _flag_snapshot(key)
+        commit_seq = _next_commit_seq()          # #291 — inside the same lock as the save
     log.info("ordered key=%s ordered=%s", key, ordered)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 @app.route("/api/ordered/bulk", methods=["POST"])
@@ -2838,8 +3215,9 @@ def api_ordered_bulk():
             else:
                 d.pop(key, None)
         _save_ordered(d)
+        commit_seq = _next_commit_seq()          # #291 — inside the same lock as the save
     log.info("ordered bulk n=%d ordered=%s", len(keys), ordered)
-    return jsonify({"ok": True, "count": len(keys)})
+    return jsonify({"ok": True, "count": len(keys), "commitSeq": commit_seq})
 
 
 @app.route("/api/waiting", methods=["GET", "POST"])
@@ -2854,9 +3232,9 @@ def api_waiting():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     waiting = bool(body.get("waiting"))
-    flags = _write_status_flag("waiting", key, waiting)   # axis B — clears the other two
+    flags, commit_seq = _write_status_flag("waiting", key, waiting)   # axis B — clears the other two
     log.info("waiting key=%s waiting=%s", key, waiting)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 @app.route("/api/instock", methods=["GET", "POST"])
@@ -2870,9 +3248,9 @@ def api_instock():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     instock = bool(body.get("instock"))
-    flags = _write_status_flag("instock", key, instock)   # axis B — clears the other two
+    flags, commit_seq = _write_status_flag("instock", key, instock)   # axis B — clears the other two
     log.info("instock key=%s instock=%s", key, instock)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 @app.route("/api/unavailable", methods=["GET", "POST"])
@@ -2886,9 +3264,9 @@ def api_unavailable():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     unavailable = bool(body.get("unavailable"))
-    flags = _write_status_flag("unavailable", key, unavailable)   # axis B — clears the rest
+    flags, commit_seq = _write_status_flag("unavailable", key, unavailable)   # axis B — clears the rest
     log.info("unavailable key=%s unavailable=%s", key, unavailable)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 # --------------------------------------------------------------------------- #
@@ -5877,9 +6255,13 @@ def run_shoptet_sync() -> dict:
     then rebuilds the in-memory CODE2PAIR/CATALOG search
     index and resyncs each review card's price/stock snapshot
     (export_helpers.resync_current — the same logic scripts/resync_export.py
-    runs manually). Passive READ-ONLY refresh: never touches the manager
-    decision stores (decisions/ordered_items/waiting_items/order_pairings/
-    supplier_assignments — those are the manager's live work, untouched here).
+    runs manually). Passive READ-ONLY refresh as far as the manager's decision
+    stores go (decisions/order_pairings/supplier_assignments — his live work),
+    with ONE deliberate exception since #212: the per-line flag stores are pruned
+    of keys whose ORDER the freshly downloaded export positively shows as closed.
+    That prune only ever REMOVES keys the tab could never display again, never
+    writes a value, and disarms itself on an implausible export
+    (`_prune_orphan_line_flags`).
 
     Fetch-then-swap (temp file + atomic os.replace) throughout: a failed/partial
     fetch raises BEFORE anything on disk changes, so the runner's existing
@@ -5890,6 +6272,24 @@ def run_shoptet_sync() -> dict:
 
     orders_bytes = _fetch_orders_csv()
     _atomic_write_bytes(ORDERS_CACHE, orders_bytes, mode=0o600)
+
+    # #212 — on the bytes we have JUST downloaded, which is the freshest ground truth
+    # there is. Deliberately NOT on the read path `/api/orders`: a write there would turn
+    # „read the export" into a mutation and would let a STALE on-disk copy keep deciding
+    # what to delete (the same reason `_export_watermark_observe` is not hidden inside a
+    # reader). Housekeeping, so it can never take the hourly refresh down with it — a
+    # refused or failed prune leaves the stores exactly as they were and the sync goes on.
+    try:
+        prune = _prune_orphan_line_flags(orders_bytes)
+    except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError,
+            csv.Error) as e:  # noqa: BLE001
+        # `csv.Error` explicitly: it is neither ValueError nor OSError, so without it a
+        # malformed export would escape and take the catalogue refresh, the review resync
+        # and the customer export down with it, every hour, while this comment promised
+        # the opposite. `_orders_by_openness` already catches it — this is the backstop.
+        log.error("prune riadkových príznakov preskočený (%r) — sync pokračuje", e)
+        prune = {"pruned": 0, "skipped": repr(e), "orders_seen": 0, "orders_open": 0,
+                 "unknown_statuses": [], "per_store": {}}
 
     # A REFUSED download is NON-FATAL (PR #280 review, MUST FIX 2). The refusal fires
     # only while the copy already on disk is fresh AND plausible — it exists to protect
@@ -5978,7 +6378,30 @@ def run_shoptet_sync() -> dict:
         "review_synced": counts["synced"],
         "review_stale": counts["stale"],
         "customers_bytes": len(customers_bytes),
+        # #212 — how many of the manager's per-line flag keys this run deleted. It is the
+        # one thing in this automation that REMOVES his markings, so it is reported next
+        # to the rest rather than living only in the log.
+        "flags_pruned": prune["pruned"],
+        # …and the numbers any refusal fired on. A refusal that returns a bare 0 tells the
+        # operator „your export is wrong" with nothing to go and look at
+        # (`.claude/rules/automation-health.md` §3, and store-prune §7).
+        "flags_orders_seen": prune["orders_seen"],
+        "flags_orders_open": prune["orders_open"],
+        # the honest cost of the terminal-status allow-list: a status nobody taught it about
+        # quietly stops being pruned, so the run names it instead of hiding it
+        "flags_unknown_statuses": prune["unknown_statuses"],
     }
+    if prune["skipped"]:
+        result["flags_prune_skipped"] = prune["skipped"]
+        # #293 — the refusal is SAFE but PERMANENT: `no-open-orders` / `no-status-column`
+        # hold until the export is fixed, so the prune never runs once and the flag stores
+        # grow exactly as they did before #212. Everything else in this run legitimately
+        # succeeded, so `last_status` stays `ok` — which is precisely how the „quietly dead
+        # automation" looks. It rides the SAME `source_degraded` flag #282 introduced (a run
+        # that cannot read its own input has failed, whether or not it threw), because
+        # `navError()` already lights the sidebar ⚠ from it; a second predicate would be one
+        # more branch every future automation has to remember to hit.
+        result["source_degraded"] = True
     if export_error:
         result["export_error"] = export_error
     if customers_error:
@@ -7348,7 +7771,12 @@ AUTOMATION_DESCRIPTIONS = {
     "shoptet_sync":
         "Každú hodinu stiahne objednávky (posledných 90 dní) a celý katalóg zo "
         "Shoptetu a podľa toho prestaví vyhľadávací index aj naše ceny/sklad na "
-        "review kartách. Nemení žiadne manažérove rozhodnutia, len obnovuje dáta.",
+        # #212 corrected `run_shoptet_sync`'s docstring but not THIS string, which is the
+        # one the manager actually reads on the card — and it promised the very thing the
+        # prune stopped being true: it does now remove his markings, just only the ones the
+        # tab could never show him again.
+        "review kartách. Zmaže pritom značky pri riadkoch tých objednávok, ktoré sú už "
+        "vybavené a na tabe sa nedajú zobraziť — nič iné z tvojej práce nemení.",
     "parovania_eshop":
         "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
         "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",

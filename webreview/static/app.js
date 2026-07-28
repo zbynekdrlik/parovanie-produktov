@@ -962,60 +962,138 @@ async function postToOrder(path, payload, out) {
 // server explicitly refused (the manager is told the save failed and then looks at a row
 // claiming it succeeded). Keyed per FLAG too — 'čaká sa' and 'skladom' are independent
 // writes on the same row and must not supersede each other.
-// (Responses arriving out of REQUEST order stay inherently unresolvable client-side;
-// this fixes the client's own bookkeeping, which is what invented the phantom flag.)
+// (#291: which answer is NEWEST is decided by the server's own commit number, not by the
+// order this client issued the writes in — see `confirmedCommit` below.)
 const _flagWrites = Object.create(null);
 
 // The entry is NEVER deleted (bounded by rows x 4 flags): `confirmed` is this row+flag's
 // last known SERVER value and is the baseline for every future write. Deleting it on
 // settle opened a generation hole — a straggler from an older burst would land on the
 // entry a LATER click had freshly created and poison its baseline, putting the phantom
-// flag right back. `confirmedSeq` is what closes it: a write's acceptance only counts if
-// no LATER-issued write has already been accepted.
+// flag right back. `confirmedCommit` is what closes it: a write's acceptance only counts
+// if no write that committed LATER has already been accepted.
+//
+// #291 — that number is the SERVER's (`commitSeq`, taken inside the same `with _lock:`
+// block that writes the store), never this client's `seq`. `seq` is taken when a write is
+// ISSUED, and two writes issued inside one round-trip go out on two connections whose
+// server threads take the lock in either order — so issue order is simply not commit
+// order, and a guard built on it stands on whichever answer was issued last instead of on
+// the one that IS the store. `seq` keeps its OTHER job untouched: it decides which write
+// still owns the (flag, row) for rollback and for REPORTING (`seqs[0] === sts[0].seq`),
+// and that one really is about the manager's latest INTENT, not about the server's history.
+//
+// The two numbers are deliberately NOT interchangeable: `seq` is an independent counter
+// per (flag, row), `confirmedCommit` is ONE global clock. That is what finally makes
+// answers comparable across flags — but the stamping rule from the PR #290 review stands
+// unchanged (a write may only stamp the guard of a flag it CLAIMED), because a write must
+// not materialise bookkeeping for a flag it never wrote.
 function _flagEntry(field, key, map) {
   const wk = field + '\u0000' + key;
   return _flagWrites[wk]
-    || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedSeq: 0, inflight: 0 });
+    || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedCommit: 0, inflight: 0 });
 }
 
-// Every flag write answers `{ok, flags:{ordered, waiting, instock, unavailable}}` — the
-// server's own account of the row AT THE MOMENT that write committed. Adopt it through the
-// SAME gate the client's bookkeeping uses, so an answer that committed EARLIER can never
-// overwrite one that committed later (`confirmedSeq`), and so a map another write is still
-// holding optimistically is left alone (`inflight`). Returns true if anything moved.
+// The server's commit number out of one answer, or `null` when the answer does not carry
+// one — a success whose body `postToOrder` turned into `null` (a truncated response; this
+// app is served through a tunnel), or a tab still running this file against a server that
+// predates #291.
+function _commitOf(body) {
+  const n = body && body.commitSeq;
+  return (typeof n === 'number' && isFinite(n)) ? n : null;
+}
+
+// An ACCEPTED answer with NO commit number cannot be placed in the server's history — and
+// every way of GUESSING where it belongs is issue-order reasoning wearing a different hat.
+// Both were tried and both are wrong:
 //
-// `claimed` = {field: the sequence number THAT FIELD took for this write}. The answer
-// describes all four flags, but only the ones the write actually claimed may be stamped
-// with it: `seq` is an INDEPENDENT counter per (flag, row) — that independence is the
-// whole point of `_flagWrites` — so the numbers are NOT comparable across flags. Stamping
-// every answered flag with the CLICKED flag's number wrote a foreign, higher value into
-// the guard of a flag whose own counter was behind; that guard then rejected that flag's
-// own accepted writes, `confirmed` froze on stale data, and the next REFUSED write "rolled
-// back" to the stale value, i.e. did not roll back — leaving the row shown un-ordered
-// while the server held it (and the mirror image). The invariant, in one line: a flag's
-// `confirmedSeq` may only ever be set from a sequence number THAT flag claimed.
+//   * refuse it outright — `confirmed` freezes on a value the server has moved past, and
+//     the next REFUSED write „rolls back" onto that stale value, i.e. does not roll back.
+//     The row then shows a flag the server does not hold, right after the manager was told
+//     the save failed. That is the #290 shape (and a regression against the code before
+//     #291, measured on both).
+//   * adopt it when this write is „still the latest issued and nothing else is out" — it
+//     can adopt OVER a newer numbered answer, and when two unnumbered answers come back in
+//     the reverse of their commit order it adopts NEITHER, leaving `confirmed` frozen and
+//     the map forced back onto it.
 //
-// Nothing is lost by the restriction, because no endpoint writes across the axes: a write
-// can only ever change the flags it claimed. `/api/ordered` touches `ordered` alone (axis A
-// clears nothing) and `_write_status_flag` only the three axis-B stores — and turning an
-// axis-B status ON already claims all three of them (`toggleStatusFlag`), which is exactly
-// the reverse-commit-order case this mirror was added for.
+// So the client does not decide at all: it asks the only party that knows. `loadOrders()`
+// re-reads every flag from the server and drops the bookkeeping with it, which is exactly
+// the recovery this situation calls for — and it is the same path a tab switch already
+// takes, so nothing new can go stale. Debounced, because a burst of unnumbered answers is
+// one event, not N.
+//
+// Reachable through a truncated body (`postToOrder` turns an unparsable one into `null`;
+// this app is served through a tunnel) and through a tab that outlives a rollback deploy.
+// Both are transient, so paying one extra read for them is the cheap side of the trade.
+let _resyncPending = false;
+
+async function _resyncFlagsFromServer() {
+  if (_resyncPending) return;
+  _resyncPending = true;
+  try {
+    await loadOrders();
+  } finally {
+    _resyncPending = false;
+  }
+  if (ACTIVE_TAB === 'toorder') renderToOrder();
+}
+
+// May this ACCEPTED answer be adopted as the flag's new server-known value? One rule, one
+// number space: only an answer that says WHEN it committed, and only if nothing that
+// committed later has been adopted already.
+function _mayAdopt(commit, st) {
+  return commit !== null && commit >= st.confirmedCommit;
+}
+
+// Every flag write answers `{ok, flags:{ordered, waiting, instock, unavailable}, commitSeq}`
+// — the server's own account of the row AT THE MOMENT that write committed, plus WHEN it
+// committed. Adopt it through the SAME gate the client's bookkeeping uses, so an answer
+// that committed EARLIER can never overwrite one that committed later (`confirmedCommit`),
+// and so a map another write is still holding optimistically is left alone (`inflight`).
+// Returns true if anything moved.
+//
+// #291 — the comparison is on the SERVER's commit number, not on this client's issue
+// counter. Issue order approximates commit order and is wrong exactly when it matters:
+// two writes issued inside one round-trip travel on separate connections, so a write
+// issued FIRST can take `with _lock:` LAST. Its answer is then the newest truth there is
+// — it IS the store — and the old gate threw it away as stale for carrying the lower
+// issue number, leaving the row showing the value that committed earlier.
+//
+// `claimed` = {field: the ISSUE number that field took}, which is now used only as the
+// SET of flags this write may stamp — never as the number stamped. The answer describes
+// all four flags, but a write may still only touch the guards of the ones it claimed:
+// `_flagEntry` creates entries on demand, so stamping an unclaimed flag would materialise
+// bookkeeping for a flag this write never wrote. (Under the old ISSUE numbering the
+// restriction was load-bearing for CORRECTNESS too — the counters were independent per
+// (flag, row), so a foreign number could outrank a flag's own accepted writes, freeze its
+// `confirmed` on stale data and turn the next refused write's rollback into a no-op. A
+// single global commit clock removes that hazard; the restriction stays for the reason
+// above.)
+//
+// Nothing is lost by it, because no endpoint writes across the axes: a write can only ever
+// change the flags it claimed. `/api/ordered` touches `ordered` alone (axis A clears
+// nothing) and `_write_status_flag` only the three axis-B stores — and turning an axis-B
+// status ON already claims all three of them (`toggleStatusFlag`).
 function _mirrorServerFlags(body, key, claimed) {
   const flags = body && body.flags;
-  if (!flags) return false;
+  const commit = _commitOf(body);
+  // An answer with no commit number cannot be ordered against the others describing this
+  // row, and here — unlike the write's OWN flag in `saveOrderWrite` — there is no „nothing
+  // else is in flight for it" to fall back on, because these are the write's other flags.
+  // Its own value is adopted there; the rest of the answer is simply not used.
+  if (!flags || commit === null) return false;
   const maps = { ordered: ORDERED, waiting: WAITING, instock: INSTOCK, unavailable: UNAVAIL };
   let moved = false;
   for (const field of Object.keys(maps)) {
     if (typeof flags[field] !== 'boolean') continue;
-    const seq = claimed[field];
     // an unclaimed flag is not even LOOKED UP: `_flagEntry` creates the entry on demand,
     // so touching one here would materialise bookkeeping for a flag this write never wrote
-    if (seq === undefined) continue;
+    if (claimed[field] === undefined) continue;
     const map = maps[field];
     const st = _flagEntry(field, key, map);
-    if (_flagWrites[st.wk] !== st || seq < st.confirmedSeq) continue;
+    if (_flagWrites[st.wk] !== st || commit < st.confirmedCommit) continue;
     st.confirmed = flags[field];
-    st.confirmedSeq = seq;
+    st.confirmedCommit = commit;
     if (st.inflight !== 0 || !!map[key] === flags[field]) continue;
     if (flags[field]) map[key] = true; else delete map[key];
     moved = true;
@@ -1059,10 +1137,16 @@ async function saveOrderWrite(path, payload, writes, key, what) {
   // the newer write already owns the row and speaks for it.
   const owner = live && seqs[0] === sts[0].seq;
   let repaint = false;
+  // #291 — WHEN this write committed, from the server, never `seq` (when it was ISSUED).
+  // One number per response, so it is read once rather than once per flag.
+  const commit = _commitOf(ans.json);
   writes.forEach((w, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;
-    if (!err && seq >= st.confirmedSeq) { st.confirmed = w.value; st.confirmedSeq = seq; }
+    // `_mirrorServerFlags` below re-reads the same number and overwrites `confirmed` with
+    // the server's own account of the flag; this line is what carries an answer that has
+    // no `flags` to mirror, and the unnumbered one (`_mayAdopt`).
+    if (!err && _mayAdopt(commit, st)) { st.confirmed = w.value; st.confirmedCommit = commit; }
     if (seq !== st.seq) {                     // a later write owns this (flag, row) now
       // …and once nothing else is out for it, the map owes the server's own last word
       if (st.inflight === 0 && !!w.map[key] !== st.confirmed) {
@@ -1076,15 +1160,18 @@ async function saveOrderWrite(path, payload, writes, key, what) {
       repaint = true;
     }
   });
-  // The SERVER is the authority and every answer says what the row now IS. The client's
-  // own issue-order bookkeeping is not enough by itself: two axis-B writes issued inside
-  // one round-trip travel on separate connections and their server threads can take
-  // `with _lock:` in the REVERSE order, so both succeed and the server's final state is
-  // the one that committed LAST — not the one the client issued last. Mirror the answered
-  // flags through the SAME confirmed/confirmedSeq gate, so a stale answer can never
-  // overwrite a newer one, and only touch a map with nothing else in flight for it —
-  // each flag under the sequence number IT claimed, never the clicked flag's.
+  // The SERVER is the authority and every answer says what the row now IS — and, since
+  // #291, WHEN it said so. Two writes issued inside one round-trip travel on separate
+  // connections and their server threads can take `with _lock:` in the REVERSE order, so
+  // both succeed and the server's final state is the one that COMMITTED last, not the one
+  // the client ISSUED last. Mirror the answered flags through the SAME
+  // confirmed/confirmedCommit gate, so an answer that committed earlier can never overwrite
+  // one that committed later, and only touch a map with nothing else in flight for it —
+  // restricted to the flags this write claimed.
   const mirrored = live && !err && _mirrorServerFlags(ans.json, key, claimed);
+  // Accepted, but it did not say WHEN — this client cannot place it in the server's
+  // history, so it re-reads the row's flags instead of guessing (see `_mayAdopt`).
+  if (!err && commit === null) _resyncFlagsFromServer();
   if (!live || !owner) {          // superseded by a newer write, or disowned by a reload
     if (repaint || mirrored) renderToOrder();
     // A write the reload DISOWNED has no map left to roll back — but it still failed, and
@@ -1177,31 +1264,37 @@ function toggleStatusFlag(key, row, field) {
 // ORDERED sa mení až PO úspechu, takže pri zlyhaní netreba nič vracať — len to povedať.
 //
 // A write that does not go through saveOrderFlag still changes the same rows, so it joins
-// the same `_flagWrites` bookkeeping — and it takes its sequence numbers when it is
+// the same `_flagWrites` bookkeeping — and it takes its OWNERSHIP numbers when it is
 // ISSUED, exactly like a per-row write. Claiming them at RESPONSE time was the bug: the
 // bulk then outranked per-row writes the manager issued AFTER clicking it (newer intent,
 // and committed LATER on the server behind the bulk's own `with _lock:`), so his last
 // click was silently inverted — the tab painted the row the bulk's way, the settle
 // reconcile forced the map to match, and nothing was reported. Issue-time sequencing puts
-// the bulk where it belongs in the order and keeps the mirror case right too: a bulk that
-// was ACCEPTED is the newest server truth for its rows, so a later refused write rolls
-// back onto it, not onto the pre-bulk baseline.
+// the bulk where it belongs in the manager's INTENT order.
+//
+// #291 — which answer is newest is a separate question, and the bulk answers it the same
+// way every other write does: with the server's `commitSeq`, taken inside the bulk's own
+// `with _lock:`. The endpoint returns no per-row `flags` (it moves one flag on many rows),
+// so unlike `saveOrderWrite` there is nothing to mirror — the value it confirms is its own
+// `ordered`, stamped with the moment the server actually wrote it.
 async function markGroupOrdered(items, ordered) {
   const keys = items.map(o => o.key);
   const sts = keys.map(k => _flagEntry('ordered', k, ORDERED));
   const seqs = sts.map(st => ++st.seq);
   sts.forEach(st => { st.inflight += 1; });
   let err;
+  const ans = {};
   // unskippable, for the same reason as in saveOrderFlag: a leaked counter would disable
   // reconciliation for those rows for the lifetime of the page
   try {
-    err = await postToOrder('/api/ordered/bulk', { keys, ordered });
+    err = await postToOrder('/api/ordered/bulk', { keys, ordered }, ans);
   } finally { sts.forEach(st => { st.inflight -= 1; }); }
   let repaint = false;
+  const commit = _commitOf(ans.json);           // one number for the whole bulk
   keys.forEach((key, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;      // loadOrders() disowned this write
-    if (!err && seq >= st.confirmedSeq) { st.confirmed = ordered; st.confirmedSeq = seq; }
+    if (!err && _mayAdopt(commit, st)) { st.confirmed = ordered; st.confirmedCommit = commit; }
     if (seq !== st.seq) {                       // a later write owns this row now
       // …and once nothing else is out for it, the map owes the server's own last word
       if (st.inflight === 0 && !!ORDERED[key] !== st.confirmed) {
@@ -1224,6 +1317,7 @@ async function markGroupOrdered(items, ordered) {
     if (ordered) ORDERED[key] = true; else delete ORDERED[key];
     repaint = true;
   });
+  if (!err && commit === null) _resyncFlagsFromServer();   // same as saveOrderWrite
   if (err) {
     if (repaint) renderToOrder();        // roll the tab back BEFORE the message, never after
     toOrderSaveFailed('Hromadné označenie skupiny', err,
@@ -3901,10 +3995,7 @@ function renderPosta() {
     const degraded = !!lr.source_degraded;
     const meta = el('div', 'autometa');
     const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
-    bits.push('Posledný beh: ' + (a.last_run
-      ? `${fmtDt(a.last_run)} — ${a.last_status !== 'ok' ? '❌ CHYBA'
-          : (degraded ? '⚠️ DEGRADOVANÝ' : '✅ OK')}`
-      : 'zatiaľ nikdy'));
+    bits.push('Posledný beh: ' + lastRunLabel(a, degraded));
     if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
     meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
     st.appendChild(meta);
@@ -3999,6 +4090,63 @@ function renderPosta() {
   }
 }
 
+// #293 — the prune refused, and the refusal is PERMANENT until someone fixes the export.
+// Every reason gets its OWN sentence AND its own place to go and look, because they are four
+// different faults; and every one carries the number it fired on — „your export is wrong"
+// with no number leaves him nothing to check (`.claude/rules/automation-health.md` §3,
+// store-prune §7).
+function flagPruneBlockedWarning(lr) {
+  // a refusal recorded BEFORE this field existed carries no counts. Say nothing rather than
+  // coerce the absent value to 0 and state „export nesie 0 objednávok" as THE number the
+  // refusal fired on — a confident wrong fact until the next hourly run.
+  const seen = lr.flags_orders_seen == null ? null : Number(lr.flags_orders_seen);
+  const count = seen == null ? '' : ` (${seen} objednávok)`;
+  const reason = lr.flags_prune_skipped;
+  const CASES = {
+    'no-open-orders': {
+      why: `v exporte${count} nie je ani jedna objednávka v stave „Vybavuje sa"`,
+      look: 'skontroluj v Shoptete názvy stavov objednávok (asi sa niektorý premenoval) '
+            + 'a adresu exportu v nastaveniach',
+    },
+    'no-status-column': {
+      why: `export${count} vôbec nemá stĺpec so stavom objednávky`,
+      look: 'skontroluj v Shoptete šablónu exportu objednávok — chýba v nej stĺpec so '
+            + 'stavom, alebo je v nastaveniach prehodená adresa exportu',
+    },
+    'unparsable-source': {
+      why: 'stiahnutý export sa nedá prečítať — namiesto tabuľky prišlo niečo iné',
+      look: 'skús export objednávok stiahnuť ručne zo Shoptetu a pozri sa, čo príde '
+            + '(chybová stránka, prihlásenie, prázdny súbor)',
+    },
+    'implausible-source': {
+      why: `export${count} nesie príliš málo objednávok na to, aby bol úplný`,
+      look: 'sťahovanie pravdepodobne skončilo v polovici — skontroluj pripojenie a '
+            + 'skús export stiahnuť ručne',
+    },
+  };
+  // an unexpected reason (the housekeeping try/except passes the exception repr through)
+  // must still reach him — rendering nothing is the exact failure this banner fixes. It is
+  // the one dynamic value here that is not a fixed literal, so it is ESCAPED.
+  const c = CASES[reason] || {
+    why: 'neočakávaná chyba: ' + escapeHtml(String(reason)),
+    look: 'pozri sa do logu služby, čo presne zlyhalo',
+  };
+  return el('div', 'autoerr',
+    `⛔ Upratovanie starých značiek pri riadkoch objednávok je zastavené: ${c.why}. `
+    + 'Značky „objednané u dodávateľa" / „čaká sa" / „skladom" / „nedostupné" sa zatiaľ '
+    + `nemažú, takže ich bude stále pribúdať. Nič sa nestratilo — ${c.look}.`);
+}
+
+// „Posledný beh: <čas> — <verdict>". DEGRADED is its own verdict, not a flavour of OK: the
+// run did not throw, but a part of it could not see its own input (#282 Pošta, #293 sync).
+// Shared so a third automation cannot quietly invent a fourth spelling of it.
+function lastRunLabel(a, degraded) {
+  if (!a.last_run) return 'zatiaľ nikdy';
+  const verdict = a.last_status !== 'ok' ? '❌ CHYBA'
+    : (degraded ? '⚠️ DEGRADOVANÝ' : '✅ OK');
+  return `${fmtDt(a.last_run)} — ${verdict}`;
+}
+
 // ---- Automatizácie (#119): tab „Sync zo Shoptetu" -------------------------- //
 // Plain status-only tab (no per-item table like posta — a sync run has nothing
 // to list, just counts) — status/controls come straight from AUTOMATIONS
@@ -4031,24 +4179,45 @@ function renderShoptetSync() {
   st.appendChild(head);
   if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
 
+  const lr = a.last_result || {};
+  // #293 — a run whose prune REFUSED must not read „✅ OK". Nothing crashed (orders,
+  // catalogue and review all landed), so `last_status` is legitimately 'ok'; what failed is
+  // the one part of this automation that DELETES data, and its refusal reasons are
+  // PERMANENT — until the export is fixed the prune never runs once and the flag stores grow
+  // exactly as they did before #212. Same flag and same wording as Pošta (#282), so the
+  // sidebar ⚠ (navError) lights from it with no second predicate to keep in sync.
+  const degraded = !!lr.source_degraded;
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
-  bits.push('Posledný beh: ' + (a.last_run
-    ? `${fmtDt(a.last_run)} — ${a.last_status === 'ok' ? '✅ OK' : '❌ CHYBA'}`
-    : 'zatiaľ nikdy'));
+  bits.push('Posledný beh: ' + lastRunLabel(a, degraded));
   if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
   meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
   st.appendChild(meta);
   if (a.last_status === 'error' && a.last_error) {
     st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
   }
-  const lr = a.last_result || {};
   if (a.last_run && a.last_status === 'ok') {
     st.appendChild(el('div', 'muted',
       `Objednávky: ${(lr.orders_bytes || 0).toLocaleString('sk-SK')} B stiahnuté`
       + ` · katalóg: ${lr.catalog_products ?? 0} produktov (${lr.catalog_codes ?? 0} kódov)`
       + ` · zosynchronizované review karty: ${lr.review_synced ?? 0}`
-      + (lr.review_stale ? ` (nenájdených v exporte: ${lr.review_stale})` : '')));
+      + (lr.review_stale ? ` (nenájdených v exporte: ${lr.review_stale})` : '')
+      // #212/#293 — the prune is the ONE thing here that removes the manager's markings, so
+      // its count belongs in front of him, not only in the log. Reported even when it is 0:
+      // „0" is the normal, reassuring answer, and it was the ABSENCE of this line that let a
+      // permanently refused prune look identical to a healthy hour.
+      + (lr.flags_prune_skipped ? ''
+         : ` · vyčistené osirelé značky: ${Number(lr.flags_pruned ?? 0)}`)));
+    // an added or renamed status silently narrows what the prune considers finished — the
+    // honest cost of the terminal-status allow-list. Informational, NOT a warning: these
+    // statuses are legitimate and permanent, so a banner here would be noise for ever.
+    const unknown = lr.flags_unknown_statuses || [];
+    if (unknown.length) {
+      st.appendChild(el('div', 'muted',
+        'Stavy objednávok, ktoré nepoznám, a preto ich nepovažujem za vybavené (značky '
+        + 'pri nich ostávajú): ' + escapeHtml(unknown.join(', '))));
+    }
+    if (lr.flags_prune_skipped) st.appendChild(flagPruneBlockedWarning(lr));
     // #280 review — a NON-FATAL degradation has to be VISIBLE. Both of these leave
     // last_status = ok on purpose (the critical refresh did land), so without a line
     // here a degraded hour reads exactly like a healthy one: the „quietly dead

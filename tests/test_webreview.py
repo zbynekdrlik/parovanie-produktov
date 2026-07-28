@@ -47,26 +47,26 @@ def test_export_route_shape():
 def test_build_to_order_rows_filters_and_joins():
     orders = (
         "code;date;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20261045;2026-04-24 19:14:05;Vybavuje sa;Polokošeľa HART;1;61247/L;Veľkosť: L;BETALOV\r\n"
-        "20261099;2026-05-01 10:00:00;Vybavená;Iné;1;99999/M;Veľkosť: M;ORBIS\r\n"
-        "20261045;2026-04-24 19:14:05;Vybavuje sa;Kuriér;1;SHIPPING11;;\r\n"
+        "99001045;2026-04-24 19:14:05;Vybavuje sa;Polokošeľa HART;1;TESTKOD/L;Veľkosť: L;BETALOV\r\n"
+        "99001099;2026-05-01 10:00:00;Vybavená;Iné;1;99999/M;Veľkosť: M;ORBIS\r\n"
+        "99001045;2026-04-24 19:14:05;Vybavuje sa;Kuriér;1;SHIPPING11;;\r\n"
     )
     products = [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa HART",
-                 "variant_codes": ["61247/L"], "pairCode": "231"}]
+                 "variant_codes": ["TESTKOD/L"], "pairCode": "231"}]
     decisions = {"BETALOV|231": {"status": "good", "url": "https://www.huntingshop.eu/x"}}
-    rows = webapp.build_to_order_rows(orders, products, decisions, {"61247/L": "231"})
+    rows = webapp.build_to_order_rows(orders, products, decisions, {"TESTKOD/L": "231"})
     assert len(rows) == 1                      # Vybavená + SHIPPING dropped
     r = rows[0]
-    assert r["itemCode"] == "61247/L" and r["qty"] == "1" and r["supplier"] == "BETALOV"
+    assert r["itemCode"] == "TESTKOD/L" and r["qty"] == "1" and r["supplier"] == "BETALOV"
     assert r["size"] == "Veľkosť: L"
-    assert r["key"] == "20261045|61247/L"
+    assert r["key"] == "99001045|TESTKOD/L"
     assert r["orderDate"] == "2026-04-24"      # date column, time dropped
     assert r["supplierUrl"] == "https://www.huntingshop.eu/x"
 
 
 def test_build_to_order_rows_missing_date_is_empty():
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261045;Vybavuje sa;X;1;61247/L;L;BETALOV\r\n")
+              "99001045;Vybavuje sa;X;1;TESTKOD/L;L;BETALOV\r\n")
     rows = webapp.build_to_order_rows(orders, [], {}, {})
     assert rows[0]["orderDate"] == ""          # no date column → graceful empty
 
@@ -74,11 +74,11 @@ def test_build_to_order_rows_missing_date_is_empty():
 def test_ordered_endpoint_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "ordered.json"))
     c = _client()
-    r = c.post("/api/ordered", json={"key": "20261045|61247/L", "ordered": True})
+    r = c.post("/api/ordered", json={"key": "99001045|TESTKOD/L", "ordered": True})
     assert r.status_code == 200 and r.get_json()["ok"] is True
-    assert c.get("/api/ordered").get_json()["ordered"]["20261045|61247/L"] is True
-    c.post("/api/ordered", json={"key": "20261045|61247/L", "ordered": False})
-    assert "20261045|61247/L" not in c.get("/api/ordered").get_json()["ordered"]
+    assert c.get("/api/ordered").get_json()["ordered"]["99001045|TESTKOD/L"] is True
+    c.post("/api/ordered", json={"key": "99001045|TESTKOD/L", "ordered": False})
+    assert "99001045|TESTKOD/L" not in c.get("/api/ordered").get_json()["ordered"]
 
 
 # --- VYLEPŠENIE 1: mark a whole supplier group ordered in one atomic write ------ #
@@ -129,12 +129,12 @@ def test_toorder_loaders_tolerate_corrupt_store(monkeypatch, tmp_path):
 
 def test_orders_route_tolerates_corrupt_flag_store(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+              "99001045;Vybavuje sa;Polokošeľa;1;TESTKOD/L;Veľkosť: L;BETALOV\r\n")
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
     monkeypatch.setattr(webapp, "PRODUCTS",
         [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
-          "variant_codes": ["61247/L"], "pairCode": "231"}])
-    monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
+          "variant_codes": ["TESTKOD/L"], "pairCode": "231"}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"TESTKOD/L": "231"})
     ordf = tmp_path / "o.json"
     ordf.write_text("{ broken", encoding="utf-8")
     waitf = tmp_path / "w.json"
@@ -165,12 +165,12 @@ def test_orders_route_tolerates_corrupt_flag_store(monkeypatch, tmp_path):
 
 def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+              "99001045;Vybavuje sa;Polokošeľa;1;TESTKOD/L;Veľkosť: L;BETALOV\r\n")
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
     monkeypatch.setattr(webapp, "PRODUCTS",
         [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
-          "variant_codes": ["61247/L"], "pairCode": "231"}])
-    monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
+          "variant_codes": ["TESTKOD/L"], "pairCode": "231"}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"TESTKOD/L": "231"})
     monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
     monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "op.json"))
@@ -189,21 +189,21 @@ def test_orders_route_joins_and_merges_ordered(monkeypatch, tmp_path):
 def test_instock_endpoint_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "instock.json"))
     c = _client()
-    r = c.post("/api/instock", json={"key": "20261045|61247/L", "instock": True})
+    r = c.post("/api/instock", json={"key": "99001045|TESTKOD/L", "instock": True})
     assert r.status_code == 200 and r.get_json()["ok"] is True
-    assert c.get("/api/instock").get_json()["instock"]["20261045|61247/L"] is True
-    c.post("/api/instock", json={"key": "20261045|61247/L", "instock": False})
-    assert "20261045|61247/L" not in c.get("/api/instock").get_json()["instock"]
+    assert c.get("/api/instock").get_json()["instock"]["99001045|TESTKOD/L"] is True
+    c.post("/api/instock", json={"key": "99001045|TESTKOD/L", "instock": False})
+    assert "99001045|TESTKOD/L" not in c.get("/api/instock").get_json()["instock"]
 
 
 def test_unavailable_endpoint_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "UNAVAIL", str(tmp_path / "unavail.json"))
     c = _client()
-    r = c.post("/api/unavailable", json={"key": "20261045|61247/L", "unavailable": True})
+    r = c.post("/api/unavailable", json={"key": "99001045|TESTKOD/L", "unavailable": True})
     assert r.status_code == 200 and r.get_json()["ok"] is True
-    assert c.get("/api/unavailable").get_json()["unavailable"]["20261045|61247/L"] is True
-    c.post("/api/unavailable", json={"key": "20261045|61247/L", "unavailable": False})
-    assert "20261045|61247/L" not in c.get("/api/unavailable").get_json()["unavailable"]
+    assert c.get("/api/unavailable").get_json()["unavailable"]["99001045|TESTKOD/L"] is True
+    c.post("/api/unavailable", json={"key": "99001045|TESTKOD/L", "unavailable": False})
+    assert "99001045|TESTKOD/L" not in c.get("/api/unavailable").get_json()["unavailable"]
 
 
 def test_instock_unavailable_reject_missing_key(monkeypatch, tmp_path):
@@ -405,12 +405,12 @@ def test_a_failed_clear_never_erases_the_flag_the_manager_just_set(monkeypatch, 
 
 def test_orders_route_merges_instock_and_unavailable(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+              "99001045;Vybavuje sa;Polokošeľa;1;TESTKOD/L;Veľkosť: L;BETALOV\r\n")
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
     monkeypatch.setattr(webapp, "PRODUCTS",
         [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokošeľa",
-          "variant_codes": ["61247/L"], "pairCode": "231"}])
-    monkeypatch.setattr(webapp, "CODE2PAIR", {"61247/L": "231"})
+          "variant_codes": ["TESTKOD/L"], "pairCode": "231"}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"TESTKOD/L": "231"})
     monkeypatch.setattr(webapp, "ORDERED", str(tmp_path / "o.json"))
     monkeypatch.setattr(webapp, "WAITING", str(tmp_path / "w.json"))
     monkeypatch.setattr(webapp, "INSTOCK", str(tmp_path / "is.json"))
@@ -422,7 +422,7 @@ def test_orders_route_merges_instock_and_unavailable(monkeypatch, tmp_path):
     assert j["orders"][0]["instock"] is False
     assert j["orders"][0]["unavailable"] is False
     (tmp_path / "is.json").write_text(
-        json.dumps({"20261045|61247/L": True}), encoding="utf-8")
+        json.dumps({"99001045|TESTKOD/L": True}), encoding="utf-8")
     j2 = _client().get("/api/orders").get_json()
     assert j2["orders"][0]["instock"] is True
     assert j2["orders"][0]["unavailable"] is False   # independent toggles
@@ -472,13 +472,13 @@ def test_order_comment_endpoint_persists(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "ORDER_COMMENTS", str(tmp_path / "oc.json"))
     c = _client()
     r = c.post("/api/order-comment",
-               json={"orderCode": "20261045", "comment": "zavolať zákazníkovi"})
+               json={"orderCode": "99001045", "comment": "zavolať zákazníkovi"})
     assert r.status_code == 200 and r.get_json()["ok"] is True
-    assert c.get("/api/order-comment").get_json()["comments"]["20261045"] == "zavolať zákazníkovi"
-    assert webapp._load_order_comments()["20261045"] == "zavolať zákazníkovi"
+    assert c.get("/api/order-comment").get_json()["comments"]["99001045"] == "zavolať zákazníkovi"
+    assert webapp._load_order_comments()["99001045"] == "zavolať zákazníkovi"
     # empty comment clears the entry
-    c.post("/api/order-comment", json={"orderCode": "20261045", "comment": ""})
-    assert "20261045" not in c.get("/api/order-comment").get_json()["comments"]
+    c.post("/api/order-comment", json={"orderCode": "99001045", "comment": ""})
+    assert "99001045" not in c.get("/api/order-comment").get_json()["comments"]
 
 
 def test_order_comment_requires_ordercode(monkeypatch, tmp_path):
@@ -491,13 +491,13 @@ def test_order_comment_requires_ordercode(monkeypatch, tmp_path):
 def test_order_comment_rejects_too_long(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "ORDER_COMMENTS", str(tmp_path / "oc.json"))
     big = "x" * (webapp.ORDER_COMMENT_MAX + 1)
-    r = _client().post("/api/order-comment", json={"orderCode": "20261045", "comment": big})
+    r = _client().post("/api/order-comment", json={"orderCode": "99001045", "comment": big})
     assert r.status_code == 400
     assert webapp._load_order_comments() == {}
     # exactly at the cap is accepted
     ok = "y" * webapp.ORDER_COMMENT_MAX
     assert _client().post("/api/order-comment",
-                          json={"orderCode": "20261045", "comment": ok}).status_code == 200
+                          json={"orderCode": "99001045", "comment": ok}).status_code == 200
 
 
 def test_order_comment_tolerate_corrupt_store(monkeypatch, tmp_path):
@@ -512,14 +512,14 @@ def test_order_comment_tolerate_corrupt_store(monkeypatch, tmp_path):
 def test_build_to_order_rows_captures_shopremark():
     orders = (
         "code;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-        "20261045;Vybavuje sa;chýba nám 1 kus;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+        "99001045;Vybavuje sa;chýba nám 1 kus;Polokošeľa;1;TESTKOD/L;Veľkosť: L;BETALOV\r\n")
     rows = webapp.build_to_order_rows(orders, [], {}, {})
     assert rows[0]["shopRemark"] == "chýba nám 1 kus"
 
 
 def test_orders_route_merges_comment_and_shopremark(monkeypatch, tmp_path):
     orders = ("code;statusName;shopRemark;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261045;Vybavuje sa;interná poznámka;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
+              "99001045;Vybavuje sa;interná poznámka;Polokošeľa;1;TESTKOD/L;Veľkosť: L;BETALOV\r\n")
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
     monkeypatch.setattr(webapp, "PRODUCTS", [])
     monkeypatch.setattr(webapp, "CODE2PAIR", {})
@@ -536,7 +536,7 @@ def test_orders_route_merges_comment_and_shopremark(monkeypatch, tmp_path):
     assert row["shopRemark"] == "interná poznámka"
     assert row["comment"] == ""                       # none set yet
     (tmp_path / "oc.json").write_text(
-        json.dumps({"20261045": "objednané u dodávateľa"}), encoding="utf-8")
+        json.dumps({"99001045": "objednané u dodávateľa"}), encoding="utf-8")
     row2 = _client().get("/api/orders").get_json()["orders"][0]
     assert row2["comment"] == "objednané u dodávateľa"   # per-ORDER comment merged in
 
@@ -692,7 +692,7 @@ def test_orders_exposes_inline_pair_url(monkeypatch, tmp_path):
     # an ordered item OUTSIDE the review dataset (no product, no decision) — the
     # inline pairing must still attach to it and surface as pairUrl.
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261050;Vybavuje sa;Vesta;1;99999/X;Veľkosť: X;ORBIS\r\n")
+              "99001050;Vybavuje sa;Vesta;1;99999/X;Veľkosť: X;ORBIS\r\n")
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
     monkeypatch.setattr(webapp, "PRODUCTS", [])
     monkeypatch.setattr(webapp, "CODE2PAIR", {})
@@ -779,7 +779,7 @@ def test_order_supplier_collapses_inner_whitespace(monkeypatch, tmp_path):
 
 def test_orders_exposes_assigned_supplier(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261060;Vybavuje sa;Bez dod;1;88/Z;Veľkosť: Z;\r\n")   # NO itemSupplier
+              "99001060;Vybavuje sa;Bez dod;1;88/Z;Veľkosť: Z;\r\n")   # NO itemSupplier
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
     monkeypatch.setattr(webapp, "PRODUCTS", [])
     monkeypatch.setattr(webapp, "CODE2PAIR", {})
@@ -843,7 +843,7 @@ def test_orders_attach_grube_rejects_non_https_deurl(monkeypatch, tmp_path):
 def test_orders_route_attaches_grube_fields(monkeypatch, tmp_path):
     # full /api/orders wiring: a GRUBE order line carries grubeItemId + grubeDeUrl.
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-              "20261045;Vybavuje sa;Bunda Grand Nord;1;60645/L;Veľkosť: L;GRUBE\r\n")
+              "99001045;Vybavuje sa;Bunda Grand Nord;1;60645/L;Veľkosť: L;GRUBE\r\n")
     monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: orders.encode("cp1250"))
     monkeypatch.setattr(webapp, "PRODUCTS", [])
     monkeypatch.setattr(webapp, "CODE2PAIR", {})

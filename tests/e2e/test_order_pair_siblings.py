@@ -7,7 +7,7 @@ used to update only the clicked row, leaving the sibling lines showing an empty
 the manager pasted the URL again (and again) for each order.
 
 Fixture (`toorder_server`): ORBIS has two lines with the same itemCode S1, in two
-different orders (20260900, 20260890). The mirror behaviour already exists for the
+different orders (99000900, 99000890). The mirror behaviour already exists for the
 per-product supplier assignment (saveSupplier); this pins the same for the pair URL.
 """
 
@@ -91,7 +91,9 @@ def test_a_non_http_stored_pair_url_never_renders_as_a_clickable_link(page, toor
     The value is not echoed back into a tooltip either."""
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
-    r = page.evaluate("""() => {
+    # r-string: the JS below carries `\/` (an escaped slash inside a regex literal), which
+    # Python 3.12 reports as an invalid escape sequence in a plain string literal.
+    r = page.evaluate(r"""() => {
       const mk = (o) => renderOrderRow(Object.assign(
         {key: 'X|W1', itemCode: 'W1', orderCode: 'X', name: 'T', supplier: 'S',
          qty: '1', size: '', orderDate: '2026-05-20 09:00:00'}, o));

@@ -2,13 +2,13 @@
 
 The manager writes a free-text comment about a whole order (mirroring the Shoptet
 admin's "Poznámka e-shopu"); it persists in data/out/order_comments.json and shows as
-a 💬 chip on every line of that order. The ORBIS fixture order (77/X = 20260700) also
+a 💬 chip on every line of that order. The ORBIS fixture order (77/X = 99000700) also
 carries a shopRemark, so the read-only 🛈 Shoptet note is asserted too. live_server is
 session-scoped and shared, so the comment is cleared at the end.
 """
 
 ORBIS_CODE = "77/X"           # itemCode of ORBIS's single fixture line
-ORBIS_ORDER = "20260700"      # its orderCode — the comment key
+ORBIS_ORDER = "99000700"      # its orderCode — the comment key
 
 
 def test_order_comment_write_persist_and_shopnote(page, live_server):

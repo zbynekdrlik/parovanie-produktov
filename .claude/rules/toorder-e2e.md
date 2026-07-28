@@ -118,7 +118,7 @@ fixtúru nechá špinavú.
 
 ## 7. Hodnotu skopírovanú zo susedného testu treba overiť TIEŽ
 
-Nové #211 testy si prevzali kľúč `20261045|61247/L` z testu o dva riadky vyššie — a
+Nové #211 testy si prevzali kľúč `<reálny kód objednávky>|<kód produktu>` (hodnota zámerne nezapísaná — #289) z testu o dva riadky vyššie — a
 `LC_ALL=C grep -ac` nad `data/out/orders_cache.csv` ho našiel (4, resp. 1 výskyt):
 reálny kód objednávky naviazaný na meno, e-mail a telefón zákazníka, vo VEREJNOM
 repozitári. „Je to už v tomto súbore" nie je overenie (pred-existujúce výskyty →
@@ -142,8 +142,8 @@ Odkedy jeden POST hýbe viacerými príznakmi riadku (#211: zapnutie stavu zhasn
 A ešte: **odpoveď servera so stavom riadku treba naozaj PREČÍTAŤ.** Dva zápisy vydané v
 jednom round-tripe idú po dvoch spojeniach a ich serverové vlákna si vezmú `with _lock:`
 v ľubovoľnom poradí — klientske poradie vydania teda NIE JE poradie commitov. Prijmi
-`flags` cez tú istú bránu `confirmed`/`confirmedSeq` (staršia odpoveď neprebije novšiu) a
-mapu prepíš len keď na ňu nič iné neletí.
+`flags` cez tú istú bránu `confirmed`/`confirmedCommit` (staršia odpoveď neprebije novšiu)
+a mapu prepíš len keď na ňu nič iné neletí.
 
 ## 9. `confirmedSeq` príznaku smie stampnúť LEN číslo, ktoré si TEN príznak nárokoval
 
@@ -226,3 +226,101 @@ navyše. `/api/*` nie je CSRF-gated (JSON + session cookie stačí — pozri fix
 Drobnosť z tej istej vlny: v **Python** literáli neuzatváraj slovenské `„…“` ASCII
 úvodzovkou — `"… „skladom" …"` reťazec ukončí a zhodí zber testov na `SyntaxError:
 invalid character '„'`. Buď použi pravú `“`, alebo v hláškach assertu píš bez úvodzoviek.
+
+## 13. Poradie VYDANIA nie je poradie COMMITOV — a dá sa to vyriešiť, len nie na klientovi (#291)
+
+Body 8 a 9 hovoria „odpovede mimo poradia sú z princípu neriešiteľné na strane klienta".
+Platilo to, kým server o svojom poradí nič nepovedal. **Odkedy každý zápis príznaku vracia
+`commitSeq` (monotónny čítač inkrementovaný VNÚTRI toho istého `with _lock:`, v ktorom sa
+zapisuje), riešiteľné to je** — a brána `confirmed` sa riadi ním, nie klientskym `seq`.
+Pole sa preto volá `confirmedCommit`; `seq` si ponechal svoju DRUHÚ úlohu (kto vlastní
+(príznak, riadok) pre rollback a pre HLÁSENIE), ktorá naozaj je o poslednom ÚMYSLE manažéra.
+
+- **Nikdy nemiešaj tie dve čísla v jednom poli.** `seq` je nezávislý čítač na dvojicu
+  (príznak, riadok), `commitSeq` je jedny globálne hodiny — medzi nimi neexistuje
+  usporiadanie. Odpoveď BEZ `commitSeq` (úspech, ktorého telo sa nedalo prečítať) preto
+  neprijíma NIČ; „fallback na poradie vydania" znie neškodne, ale znamená, že raz stampnuté
+  commit-číslo už žiadne issue-číslo neprebije a dovtedy potichu rozhoduje poradie vydania.
+  Prvý pokus to tak mal a zhodil ho `test_a_straggler_from_an_older_burst_cannot_poison_a_later_click`.
+- **Čítač nasaď na wall-clock v ms, nie na 0.** Reštart služby pod otvorenou kartou by inak
+  klientovi s číslom 4 812 posielal samé „staršie" odpovede a ten by ich do konca života
+  stránky odmietal — teda zamrznutý `confirmed`, čo je tvar chyby z PR #290 cez iné dvere.
+- **Obmedzenie „stampuj len nárokované príznaky" ostáva**, hoci pri globálnych hodinách už
+  nie je nosné pre korektnosť: bráni `_flagEntry` založiť účtovníctvo pre príznak, ktorý sa
+  nikdy nezapisoval.
+- **Stub v cudzom teste kodifikuje DRÔT.** `page.route`, ktorý si vymyslí `{ok, flags}` bez
+  `commitSeq`, spadne na tom, že odpoveď bez commit-čísla sa neprijíma — nie na kliente.
+  Taký stub uprav v samostatnom `test:` commite (je spätne kompatibilný, prejde aj proti
+  neopravenému klientovi) — pozri bod 6.
+
+### Ako divergenciu v teste VYROBIŤ (a čím si zavesíš celý beh)
+
+Klikaním sa nedosiahne — obe poradia si takmer vždy sadnú. Obal `window.fetch` cez
+`add_init_script` (teda skôr, než sa načíta `app.js`) a PODRŽ prvý POST na hranici siete,
+kým druhý neskončí; server tak commitne B a potom A. Vzor:
+`tests/e2e/test_order_flag_commit_order.py` (`window.__posts.issued/done` + `window.__release()`).
+
+**PASCA: `page.evaluate` nemá žiadny predvolený timeout.** Test, ktorý v tej istej stránke
+`await`-uje POST, ktorý obal drží, sa nezasekne na 30 s — visí, kým ho nezabije celý beh
+(u nás 600 s SIGTERM, bez jediného riadku výstupu). Testy, ktoré si svoje zápisy awaitujú,
+drž MIMO tej fixtúry (vlastný `page`), nie „len opatrne".
+
+### Čo z bodu 13 zistila až adversariálna revízia (PR #292)
+
+- **„Nedá sa usporiadať" NIE JE „musí sa ignorovať".** Prvý cut odmietal prijať KAŽDÚ
+  odpoveď bez `commitSeq` — a tým znova otvoril chybu z #290: `confirmed` zamrzol a
+  nasledujúci ODMIETNUTÝ zápis sa „vrátil" na hodnotu, ktorú server nedrží. Meraním
+  potvrdené, že `main` to nerobil, čiže to bola REGRESIA. Usporiadanie treba len vtedy,
+  keď je voči čomu usporadúvať: keď je zápis stále posledný vydaný pre svoju dvojicu
+  (príznak, riadok) a nič iné pre ňu neletí, je jediným pisateľom a jeho prijatie JE stav
+  servera. Prijmi ho — ale hodiny NEPOSÚVAJ (číslo, ktoré si nedostal, nesmie hýbať
+  poradím). Dvere k odpovedi bez čísla sú bežné: useknuté telo (appka beží cez tunel) a
+  karta, ktorá prežije rollback deploy.
+- **Wall-clock seed sám o sebe monotónnosť NEDÁVA.** `time.time()` je CLOCK_REALTIME:
+  reštart + korekcia času dozadu (NTP, snapshot VM, ručne prestavené hodiny) vydá čísla,
+  ktoré živá karta už videla — a tá potom odmieta všetko do konca svojho života. To isté
+  spraví DRUHÝ proces (každý si seeduje vlastný čítač; #262 zaznamenal druhú inštanciu
+  bežiacu štyri dni). Najvyššie vydané číslo preto REZERVUJ na disk (po blokoch, aby klik
+  nestál zápis) a seeduj `max(hodiny, rezervácia)`.
+- **Umiestnenie `_next_commit_seq()` V ZÁMKU sa e2e testom nedá pripnúť.** Presunutie
+  všetkých troch volaní MIMO ich `with _lock:` nechalo 50 e2e testov zelených — testy
+  vydávajú zápisy po sebe, takže čísla vyjdú rastúce tak či tak. Pripni to serverovým
+  testom, ktorý číta hĺbku zámku priamo (`webapp._lock._depth > 0`) v okamihu, keď sa
+  číslo berie.
+- **Vymyslené `commitSeq` v stube voľ VYSOKÉ.** `commitSeq: 1` funguje len dovtedy, kým je
+  záznam panenský; prvá úprava, ktorá pred neho vloží reálny zápis, ho zhodí ako
+  zastaraný — a test spadne z dôvodu, ktorý s jeho menom nemá nič spoločné.
+- **`__posts.done` (alebo hocijaký signál z `fetch().then()`) NIE JE „riadok je
+  prekreslený".** Fires skôr, než `postToOrder` dočíta telo, než sa prepíše účtovníctvo a
+  než `renderToOrder()` zbehne. Čakaj na DOM (triedu riadku), inak test prechádza na
+  náhode v časovaní.
+
+### Odpoveď, ktorú sa nedá zaradiť — NEHÁDAJ, spýtaj sa servera (revízia opravy #291)
+
+Prijatý zápis bez `commitSeq` sa nedá zaradiť do serverovej histórie, a **každý spôsob, ako
+to UHÁDNUŤ, je poradie vydania v inom kabáte.** Oba sa vyskúšali a oba sú zlé:
+
+- **Odmietnuť ju úplne** → `confirmed` zamrzne a nasledujúci ODMIETNUTÝ zápis sa „vráti" na
+  hodnotu, ktorú server nedrží (regresia proti stavu pred #291).
+- **Prijať ju, keď „som stále posledný vydaný a nič iné neletí"** → vie prebiť NOVŠIU
+  očíslovanú odpoveď, a keď sa dve neočíslované vrátia v opačnom poradí, než commitli,
+  neprijme ANI JEDNU: tá, čo je stále posledná vydaná, padne na „druhá ešte letí", a tá,
+  čo sa usadí posledná, padne na „už nie som posledný vydaný".
+
+Riešenie je **nerozhodovať sa**: klient si znova načíta príznaky riadku zo servera
+(`loadOrders()` + prekreslenie, debouncované — dávka neočíslovaných odpovedí je JEDNA
+udalosť). Je to tá istá cesta, akou už chodí prepnutie tabu, takže nič nové nezastará.
+
+**Dôsledok pre stuby v testoch:** vymyslený ÚSPECH musí niesť `commitSeq`, inak spustí
+resync a ten zmaže presne to účtovníctvo, ktoré test pripína (zhodilo to
+`test_a_straggler_from_an_older_burst_cannot_poison_a_later_click`). Číslo prideľuj pri
+ZACHYTENÍ POST-u, nie pri jeho uvoľnení: tie testy sú o odpovediach mimo poradia pre
+zápisy, ktoré commitli v bežnom poradí.
+
+### A seeduj LENIVO — import nesmie zapisovať do dátového adresára
+
+Prvá verzia hodín seedovala pri importe, čím `import app` zapísal `flag_commit_seq.json` do
+OUT. To je proti invariantu, na ktorom stojí celé #261: suchý beh, ktorý ešte neprehodil
+`WEBREVIEW_OUT` na kópiu, by trafil živý adresár skôr, než stihne zabrať jeho vlastný
+`assert` — a import by si bral medziprocesový flock (až 30 s za bežiacou službou).
+Seeduj pri PRVOM zápise, pod zámkom, ktorý si volajúci aj tak drží.

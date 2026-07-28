@@ -94,10 +94,18 @@ def _chip(alert, label):
 _HOLD_TEMPLATE = """
 window.__held = [];
 window.__settled = [];
+window.__commitSeq = 0;
 window.__realFetch = window.fetch.bind(window);
 window.fetch = (url, opts) => {
   const p = new URL(String(url), location.href).pathname;
   if (p === '__PATH__' && opts && opts.method === 'POST') {
+    // The commit number is taken when the POST is INTERCEPTED, i.e. in issue order: these
+    // tests are about answers arriving out of order for writes that committed in the
+    // ordinary order, which is what the real server does when nothing is racing inside its
+    // lock. A faked SUCCESS must carry one at all (#291) — an answer with no number says
+    // nothing about when it committed, and the client then re-reads the row from the
+    // server rather than guessing, which would wipe the very bookkeeping these tests pin.
+    const commitSeq = ++window.__commitSeq;
     return new Promise((resolve, reject) => window.__held.push((status, passthrough) => {
       if (status === 200 && passthrough) {
         window.__realFetch(url, opts).then(
@@ -106,7 +114,9 @@ window.fetch = (url, opts) => {
         return;
       }
       window.__settled.push(status || 500);
-      resolve(new Response(status === 200 ? '{"ok": true}' : '{"ok": false}',
+      resolve(new Response(status === 200
+                             ? JSON.stringify({ok: true, commitSeq})
+                             : '{"ok": false}',
                            {status: status || 500,
                             headers: {'Content-Type': 'application/json'}}));
     }));
@@ -337,8 +347,8 @@ def test_a_refused_second_write_rolls_back_to_what_the_server_ACCEPTED(page, too
 
     server = page.evaluate(
         "() => window.__realFetch('/api/instock').then(r => r.json())")
-    assert list(server["instock"]) == ["20260001|N1"], server
-    assert page.evaluate("() => Object.keys(INSTOCK)") == ["20260001|N1"], "the accepted write was lost"
+    assert list(server["instock"]) == ["99000001|N1"], server
+    assert page.evaluate("() => Object.keys(INSTOCK)") == ["99000001|N1"], "the accepted write was lost"
     row = page.locator(".toorder-row[data-code='N1']")
     assert "instock" in (row.get_attribute("class") or "").split()
     assert "on" in (row.locator(".to-instock").get_attribute("class") or "").split()
@@ -372,8 +382,8 @@ def test_an_accepted_write_survives_a_refusal_that_answers_FIRST(page, toorder_s
 
     server = page.evaluate(
         "() => window.__realFetch('/api/instock').then(r => r.json())")
-    assert list(server["instock"]) == ["20260001|N1"], server
-    assert page.evaluate("() => Object.keys(INSTOCK)") == ["20260001|N1"], \
+    assert list(server["instock"]) == ["99000001|N1"], server
+    assert page.evaluate("() => Object.keys(INSTOCK)") == ["99000001|N1"], \
         "the accepted write was dropped because its success landed last"
     row = page.locator(".toorder-row[data-code='N1']")
     assert "instock" in (row.get_attribute("class") or "").split()
@@ -455,9 +465,9 @@ def test_a_bulk_write_supersedes_an_in_flight_per_row_write(page, toorder_server
     page.wait_for_function("() => window.__settled.length === 1", timeout=3000)
     page.wait_for_timeout(400)     # give the (wrong) rollback every chance to happen
 
-    assert page.evaluate("() => Object.keys(ORDERED)") == ["20260001|N1"]
+    assert page.evaluate("() => Object.keys(ORDERED)") == ["99000001|N1"]
     server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
-    assert list(server["ordered"]) == ["20260001|N1"], server
+    assert list(server["ordered"]) == ["99000001|N1"], server
     assert "done" in (page.locator(".toorder-row[data-code='N1']")
                       .get_attribute("class") or "").split()
     # nothing failed from the manager's point of view: the group write carried the row
@@ -702,7 +712,7 @@ def test_a_per_row_write_issued_DURING_the_bulk_flight_is_not_inverted(page, too
     page.wait_for_timeout(400)      # let every continuation (incl. reconcile) settle
 
     server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
-    assert "20260001|N1" not in server["ordered"], server      # his last click won
+    assert "99000001|N1" not in server["ordered"], server      # his last click won
     assert page.evaluate("() => Object.keys(ORDERED)") == [], \
         "the client map crowned the bulk over a per-row write issued AFTER it"
     assert "done" not in (page.locator(".toorder-row[data-code='N1']")
@@ -738,8 +748,8 @@ def test_a_bulk_that_LANDED_still_owns_the_row_when_the_later_writes_all_fail(pa
     page.wait_for_timeout(300)
 
     server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
-    assert list(server["ordered"]) == ["20260001|N1"], server
-    assert page.evaluate("() => Object.keys(ORDERED)") == ["20260001|N1"], \
+    assert list(server["ordered"]) == ["99000001|N1"], server
+    assert page.evaluate("() => Object.keys(ORDERED)") == ["99000001|N1"], \
         "the rollback discarded the bulk write the server had already accepted"
     assert "done" in (page.locator(".toorder-row[data-code='N1']")
                       .get_attribute("class") or "").split()
@@ -1064,7 +1074,7 @@ def test_a_refused_write_cannot_resurrect_a_status_a_LATER_write_cleared(page, t
       .then(([w, i, u]) => ({waiting: Object.keys(w.waiting),
                              instock: Object.keys(i.instock),
                              unavailable: Object.keys(u.unavailable)}))""")
-    assert srv == {"waiting": [], "instock": [], "unavailable": ["20260910|C1"]}, srv
+    assert srv == {"waiting": [], "instock": [], "unavailable": ["99000910|C1"]}, srv
 
     cls = set((row.get_attribute("class") or "").split())
     assert "unavail" in cls, cls
@@ -1077,13 +1087,23 @@ def test_the_client_adopts_the_flags_the_SERVER_answers_with(page, toorder_serve
     """The server is the authority, and it says what the row now IS in every answer. Two
     axis-B writes issued within one round-trip can commit on the server in the reverse
     order (each queues behind the other's `with _lock:`), so the client's own issue-order
-    bookkeeping is not by itself enough — the answered `flags` have to be mirrored."""
+    bookkeeping is not by itself enough — the answered `flags` have to be mirrored.
+
+    The fabricated answer carries a `commitSeq` because a real one always does (#291): the
+    client orders answers by the server's commit number, so a body without one says nothing
+    about WHEN it committed and is deliberately not adopted at all. The intent pinned here
+    — the answered `flags` win over what the client predicted — is unchanged."""
     _open(page, toorder_server)
     # the server answers OK, but with a state the client did not predict
     page.route("**/api/instock", lambda r: r.fulfill(
         status=200, content_type="application/json",
-        body=json.dumps({"ok": True, "flags": {"ordered": False, "waiting": True,
-                                               "instock": False, "unavailable": False}}))
+        # far above any wall-clock-seeded number: with `commitSeq: 1` this stub only
+        # worked while the entry was virgin, so any future edit landing a real write on
+        # the row first would make it drop out as stale and fail for a reason that looks
+        # nothing like the test's name
+        body=json.dumps({"ok": True, "commitSeq": 2 ** 62,
+                         "flags": {"ordered": False, "waiting": True,
+                                   "instock": False, "unavailable": False}}))
         if r.request.method == "POST" else r.continue_())
 
     page.locator(".toorder-row[data-code='C1'] .to-instock").click()

@@ -12,6 +12,7 @@ SYNTHETIC — never real PII.
 import json
 import os
 import sys
+from datetime import date, timedelta
 
 import pytest
 import requests
@@ -209,9 +210,98 @@ def test_run_via_runner_after_export_failure_records_error(iso, monkeypatch):
 
 # ── never touches the manager's live decision stores ───────────────────────────
 def test_run_never_touches_manager_decision_stores(iso):
+    """Still true after #212 gave the sync a prune, and true for two independent reasons:
+    this fixture's one-order export is far under `ORDERS_PRUNE_MIN_ORDERS`, and the
+    sentinel key is not `<order>|<item>` shaped so no export could ever judge it."""
     webapp.run_shoptet_sync()
     for _name, path in iso["manager_stores"].items():
         assert path.read_text(encoding="utf-8") == '{"sentinel": true}'
+
+
+# ── #212: the hourly refresh is where the orphan prune runs ────────────────────
+def test_run_prunes_orphan_line_flags_from_the_freshly_downloaded_export(iso, monkeypatch):
+    """The prune must be WIRED, not merely written — and wired to the bytes just
+    downloaded, which is the only copy guaranteed to be current.
+
+    The export below closes `99002002` and keeps `99002001` open, plus enough other orders
+    to clear the plausibility floor. Only the closed order's key may go; the one whose
+    order is still open, and the one no export row mentions, must both survive.
+    """
+    # dated relative to TODAY: the closed order must be past the reopen grace period
+    # (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`), which a fixed date silently stops being
+    recent = (date.today() - timedelta(days=2)).isoformat()
+    old_day = (date.today() - timedelta(days=120)).isoformat()
+    rows = (f"99002001;{recent} 09:00:00;Vybavuje sa;a@x.sk;;X Y;;A1\r\n"
+            f"99002002;{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;B1\r\n"
+            + "".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+                      for i in range(60)))
+    monkeypatch.setattr(webapp, "_fetch_orders_csv",
+                        lambda: (ORDERS_CSV.decode("cp1250") + rows).encode("cp1250"))
+    ordered = iso["manager_stores"]["ORDERED"]
+    ordered.write_text(json.dumps({"99002001|A1": True, "99002002|B1": True,
+                                   "99001500|C1": True}), encoding="utf-8")
+
+    result = webapp.run_shoptet_sync()
+
+    assert result["flags_pruned"] == 1, result
+    assert "flags_prune_skipped" not in result, result
+    assert sorted(json.loads(ordered.read_text(encoding="utf-8"))) == \
+        ["99001500|C1", "99002001|A1"]
+
+
+# ── #293: a refused prune is a DEGRADED run, and says what it fired on ─────────
+def test_a_refused_prune_marks_the_run_degraded_and_returns_its_numbers(iso, monkeypatch):
+    """`no-open-orders` / `no-status-column` are PERMANENT: until the export is fixed the
+    prune never runs once and the flag stores grow exactly as before #212. The run itself
+    legitimately ends `ok` (orders, catalogue and review all landed), so without a signal of
+    its own the card reads as a healthy hour — the „quietly dead automation" shape from
+    `.claude/rules/automation-health.md` §3, reached from the other side.
+
+    It rides the SAME `source_degraded` flag #282 introduced, which `navError()` already
+    reads, rather than inventing a second predicate the sidebar would have to learn."""
+    old_day = (date.today() - timedelta(days=120)).isoformat()
+    # a plausible export in which NOTHING is open: the open literal has been renamed. Built
+    # WITHOUT the fixture's own open order, which is the whole point of this shape.
+    head = ORDERS_CSV.decode("cp1250").splitlines(keepends=True)[0]
+    rows = "".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+                   for i in range(60))
+    monkeypatch.setattr(webapp, "_fetch_orders_csv",
+                        lambda: (head + rows).encode("cp1250"))
+
+    result = webapp.run_shoptet_sync()
+
+    assert result["flags_prune_skipped"] == "no-open-orders", result
+    assert result["source_degraded"] is True, result
+    # a refusal has to return the number it fired on, or the operator is told „your export
+    # is wrong" with nothing to go and look at
+    assert result["flags_orders_seen"] >= 60, result
+    assert result["flags_orders_open"] == 0, result
+
+
+def test_a_healthy_run_is_NOT_marked_degraded_and_reports_the_unknown_statuses(
+        iso, monkeypatch):
+    """The other half: a run that pruned normally must not carry the degraded flag, or the ⚠
+    badge becomes permanent noise and stops meaning anything. It still reports a status
+    nobody has judged yet — the honest cost of the allow-list.
+
+    The reported status must be one that is on NEITHER list. `Osob. odber` and its three
+    companions were weighed and deliberately left off the terminal list, so reporting THEM
+    would put a permanent four-item line on the card and bury the one case this exists for."""
+    recent = (date.today() - timedelta(days=2)).isoformat()
+    old_day = (date.today() - timedelta(days=120)).isoformat()
+    rows = (f"99002001;{recent} 09:00:00;Vybavuje sa;a@x.sk;;X Y;;A1\r\n"
+            f"99002002;{old_day} 09:00:00;Čaká na dodávateľa;a@x.sk;;X Y;;B1\r\n"
+            + "".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+                      for i in range(60)))
+    monkeypatch.setattr(webapp, "_fetch_orders_csv",
+                        lambda: (ORDERS_CSV.decode("cp1250") + rows).encode("cp1250"))
+
+    result = webapp.run_shoptet_sync()
+
+    assert "flags_prune_skipped" not in result, result
+    assert "source_degraded" not in result, result
+    assert result["flags_unknown_statuses"] == ["Čaká na dodávateľa"], result
+    assert result["flags_orders_open"] == 2, result   # 99002001 + the fixture's own
 
 
 # ── customer export: secret hygiene (same rule as the catalog export) ──────────

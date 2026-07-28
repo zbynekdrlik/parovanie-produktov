@@ -25,13 +25,13 @@ from tests.conftest import authed_client as _client  # noqa: E402 — logged-in 
 # One order line whose product carries a reviewed decision, one whose product does not.
 ORDERS_CSV = (
     "code;date;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
-    "20261045;2026-04-24 19:14:05;Vybavuje sa;Polokosela HART;1;61247/L;Velkost: L;BETALOV\r\n"
-    "20261046;2026-04-25 19:14:05;Vybavuje sa;Nepatriaci do review;1;99999/M;Velkost: M;ORBIS\r\n"
+    "99001045;2026-04-24 19:14:05;Vybavuje sa;Polokosela HART;1;TESTKOD/L;Velkost: L;BETALOV\r\n"
+    "99001046;2026-04-25 19:14:05;Vybavuje sa;Nepatriaci do review;1;99999/M;Velkost: M;ORBIS\r\n"
 )
 PRODUCTS = [{"key": "BETALOV|231", "supplier": "BETALOV", "name": "Polokosela HART",
-             "variant_codes": ["61247/L", "61247/XL"], "pairCode": "231"}]
+             "variant_codes": ["TESTKOD/L", "TESTKOD/XL"], "pairCode": "231"}]
 DECISIONS = {"BETALOV|231": {"status": "good", "url": "https://www.huntingshop.eu/stara"}}
-CODE2PAIR = {"61247/L": "231", "61247/XL": "231"}
+CODE2PAIR = {"TESTKOD/L": "231", "TESTKOD/XL": "231"}
 
 
 def _rows():
@@ -47,7 +47,7 @@ def test_a_decision_backed_row_names_the_decision_that_owns_its_link():
     """Without this the tab can only offer a paste box writing to a PARALLEL store —
     the exact no-op the manager hit. Naming the owner is what lets the edit land on
     the value the row shows and the import ships."""
-    r = _by_code(_rows(), "61247/L")
+    r = _by_code(_rows(), "TESTKOD/L")
     assert r["supplierUrl"] == "https://www.huntingshop.eu/stara"
     assert r["reviewKey"] == "BETALOV|231"
     assert r["reviewStatus"] == "good"
@@ -64,10 +64,10 @@ def test_every_variant_of_the_product_names_the_same_owner():
     """A decision covers ALL variant codes, so a sibling size ordered separately must
     be fixable from its own row too — and the fix must propagate to both."""
     orders = ORDERS_CSV + (
-        "20261047;2026-04-26 19:14:05;Vybavuje sa;Polokosela HART;1;61247/XL;Velkost: XL;BETALOV\r\n")
+        "99001047;2026-04-26 19:14:05;Vybavuje sa;Polokosela HART;1;TESTKOD/XL;Velkost: XL;BETALOV\r\n")
     rows = webapp.build_to_order_rows(orders, PRODUCTS, DECISIONS, CODE2PAIR)
-    assert _by_code(rows, "61247/XL")["reviewKey"] == "BETALOV|231"
-    assert _by_code(rows, "61247/L")["reviewKey"] == "BETALOV|231"
+    assert _by_code(rows, "TESTKOD/XL")["reviewKey"] == "BETALOV|231"
+    assert _by_code(rows, "TESTKOD/L")["reviewKey"] == "BETALOV|231"
 
 
 # --- the owner map cannot drift away from what link_rows writes ------------- #
@@ -97,8 +97,8 @@ def test_link_row_specs_names_the_owner_of_exactly_the_codes_link_rows_writes():
 
 # --- a split product must not be a blind spot on the to-order tab ----------- #
 SPLIT_DECISIONS = {"BETALOV|231": {"status": "split", "url": ""}}
-SPLIT_LINKS = {"61247/L": "https://www.huntingshop.eu/velkost-L",
-               "61247/XL": "https://www.huntingshop.eu/velkost-XL"}
+SPLIT_LINKS = {"TESTKOD/L": "https://www.huntingshop.eu/velkost-L",
+               "TESTKOD/XL": "https://www.huntingshop.eu/velkost-XL"}
 
 
 def test_a_split_row_shows_its_per_size_link_and_names_its_owner():
@@ -110,7 +110,7 @@ def test_a_split_row_shows_its_per_size_link_and_names_its_owner():
     permanently clobbers an already-uploaded per-size link."""
     rows = webapp.build_to_order_rows(ORDERS_CSV, PRODUCTS, SPLIT_DECISIONS, CODE2PAIR,
                                       SPLIT_LINKS)
-    r = _by_code(rows, "61247/L")
+    r = _by_code(rows, "TESTKOD/L")
     assert r["supplierUrl"] == "https://www.huntingshop.eu/velkost-L"
     assert r["reviewKey"] == "BETALOV|231"
     assert r["reviewStatus"] == "split"
@@ -123,8 +123,8 @@ def test_a_split_variant_with_no_link_of_its_own_keeps_the_inline_paste_box():
     value is genuinely what the eshop gets until that size is linked; once it is,
     `split_links` owns the code and the nightly excludes the inline one."""
     rows = webapp.build_to_order_rows(ORDERS_CSV, PRODUCTS, SPLIT_DECISIONS, CODE2PAIR,
-                                      {"61247/XL": SPLIT_LINKS["61247/XL"]})
-    r = _by_code(rows, "61247/L")
+                                      {"TESTKOD/XL": SPLIT_LINKS["TESTKOD/XL"]})
+    r = _by_code(rows, "TESTKOD/L")
     assert r["supplierUrl"] == "" and r["reviewKey"] == "" and r["reviewStatus"] == ""
 
 
@@ -142,7 +142,7 @@ def test_a_spec_without_a_usable_key_owns_nothing_anywhere():
     products = [dict(PRODUCTS[0], key="")]
     decisions = {"": {"status": "good", "url": "https://a.test/x"}}
     rows = webapp.build_to_order_rows(ORDERS_CSV, products, decisions, CODE2PAIR)
-    r = _by_code(rows, "61247/L")
+    r = _by_code(rows, "TESTKOD/L")
     assert r["supplierUrl"] == ""                        # no owner-backed URL, no ✏️
     assert r["reviewKey"] == "" and r["reviewStatus"] == ""
     # and the write-back does not claim the code either, so the inline paste box the
@@ -177,8 +177,8 @@ def test_the_rewrite_reaches_the_eshop_import_row(monkeypatch, tmp_path):
     _client().post("/api/order-decision-url",
                    json={"key": "BETALOV|231", "url": "https://www.huntingshop.eu/nova"})
     rows = import_builder.link_rows(PRODUCTS, webapp._load_decisions(), CODE2PAIR)
-    assert sorted(rows) == [["61247/L", "231", "https://www.huntingshop.eu/nova"],
-                            ["61247/XL", "231", "https://www.huntingshop.eu/nova"]]
+    assert sorted(rows) == [["TESTKOD/L", "231", "https://www.huntingshop.eu/nova"],
+                            ["TESTKOD/XL", "231", "https://www.huntingshop.eu/nova"]]
 
 
 def test_a_non_http_url_is_refused_and_nothing_changes(monkeypatch, tmp_path):
@@ -262,14 +262,14 @@ def test_correcting_a_reviewed_link_drops_the_superseded_inline_pairing(monkeypa
     moment it is provably superseded, so drop it — other codes are untouched."""
     _arm(monkeypatch, tmp_path)
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
-    webapp._save_order_pairings({"61247/L": "https://stale.test/inline",
-                                 "61247/XL": "https://stale.test/inline-xl",
+    webapp._save_order_pairings({"TESTKOD/L": "https://stale.test/inline",
+                                 "TESTKOD/XL": "https://stale.test/inline-xl",
                                  "99999/M": "https://other.test/keep"})
     r = _client().post("/api/order-decision-url",
                        json={"key": "BETALOV|231", "url": "https://www.huntingshop.eu/nova"})
     assert r.status_code == 200
     left = webapp._load_order_pairings()
-    assert "61247/L" not in left and "61247/XL" not in left
+    assert "TESTKOD/L" not in left and "TESTKOD/XL" not in left
     assert left == {"99999/M": "https://other.test/keep"}
 
 
@@ -300,7 +300,7 @@ def test_an_absurdly_long_url_is_refused(monkeypatch, tmp_path):
                                 "url": long_url}).status_code == 400
     assert webapp._load_decisions()["BETALOV|231"]["url"] == "https://www.huntingshop.eu/stara"
     assert _client().post("/api/variant-link",
-                          json={"code": "61247/L", "url": long_url}).status_code == 400
+                          json={"code": "TESTKOD/L", "url": long_url}).status_code == 400
     assert webapp._load_variant_links() == {}
 
 
@@ -322,7 +322,7 @@ def test_a_crlf_in_the_url_cannot_forge_a_log_line(monkeypatch, tmp_path, caplog
         ("/api/decision", {"key": "BETALOV|231", "status": "manual", "url": forged}),
         ("/api/decision", {"key": "K\r\nSet-Cookie: k", "status": "manual",
                            "url": "https://x.test/ok"}),
-        ("/api/variant-link", {"code": "61247/L", "url": forged}),
+        ("/api/variant-link", {"code": "TESTKOD/L", "url": forged}),
     ]
     with caplog.at_level("INFO"):
         for path, payload in posts:
