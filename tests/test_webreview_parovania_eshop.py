@@ -233,6 +233,120 @@ def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkey
     assert up == {"9/Z": "BETALOV"}
 
 
+# ── #215: an assignment BLOCKED by BUG 1 must not linger for ever ─────────────────
+#    After the BUG 1 exclusion the assignment is never written, so it is never recorded
+#    as uploaded either — it stays „new" on every single nightly run (a warning every
+#    night) and, worse, it would FIRE later if the manager ever deliberately cleared that
+#    supplier in the eshop: the app cannot tell „never had one" from „just deleted it".
+#    A per-product assignment for a product that has its own supplier is by definition
+#    out of date, so it is removed — on POSITIVE evidence only, and never on a dry run.
+def test_an_assignment_the_eshop_has_OVERTAKEN_is_removed_from_the_store(iso, monkeypatch):
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "5/A": "STALE_ASSIGN"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n9/Z;777;\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200
+    # the overtaken one is gone; the one we legitimately wrote stays (it is the record of
+    # what the manager assigned, and `uploaded_suppliers.json` is keyed against it)
+    assert webapp._load_supplier_assign() == {"9/Z": "BETALOV"}
+    assert result["obsolete_removed"] == ["5/A"], result
+    # …and it stops being counted as work still waiting to go up
+    assert result["remaining"] == 0, result
+
+
+def test_a_DRY_run_removes_NOTHING(iso, monkeypatch):
+    """A dry run exists to show what WOULD happen. A store it quietly edits is not a
+    dry run."""
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGN"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+
+    result, _status = webapp._do_upload_suppliers(dry=True)
+
+    assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}
+    assert result["obsolete_removed"] == [], result
+
+
+def test_a_code_the_CATALOGUE_DOES_NOT_CARRY_is_never_removed(iso, monkeypatch):
+    """#275 holds a code the eshop does not have — a DIFFERENT reason with a different
+    fate. That hold is self-healing: the code may appear in the catalogue tomorrow and the
+    assignment must still be there when it does. Absence is not evidence (store-prune §1)."""
+    webapp._save_supplier_assign({"absent/XL": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"absent/XL": "999"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, _status = webapp._do_upload_suppliers(dry=False)
+
+    assert webapp._load_supplier_assign() == {"absent/XL": "BETALOV"}
+    assert result["obsolete_removed"] == [], result
+    assert result["missing_count"] == 1, result
+
+
+@pytest.mark.parametrize("why,setup", [
+    ("empty", lambda mp: mp.setattr(webapp, "_iter_export_lines", _export_lines(""))),
+    ("small", lambda mp: mp.setattr(webapp, "EXPORT_MIN_CODES", 1000)),
+    ("stale", lambda mp: mp.setattr(webapp, "_export_age_s",
+                                    lambda: webapp.EXPORT_MAX_AGE_S + 60)),
+])
+def test_an_export_we_cannot_BELIEVE_removes_nothing(iso, monkeypatch, why, setup):
+    """The removal is a WRITE condition, so it may only stand on bytes we believe — the
+    same three gates that already block the upload itself. An unbelievable export cannot
+    tell which codes carry their own supplier, so it cannot condemn anything."""
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGN"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    setup(monkeypatch)
+
+    result, _status = webapp._do_upload_suppliers(dry=False)
+
+    assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}, why
+    assert result.get("obsolete_removed", []) == [], (why, result)
+
+
+def test_an_assignment_ALREADY_uploaded_is_left_alone(iso, monkeypatch):
+    """Only assignments still waiting to go up are candidates. One that was written back
+    long ago is not „blocked" — it is done, and its record is what keeps the upload
+    incremental."""
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    webapp._save_uploaded_suppliers({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;BETALOV\r\n"))
+
+    result, _status = webapp._do_upload_suppliers(dry=False)
+
+    assert webapp._load_supplier_assign() == {"5/A": "BETALOV"}
+    assert result["obsolete_removed"] == [], result
+
+
+def test_the_store_is_not_REWRITTEN_when_there_is_nothing_to_remove(iso, monkeypatch):
+    """store-prune §3 — a no-op write over a `protect=True` store burns its read receipt
+    and rewrites a file nobody asked to change."""
+    webapp._save_supplier_assign({"9/Z": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n9/Z;777;\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+    p = iso["tmp"] / "supplier_assignments.json"
+    before, mtime = p.read_bytes(), p.stat().st_mtime_ns
+
+    webapp._do_upload_suppliers(dry=False)
+
+    assert p.read_bytes() == before
+    assert p.stat().st_mtime_ns == mtime
+
+
 # ── BUG 1 safety: FAIL-CLOSED when the export is missing/empty/unreadable. The
 #    exclusion guard (_export_supplier_index) needs the catalog export to know which
 #    codes ALREADY carry their own eshop supplier. With NO export it cannot tell — it
