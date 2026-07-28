@@ -52,9 +52,21 @@ def unavailable_item_codes(unavail_store) -> set:
     return out
 
 
-def affected_orders(orders_csv, item_codes, order_status: str = ORDER_STATUS) -> dict:
+def _status_set(order_status) -> frozenset:
+    """One status name OR a whole collection of them → the set to test membership against.
+
+    #209: the shop's status names are editable text, so „open" is a CONFIGURED SET the web
+    app passes in. A plain string keeps working (this module's own default, and every
+    caller that only ever had one), which is why the parameter is not simply retyped."""
+    if isinstance(order_status, str):
+        return frozenset({order_status})
+    return frozenset(s for s in order_status if s)
+
+
+def affected_orders(orders_csv, item_codes, order_status=ORDER_STATUS) -> dict:
     """itemCode -> [ {orderCode, date, email, billFullName, qty, size, itemName, key} ] for every
-    OPEN order line whose itemCode is in ``item_codes``.
+    OPEN order line whose itemCode is in ``item_codes``. ``order_status`` is one status name or
+    a collection of them (#209).
 
     Matched by EXACT variant itemCode (a customer who ordered size L is not notified when only size
     M was flagged unavailable — the flag is per variant). One entry per order LINE; the send-plan
@@ -62,11 +74,12 @@ def affected_orders(orders_csv, item_codes, order_status: str = ORDER_STATUS) ->
     text = (orders_csv.decode("cp1250", errors="replace")
             if isinstance(orders_csv, bytes) else orders_csv)
     want = {str(c).strip() for c in item_codes if str(c).strip()}
+    statuses = _status_set(order_status)
     out: dict = {}
     if not want:
         return out
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
-        if (r.get("statusName") or "").strip() != order_status:
+        if (r.get("statusName") or "").strip() not in statuses:
             continue
         code = (r.get("itemCode") or "").strip()
         if not code or code not in want:
@@ -109,7 +122,7 @@ def _max_open_order_date(order_rows) -> str:
 
 
 def build_view(orders_csv, unavail_store, state_store, resolve,
-               order_status: str = ORDER_STATUS) -> list:
+               order_status=ORDER_STATUS) -> list:
     """The „Nedostupné tovary" tab data: one entry per flagged (unavailable) product.
 
     ``resolve(code)`` -> (product_name, alternatives) where alternatives is a list of

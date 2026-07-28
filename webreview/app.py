@@ -1880,12 +1880,94 @@ ORDERS_KNOWN_OPEN_STATUSES = frozenset({
     "Vybavuje sa", "Osob. odber", "Výmena tovaru", "Vratený tovar", "Kompletná",
 })
 
+# The statuses that mean „this order is being processed" — the ones whose lines belong on
+# „Na objednanie", drive „Nedostupné" and select the customer reminders. It used to be the
+# bare literal „Vybavuje sa" written out in FOUR places (here, `build_to_order_rows`,
+# `nedostupne.ORDER_STATUS`, `orders_reminder.ORDER_STATUS`).
+ORDERS_OPEN_STATUSES = frozenset({"Vybavuje sa"})
+
 # `statusName` is an untrusted CSV cell: a shifted or corrupt export puts arbitrary row
 # content there, and whatever lands in the unknown list is logged, persisted into
 # `automations.json` and rendered on the card. Bound both axes so a broken export can never
 # dump its contents — possibly customer data — into the manager's automation store for good.
 ORDERS_UNKNOWN_STATUS_MAX = 20
 ORDERS_UNKNOWN_STATUS_MAXLEN = 80
+
+# #209 — Shoptet's order statuses are a TEXT field the shop owner edits, so none of the
+# three sets above may stay baked in. They become the DEFAULTS of one store the manager
+# edits on the „Sync zo Shoptetu" card, right under the line that reports the statuses this
+# app does not recognise: he learns about a new status there, so he classifies it there.
+#
+# ONE store for all three sets on purpose. The prune's allow-list (PR #292) and the tab's
+# „open" literal are two halves of the same question — split across two settings they would
+# drift, and a status could end up meaning „still being handled" AND „over" at once, which
+# is the one state that deletes the marks of live orders.
+ORDER_STATUSES = _store("order_statuses.json")
+ORDER_STATUS_DEFAULTS = {
+    "to_order": tuple(sorted(ORDERS_OPEN_STATUSES)),
+    "terminal": tuple(sorted(ORDERS_TERMINAL_STATUSES)),
+    # the DEFAULT third set is the known-open one minus the open literal itself, which now
+    # lives in `to_order`; the effective „known" set is the union of all three (see
+    # `_order_statuses`), so nothing changes for a shop that never edits the config.
+    "known_open": tuple(sorted(ORDERS_KNOWN_OPEN_STATUSES - ORDERS_OPEN_STATUSES)),
+}
+# Same two axes, and the same reason, as `ORDERS_UNKNOWN_STATUS_MAX/MAXLEN`: a status is
+# untrusted text that ends up in the log, in `automations.json` and on the card. A shop with
+# more than 50 order statuses does not exist; a broken paste does.
+ORDER_STATUS_MAX = 50
+# What each set is called where the manager reads it — the card and the refusal messages use
+# the SAME words, so an error names the box he was editing.
+ORDER_STATUS_LABELS = {
+    "to_order": "objednávka sa spracúva",
+    "terminal": "objednávka je ukončená",
+    "known_open": "ostatné známe stavy (nie sú ukončené)",
+}
+
+
+def _clean_status_list(value):
+    """A stored/posted set of status names → a clean, bounded, de-duplicated list.
+
+    `None` when the value is not a usable list of names at all (wrong type, or nothing but
+    blanks) — the caller then falls back to the measured default rather than to an EMPTY
+    set. Emptiness is never a usable answer here: an empty `to_order` blanks the tab, the
+    „Nedostupné" view and the customer reminders, and an empty `terminal` silently disarms
+    the prune. A file this app cannot read is not permission to invent behaviour."""
+    if not isinstance(value, list):
+        return None
+    out = []
+    for v in value:
+        if not isinstance(v, str):
+            continue
+        s = v.strip()[:ORDERS_UNKNOWN_STATUS_MAXLEN]
+        if s and s not in out:
+            out.append(s)
+    return out[:ORDER_STATUS_MAX] or None
+
+
+def _order_statuses() -> dict:
+    """`{"to_order": frozenset, "terminal": frozenset, "known_open": frozenset}` — the
+    EFFECTIVE sets, resolved PER CALL (a module-level dict would freeze at import and stop
+    seeing an edit until the service restarts, the same trap `_line_flag_stores` avoids).
+
+    Fail-SAFE in both directions, because both directions are damaging: an unusable set
+    falls back to its measured default, and a configuration whose `to_order` and `terminal`
+    OVERLAP is discarded WHOLE. That overlap is the one state the prune cannot survive — a
+    status meaning both „still being handled" and „over" deletes the marks of live orders —
+    and patching only one side of it would leave the manager running a configuration he
+    never wrote. The write endpoint refuses it at the door; this is the backstop for a
+    hand-edited file and for a store written by an older version."""
+    raw = _read_json_store(ORDER_STATUSES, {})
+    out = {}
+    for key, default in ORDER_STATUS_DEFAULTS.items():
+        vals = _clean_status_list(raw.get(key))
+        out[key] = frozenset(vals) if vals else frozenset(default)
+    clash = out["to_order"] & out["terminal"]
+    if clash:
+        log.error("nastavenie stavov objednávok je nekonzistentné (%s je naraz "
+                  "rozpracovaný aj ukončený) — používam pôvodné nastavenie",
+                  ", ".join(sorted(clash)))
+        return {k: frozenset(v) for k, v in ORDER_STATUS_DEFAULTS.items()}
+    return out
 # a blank status is not falsy-therefore-ignorable: it is an unreadable one, and dropping it
 # would narrow the prune with no trace anywhere. It gets a name instead.
 ORDERS_BLANK_STATUS_LABEL = "(prázdny stav)"
@@ -1958,6 +2040,12 @@ def _orders_by_openness(orders_csv):
     if text and not text.endswith(("\n", "\r")):
         cut = max(text.rfind("\n"), text.rfind("\r"))
         text = text[:cut + 1] if cut >= 0 else ""
+    st = _order_statuses()
+    open_set, terminal = st["to_order"], st["terminal"]
+    # „known" is the union of ALL THREE sets: a status is only reported as unknown when the
+    # manager has classified it NOWHERE (store-prune §1a — the signal must mean genuinely
+    # UNJUDGED, or it fires permanently on expected values and hides the one new one).
+    known = open_set | terminal | st["known_open"]
     seen, still_open, unfinished, dates, unknown = set(), set(), set(), {}, set()
     try:
         rd = csv.DictReader(io.StringIO(text), delimiter=";")
@@ -1973,11 +2061,11 @@ def _orders_by_openness(orders_csv):
                 continue
             seen.add(code)
             status = (r.get("statusName") or "").strip()
-            if status == "Vybavuje sa":
+            if status in open_set:
                 still_open.add(code)
-            if status not in ORDERS_TERMINAL_STATUSES:
+            if status not in terminal:
                 unfinished.add(code)
-                if status not in ORDERS_KNOWN_OPEN_STATUSES:
+                if status not in known:
                     unknown.add(status[:ORDERS_UNKNOWN_STATUS_MAXLEN] if status
                                 else ORDERS_BLANK_STATUS_LABEL)
             if code not in dates:
@@ -2046,34 +2134,38 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     all, so there is no client state for it to order against."""
     seen, still_open, finished, dates, unknown, reason = _orders_by_openness(orders_csv)
     unknown_statuses = sorted(unknown)[:ORDERS_UNKNOWN_STATUS_MAX]
+    # #209 — every answer carries the statuses this run was actually looking for. The
+    # „nothing is open" banner used to name the hard-coded „Vybavuje sa", which after a
+    # rename sends the manager looking for exactly the wrong thing.
+    open_statuses = sorted(_order_statuses()["to_order"])
+    base = {"orders_seen": len(seen), "orders_open": len(still_open),
+            "unknown_statuses": unknown_statuses, "open_statuses": open_statuses,
+            "per_store": {}}
     if reason:
         log.error("prune riadkových príznakov PRESKOČENÝ (%s): export nesie %d objednávok "
                   "— nemaže sa nič", reason, len(seen))
-        return {"pruned": 0, "skipped": reason, "orders_seen": len(seen),
-                "orders_open": 0, "unknown_statuses": unknown_statuses, "per_store": {}}
+        return {**base, "pruned": 0, "skipped": reason}
     if len(seen) < ORDERS_PRUNE_MIN_ORDERS:
         log.warning("prune riadkových príznakov PRESKOČENÝ: export nesie len %d objednávok "
                     "(minimum %d) — vyzerá neúplne, nemaže sa nič",
                     len(seen), ORDERS_PRUNE_MIN_ORDERS)
-        return {"pruned": 0, "skipped": "implausible-source", "orders_seen": len(seen),
-                "orders_open": len(still_open),
-                "unknown_statuses": unknown_statuses, "per_store": {}}
+        return {**base, "pruned": 0, "skipped": "implausible-source"}
     # An export in which NOTHING is open is a sign we are reading something other than what
-    # we think: a renamed open status (Shoptet's status names are shop-configurable TEXT and
-    # the literal is hard-coded here), a different export, a filter left on. On a healthy
-    # feed it is impossible — measured: 57 open of 521 — so it is not a quiet week.
+    # we think: a renamed open status (Shoptet's status names are shop-configurable TEXT), a
+    # different export, a filter left on. On a healthy feed it is impossible — measured: 57
+    # open of 521 — so it is not a quiet week.
     #
     # Since the allow-list above, this can no longer turn into a wipe on its own (closure
     # needs positive membership, and a renamed status is simply not on the list), so it is
     # now belt to that braces. It stays because it is still the cheapest signal that the
     # source changed under us, and it names the failure instead of leaving the run to look
-    # healthy while pruning nothing.
+    # healthy while pruning nothing. Since #209 the renamed status is also FIXABLE from the
+    # card the banner points at, so the message names the configured statuses, not a literal.
     if not still_open:
         log.error("prune riadkových príznakov PRESKOČENÝ: v exporte s %d objednávkami nie "
-                  "je ani jedna so stavom Vybavuje sa — premenovaný stav alebo iný "
-                  "export? Nemaže sa nič", len(seen))
-        return {"pruned": 0, "skipped": "no-open-orders", "orders_seen": len(seen),
-                "orders_open": 0, "unknown_statuses": unknown_statuses, "per_store": {}}
+                  "je ani jedna v stave %s — premenovaný stav alebo iný export? "
+                  "Nemaže sa nič", len(seen), ", ".join(open_statuses))
+        return {**base, "pruned": 0, "skipped": "no-open-orders"}
     # An added status narrows what gets pruned without anything failing — the honest cost of
     # the allow-list, so it is logged and reported (rendered on the card) rather than hidden.
     if unknown_statuses:
@@ -2102,9 +2194,7 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     if not total:
         log.info("prune riadkových príznakov: nič na odstránenie (%d objednávok v exporte, "
                  "%d otvorených)", len(seen), len(still_open))
-    return {"pruned": total, "skipped": "", "orders_seen": len(seen),
-            "orders_open": len(still_open), "unknown_statuses": unknown_statuses,
-            "per_store": per_store}
+    return {**base, "pruned": total, "skipped": "", "per_store": per_store}
 
 
 def _flag_snapshot(key: str) -> dict:
@@ -2376,10 +2466,14 @@ def _cred(key: str):
     return None
 
 
-def build_to_order_rows(orders_csv, products, decisions, code2pair, variant_links=None):
+def build_to_order_rows(orders_csv, products, decisions, code2pair, variant_links=None,
+                        statuses=None):
     """Forestshop orders.csv (cp1250 bytes or str) → to-order rows.
 
-    Keeps statusName=='Vybavuje sa', drops SHIPPING*/BILLING* pseudo-items, and joins
+    Keeps the rows whose `statusName` is one of the CONFIGURED „being processed" statuses
+    (#209 — `statuses`, defaulting to the store the manager edits; it was the bare literal
+    „Vybavuje sa", so renaming the status in Shoptet emptied this tab in silence), drops
+    SHIPPING*/BILLING* pseudo-items, and joins
     each item code to its supplier reorder URL via the canonical
     import_builder.link_rows() (code -> internalNote). One row per order line; row
     key = '<orderCode>|<itemCode>'. Pure (no network) -> unit-testable."""
@@ -2400,9 +2494,10 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair, variant_link
     # routes on `reviewKey`, so advertising a status without a key would send the
     # correction to order_pairings — the silent no-op #242 exists to remove.
     code2owner = {s[0]: (s[3], s[4]) for s in specs if s[3]}
+    open_set = _order_statuses()["to_order"] if statuses is None else frozenset(statuses)
     rows = []
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
-        if (r.get("statusName") or "").strip() != "Vybavuje sa":
+        if (r.get("statusName") or "").strip() not in open_set:
             continue
         code = (r.get("itemCode") or "").strip()
         if not code or re.match(r"^(SHIPPING|BILLING)", code, re.I):
@@ -3275,6 +3370,18 @@ def api_unavailable():
 # preview-gated customer e-mails. SAFETY: no e-mail is EVER sent automatically —
 # a checkbox only persists intent; a send needs the explicit preview → Odoslať.
 # --------------------------------------------------------------------------- #
+def _nedostupne_view(csv_bytes, unavail=None, state=None):
+    """The ONE place the „Nedostupné" view is built — so the CONFIGURED „being processed"
+    statuses (#209) reach it and a second call site cannot quietly fall back to the literal
+    the module still defaults to."""
+    return nedostupne.build_view(
+        csv_bytes,
+        _load_unavailable() if unavail is None else unavail,
+        _load_nedostupne() if state is None else state,
+        _resolve_alternatives,
+        order_status=_order_statuses()["to_order"])
+
+
 @app.route("/api/nedostupne")
 def api_nedostupne():
     """Tab data: flagged-unavailable products grouped per product, joined to open orders +
@@ -3284,9 +3391,7 @@ def api_nedostupne():
     except Exception as e:  # noqa: BLE001 — degrade to empty, log the cause
         log.warning("nedostupne orders fetch failed: %r", e)
         return jsonify({"products": [], "error": str(e)})
-    view = nedostupne.build_view(csv_bytes, _load_unavailable(),
-                                 _load_nedostupne(), _resolve_alternatives)
-    return jsonify({"products": view})
+    return jsonify({"products": _nedostupne_view(csv_bytes)})
 
 
 @app.route("/api/nedostupne/state", methods=["POST"])
@@ -3318,7 +3423,8 @@ def _nedostupne_orders_alts(code: str):
     """(product_name, order_rows, alternatives) for ONE flagged product from the cached orders +
     catalog. Raises on orders-fetch failure (caller maps to 502)."""
     csv_bytes = _orders_csv_cached()
-    orders = nedostupne.affected_orders(csv_bytes, {code}).get(code, [])
+    orders = nedostupne.affected_orders(csv_bytes, {code},
+                                        _order_statuses()["to_order"]).get(code, [])
     cat_name, alts = _resolve_alternatives(code)
     name = (orders[0]["itemName"] if orders and orders[0].get("itemName") else "") or cat_name
     return name, orders, alts
@@ -6289,7 +6395,7 @@ def run_shoptet_sync() -> dict:
         # the opposite. `_orders_by_openness` already catches it — this is the backstop.
         log.error("prune riadkových príznakov preskočený (%r) — sync pokračuje", e)
         prune = {"pruned": 0, "skipped": repr(e), "orders_seen": 0, "orders_open": 0,
-                 "unknown_statuses": [], "per_store": {}}
+                 "unknown_statuses": [], "open_statuses": [], "per_store": {}}
 
     # A REFUSED download is NON-FATAL (PR #280 review, MUST FIX 2). The refusal fires
     # only while the copy already on disk is fresh AND plausible — it exists to protect
@@ -6390,6 +6496,10 @@ def run_shoptet_sync() -> dict:
         # the honest cost of the terminal-status allow-list: a status nobody taught it about
         # quietly stops being pruned, so the run names it instead of hiding it
         "flags_unknown_statuses": prune["unknown_statuses"],
+        # #209 — the statuses this run treated as „being processed". The „nothing is open"
+        # banner names THESE, so after a rename it stops sending the manager to look for a
+        # literal the shop no longer uses.
+        "flags_open_statuses": prune["open_statuses"],
     }
     if prune["skipped"]:
         result["flags_prune_skipped"] = prune["skipped"]
@@ -7218,7 +7328,11 @@ def run_orders_reminder() -> dict:
         # either, but it is not read as „never mailed" — see _reminder_unreadable.
         done = dict(state.get("orders") or {})                              # code -> {status,…}
     csv_bytes = _orders_csv_cached()
-    orders = orders_reminder.select_orders(csv_bytes)
+    # #209 — the SAME configured „being processed" set the to-order tab uses. It is one
+    # notion, not four: a renamed status must not leave this automation silently mailing
+    # nobody while the tab is empty for the same reason (automation-health.md §3).
+    orders = orders_reminder.select_orders(
+        csv_bytes, statuses=_order_statuses()["to_order"])
     # Every code in the export (not just the >4d „Vybavuje sa" ones) — the window the dedup
     # store is pruned against at the final save (#220). Empty = export unreadable → no pruning.
     window_codes = orders_reminder.all_order_codes(csv_bytes)
@@ -8095,6 +8209,67 @@ def api_ui_label():
         _save_ui_labels(d)
     log.info("ui-label: %s set %s -> %r", me["email"], key, label)
     return jsonify({"ok": True, "label": label})
+
+
+@app.route("/api/order-statuses")
+def api_order_statuses():
+    """#209 — the three order-status sets the app is ACTUALLY using, plus the built-in
+    defaults it falls back to. GET is open to every logged-in user (the card shows the sets
+    next to the statuses a run did not recognise, and that is not admin-only reading); only
+    the POST below is admin-gated, like /api/ui-label."""
+    st = _order_statuses()
+    return jsonify({
+        "statuses": {k: sorted(v) for k, v in st.items()},
+        "defaults": {k: sorted(v) for k, v in ORDER_STATUS_DEFAULTS.items()},
+        "max_per_set": ORDER_STATUS_MAX,
+        "max_len": ORDERS_UNKNOWN_STATUS_MAXLEN,
+    })
+
+
+@app.route("/api/order-statuses", methods=["POST"])
+def api_order_statuses_save():
+    """Save all three sets at once. Admin-only.
+
+    REFUSES — rather than silently correcting — the two configurations that would break the
+    prune, because a correction the manager did not ask for is a configuration he does not
+    know he is running:
+
+    * an EMPTY `to_order` or `terminal`: the first blanks „Na objednanie", „Nedostupné" and
+      the customer reminders; the second disarms the prune (nothing is ever finished);
+    * a status claimed by BOTH: it would mean „still being handled" and „over" at once, and
+      the prune would delete the marks of live orders — the exact harm #212/#292 exist to
+      prevent.
+
+    A set that is merely omitted from the payload keeps its stored value, so a screen that
+    only edits one box cannot wipe the other two."""
+    me = _admin_or_none()
+    if not me:
+        return _forbidden()
+    body = request.get_json(silent=True) or {}
+    stored = _read_json_store(ORDER_STATUSES, {})
+    out = {}
+    for key in ORDER_STATUS_DEFAULTS:
+        raw = body.get(key, stored.get(key))
+        vals = _clean_status_list(raw)
+        if vals is None and key in body:
+            return jsonify({"ok": False, "error": (
+                "zoznam „%s“ nesmie byť prázdny — bez neho by appka nevedela, ktoré "
+                "objednávky sú rozpracované a ktoré ukončené"
+                % ORDER_STATUS_LABELS[key])}), 400
+        out[key] = vals if vals is not None else list(ORDER_STATUS_DEFAULTS[key])
+    clash = sorted(set(out["to_order"]) & set(out["terminal"]))
+    if clash:
+        return jsonify({"ok": False, "error": (
+            "stav %s je uvedený aj medzi rozpracovanými, aj medzi ukončenými — "
+            "to sa navzájom vylučuje a pri mazaní starých značiek by to zmazalo prácu "
+            "pri živých objednávkach" % ", ".join(clash))}), 400
+    with _lock:
+        d = _read_json_store(ORDER_STATUSES, {})
+        d.update(out)
+        _atomic_write_json(ORDER_STATUSES, d, protect=True)
+    log.info("order-statuses: %s set to_order=%s terminal=%s known_open=%s",
+             me["email"], out["to_order"], out["terminal"], out["known_open"])
+    return jsonify({"ok": True, "statuses": {k: sorted(v) for k, v in out.items()}})
 
 
 @app.route("/api/automations/<key>/toggle", methods=["POST"])

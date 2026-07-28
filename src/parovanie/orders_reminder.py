@@ -65,7 +65,7 @@ def _parse_dt(s) -> datetime | None:
 
 
 def select_orders(orders_csv, now: datetime | None = None,
-                  min_days: int = MIN_DAYS) -> list[dict]:
+                  min_days: int = MIN_DAYS, statuses=None) -> list[dict]:
     """Shoptet orders.csv (cp1250 bytes or str) → one entry per ORDER worth acting on.
 
     Port of the n8n „Filter" (statusName == 'Vybavuje sa') + „Remove Duplicates" (by code, first
@@ -75,6 +75,12 @@ def select_orders(orders_csv, now: datetime | None = None,
     text = (orders_csv.decode("cp1250", errors="replace")
             if isinstance(orders_csv, bytes) else orders_csv)
     now = now or datetime.now()
+    # #209 — the CONFIGURED „being processed" set when the web app passes one, otherwise the
+    # module's own literal. A rename in the Shoptet admin must not leave this automation
+    # mailing nobody in silence (automation-health.md §3); it is the SAME set the to-order
+    # tab and „Nedostupné" use, so there is one notion of „open", not three.
+    wanted = frozenset({ORDER_STATUS}) if statuses is None else frozenset(
+        s for s in statuses if s)
     cutoff = timedelta(days=min_days)
     out, seen = [], set()
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
@@ -82,7 +88,7 @@ def select_orders(orders_csv, now: datetime | None = None,
         if not code or code in seen:
             continue
         seen.add(code)
-        if (r.get("statusName") or "").strip() != ORDER_STATUS:
+        if (r.get("statusName") or "").strip() not in wanted:
             continue
         od = _parse_dt(r.get("date"))
         if od is None or (now - od) <= cutoff:

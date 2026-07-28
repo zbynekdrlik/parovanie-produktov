@@ -35,6 +35,7 @@ let ORDERS_REMINDER = null; // /api/orders-reminder — last orders-reminder run
 let DEV = null;             // /api/dev/issues — {available, issues:[...]} or null (#115)
 let DEV_FILTER = 'open';    // 'Vývoj' tab filter: open | closed | all
 let UI_LABELS = {};         // /api/ui-labels — admin-set custom names {key: label} (#173)
+let ORDER_STATUSES = null;  // /api/order-statuses — which Shoptet status means what (#209)
 let ORDER_SUPPLIER = 'all';
 // #205 — hide the lines the manager has already dealt with (any flag on them). Purely a
 // VIEW filter: nothing is written, the chips keep counting every line, and it survives a
@@ -785,7 +786,7 @@ async function switchTab(tab) {
   if (tab === 'notes' && !NOTES.length) await loadNotes();
   if (tab === 'users') await loadUsers();   // always fresh — small list
   if (tab === 'posta') await loadPosta();   // always fresh — status can change
-  if (tab === 'shoptet_sync') await loadAutomations();   // always fresh — status can change
+  if (tab === 'shoptet_sync') await loadShoptetSync();   // always fresh — status can change
   if (tab === 'parovania_eshop') await loadAutomations();   // always fresh — status can change
   if (tab === 'dodavatelsky_sklad') await loadSupplierStock();   // always fresh — status can change
   if (tab === 'riziko_vypadku') await loadRiziko();   // always fresh — status can change
@@ -3756,6 +3757,15 @@ async function renameNavItem(key, defaultLbl) {
   render();
 }
 
+async function loadShoptetSync() {
+  await loadAutomations();
+  // #209 — the status configuration is edited on this card, so it is loaded with it (and
+  // re-read on every visit: another admin may have changed it meanwhile).
+  try { ORDER_STATUSES = await (await fetch('/api/order-statuses')).json(); }
+  catch (_) { ORDER_STATUSES = null; }
+}
+
+
 async function loadPosta() {
   await loadAutomations();
   try { POSTA = await (await fetch('/api/posta-uncollected')).json(); }
@@ -4104,9 +4114,14 @@ function flagPruneBlockedWarning(lr) {
   const reason = lr.flags_prune_skipped;
   const CASES = {
     'no-open-orders': {
-      why: `v exporte${count} nie je ani jedna objednávka v stave „Vybavuje sa"`,
+      // #209 — name the statuses the run was ACTUALLY looking for, not a hard-coded
+      // „Vybavuje sa": after a rename that sends him looking for exactly the wrong thing.
+      // An older recorded refusal has no such field → fall back to the built-in default.
+      why: `v exporte${count} nie je ani jedna objednávka v stave `
+           + escapeHtml((lr.flags_open_statuses || ['Vybavuje sa'])
+             .map(s => `„${s}"`).join(' / ')),
       look: 'skontroluj v Shoptete názvy stavov objednávok (asi sa niektorý premenoval) '
-            + 'a adresu exportu v nastaveniach',
+            + 'a nižšie na tejto karte ich zaraď do správnej skupiny',
     },
     'no-status-column': {
       why: `export${count} vôbec nemá stĺpec so stavom objednávky`,
@@ -4215,7 +4230,9 @@ function renderShoptetSync() {
     if (unknown.length) {
       st.appendChild(el('div', 'muted',
         'Stavy objednávok, ktoré nepoznám, a preto ich nepovažujem za vybavené (značky '
-        + 'pri nich ostávajú): ' + escapeHtml(unknown.join(', '))));
+        + 'pri nich ostávajú): <b>' + escapeHtml(unknown.join(', ')) + '</b>'
+        // #209 — the whole point of naming them: the box that fixes it is right below.
+        + '. Zaraď ich nižšie do správnej skupiny.'));
     }
     if (lr.flags_prune_skipped) st.appendChild(flagPruneBlockedWarning(lr));
     // #280 review — a NON-FATAL degradation has to be VISIBLE. Both of these leave
@@ -4234,6 +4251,100 @@ function renderShoptetSync() {
     }
   }
   wrap.appendChild(st);
+  wrap.appendChild(renderOrderStatusConfig());
+}
+
+// ---- #209: which order statuses mean WHAT ---------------------------------- //
+// It lives on THIS card and nowhere else on purpose: this is where the manager is told
+// that a status he does not recognise appeared (the „nepoznám" line above) and where the
+// „nothing is open" refusal points him, so it is where he must be able to file it. Shoptet's
+// status names are a text field the shop owner edits; until #209 they were baked into the
+// code, so a rename emptied „Na objednanie", „Nedostupné" and the customer reminders in
+// silence and narrowed the prune.
+const ORDER_STATUS_BOXES = [
+  ['to_order', 'Objednávka sa spracúva',
+   'Riadky takých objednávok sa zobrazujú v „Na objednanie" a v „Nedostupné" a chodia z '
+   + 'nich pripomienkové e-maily zákazníkom.'],
+  ['terminal', 'Objednávka je ukončená',
+   'Len pri týchto stavoch sa po čase upratujú staré značky („objednané u dodávateľa", '
+   + '„čaká sa", „skladom", „nedostupné"). Stav sem daj, len keď si istý — zmazané '
+   + 'značky sa nedajú vrátiť.'],
+  ['known_open', 'Ostatné známe stavy (nie sú ukončené)',
+   'Stavy, o ktorých vieš, ale ktoré neznamenajú ukončenie. Značky pri nich ostávajú; '
+   + 'sem patria, aby ich appka nehlásila ako neznáme.'],
+];
+
+function renderOrderStatusConfig() {
+  const box = el('div', 'autostatus');
+  box.dataset.testid = 'order-statuses';
+  box.appendChild(el('div', 'autohead', '<b>Stavy objednávok v Shoptete</b>'));
+  box.appendChild(el('div', 'autodesc',
+    'Názvy stavov si v Shoptete nastavuje obchod, takže ich appka nemôže mať napevno. '
+    + 'Tu je povedané, čo ktorý stav znamená — jeden stav na riadok.'));
+  if (!ORDER_STATUSES) {
+    box.appendChild(el('div', 'muted', 'Nastavenie sa nepodarilo načítať.'));
+    return box;
+  }
+  const admin = isAdmin();
+  const fields = {};
+  for (const [key, title, help] of ORDER_STATUS_BOXES) {
+    const values = (ORDER_STATUSES.statuses || {})[key] || [];
+    box.appendChild(el('div', 'autometa', `<span><b>${escapeHtml(title)}</b></span>`));
+    box.appendChild(el('div', 'muted', escapeHtml(help)));
+    if (admin) {
+      const ta = document.createElement('textarea');
+      ta.className = 'statusset';
+      ta.rows = Math.max(3, values.length + 1);
+      ta.value = values.join('\n');
+      ta.dataset.testid = `order-statuses-${key}`;
+      fields[key] = ta;
+      box.appendChild(ta);
+    } else {
+      // a non-admin still needs to SEE what the app is going by — the counts on this card
+      // only make sense next to it
+      box.appendChild(el('div', 'muted',
+        values.length ? escapeHtml(values.join(' · ')) : '(prázdne)'));
+    }
+  }
+  if (!admin) return box;
+  const save = el('button', 'btn sm good', '💾 Uložiť stavy');
+  save.dataset.testid = 'order-statuses-save';
+  const msg = el('div', 'muted', '');
+  msg.dataset.testid = 'order-statuses-msg';
+  save.onclick = async () => {
+    const payload = {};
+    for (const [key] of ORDER_STATUS_BOXES) {
+      payload[key] = fields[key].value.split('\n').map(s => s.trim()).filter(Boolean);
+    }
+    save.disabled = true;
+    try {
+      const r = await fetch('/api/order-statuses', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        // the server REFUSES a configuration that would break the prune; show its sentence
+        // verbatim instead of a generic „nepodarilo sa", which would tell him nothing
+        msg.className = 'autoerr';
+        msg.textContent = '⛔ ' + (j.error || 'Nepodarilo sa uložiť.');
+        return;
+      }
+      ORDER_STATUSES.statuses = j.statuses;
+      msg.className = 'muted';
+      msg.textContent = '✅ Uložené. Platí to hneď pre celú appku.';
+    } catch (e) {
+      msg.className = 'autoerr';
+      msg.textContent = '⛔ Server neodpovedal: ' + String(e);
+    } finally {
+      save.disabled = false;
+    }
+  };
+  const foot = el('div', 'autohead');
+  foot.appendChild(save);
+  box.appendChild(foot);
+  box.appendChild(msg);
+  return box;
 }
 
 // ---- Automatizácie (#135): tab „Kontrola obrázkov" -------------------------- //

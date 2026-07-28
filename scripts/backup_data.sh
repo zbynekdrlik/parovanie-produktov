@@ -32,7 +32,7 @@ FILES="decisions.json review_data.json ordered_items.json uploaded_pairings.json
        order_pairings.json supplier_assignments.json variant_links.json
        waiting_items.json instock_items.json unavailable_items.json
        order_comments.json nedostupne.json vystavy.json users.json
-       notes.json ui_labels.json"
+       notes.json ui_labels.json order_statuses.json"
 
 for f in $FILES; do
     src="$OUT/$f"

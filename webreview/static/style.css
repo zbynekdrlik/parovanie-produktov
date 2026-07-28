@@ -481,6 +481,10 @@ body[data-theme=dark] .pill.on{background:#064e3b;color:#6ee7b7}
    a footnote; sits between the Štart/Stop head and the Plán/Posledný beh line. */
 .autodesc{font-size:13.5px;color:var(--text);line-height:1.45}
 .autometa{font-size:13px;color:var(--muted);display:flex;gap:6px;flex-wrap:wrap}
+/* #209 — one Shoptet order status per line, on the „Sync zo Shoptetu" card. */
+.statusset{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;
+  background:var(--panel);color:var(--text);font-size:13.5px;line-height:1.5;resize:vertical}
+.statusset:focus{outline:2px solid var(--accent);border-color:var(--accent)}
 .autoerr{font-size:13px;color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
   border-radius:8px;padding:8px 10px;word-break:break-word}
 body[data-theme=dark] .autoerr{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
