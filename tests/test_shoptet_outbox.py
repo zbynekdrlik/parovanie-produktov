@@ -149,3 +149,57 @@ def test_a_code_with_no_queued_fields_is_never_sent_as_an_empty_row():
     assert [r[0] for r in rows] == ["A", "B"]
     assert blocked == {}
     assert header == "code;pairCode;availabilityInStock;internalNote;stock"
+
+
+def _pending_group_of_two():
+    return ob.queue_fields(
+        {}, source="parovania_eshop", header="code;pairCode;internalNote",
+        rows=[["A", "P", "u"], ["B", "P", "u"]],
+        credit_group={"A": "K", "B": "K"},
+        credit_value={"A": "u", "B": "u"}, now="T")[0]
+
+
+def test_a_confirmed_code_leaves_the_table():
+    p, credits = ob.settle(_pending_group_of_two(), success_codes={"A"},
+                           blocked={}, now="T2")
+    assert set(p) == {"B"}
+
+
+def test_a_group_is_credited_only_when_ALL_its_codes_are_confirmed():
+    _, half = ob.settle(_pending_group_of_two(), success_codes={"A"},
+                        blocked={}, now="T2")
+    assert half == {}
+    _, full = ob.settle(_pending_group_of_two(), success_codes={"A", "B"},
+                        blocked={}, now="T2")
+    assert full == {"parovania_eshop": {"K": "u"}}
+
+
+def test_an_unconfirmed_code_stays_and_counts_an_attempt():
+    p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
+                     blocked={}, now="T2")
+    assert p["A"]["attempts"] == 1
+    p2, _ = ob.settle(p, success_codes=set(), blocked={}, now="T3")
+    assert p2["A"]["attempts"] == 2
+
+
+def test_a_blocked_code_records_its_reason_and_since_but_is_never_dropped():
+    p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
+                     blocked={"A": "not-in-catalog"}, now="T2")
+    assert p["A"]["blocked"] == {"reason": "not-in-catalog", "since": "T2"}
+    assert p["A"]["fields"]["internalNote"]["value"] == "u"
+
+
+def test_a_code_that_stops_being_blocked_clears_its_flag():
+    p, _ = ob.settle(_pending_group_of_two(), success_codes=set(),
+                     blocked={"A": "not-in-catalog"}, now="T2")
+    p, _ = ob.settle(p, success_codes=set(), blocked={}, now="T3")
+    assert p["A"]["blocked"] is None
+
+
+def test_stale_blocked_names_the_codes_that_have_been_stuck_for_three_runs():
+    p = _pending_group_of_two()
+    for t in ("T2", "T3", "T4"):
+        p, _ = ob.settle(p, success_codes=set(),
+                         blocked={"A": "not-in-catalog"}, now=t)
+    assert ob.stale_blocked(p) == ["A"]
+    assert ob.stale_blocked(p, min_attempts=99) == []
