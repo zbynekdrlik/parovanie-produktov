@@ -133,6 +133,15 @@ MIN_PACKAGE_COVERAGE = 0.5
 MAX_PACKAGE_GAP_DAYS = 7
 MIN_DISPATCHED_FOR_ALARM = 5
 
+# The window size above which „almost nothing is recognised as dispatched" stops being a quiet
+# week and becomes a broken vocabulary (PR #298 review, A1 — see `dispatched_status_unknown`).
+# Measured read-only over 120 rolling windows of the live export: the dispatched/eligible ratio
+# never fell below 0.63 (worst window 86 of 136), and NOT ONE window had >= 5 eligible orders
+# with fewer than 5 dispatched. Fewer than MIN_DISPATCHED_FOR_ALARM out of 20 is a ratio under
+# 0.25 — 2.5x below the worst healthy reading — so this cannot fire on trading noise, while a
+# renamed status (100 orders leaving the set at once) clears it immediately.
+MIN_ELIGIBLE_FOR_BLIND_SPOT = 20
+
 
 def _parse_date(s) -> date | None:
     """Lenient 'YYYY-MM-DD...' prefix → date; None (never raises) on junk."""
@@ -298,10 +307,35 @@ def source_coverage(orders_csv, today: date | None = None,
         # than from a literal in this file, so a rename is now a one-line edit on the card — but
         # the signal stays, because a name can still be edited WRONG (a typo, a status renamed in
         # Shoptet and not here). If the vocabulary stops matching, `dispatched_orders` silently
-        # falls to 0 and this alarm — built against silent death — would itself go quietly green
-        # forever. Eligible orders but not one of them dispatched is the signature.
-        "dispatched_status_unknown": (len(eligible) >= MIN_DISPATCHED_FOR_ALARM
-                                      and not dispatched),
+        # collapses and this alarm — built against silent death — would itself go quietly green
+        # forever.
+        #
+        # The signature is NOT „the set came out empty" (PR #298 review, A1). That test was
+        # written when DISPATCHED was the single literal „Vybavená", where „the shop renamed the
+        # status" and „nothing matches" were the SAME event. Deriving the set as
+        # `terminal − cancelled` (three live names) split them apart: renaming just the main one
+        # leaves the two rare siblings matching, so the set stays non-empty for ever — and 1-4
+        # dispatched orders are ALSO below MIN_DISPATCHED_FOR_ALARM, so `degraded` is not
+        # computed either. Measured on the reviewer's repro (100 dispatched orders renamed, one
+        # dobropis and one výmena surviving, source dead): `dispatched_orders=2`,
+        # `dispatched_status_unknown=False`, `degraded=False` — main's single-name version
+        # alarmed on the same shop.
+        #
+        # Comparing the configured names against the names the export CARRIES does not fix it:
+        # in that very repro two of the three configured names ARE in the export, so „not one of
+        # them is present" stays False. Asking for ALL of them instead is permanent noise —
+        # „Vybavený Dobropis" has 10 rows in 90 days, so it is legitimately absent from a 30-day
+        # window most of the time.
+        #
+        # So the question the flag answers is the honest one: is there a window worth judging in
+        # which too few orders are RECOGNISED as dispatched to judge it? That is the same
+        # evidence floor `degraded` already refuses to work below, which makes the two verdicts
+        # exhaustive — no window can be silently green any more. The `not dispatched` branch is
+        # kept so a SMALL window behaves exactly as it did before this change.
+        "dispatched_status_unknown": (
+            len(dispatched) < MIN_DISPATCHED_FOR_ALARM
+            and (len(eligible) >= MIN_ELIGIBLE_FOR_BLIND_SPOT
+                 or (not dispatched and len(eligible) >= MIN_DISPATCHED_FOR_ALARM))),
         "degraded": False,
     }
     if len(dispatched) >= MIN_DISPATCHED_FOR_ALARM:

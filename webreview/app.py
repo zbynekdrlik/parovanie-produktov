@@ -2166,17 +2166,25 @@ def _posta_statuses() -> tuple:
     return st["cancelled"], st["terminal"] - st["cancelled"]
 
 
-def _dispatched_status_blind_message(eligible: int, dispatched_statuses) -> str:
+def _dispatched_status_blind_message(eligible: int, dispatched_statuses,
+                                     dispatched: int = 0) -> str:
     """The ERROR line for the alarm's own blind spot — naming the CONFIGURED statuses.
 
     store-prune §7: a refusal that names a literal the shop no longer uses sends the manager
     looking for something that does not exist. The old line told him to fill the new name into
-    `DISPATCHED_STATUS`, a name only the source code has."""
-    return ("posta: v okne je %d objednávok, ale ANI JEDNA nemá niektorý zo stavov, ktoré "
+    `DISPATCHED_STATUS`, a name only the source code has.
+
+    Since PR #298's review (A1) the signal also fires with 1-4 recognised orders — a renamed
+    main status whose rare siblings survive — so the sentence may no longer assert that not one
+    order carries the names. automation-health §4: the flag has to report the number it actually
+    triggered on, or the ERROR is false about the only figure the manager can act on."""
+    names = ", ".join(sorted(dispatched_statuses)) or "zoznam je prázdny"
+    found = ("ANI JEDNA nemá" if not dispatched
+             else "len %d z nich má" % dispatched)
+    return ("posta: v okne je %d objednávok, ale %s niektorý zo stavov, ktoré "
             "znamenajú „odoslaná“ (%s) — stavy sa v Shoptete zrejme premenovali; kontrola "
             "pokrytia podacích čísel je odteraz slepá, kým sa nové názvy nedoplnia do "
-            "nastavenia stavov na karte „Sync zo Shoptetu“"
-            % (eligible, ", ".join(sorted(dispatched_statuses)) or "zoznam je prázdny"))
+            "nastavenia stavov na karte „Sync zo Shoptetu“" % (eligible, found, names))
 # a blank status is not falsy-therefore-ignorable: it is an unreadable one, and dropping it
 # would narrow the prune with no trace anywhere. It gets a name instead.
 ORDERS_BLANK_STATUS_LABEL = "(prázdny stav)"
@@ -6740,12 +6748,14 @@ def run_posta_uncollected() -> dict:
         # WRONG. Orders in the window of which NOT ONE is recognised as dispatched means that
         # vocabulary moved — and this alarm would then sit green forever, exactly like the
         # automation it was built to watch.
-        # `eligible_orders` and not `missing_package + dispatched_orders`: this branch fires only
-        # when dispatched_orders is 0, so that sum degenerates to „orders WITHOUT a number", and a
-        # window whose orders all carry one reported „v okne je 0 objednávok, ale ANI JEDNA…" —
-        # self-contradictory, and wrong about the only number the reader can act on.
+        # `eligible_orders` and not `missing_package + dispatched_orders`: that sum degenerates
+        # to „orders WITHOUT a number", and a window whose orders all carry one reported „v okne
+        # je 0 objednávok, ale ANI JEDNA…" — self-contradictory, and wrong about the only number
+        # the reader can act on. The recognised COUNT goes with it since PR #298's review: the
+        # branch no longer implies zero (1-4 survivors fire it too).
         log.error("%s", _dispatched_status_blind_message(
-            coverage["eligible_orders"], dispatched_statuses))
+            coverage["eligible_orders"], dispatched_statuses,
+            coverage["dispatched_orders"]))
     if coverage["degraded"]:
         log.error("posta: ZDROJ ZÁSIELOK JE DEGRADOVANÝ — %d z %d odoslaných objednávok v okne "
                   "nemá podacie číslo, posledné pribudlo pred %s dňami; automatizácia z nich "
