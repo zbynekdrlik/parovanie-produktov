@@ -234,7 +234,7 @@ def test_toorder_tab_lists_items_and_checkbox_persists(page, live_server):
     # The BETALOV line (1/M) renders its order number as a clickable admin link
     # (target by code — robust to the oldest-first group ordering).
     beta = page.locator(".toorder-row[data-code='1/M']")
-    assert "objednavky-detail/?code=20260900" in beta.locator(".to-order").first.get_attribute("href")
+    assert "objednavky-detail/?code=99000900" in beta.locator(".to-order").first.get_attribute("href")
 
     # Tick 'objednané' on it; wait for the persist POST, then confirm it survives reload.
     cb = beta.locator("input[type='checkbox']").first
@@ -298,13 +298,13 @@ def test_toorder_newest_first_ordering(page, live_server):
     page.wait_for_selector(".toorder-supplier")
 
     # Newest orders on top (like Shoptet) → the supplier with the newest pending order
-    # sorts first. BETALOV holds 1/M = 20260900 (newest); ORBIS's newest is 20260700 →
+    # sorts first. BETALOV holds 1/M = 99000900 (newest); ORBIS's newest is 99000700 →
     # BETALOV first.
     headers = page.locator(".toorder-supplier").all_inner_texts()
     assert headers[0].startswith("BETALOV"), headers
     assert any(h.startswith("ORBIS") for h in headers), headers
 
-    # Within BETALOV the newer order (1/M = 20260900) precedes the older (2/M = 20260750).
+    # Within BETALOV the newer order (1/M = 99000900) precedes the older (2/M = 99000750).
     codes = page.locator(".toorder-row").evaluate_all("els => els.map(e => e.dataset.code)")
     assert codes.index("1/M") < codes.index("2/M"), codes
 

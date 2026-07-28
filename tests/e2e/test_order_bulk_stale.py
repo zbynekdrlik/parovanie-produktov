@@ -12,8 +12,8 @@ classic app.js script → unit-tested by bare name via page.evaluate.
 Both drive the session-scoped `live_server`; every seeded flag is cleaned up.
 """
 
-BETALOV_KEYS = ["20260900|1/M", "20260750|2/M"]   # the two BETALOV fixture lines
-ORBIS_KEY = "20260700|77/X"                        # ORBIS single line (2026-04-24, old)
+BETALOV_KEYS = ["99000900|1/M", "99000750|2/M"]   # the two BETALOV fixture lines
+ORBIS_KEY = "99000700|77/X"                        # ORBIS single line (2026-04-24, old)
 
 
 def _clear_flags(page, base, key):

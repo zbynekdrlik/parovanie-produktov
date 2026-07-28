@@ -141,7 +141,7 @@ Pravidlá, ktoré z toho platia pre každé pole idúce do zákazníckeho textu:
    endpoint mu podáva hodnotu priamo z `posta_uncollected.json`, takže pokazený zápis staršieho
    behu by prešiel aj s opravenou čítačkou. A rob to BEZPODMIENEČNE (nie `if hodnota:`), aby typ
    z pokazeného storu nespadol v `escape()` a nezobral so sebou celý denný beh.
-3. **Nezúž fail-soft na „čo nepoznám, to je prázdne".** ISO **basic** tvar (`20260803`) je platný
+3. **Nezúž fail-soft na „čo nepoznám, to je prázdne".** ISO **basic** tvar (`99000803`) je platný
    dátum a `date.fromisoformat` ho číta jednoznačne — pripni ho testom, nech ho nikto nezahodí.
 4. **Zákazník číta po slovensky: `3. 8. 2026`, nie `2026-08-03`.** ISO drž interne (tvar API,
    JSON store, tabuľka na webe) a prekladaj až pri renderovaní mailu. Pozor na tichý prípad: kým

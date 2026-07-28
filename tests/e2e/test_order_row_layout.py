@@ -85,7 +85,7 @@ def test_a_reviewed_pairing_link_offers_an_edit_button(page, toorder_wide_server
     page.goto(toorder_wide_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
 
-    row = page.locator('.toorder-row[data-key="20261217|61247/L"]')
+    row = page.locator('.toorder-row[data-key="99001217|TESTKOD/L"]')
     assert row.locator("a.to-link").count() == 1, "row must render the reviewed link"
     assert row.locator(".to-pairedit").count() == 1, \
         "a reviewed pairing must be correctable from this tab (#242)"
@@ -103,7 +103,7 @@ def test_fixing_a_reviewed_link_sticks_and_reaches_the_import(page, toorder_wide
     page.wait_for_selector(".toorder-row")
 
     new_url = "https://www.huntingshop.eu/polokosela-forest-OPRAVENA/"
-    row = page.locator('.toorder-row[data-key="20261217|61247/L"]')
+    row = page.locator('.toorder-row[data-key="99001217|TESTKOD/L"]')
     row.locator(".to-pairedit").click()
     row.locator(".to-pairurl").fill(new_url)
     with page.expect_response("**/api/order-decision-url") as resp:
@@ -112,11 +112,11 @@ def test_fixing_a_reviewed_link_sticks_and_reaches_the_import(page, toorder_wide
 
     # back to a link, carrying the corrected address — without a reload, because the
     # repaint is what the manager actually sees (a reload would hide a stale-DOM bug)
-    page.wait_for_selector('.toorder-row[data-key="20261217|61247/L"] a.to-link')
+    page.wait_for_selector('.toorder-row[data-key="99001217|TESTKOD/L"] a.to-link')
     assert row.locator("a.to-link").get_attribute("href") == new_url
 
     # the SIBLING size is the same review product → one decision covers both (#204 shape)
-    sib = page.locator('.toorder-row[data-key="20261218|61247/XL"]')
+    sib = page.locator('.toorder-row[data-key="99001218|TESTKOD/XL"]')
     assert sib.locator("a.to-link").get_attribute("href") == new_url
 
     page.reload()
@@ -126,7 +126,7 @@ def test_fixing_a_reviewed_link_sticks_and_reaches_the_import(page, toorder_wide
     # and it is what the eshop import would receive, for EVERY variant of the product
     served = page.evaluate("""async () => {
       const j = await (await fetch('/api/orders')).json();
-      return (j.orders || []).filter(o => o.itemCode.startsWith('61247/'))
+      return (j.orders || []).filter(o => o.itemCode.startsWith('TESTKOD/'))
                              .map(o => o.supplierUrl);
     }""")
     assert served == [new_url, new_url], served
@@ -169,7 +169,7 @@ def test_the_url_box_never_collapses_below_a_readable_width(page, toorder_wide_s
 
 # --- the .to-badlink branch: an unusable reviewed link is the row that most --- #
 # --- needs repairing, and it had ZERO coverage.                             --- #
-_BAD = '.toorder-row[data-key="20261221|77777/S"]'
+_BAD = '.toorder-row[data-key="99001221|77777/S"]'
 
 
 def test_an_unusable_reviewed_link_is_inert_and_still_repairable(page, toorder_wide_server):
@@ -223,12 +223,12 @@ def test_typing_on_an_unusable_link_row_survives_a_repaint(page, toorder_wide_se
     row.locator(".to-pairurl").fill("https://www.citrade.sk/rukavice-ZATIAL-NEULOZENE")
 
     # assign a supplier on the supplier-less row → saveSupplier() → renderToOrder()
-    n1 = page.locator('.toorder-row[data-key="20261220|N1"]')
+    n1 = page.locator('.toorder-row[data-key="99001220|N1"]')
     n1.locator(".to-supinput").fill("CITRADE")
     with page.expect_response("**/api/order-supplier") as resp:
         n1.locator(".to-supsave").click()
     assert resp.value.status == 200
-    page.wait_for_selector('.toorder-row[data-key="20261220|N1"] .to-suptag')
+    page.wait_for_selector('.toorder-row[data-key="99001220|N1"] .to-suptag')
 
     assert row.locator(".to-pairurl").count() == 1, "the editor was thrown away by the repaint"
     assert row.locator(".to-pairurl").input_value() == \
@@ -238,7 +238,7 @@ def test_typing_on_an_unusable_link_row_survives_a_repaint(page, toorder_wide_se
 
 
 # --- a split product is not a blind spot ------------------------------------ #
-_SPLIT = '.toorder-row[data-key="20261222|55555/M"]'
+_SPLIT = '.toorder-row[data-key="99001222|55555/M"]'
 
 
 def test_a_split_product_shows_its_per_size_link(page, toorder_wide_server):
@@ -334,12 +334,12 @@ def test_a_row_outside_the_review_set_keeps_its_inline_paste_box(page, toorder_w
     page.goto(toorder_wide_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
 
-    row = page.locator('.toorder-row[data-key="20261219|99999/M"]')
+    row = page.locator('.toorder-row[data-key="99001219|99999/M"]')
     assert row.locator(".to-pair .to-pairurl").count() == 1
     row.locator(".to-pairurl").fill("https://www.orbis.sk/nohavice-trophy/")
     with page.expect_response("**/api/order-pair") as resp:
         row.locator(".to-pairsave").click()
     assert resp.value.status == 200
-    page.wait_for_selector('.toorder-row[data-key="20261219|99999/M"] a.to-link')
+    page.wait_for_selector('.toorder-row[data-key="99001219|99999/M"] a.to-link')
 
     assert console == [], f"console not clean: {console}"

@@ -118,7 +118,7 @@ fixtúru nechá špinavú.
 
 ## 7. Hodnotu skopírovanú zo susedného testu treba overiť TIEŽ
 
-Nové #211 testy si prevzali kľúč `20261045|61247/L` z testu o dva riadky vyššie — a
+Nové #211 testy si prevzali kľúč `<reálny kód objednávky>|<kód produktu>` (hodnota zámerne nezapísaná — #289) z testu o dva riadky vyššie — a
 `LC_ALL=C grep -ac` nad `data/out/orders_cache.csv` ho našiel (4, resp. 1 výskyt):
 reálny kód objednávky naviazaný na meno, e-mail a telefón zákazníka, vo VEREJNOM
 repozitári. „Je to už v tomto súbore" nie je overenie (pred-existujúce výskyty →

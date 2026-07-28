@@ -12,7 +12,7 @@ Colours softened for #143 (2026-07-22, exact hex from the boss):
 green #6CAB68 = rgb(108,171,104), red #D14D3B = rgb(209,77,59),
 orange (kept distinct, gently muted) #DDA43C = rgb(221,164,60)."""
 
-ORBIS_KEY = "20260700|77/X"   # <orderCode>|<itemCode> of ORBIS's single fixture line
+ORBIS_KEY = "99000700|77/X"   # <orderCode>|<itemCode> of ORBIS's single fixture line
 
 
 def _chip(page, name):

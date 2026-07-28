@@ -52,7 +52,7 @@ def test_red_and_orange_sections_render(page, automations_server):
 
     red = page.locator('[data-testid="ordrem-red"]')
     assert red.is_visible()
-    assert "Bunda Test Red" in red.inner_text() and "20261000" in red.inner_text()
+    assert "Bunda Test Red" in red.inner_text() and "99001000" in red.inner_text()
 
     orange = page.locator('[data-testid="ordrem-orange"]')
     assert orange.is_visible()
@@ -95,7 +95,7 @@ def test_mark_red_order_as_contacted_moves_it_to_skipped(page, automations_serve
     console = _console(page)
     _open_tab(page, automations_server)
 
-    row = page.locator('tr[data-code="20261000"]')
+    row = page.locator('tr[data-code="99001000"]')
     assert row.is_visible()
     with page.expect_response("**/api/orders-reminder/override"):
         row.locator(".ordrem-act-contact").click()
@@ -104,14 +104,14 @@ def test_mark_red_order_as_contacted_moves_it_to_skipped(page, automations_serve
     # for a skipped table to exist somewhere).
     page.wait_for_function(
         "() => document.querySelectorAll('[data-testid=ordrem-red]"
-        " tr[data-code=\"20261000\"]').length === 0")
-    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 0
+        " tr[data-code=\"99001000\"]').length === 0")
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="99001000"]').count() == 0
     # …into the MANUAL section (#227), never under the „AI usúdilo…" heading: this order had no
     # internal note at all, so the classifier never ran — the manager decided.
     manual = page.locator('[data-testid="ordrem-manual"]')
     assert manual.is_visible()
-    assert "20261000" in manual.inner_text()
-    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261000"]').count() == 0
+    assert "99001000" in manual.inner_text()
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="99001000"]').count() == 0
 
     assert console == [], f"console not clean: {console}"
 
@@ -127,14 +127,14 @@ def test_manually_handled_row_renders_in_its_own_section(page, automations_serve
 
     manual = page.locator('[data-testid="ordrem-manual"]')
     assert manual.is_visible()
-    row = manual.locator('tr[data-code="20261007"]')
+    row = manual.locator('tr[data-code="99001007"]')
     assert row.count() == 1
     assert "Termoska Test Manual" in row.inner_text()
     assert page.locator(".warnhead", has_text="vybavené ručne manažérom").count() == 1
 
     # …and it is NOT in the AI-verdict table, while the AI's own row still is
-    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261007"]').count() == 0
-    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261002"]').count() == 1
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="99001007"]').count() == 0
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="99001002"]').count() == 1
 
     assert console == [], f"console not clean: {console}"
 
@@ -148,7 +148,7 @@ def test_send_now_button_posts_and_surfaces_smtp_failure(page, automations_serve
     console = _console(page)
     _open_tab(page, automations_server)
 
-    row = page.locator('tr[data-code="20261000"]')
+    row = page.locator('tr[data-code="99001000"]')
     with page.expect_response("**/api/orders-reminder/override") as resp_info, \
          page.expect_event("dialog") as dialog_info:
         row.locator(".ordrem-act-send").click()
@@ -157,7 +157,7 @@ def test_send_now_button_posts_and_surfaces_smtp_failure(page, automations_serve
     assert "Nepodarilo sa" in dialog.message
     dialog.accept()
     # nothing was persisted on failure — the row stays exactly where it was
-    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]').count() == 1
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="99001000"]').count() == 1
 
     assert _unexpected(console) == [], f"console not clean: {console}"
 
@@ -173,14 +173,14 @@ def test_no_email_section_renders_and_offers_no_send_button(page, automations_se
     tbl = page.locator('[data-testid="ordrem-noemail"]')
     assert tbl.is_visible()
     body = tbl.inner_text()
-    assert "20261004" in body and "Bez Mailu" in body and "Rukavice Test NoMail" in body
+    assert "99001004" in body and "Bez Mailu" in body and "Rukavice Test NoMail" in body
     assert "treba doriešiť" in body                 # the note the AI never had to read
     assert "chýba e-mail" in body
-    row = tbl.locator('tr[data-code="20261004"]')
+    row = tbl.locator('tr[data-code="99001004"]')
     assert row.locator(".ordrem-act-send").count() == 0
     assert row.locator(".ordrem-act-contact").count() == 0
     # and it is NOT mixed into the „bez internej poznámky" (red) list — it HAS a note
-    assert page.locator('[data-testid="ordrem-red"] tr[data-code="20261004"]').count() == 0
+    assert page.locator('[data-testid="ordrem-red"] tr[data-code="99001004"]').count() == 0
 
     assert console == [], f"console not clean: {console}"
 
@@ -198,7 +198,7 @@ def test_an_unfinished_order_shows_its_reason_and_stays_actionable(page, automat
     # state something that never happened (with no MAIL_BCC the AI does not even run)
     tbl = page.locator('[data-testid="ordrem-pending"]')
     assert tbl.is_visible()
-    row = tbl.locator('tr[data-code="20261006"]')
+    row = tbl.locator('tr[data-code="99001006"]')
     assert row.count() == 1
     body = row.inner_text()
     assert "Čelovka Test Pending" in body and "Nedokončený Beh" in body
@@ -206,7 +206,7 @@ def test_an_unfinished_order_shows_its_reason_and_stays_actionable(page, automat
     assert row.locator(".ordrem-act-send").count() == 1  # …and the manager can finish it by hand
 
     # …and it is NOT mixed into the AI-verdict table
-    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="20261006"]').count() == 0
+    assert page.locator('[data-testid="ordrem-skipped"] tr[data-code="99001006"]').count() == 0
     assert "nestihol vybaviť" in page.locator(".warnhead", has_text="automat").inner_text()
 
     assert console == [], f"console not clean: {console}"
@@ -220,16 +220,16 @@ def test_preview_button_shows_the_email_without_sending(page, automations_server
     console = _console(page)
     _open_tab(page, automations_server)
 
-    row = page.locator('[data-testid="ordrem-red"] tr[data-code="20261000"]')
+    row = page.locator('[data-testid="ordrem-red"] tr[data-code="99001000"]')
     with page.expect_response("**/api/orders-reminder/preview") as resp:
-        row.locator('[data-testid="ordrem-preview-20261000"]').click()
+        row.locator('[data-testid="ordrem-preview-99001000"]').click()
     assert resp.value.status == 200
 
     modal = page.locator("#emModal")
     modal.wait_for(state="visible")
     assert "Ján Bez" in page.locator("#emRecipient").inner_text()
     assert "jan@example.com" in page.locator("#emRecipient").inner_text()
-    assert "20261000" in page.locator("#emHead").inner_text()
+    assert "99001000" in page.locator("#emHead").inner_text()
     # the rendered mail really is in the sandboxed iframe
     assert "Ján Bez" in page.frame_locator("#emPreview").locator("body").inner_text()
     # …and this dialog can never send: there is no send control in it

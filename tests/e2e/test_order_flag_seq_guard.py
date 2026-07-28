@@ -30,7 +30,7 @@ client that repaints prettily while the store disagrees still fails.
 """
 import pytest
 
-_KEY = "20260910|C1"
+_KEY = "99000910|C1"
 _ROW = ".toorder-row[data-code='C1']"
 _CHECK = _ROW + " input[type=checkbox]"
 

@@ -21,7 +21,7 @@ _STATUS = {"waiting": (".to-wait", "/api/waiting"),
            "instock": (".to-instock", "/api/instock"),
            "unavail": (".to-unavail", "/api/unavailable")}
 _FIELD = {"waiting": "waiting", "instock": "instock", "unavail": "unavailable"}
-_KEY = "20260910|C1"
+_KEY = "99000910|C1"
 
 
 def _open(page, base):

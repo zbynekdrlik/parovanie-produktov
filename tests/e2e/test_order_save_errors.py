@@ -337,8 +337,8 @@ def test_a_refused_second_write_rolls_back_to_what_the_server_ACCEPTED(page, too
 
     server = page.evaluate(
         "() => window.__realFetch('/api/instock').then(r => r.json())")
-    assert list(server["instock"]) == ["20260001|N1"], server
-    assert page.evaluate("() => Object.keys(INSTOCK)") == ["20260001|N1"], "the accepted write was lost"
+    assert list(server["instock"]) == ["99000001|N1"], server
+    assert page.evaluate("() => Object.keys(INSTOCK)") == ["99000001|N1"], "the accepted write was lost"
     row = page.locator(".toorder-row[data-code='N1']")
     assert "instock" in (row.get_attribute("class") or "").split()
     assert "on" in (row.locator(".to-instock").get_attribute("class") or "").split()
@@ -372,8 +372,8 @@ def test_an_accepted_write_survives_a_refusal_that_answers_FIRST(page, toorder_s
 
     server = page.evaluate(
         "() => window.__realFetch('/api/instock').then(r => r.json())")
-    assert list(server["instock"]) == ["20260001|N1"], server
-    assert page.evaluate("() => Object.keys(INSTOCK)") == ["20260001|N1"], \
+    assert list(server["instock"]) == ["99000001|N1"], server
+    assert page.evaluate("() => Object.keys(INSTOCK)") == ["99000001|N1"], \
         "the accepted write was dropped because its success landed last"
     row = page.locator(".toorder-row[data-code='N1']")
     assert "instock" in (row.get_attribute("class") or "").split()
@@ -455,9 +455,9 @@ def test_a_bulk_write_supersedes_an_in_flight_per_row_write(page, toorder_server
     page.wait_for_function("() => window.__settled.length === 1", timeout=3000)
     page.wait_for_timeout(400)     # give the (wrong) rollback every chance to happen
 
-    assert page.evaluate("() => Object.keys(ORDERED)") == ["20260001|N1"]
+    assert page.evaluate("() => Object.keys(ORDERED)") == ["99000001|N1"]
     server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
-    assert list(server["ordered"]) == ["20260001|N1"], server
+    assert list(server["ordered"]) == ["99000001|N1"], server
     assert "done" in (page.locator(".toorder-row[data-code='N1']")
                       .get_attribute("class") or "").split()
     # nothing failed from the manager's point of view: the group write carried the row
@@ -702,7 +702,7 @@ def test_a_per_row_write_issued_DURING_the_bulk_flight_is_not_inverted(page, too
     page.wait_for_timeout(400)      # let every continuation (incl. reconcile) settle
 
     server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
-    assert "20260001|N1" not in server["ordered"], server      # his last click won
+    assert "99000001|N1" not in server["ordered"], server      # his last click won
     assert page.evaluate("() => Object.keys(ORDERED)") == [], \
         "the client map crowned the bulk over a per-row write issued AFTER it"
     assert "done" not in (page.locator(".toorder-row[data-code='N1']")
@@ -738,8 +738,8 @@ def test_a_bulk_that_LANDED_still_owns_the_row_when_the_later_writes_all_fail(pa
     page.wait_for_timeout(300)
 
     server = page.evaluate("() => window.__realFetch('/api/ordered').then(r => r.json())")
-    assert list(server["ordered"]) == ["20260001|N1"], server
-    assert page.evaluate("() => Object.keys(ORDERED)") == ["20260001|N1"], \
+    assert list(server["ordered"]) == ["99000001|N1"], server
+    assert page.evaluate("() => Object.keys(ORDERED)") == ["99000001|N1"], \
         "the rollback discarded the bulk write the server had already accepted"
     assert "done" in (page.locator(".toorder-row[data-code='N1']")
                       .get_attribute("class") or "").split()
@@ -1064,7 +1064,7 @@ def test_a_refused_write_cannot_resurrect_a_status_a_LATER_write_cleared(page, t
       .then(([w, i, u]) => ({waiting: Object.keys(w.waiting),
                              instock: Object.keys(i.instock),
                              unavailable: Object.keys(u.unavailable)}))""")
-    assert srv == {"waiting": [], "instock": [], "unavailable": ["20260910|C1"]}, srv
+    assert srv == {"waiting": [], "instock": [], "unavailable": ["99000910|C1"]}, srv
 
     cls = set((row.get_attribute("class") or "").split())
     assert "unavail" in cls, cls

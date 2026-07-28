@@ -261,10 +261,10 @@ function toorderPage(){
   const chips=[['Všetci',24,'sel'],['GRUBE',9,'todo'],['BETALOV',7,'todo'],['ODIMON',5,'done'],['WETLAND',3,'todo']];
   let h='<div class="supchips">'+chips.map(c=>`<button class="sc ${c[2]}">${c[0]} (${c[1]})</button>`).join('')+'</div>';
   const rows=[
-    {n:'Alpenheat AH5 vyhrievané vložky',m:'Objednávka 20260712 · ODIMON · kód 60648',url:'odimon.sk/produkt/ah5-trend',tg:'stock',tgl:'Skladom ✓'},
-    {n:'Deerhunter Moor Padded Waistcoat',m:'Objednávka 20260712 · BETALOV · kód 15233',url:'huntingshop.eu/moor-padded',tg:'order',tgl:'Objednané'},
-    {n:'Härkila Pro Hunter GTX 42',m:'Objednávka 20260711 · WETLAND · kód 88120',url:'wetland.sk/pro-hunter-gtx',tg:'wait',tgl:'Čaká sa'},
-    {n:'Blaser lovecký nôž R8',m:'Objednávka 20260711 · GRUBE · kód R8-KNF',url:'grube.sk/p/blaser-r8-noz/44210',tg:'un',tgl:'Nedostupné ✗'},
+    {n:'Alpenheat AH5 vyhrievané vložky',m:'Objednávka 99000712 · ODIMON · kód 60648',url:'odimon.sk/produkt/ah5-trend',tg:'stock',tgl:'Skladom ✓'},
+    {n:'Deerhunter Moor Padded Waistcoat',m:'Objednávka 99000712 · BETALOV · kód 15233',url:'huntingshop.eu/moor-padded',tg:'order',tgl:'Objednané'},
+    {n:'Härkila Pro Hunter GTX 42',m:'Objednávka 99000711 · WETLAND · kód 88120',url:'wetland.sk/pro-hunter-gtx',tg:'wait',tgl:'Čaká sa'},
+    {n:'Blaser lovecký nôž R8',m:'Objednávka 99000711 · GRUBE · kód R8-KNF',url:'grube.sk/p/blaser-r8-noz/44210',tg:'un',tgl:'Nedostupné ✗'},
   ];
   h+=rows.map(r=>`
     <div class="orow"><div class="oim">📦</div>
