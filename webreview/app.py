@@ -5613,7 +5613,9 @@ def _do_upload_suppliers(dry):
     products = [{"code": c, "supplier": assigns[c]} for c in new_codes]
     if not new_codes:
         log.info("n8n suppliers: 0 new assignments")
-        return {"ok": True, "count": 0, "products": [],
+        # `obsolete_removed` is part of the shape on EVERY path, so a caller never has to
+        # tell „nothing was removed" from „this build does not report it"
+        return {"ok": True, "count": 0, "products": [], "obsolete_removed": [],
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
@@ -5668,6 +5670,7 @@ def _do_upload_suppliers(dry):
         return {"ok": True, "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
+                "obsolete_removed": [],
                 "gate_blocked": {"reason": reason, "codes": len(export_codes),
                                  "min_codes": min_codes,
                                  "age_h": (round(export_age / 3600, 1)
@@ -5675,6 +5678,59 @@ def _do_upload_suppliers(dry):
                                  "max_age_h": round(EXPORT_MAX_AGE_S / 3600, 1)},
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
+
+    # #215 — CLEAN UP the assignments the eshop has OVERTAKEN.
+    #
+    # BUG 1 excludes a code whose product already carries its own supplier, and that is
+    # right: a per-product assignment exists to FILL IN a missing supplier, so once the
+    # eshop has one the assignment is by definition out of date. But excluding it was all
+    # that ever happened to it — it was never written, therefore never recorded as
+    # uploaded, therefore came back as „new" on every single nightly run (a warning every
+    # night, for ever), and it would FIRE the day the manager deliberately CLEARED that
+    # supplier in the eshop, because nothing here can tell „never had one" from „just
+    # deleted it". So it is removed.
+    #
+    # It removes the MANAGER'S OWN INPUT, so it obeys the same discipline as the flag prune
+    # (`.claude/rules/store-prune.md`):
+    #   * POSITIVE evidence on both axes — the code IS in the export (presence) AND the
+    #     export shows it carrying its own supplier (state). „I do not see a supplier" is
+    #     never evidence of anything;
+    #   * FAIL-CLOSED on the source — reaching this line already proves the export is
+    #     present, plausible (>= `_export_min_codes()`) and FRESH, because the gate above
+    #     returns otherwise. There is deliberately no second, weaker check here;
+    #   * only for codes still waiting to go up (`new_codes`) — one already uploaded is
+    #     done, not blocked, and its record is what keeps the upload incremental;
+    #   * NEVER `missing_codes` (#275): „the catalogue does not carry this code" is a
+    #     different hold with a different fate — it is self-healing and the code may appear
+    #     tomorrow, so that assignment must still be there when it does;
+    #   * never on a DRY run, in-place `pop` under one `with _lock:`, no write at all when
+    #     there is nothing to remove, and the concrete codes AND the values dropped go into
+    #     the log — a count alone defends nothing three weeks later.
+    obsolete = sorted(set(new_codes) & own_supplier & export_codes)
+    if obsolete and not dry:
+        with _lock:
+            live = _load_supplier_assign()
+            dropped = {c: live[c] for c in obsolete if c in live}
+            if dropped:
+                for c in dropped:
+                    live.pop(c, None)
+                _save_supplier_assign(live)
+                log.info("n8n suppliers: %d priradení zmazaných ako neaktuálne — eshop už "
+                         "pri tých kódoch má vlastného dodávateľa: %s", len(dropped),
+                         ", ".join(f"{c}={v}" for c, v in sorted(dropped.items())))
+    elif obsolete:
+        log.info("n8n suppliers: %d priradení je neaktuálnych (eshop má vlastného "
+                 "dodávateľa), suchý beh ich nemaže: %s", len(obsolete),
+                 ", ".join(obsolete))
+    obsolete_removed = obsolete if not dry else []
+    if obsolete_removed:
+        # A removed assignment is no longer one: it must leave THIS run's view of the work
+        # too, or the summary would go on counting it as waiting to go up and the row
+        # builder below would look up a key that is no longer in the store.
+        assigns = _load_supplier_assign()
+        gone = set(obsolete_removed)
+        new_codes = [c for c in new_codes if c not in gone]
+        products = [p for p in products if p["code"] not in gone]
 
     # #270/#275: the same "the eshop has no such code" rows that doom the pairings push
     # also sit here (145/3XL is both an inline pairing and a supplier assignment). Such
@@ -5715,6 +5771,7 @@ def _do_upload_suppliers(dry):
                     len(new_codes), len(own_supplier & set(new_codes)), len(missing_codes))
         return {"ok": True, "count": 0, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
+                "obsolete_removed": obsolete_removed,
                 **_missing_report(missing_codes, assigns),
                 **_supplier_summary(uploaded, assigns)}, 200
 
@@ -5754,6 +5811,7 @@ def _do_upload_suppliers(dry):
               "error_detail": res["error_detail"], "error": err_msg,
               "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
               "products": products, "stdout_tail": res["stdout_tail"],
+              "obsolete_removed": obsolete_removed,
               **_missing_report(missing_codes, assigns),
               **_supplier_summary(uploaded, assigns)}
     log.info("n8n suppliers: rc=%s chunks=%d/%d processed=%s codes=%d",
