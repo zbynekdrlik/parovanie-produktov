@@ -249,6 +249,55 @@ def test_run_prunes_orphan_line_flags_from_the_freshly_downloaded_export(iso, mo
         ["99001500|C1", "99002001|A1"]
 
 
+# ── #293: a refused prune is a DEGRADED run, and says what it fired on ─────────
+def test_a_refused_prune_marks_the_run_degraded_and_returns_its_numbers(iso, monkeypatch):
+    """`no-open-orders` / `no-status-column` are PERMANENT: until the export is fixed the
+    prune never runs once and the flag stores grow exactly as before #212. The run itself
+    legitimately ends `ok` (orders, catalogue and review all landed), so without a signal of
+    its own the card reads as a healthy hour — the „quietly dead automation" shape from
+    `.claude/rules/automation-health.md` §3, reached from the other side.
+
+    It rides the SAME `source_degraded` flag #282 introduced, which `navError()` already
+    reads, rather than inventing a second predicate the sidebar would have to learn."""
+    old_day = (date.today() - timedelta(days=120)).isoformat()
+    # a plausible export in which NOTHING is open: the open literal has been renamed
+    rows = ("".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+                    for i in range(60)))
+    monkeypatch.setattr(webapp, "_fetch_orders_csv",
+                        lambda: (ORDERS_CSV.decode("cp1250") + rows).encode("cp1250"))
+
+    result = webapp.run_shoptet_sync()
+
+    assert result["flags_prune_skipped"] == "no-open-orders", result
+    assert result["source_degraded"] is True, result
+    # a refusal has to return the number it fired on, or the operator is told „your export
+    # is wrong" with nothing to go and look at
+    assert result["flags_orders_seen"] >= 60, result
+    assert result["flags_orders_open"] == 0, result
+
+
+def test_a_healthy_run_is_NOT_marked_degraded_and_reports_the_unknown_statuses(
+        iso, monkeypatch):
+    """The other half: a run that pruned normally must not carry the degraded flag, or the ⚠
+    badge becomes permanent noise and stops meaning anything. It still reports the statuses
+    the allow-list does not know — the honest cost of that list."""
+    recent = (date.today() - timedelta(days=2)).isoformat()
+    old_day = (date.today() - timedelta(days=120)).isoformat()
+    rows = (f"99002001;{recent} 09:00:00;Vybavuje sa;a@x.sk;;X Y;;A1\r\n"
+            f"99002002;{old_day} 09:00:00;Osob. odber;a@x.sk;;X Y;;B1\r\n"
+            + "".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+                      for i in range(60)))
+    monkeypatch.setattr(webapp, "_fetch_orders_csv",
+                        lambda: (ORDERS_CSV.decode("cp1250") + rows).encode("cp1250"))
+
+    result = webapp.run_shoptet_sync()
+
+    assert "flags_prune_skipped" not in result, result
+    assert "source_degraded" not in result, result
+    assert result["flags_unknown_statuses"] == ["Osob. odber"], result
+    assert result["flags_orders_open"] == 1, result
+
+
 # ── customer export: secret hygiene (same rule as the catalog export) ──────────
 def test_fetch_customers_csv_sanitizes_secret_url_on_network_failure(monkeypatch):
     secret_url = "https://www.forestshop.sk/export/customers.csv?hash=TOTALLY-SECRET-HASH"

@@ -65,7 +65,8 @@ def _admin_session_cookie(base: str) -> str:
 
 _SERVER_FIXTURES = ("live_server", "matched_server",
                     "longcontent_matched_server", "search_server", "search_dup_server",
-                    "automations_server", "posta_degraded_server", "imgfail_server",
+                    "automations_server", "posta_degraded_server",
+                    "sync_prune_blocked_server", "imgfail_server",
                     "imgflood_server", "dev_server",
                     "nedostupne_server", "vystavy_server", "toorder_server",
                     "toorder_wide_server")
@@ -625,6 +626,60 @@ def posta_degraded_server(tmp_path_factory):
         "SHOPTET_CRED": str(out / "no_creds_here"),
         "MAIL_HOST": "",
         "MAIL_BCC": "owner@example.com",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def sync_prune_blocked_server(tmp_path_factory):
+    """Isolated webreview instance whose LAST hourly sync could not prune (#293).
+
+    `no-open-orders` and `no-status-column` are PERMANENT states: until the export is fixed
+    the prune never runs once, the flag stores go on growing exactly as before #212, and the
+    only trace used to be a log line. The whole value of the refusal is what the manager
+    SEES, so it needs browser coverage — a unit test over the stats proves only half
+    (`.claude/rules/automation-health.md` §3).
+
+    Seeded through `automations.json` → `last_result`, which is what the card renders from;
+    the sync itself is never triggered here (creds point at a nonexistent file)."""
+    out = tmp_path_factory.mktemp("wr_sync_blocked_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    # the live shape: everything else about the run succeeded, only the prune refused
+    (out / "automations.json").write_text(json.dumps({
+        "shoptet_sync": {
+            "last_run": "2026-07-28T09:00:05+02:00",
+            "last_status": "ok",
+            "last_result": {"orders_bytes": 1234567, "catalog_products": 4321,
+                            "catalog_codes": 8765, "review_synced": 120, "review_stale": 0,
+                            "customers_bytes": 999, "flags_pruned": 0,
+                            "flags_prune_skipped": "no-open-orders",
+                            "flags_orders_seen": 521, "flags_orders_open": 0,
+                            "flags_unknown_statuses": [], "source_degraded": True},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+        "9900200;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),
+        "MAIL_HOST": "",
     }
     proc = subprocess.Popen(
         [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)

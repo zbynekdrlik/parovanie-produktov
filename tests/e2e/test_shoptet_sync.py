@@ -128,3 +128,77 @@ def test_a_degraded_sync_announces_it_instead_of_reading_as_a_clean_run(
     assert "nepravdepodobne" not in ok and "zlyhalo" not in ok
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #293: a permanently refusing prune must not be SILENT ─────────────────────
+
+def _open_sync_tab(page, base):
+    page.goto(base)
+    page.wait_for_selector('[data-testid="version"]')
+    page.get_by_role("button", name="Sync zo Shoptetu").click()
+    page.wait_for_selector('[data-testid="shoptet-sync-status"]')
+
+
+def test_a_refused_prune_shows_a_banner_and_does_not_read_as_a_healthy_run(
+        page, sync_prune_blocked_server):
+    """The whole point of refusing to prune is safety, and the whole cost of it is silence:
+    `no-open-orders` is a permanent state, so until the export is fixed the stores grow
+    exactly as they did before #212 while the card stays green.
+
+    So the card must say three things: that the run was DEGRADED (not „✅ OK"), what the
+    prune refused on WITH the numbers it fired on, and what the manager should go and look
+    at (`.claude/rules/automation-health.md` §3, steps 3+4)."""
+    console = _console(page)
+    _open_sync_tab(page, sync_prune_blocked_server)
+
+    meta = page.locator(".autometa").inner_text()
+    assert "⚠️ DEGRADOVANÝ" in meta, meta
+    assert "✅ OK" not in meta, meta
+
+    banner = page.locator(".autostatus .autoerr").inner_text()
+    assert "Upratovanie starých značiek" in banner, banner
+    assert "521" in banner, banner            # the number the refusal fired on
+    assert "Vybavuje sa" in banner, banner    # what to go and check in Shoptet
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_refused_prune_lights_the_sidebar_warning_badge(page, sync_prune_blocked_server):
+    """Step 4 of the same rule: without the ⚠ in the sidebar the manager only learns about it
+    if he happens to open this one tab — which is exactly why #153 exists."""
+    console = _console(page)
+    _open_sync_tab(page, sync_prune_blocked_server)
+
+    badge = page.locator('.tabs .navrow:has-text("Sync zo Shoptetu") .navwarn')
+    assert badge.count() == 1, page.locator(".tabs").inner_text()
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_healthy_run_reports_how_many_marks_the_prune_removed(page, automations_server):
+    """The prune is the one thing in this automation that DELETES the manager's markings, so
+    the count belongs in front of him and not only in the log. A run that removed nothing is
+    still reported — „0" is the normal, reassuring answer, and its absence is what let the
+    refusal hide."""
+    console = _console(page)
+    _open_sync_tab(page, automations_server)
+
+    page.evaluate("""() => {
+      const a = AUTOMATIONS.find(x => x.key === 'shoptet_sync');
+      a.last_run = '2026-07-28T09:00:05+02:00';
+      a.last_status = 'ok';
+      a.last_result = {orders_bytes: 1234567, catalog_products: 4321, catalog_codes: 8765,
+                       review_synced: 120, review_stale: 0, flags_pruned: 22,
+                       flags_orders_seen: 521, flags_orders_open: 57,
+                       flags_unknown_statuses: ['Osob. odber', 'Vratený tovar']};
+      renderShoptetSync();
+    }""")
+
+    txt = page.locator(".autostatus").inner_text()
+    assert "vyčistené osirelé značky: 22" in txt, txt
+    # the honest cost of the allow-list: a status nobody taught it about silently stops
+    # being pruned, so it is named rather than hidden
+    assert "Osob. odber" in txt and "Vratený tovar" in txt, txt
+    assert page.locator(".autostatus .autoerr").count() == 0, txt
+
+    assert console == [], f"console not clean: {console}"
