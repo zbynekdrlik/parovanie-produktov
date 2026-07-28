@@ -86,6 +86,12 @@ def test_run_queues_externalcodes_and_records_counts(iso, monkeypatch):
     assert d["60645/L"]["fields"]["externalCode"]["value"] == "1547734519"
     assert d["60645/L"]["fields"]["externalCode"]["source"] == "grube_externalcode"
     assert d["60645/S"]["fields"]["externalCode"]["value"] == "1547734523"
+    # #299 review I2 — field["credit"]["value"] was never asserted anywhere in the
+    # whole suite (the exact gap C1 slipped through in the sibling split_links
+    # producer). Here it's the same raw itemId as the queued value (no
+    # normalization happens for externalCode), but it must still be pinned.
+    assert d["60645/L"]["fields"]["externalCode"]["credit"]["value"] == "1547734519"
+    assert d["60645/S"]["fields"]["externalCode"]["credit"]["value"] == "1547734523"
 
     # the producer itself never writes its own "uploaded" state (decision carried
     # over from Task 6/7, not in this task's brief — see automation-health.md)
@@ -213,14 +219,22 @@ def test_n8n_endpoint_requires_bearer_token(iso, monkeypatch):
 
 
 def test_n8n_endpoint_dry_run_queues_nothing(iso, monkeypatch):
+    """#299 review m3 — dry_run used to reach a real Shoptet dry-run import
+    (`test_n8n_endpoint_dry_run_reaches_import_without_recording`, pre-migration);
+    the Task 8 rewrite made it an early-return no-op that ALWAYS said `queued: 0`
+    regardless of how many codes were actually candidates — a silent contract
+    change nobody could tell from the response. `would_queue` restores that
+    meaning (a genuine preview) without reintroducing any live write."""
     _seed_grube({"60645/L": "111"})
     monkeypatch.setattr(webapp, "_import_token", lambda: "SEKRET")
     c = authed_client()
     r = c.post("/api/n8n/upload-externalcode?dry_run=1",
                headers={"Authorization": "Bearer SEKRET"})
     assert r.status_code == 200
-    assert r.get_json()["dry_run"] is True
-    assert r.get_json()["queued"] == 0
+    j = r.get_json()
+    assert j["dry_run"] is True
+    assert j["queued"] == 0
+    assert j["would_queue"] == 1        # the honest preview of what WOULD be queued
     # dry run queues NOTHING (so the real nightly run still pushes it)
     assert not (iso["tmp"] / "pending_shoptet.json").exists()
     assert not (iso["tmp"] / "uploaded_externalcodes.json").exists()

@@ -106,6 +106,14 @@ def test_run_queues_split_links_and_records_counts(iso, monkeypatch):
     assert d["60645/S"]["fields"]["internalNote"]["value"] == "https://trigona.sk/s"
     assert d["60645/S"]["fields"]["internalNote"]["source"] == "split_links"
     assert d["60645/L"]["fields"]["internalNote"]["value"] == "https://trigona.sk/l"
+    # #299 review I2/C1 — field["credit"]["value"] was never asserted anywhere in
+    # the whole suite; that gap is exactly how C1 (the credit carrying the
+    # NORMALIZED cell value instead of the RAW variant_links.json value) shipped
+    # unnoticed. TRIGONA doesn't normalize, so raw == cell value here — the
+    # GRUBE case where they DIFFER is `test_grube_split_link_credit_is_RAW_not_
+    # normalized_and_is_not_requeued_once_credited` below.
+    assert d["60645/S"]["fields"]["internalNote"]["credit"]["value"] == "https://trigona.sk/s"
+    assert d["60645/L"]["fields"]["internalNote"]["credit"]["value"] == "https://trigona.sk/l"
 
     # the producer itself never writes its own "uploaded" state
     assert not (iso["tmp"] / "uploaded_variant_links.json").exists()
@@ -142,6 +150,49 @@ def test_run_requeues_the_same_link_until_it_is_actually_credited(iso, monkeypat
     assert d["60645/M"]["fields"]["internalNote"]["value"] == "https://trigona.sk/m"
     # 60645/S unchanged this round — still whatever r1/r2 queued
     assert d["60645/S"]["fields"]["internalNote"]["value"] == "https://trigona.sk/s"
+
+
+def test_grube_split_link_credit_is_RAW_not_normalized_and_is_not_requeued_once_credited(
+        iso, monkeypatch):
+    """#299 review C1/I2 — the test above (`test_run_requeues_the_same_link_
+    until_it_is_actually_credited`) uses TRIGONA, a supplier whose URL is written
+    verbatim — normalization never enters the picture, so it could never have
+    caught C1 (the producer crediting the NORMALIZED `.de` cell value instead of
+    the RAW variant_links.json value `new_variant_link_keys` actually compares
+    against). Rewritten on GRUBE, the supplier where `link_rows`/`to_grube_de`
+    REBUILDS the URL, per the review's explicit instruction to base the
+    incremental test on the supplier where normalization changes the shape.
+
+    Two things are pinned: (1) crediting the RAW url (what a correct
+    `_credit_producer` write actually contains) makes the link genuinely skipped
+    on the next run — proving the credited-store COMPARISON side is healthy; (2)
+    crediting the NORMALIZED `.de` url (what the C1 bug wrote) does NOT stop the
+    requeue — the same link keeps coming back forever, exactly the review's own
+    probe (`SECOND RUN count: 1`, `total_uploaded: 0` — never confirmed)."""
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
+    raw = "https://www.grube.sk/p/grand-nord/154773/?q=a#itemId=1"
+    normalized = "https://www.grube.de/p/x/154773/"
+    _seed({"70000/S": raw}, split_keys=("GRUBE|700",))
+
+    r1 = webapp.run_split_links()
+    assert r1["variantlinks"]["count"] == 1
+    d = webapp._load_pending()
+    assert d["70000/S"]["fields"]["internalNote"]["value"] == normalized
+
+    # credit the NORMALIZED value (what the C1 bug wrote) → must still requeue
+    with open(webapp.VARIANT_LINKS_STATE, "w", encoding="utf-8") as f:
+        json.dump({"70000/S": normalized}, f)
+    r2 = webapp.run_split_links()
+    assert r2["variantlinks"]["count"] == 1, (
+        "crediting the normalized value must NOT stop the requeue — "
+        "new_variant_link_keys compares the RAW store, never the normalized one")
+
+    # credit the RAW value (what a correct write contains) → now genuinely skipped
+    with open(webapp.VARIANT_LINKS_STATE, "w", encoding="utf-8") as f:
+        json.dump({"70000/S": raw}, f)
+    r3 = webapp.run_split_links()
+    assert r3["variantlinks"]["count"] == 0
 
 
 def test_run_zero_new_reports_ok_without_queuing(iso, monkeypatch):
@@ -260,14 +311,20 @@ def test_n8n_endpoint_requires_bearer_token(iso, monkeypatch):
 
 
 def test_n8n_endpoint_dry_run_queues_nothing(iso, monkeypatch):
+    """#299 review m3 — dry_run used to reach a real Shoptet dry-run import; the
+    Task 8 rewrite made it an early-return no-op always reporting `queued: 0`
+    regardless of how many links were actually candidates — a silent contract
+    change. `would_queue` restores a genuine preview without any live write."""
     _seed({"60645/S": "https://trigona.sk/s"})
     monkeypatch.setattr(webapp, "_import_token", lambda: "SEKRET")
     c = authed_client()
     r = c.post("/api/n8n/upload-variant-links?dry_run=1",
                headers={"Authorization": "Bearer SEKRET"})
     assert r.status_code == 200
-    assert r.get_json()["dry_run"] is True
-    assert r.get_json()["queued"] == 0
+    j = r.get_json()
+    assert j["dry_run"] is True
+    assert j["queued"] == 0
+    assert j["would_queue"] == 1        # the honest preview of what WOULD be queued
     # dry run queues NOTHING (so the real nightly run still pushes it)
     assert not (iso["tmp"] / "pending_shoptet.json").exists()
     assert not (iso["tmp"] / "uploaded_variant_links.json").exists()

@@ -421,9 +421,17 @@ def test_grube_producer_queues_instead_of_importing(pend, monkeypatch):
     res, status = webapp._do_upload_externalcodes(False)
     assert status == 200
     assert res["queued"] == 1
+    assert res["count"] == res["queued"]           # #299 review m1 — never allowed to drift
     d = webapp._load_pending()
     assert d["A"]["fields"]["externalCode"]["value"] == "12345"
     assert d["A"]["fields"]["externalCode"]["source"] == "grube_externalcode"
+    # #299 review I2 — field["credit"]["value"] was never asserted anywhere in the
+    # whole suite; that gap is exactly how C1 (split_links crediting the wrong,
+    # normalized value) shipped unnoticed. For grube_externalcode the credit value
+    # is the same raw itemId in both places (no normalization happens), so this
+    # pins the healthy case; the GRUBE-normalizing case lives in
+    # test_split_links_grube_credit_value_is_RAW_not_normalized below.
+    assert d["A"]["fields"]["externalCode"]["credit"]["value"] == "12345"
 
 
 def test_grube_producer_never_credits_itself(pend, monkeypatch):
@@ -457,9 +465,46 @@ def test_split_links_producer_queues_instead_of_importing(pend, monkeypatch):
     res, status = webapp._do_upload_variant_links(False)
     assert status == 200
     assert res["queued"] == 1
+    assert res["count"] == res["queued"]           # #299 review m1 — never allowed to drift
     d = webapp._load_pending()
     assert d["60645/S"]["fields"]["internalNote"]["value"] == "https://trigona.sk/s"
     assert d["60645/S"]["fields"]["internalNote"]["source"] == "split_links"
+    # #299 review I2 — TRIGONA doesn't normalize, so raw == queued value here; the
+    # GRUBE case (where they DIFFER) is the actual C1 regression test below.
+    assert d["60645/S"]["fields"]["internalNote"]["credit"]["value"] == "https://trigona.sk/s"
+
+
+def test_split_links_grube_credit_value_is_RAW_not_normalized(pend, monkeypatch):
+    """#299 review C1 (Critical) — the split-link credit value must be the RAW
+    variant_links.json URL that `import_builder.new_variant_link_keys` compares
+    against `uploaded_variant_links.json`, never the normalized `.de` URL
+    `link_rows` builds for the eshop's `internalNote` cell. The old code credited
+    `r[2]` (the normalized cell value) — for GRUBE that is a DIFFERENT string than
+    the raw stored link, so the incremental check (`uploaded.get(c) != u`, always
+    comparing against RAW) could never see a match: the same link would queue
+    again on every single hourly run, forever, and `total_uploaded` would stay 0
+    even after the drain "confirmed" it. Regression: revert `credit_value` back to
+    `r[0]: r[2]` and this fails (credit.value becomes the normalized .de URL)."""
+    monkeypatch.setattr(webapp, "PRODUCTS", [
+        {"key": "GRUBE|700", "supplier": "GRUBE", "variant_codes": ["70000/S"]}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"70000/S": "700"})
+    raw = "https://www.grube.sk/p/grand-nord/154773/?q=a#itemId=1"
+    monkeypatch.setattr(webapp, "_load_variant_links", lambda: {"70000/S": raw})
+    monkeypatch.setattr(webapp, "_load_uploaded_variant_links", lambda: {})
+    monkeypatch.setattr(webapp, "_load_decisions",
+                        lambda: {"GRUBE|700": {"status": "split", "url": ""}})
+
+    res, status = webapp._do_upload_variant_links(False)
+
+    assert status == 200
+    assert res["queued"] == 1
+    d = webapp._load_pending()
+    field = d["70000/S"]["fields"]["internalNote"]
+    # the CELL sent to Shoptet is normalized (proves link_rows/to_grube_de still ran)
+    assert field["value"] == "https://www.grube.de/p/x/154773/"
+    # the CREDIT must be the RAW value — what new_variant_link_keys will compare
+    # against uploaded_variant_links.json on the next run
+    assert field["credit"]["value"] == raw
 
 
 def test_split_links_producer_never_credits_itself(pend, monkeypatch):
@@ -480,13 +525,28 @@ def test_split_links_producer_never_credits_itself(pend, monkeypatch):
     assert res["queued"] == 1
 
 
-def test_both_task8_producers_are_open_in_the_queue_migration_gate():
-    """Without both keys in QUEUE_MIGRATED, `run_shoptet_upload`'s hourly cycle
-    would never invoke either producer even after a manager enables them — the
-    migration would ship dead (the tichá smrť class, `automation-health.md` §3).
-    Kills a regression that reverts either addition to QUEUE_MIGRATED."""
-    assert "grube_externalcode" in webapp.QUEUE_MIGRATED
-    assert "split_links" in webapp.QUEUE_MIGRATED
+def test_both_task8_producers_are_open_in_the_queue_migration_gate(cycle, monkeypatch):
+    """#299 review m4 — the old version of this test asserted membership in the
+    QUEUE_MIGRATED tuple directly (`assert "x" in webapp.QUEUE_MIGRATED`), which is
+    an assert about a CONSTANT, not about BEHAVIOUR: a mutation that emptied
+    QUEUE_MIGRATED entirely was the only thing it could ever catch, and the gate's
+    real behaviour (a producer missing from the gate never runs even when enabled)
+    was already independently pinned by
+    `test_a_producer_not_yet_migrated_to_the_queue_never_runs_even_when_enabled`.
+    Rewritten to exercise `run_shoptet_upload` itself with BOTH Task 8 producers
+    ENABLED against the REAL (unmonkeypatched) QUEUE_MIGRATED — so a regression
+    that drops either key out of the gate leaves that producer's key missing from
+    `cycle["run_sync"]`/`res["producers"]`, which this test can actually observe.
+    Kills a regression that removes either producer from QUEUE_MIGRATED (verified
+    by mutation, not by inspection — see the report)."""
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: [
+        {"key": "grube_externalcode", "enabled": True},
+        {"key": "split_links", "enabled": True},
+    ])
+    res = webapp.run_shoptet_upload()
+    assert cycle["run_sync"].count("grube_externalcode") == 1
+    assert cycle["run_sync"].count("split_links") == 1
+    assert res["producers"] == {"grube_externalcode": True, "split_links": True}
 
 
 def test_a_confirmed_credit_for_grube_externalcode_actually_writes_EXTERNALCODES_STATE(
@@ -524,3 +584,77 @@ def test_a_confirmed_credit_for_split_links_actually_writes_VARIANT_LINKS_STATE(
     assert res["confirmed"] == 1
     d = json.loads(state.read_text(encoding="utf-8"))
     assert d["60645/S"] == "https://trigona.sk/s"
+
+
+def test_a_GRUBE_split_link_is_credited_and_never_requeued_again_end_to_end(
+        cycle, tmp_path, monkeypatch):
+    """#299 review C1/I2 — the full producer→drain→credit loop for the GRUBE
+    normalizing case, proving the fix closes the actual live-eshop-facing bug (not
+    just the isolated credit-value assert above): queue the GRUBE split link via
+    the REAL producer (`_do_upload_variant_links`, normalized cell + raw credit),
+    run the hourly cycle so `_credit_producer` writes `uploaded_variant_links.json`
+    from that same credit value, then run the producer AGAIN and confirm the link
+    is now genuinely skipped (queued == 0) instead of being queued forever (the
+    review's own probe measured `SECOND RUN count: 1` against the buggy code —
+    this reproduces that exact scenario end to end)."""
+    monkeypatch.setattr(webapp, "VARIANT_LINKS_STATE", str(tmp_path / "uploaded_variant_links.json"))
+    monkeypatch.setattr(webapp, "PRODUCTS", [
+        {"key": "GRUBE|700", "supplier": "GRUBE", "variant_codes": ["70000/S"]}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"70000/S": "700"})
+    raw = "https://www.grube.sk/p/grand-nord/154773/?q=a#itemId=1"
+    monkeypatch.setattr(webapp, "_load_variant_links", lambda: {"70000/S": raw})
+    # NOT monkeypatched: `_load_uploaded_variant_links` stays the REAL function
+    # (`_read_json_store(VARIANT_LINKS_STATE, {})`) — it must re-read the state
+    # `_credit_producer` writes below, or the second call below proves nothing.
+    monkeypatch.setattr(webapp, "_load_decisions",
+                        lambda: {"GRUBE|700": {"status": "split", "url": ""}})
+
+    res1, _ = webapp._do_upload_variant_links(False)
+    assert res1["queued"] == 1
+
+    cycle_res = webapp.run_shoptet_upload()
+    assert cycle_res["confirmed"] == 1
+
+    res2, _ = webapp._do_upload_variant_links(False)
+    assert res2["queued"] == 0, (
+        "the same GRUBE split link must NOT be a candidate again once the drain "
+        "confirmed it — a non-zero queued here is the C1 infinite-requeue bug")
+
+
+# ── #299 review m3 — dry_run must PREVIEW what would be queued, not just say ── #
+# ── "0" unconditionally. The old direct-import producers' dry_run reached a ── #
+# ── real Shoptet dry-run validation; these two no longer import at all, so ── #
+# ── the honest equivalent is: report how many field values WOULD be queued, ── #
+# ── while genuinely queueing nothing. ────────────────────────────────────── #
+
+def test_dry_run_previews_the_grube_queue_count_without_queuing_anything(pend, monkeypatch):
+    monkeypatch.setattr(webapp, "_load_grube_codes",
+                        lambda: {"A": {"itemId": "12345"}, "B": {"itemId": "999"}})
+    monkeypatch.setattr(webapp, "_load_uploaded_externalcodes", lambda: {})
+
+    res, status = webapp._do_upload_externalcodes(True)
+
+    assert status == 200
+    assert res["dry_run"] is True
+    assert res["queued"] == 0                 # nothing was ACTUALLY queued
+    assert res["would_queue"] == 2             # but the preview says what WOULD be
+    assert webapp._load_pending() == {}        # and the pending table proves it
+
+
+def test_dry_run_previews_the_split_links_queue_count_without_queuing_anything(pend, monkeypatch):
+    monkeypatch.setattr(webapp, "PRODUCTS",
+                        [{"key": "TRIGONA|395", "variant_codes": ["60645/S"]}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"60645/S": "395"})
+    monkeypatch.setattr(webapp, "_load_variant_links",
+                        lambda: {"60645/S": "https://trigona.sk/s"})
+    monkeypatch.setattr(webapp, "_load_uploaded_variant_links", lambda: {})
+    monkeypatch.setattr(webapp, "_load_decisions",
+                        lambda: {"TRIGONA|395": {"status": "split", "url": ""}})
+
+    res, status = webapp._do_upload_variant_links(True)
+
+    assert status == 200
+    assert res["dry_run"] is True
+    assert res["queued"] == 0
+    assert res["would_queue"] == 1
+    assert webapp._load_pending() == {}
