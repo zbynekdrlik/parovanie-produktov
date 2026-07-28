@@ -131,3 +131,17 @@ zdroj nezmaže nič, useknutý zdroj zmaže MENEJ, nepriraditeľný kľúč pre�
 sa neprepíše. Každú z tých vlastností over MUTÁCIOU (dočasne ju v kóde zruš a pozri, ktorý
 test spadne) — negatívny test, ktorý by prešiel aj bez opravy, nedokazuje nič.
 Vzor: `tests/test_webreview_flag_prune.py`.
+
+## 7. Odmietnutie musí byť VIDIEŤ, inak si vymenil rast za ticho
+
+Body 1b/2 hovoria „radšej nemaž nič". Lenže „ani jedna otvorená" / „chýbajúci stĺpec" sú
+TRVALÉ stavy: kým sa zdroj neopraví, prune sa nevykoná ani raz a úložiská rastú presne ako
+predtým — s jediným riadkom v logu. To je „tichá smrť automatizácie" z
+`.claude/rules/automation-health.md` bodu 3, len z druhej strany.
+
+- **Odmietnutie vracia ČÍSLO, na ktorom sa spustilo** (koľko objednávok zdroj niesol,
+  koľko otvorených) — nie holé `0`. Bez neho sa nedá napísať veta pre človeka.
+- **Každý trvalý dôvod pomenuj zvlášť** a prejdi všetky štyri kroky z automation-health §3
+  (stat → ERROR log → červený banner v karte → `navError()` odznak), vrátane E2E.
+  Pri #212 to zostalo ako #293 — a to je práve tá časť, ktorú je najľahšie zabudnúť,
+  lebo „veď to nič nezmazalo".

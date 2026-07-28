@@ -18,6 +18,7 @@ the e2e suite stay green):
 """
 import json
 import os
+import subprocess
 import sys
 
 import pytest
@@ -138,3 +139,50 @@ def test_a_missing_or_corrupt_reservation_degrades_to_the_wall_clock(flag_stores
         c = authed_client()
         seq = c.post("/api/ordered", json={"key": _KEY, "ordered": True}).get_json()["commitSeq"]
         assert isinstance(seq, int) and seq > 0, (blob, seq)
+
+
+def test_importing_the_app_writes_nothing_into_the_data_dir(tmp_path):
+    """#261's invariant, and the one the first cut of the commit clock broke: importing
+    `app` must not touch OUT. Seeding the clock at import made it write
+    `flag_commit_seq.json` before a single call — which also means a dry-run script that
+    forgets `WEBREVIEW_OUT` writes into the manager's live dir BEFORE its own guard assert
+    can fire, and that the import takes the inter-process flock (up to 30 s behind a
+    running service).
+
+    Scoped to THIS store: importing already creates `.store.lock` and bootstraps
+    `users.json`, which predates all of this and is out of scope here. What must not happen
+    is the clock adding a THIRD import-time write — and, with it, an import-time flock.
+
+    A subprocess, because the module is already imported in this one."""
+    out = tmp_path / "out"
+    out.mkdir()
+    env = dict(os.environ, WEBREVIEW_OUT=str(out), WEBREVIEW_NO_SCHEDULER="1",
+               WEBREVIEW_PRODUCTS=str(tmp_path / "products.csv"),
+               PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src"))
+    env.pop("PYTEST_CURRENT_TEST", None)
+    r = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, 'webreview'); import app"],
+        cwd=os.path.join(os.path.dirname(__file__), ".."),
+        env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "flag_commit_seq.json" not in [p.name for p in out.iterdir()], (
+        "importing the app seeded the commit clock, i.e. WROTE into the data dir before a "
+        "single call — a dry run that has not yet repointed WEBREVIEW_OUT would land in "
+        "the manager's live dir", sorted(p.name for p in out.iterdir()))
+
+
+def test_the_clock_is_seeded_lazily_on_the_first_write(flag_stores):
+    """…so the reservation file appears when the first number is actually handed out, not
+    before. Seeding still happens exactly once — under the lock the writer already holds."""
+    # a FRESH process: the module global survives between tests in one pytest run
+    webapp._flag_commit_seq = 0
+    webapp._flag_commit_reserved = 0
+    assert not os.path.exists(os.fspath(webapp.COMMIT_SEQ))
+
+    c = authed_client()
+    first = c.post("/api/ordered", json={"key": _KEY, "ordered": True}).get_json()["commitSeq"]
+
+    assert os.path.exists(os.fspath(webapp.COMMIT_SEQ))
+    assert first > int(webapp.time.time() * 1000) - 60_000, (
+        "the first number must still be seeded from the wall clock", first)

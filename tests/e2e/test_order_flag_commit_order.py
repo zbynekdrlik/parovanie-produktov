@@ -214,3 +214,71 @@ def test_an_accepted_write_without_a_commit_number_still_matches_the_server(
     assert "instock" in cls, (
         "the row shows the flag OFF while the server holds it ON — the accepted write was "
         "never adopted, so the refused one rolled back onto a stale baseline", server, cls)
+
+
+# Both at once: the first POST is HELD at the network boundary (so the server commits the
+# writes in the REVERSE of the issue order) AND every answer loses its commit number.
+_HOLD_AND_STRIP_INSTOCK = """
+(() => {
+  const _fetch = window.fetch;
+  let _release;
+  const _gate = new Promise(r => { _release = r; });
+  window.__release = () => _release();
+  window.__posts = { issued: 0, done: 0 };
+  const strip = async (r) => {
+    const j = await r.json();
+    delete j.commitSeq;
+    return new Response(JSON.stringify(j),
+                        {status: r.status, headers: {'Content-Type': 'application/json'}});
+  };
+  window.fetch = function (url, opts) {
+    const isWrite = (typeof url === 'string') && url === '/api/instock'
+                    && opts && opts.method === 'POST';
+    if (!isWrite) return _fetch.call(window, url, opts);
+    window.__posts.issued += 1;
+    const send = () => _fetch.call(window, url, opts).then(strip).then(
+      (r) => { window.__posts.done += 1; return r; },
+      (e) => { window.__posts.done += 1; throw e; });
+    return window.__posts.issued === 1 ? _gate.then(send) : send();
+  };
+})();
+"""
+
+
+def test_two_unnumbered_writes_still_leave_the_row_matching_the_server(page, toorder_server):
+    """The residual the first `_mayAdopt` fallback left open. With NO number there is
+    nothing to order two answers by, and the fallback („adopt when I am still the latest
+    issued and nothing else is out") is issue-order reasoning wearing a different hat: when
+    both answers are unnumbered and the writes commit in the REVERSE of the issue order it
+    adopts NEITHER — the one that is still latest-issued is rejected because the other is
+    in flight, and the one that settles last is rejected because it is no longer latest.
+    `confirmed` stays frozen at the pre-burst value and the map is forced back onto it,
+    while the server holds the write that committed last.
+
+    So an unorderable answer is not guessed at at all: the client re-reads the row's flags
+    from the server, which is the only thing that actually knows.
+    """
+    page.add_init_script(_HOLD_AND_STRIP_INSTOCK)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    btn = page.locator(_N1 + " .to-instock")
+    btn.click()                                                  # A — held
+    page.wait_for_function("() => window.__posts.issued === 1")
+    btn.click()                                                  # B — commits FIRST
+    page.wait_for_function("() => window.__posts.done === 1")
+    page.evaluate("() => window.__release()")                     # …A commits LAST
+    page.wait_for_function("() => window.__posts.done === 2")
+
+    # the resync settles asynchronously — wait for screen and server to agree
+    page.wait_for_function("""() => fetch('/api/instock').then(r => r.json()).then(j => {
+        const row = document.querySelector(".toorder-row[data-code='N1']");
+        return row && (Object.keys(j.instock).length > 0) === row.classList.contains('instock');
+      })""", timeout=5000)
+
+    server = page.evaluate(
+        """() => fetch('/api/instock').then(r => r.json())
+                   .then(j => Object.keys(j.instock))""")
+    cls = set((page.locator(_N1).get_attribute("class") or "").split())
+    assert ("instock" in cls) == bool(server), (
+        "screen and server disagree after a burst of unnumbered answers", server, cls)

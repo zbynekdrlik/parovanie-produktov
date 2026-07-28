@@ -294,3 +294,33 @@ drž MIMO tej fixtúry (vlastný `page`), nie „len opatrne".
   prekreslený".** Fires skôr, než `postToOrder` dočíta telo, než sa prepíše účtovníctvo a
   než `renderToOrder()` zbehne. Čakaj na DOM (triedu riadku), inak test prechádza na
   náhode v časovaní.
+
+### Odpoveď, ktorú sa nedá zaradiť — NEHÁDAJ, spýtaj sa servera (revízia opravy #291)
+
+Prijatý zápis bez `commitSeq` sa nedá zaradiť do serverovej histórie, a **každý spôsob, ako
+to UHÁDNUŤ, je poradie vydania v inom kabáte.** Oba sa vyskúšali a oba sú zlé:
+
+- **Odmietnuť ju úplne** → `confirmed` zamrzne a nasledujúci ODMIETNUTÝ zápis sa „vráti" na
+  hodnotu, ktorú server nedrží (regresia proti stavu pred #291).
+- **Prijať ju, keď „som stále posledný vydaný a nič iné neletí"** → vie prebiť NOVŠIU
+  očíslovanú odpoveď, a keď sa dve neočíslované vrátia v opačnom poradí, než commitli,
+  neprijme ANI JEDNU: tá, čo je stále posledná vydaná, padne na „druhá ešte letí", a tá,
+  čo sa usadí posledná, padne na „už nie som posledný vydaný".
+
+Riešenie je **nerozhodovať sa**: klient si znova načíta príznaky riadku zo servera
+(`loadOrders()` + prekreslenie, debouncované — dávka neočíslovaných odpovedí je JEDNA
+udalosť). Je to tá istá cesta, akou už chodí prepnutie tabu, takže nič nové nezastará.
+
+**Dôsledok pre stuby v testoch:** vymyslený ÚSPECH musí niesť `commitSeq`, inak spustí
+resync a ten zmaže presne to účtovníctvo, ktoré test pripína (zhodilo to
+`test_a_straggler_from_an_older_burst_cannot_poison_a_later_click`). Číslo prideľuj pri
+ZACHYTENÍ POST-u, nie pri jeho uvoľnení: tie testy sú o odpovediach mimo poradia pre
+zápisy, ktoré commitli v bežnom poradí.
+
+### A seeduj LENIVO — import nesmie zapisovať do dátového adresára
+
+Prvá verzia hodín seedovala pri importe, čím `import app` zapísal `flag_commit_seq.json` do
+OUT. To je proti invariantu, na ktorom stojí celé #261: suchý beh, ktorý ešte neprehodil
+`WEBREVIEW_OUT` na kópiu, by trafil živý adresár skôr, než stihne zabrať jeho vlastný
+`assert` — a import by si bral medziprocesový flock (až 30 s za bežiacou službou).
+Seeduj pri PRVOM zápise, pod zámkom, ktorý si volajúci aj tak drží.

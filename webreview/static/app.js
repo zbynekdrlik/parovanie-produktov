@@ -1002,28 +1002,47 @@ function _commitOf(body) {
   return (typeof n === 'number' && isFinite(n)) ? n : null;
 }
 
-// May this ACCEPTED answer be adopted as the flag's new server-known value?
+// An ACCEPTED answer with NO commit number cannot be placed in the server's history — and
+// every way of GUESSING where it belongs is issue-order reasoning wearing a different hat.
+// Both were tried and both are wrong:
 //
-// With a number, the rule is the whole point of #291: only if nothing that committed LATER
-// has been adopted already.
+//   * refuse it outright — `confirmed` freezes on a value the server has moved past, and
+//     the next REFUSED write „rolls back" onto that stale value, i.e. does not roll back.
+//     The row then shows a flag the server does not hold, right after the manager was told
+//     the save failed. That is the #290 shape (and a regression against the code before
+//     #291, measured on both).
+//   * adopt it when this write is „still the latest issued and nothing else is out" — it
+//     can adopt OVER a newer numbered answer, and when two unnumbered answers come back in
+//     the reverse of their commit order it adopts NEITHER, leaving `confirmed` frozen and
+//     the map forced back onto it.
 //
-// Without one, there is nothing to order this answer BY — but „cannot be ordered" is not
-// the same as „must be ignored". Ordering only matters when there is something to be
-// ordered AGAINST: if this write is still the latest one issued for its (flag, row) and
-// nothing else is in flight for it, then it is the only writer, its acceptance IS the
-// server's state, and refusing it just freezes `confirmed` on a value the server has moved
-// past — after which the next REFUSED write „rolls back" onto that stale value, i.e. does
-// not roll back, and the row shows a flag the server does not hold. That is the #290
-// failure shape, and the first cut of this fix reintroduced it (measured against `main`,
-// which did not have it). So: adopt, and leave the clock where it is — advancing it on a
-// number we never received is what would let issue order silently creep back in.
+// So the client does not decide at all: it asks the only party that knows. `loadOrders()`
+// re-reads every flag from the server and drops the bookkeeping with it, which is exactly
+// the recovery this situation calls for — and it is the same path a tab switch already
+// takes, so nothing new can go stale. Debounced, because a burst of unnumbered answers is
+// one event, not N.
 //
-// The two numbers are never mixed. `seq` is an independent counter per (flag, row),
-// `confirmedCommit` is one global clock; a guard that accepted either would be comparing
-// values with no order between them.
-function _mayAdopt(commit, st, seq) {
-  return commit !== null ? commit >= st.confirmedCommit
-                         : (seq === st.seq && st.inflight === 0);
+// Reachable through a truncated body (`postToOrder` turns an unparsable one into `null`;
+// this app is served through a tunnel) and through a tab that outlives a rollback deploy.
+// Both are transient, so paying one extra read for them is the cheap side of the trade.
+let _resyncPending = false;
+
+async function _resyncFlagsFromServer() {
+  if (_resyncPending) return;
+  _resyncPending = true;
+  try {
+    await loadOrders();
+  } finally {
+    _resyncPending = false;
+  }
+  if (ACTIVE_TAB === 'toorder') renderToOrder();
+}
+
+// May this ACCEPTED answer be adopted as the flag's new server-known value? One rule, one
+// number space: only an answer that says WHEN it committed, and only if nothing that
+// committed later has been adopted already.
+function _mayAdopt(commit, st) {
+  return commit !== null && commit >= st.confirmedCommit;
 }
 
 // Every flag write answers `{ok, flags:{ordered, waiting, instock, unavailable}, commitSeq}`
@@ -1127,10 +1146,7 @@ async function saveOrderWrite(path, payload, writes, key, what) {
     // `_mirrorServerFlags` below re-reads the same number and overwrites `confirmed` with
     // the server's own account of the flag; this line is what carries an answer that has
     // no `flags` to mirror, and the unnumbered one (`_mayAdopt`).
-    if (!err && _mayAdopt(commit, st, seq)) {
-      st.confirmed = w.value;
-      if (commit !== null) st.confirmedCommit = commit;
-    }
+    if (!err && _mayAdopt(commit, st)) { st.confirmed = w.value; st.confirmedCommit = commit; }
     if (seq !== st.seq) {                     // a later write owns this (flag, row) now
       // …and once nothing else is out for it, the map owes the server's own last word
       if (st.inflight === 0 && !!w.map[key] !== st.confirmed) {
@@ -1153,6 +1169,9 @@ async function saveOrderWrite(path, payload, writes, key, what) {
   // one that committed later, and only touch a map with nothing else in flight for it —
   // restricted to the flags this write claimed.
   const mirrored = live && !err && _mirrorServerFlags(ans.json, key, claimed);
+  // Accepted, but it did not say WHEN — this client cannot place it in the server's
+  // history, so it re-reads the row's flags instead of guessing (see `_mayAdopt`).
+  if (!err && commit === null) _resyncFlagsFromServer();
   if (!live || !owner) {          // superseded by a newer write, or disowned by a reload
     if (repaint || mirrored) renderToOrder();
     // A write the reload DISOWNED has no map left to roll back — but it still failed, and
@@ -1275,10 +1294,7 @@ async function markGroupOrdered(items, ordered) {
   keys.forEach((key, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;      // loadOrders() disowned this write
-    if (!err && _mayAdopt(commit, st, seq)) {
-      st.confirmed = ordered;
-      if (commit !== null) st.confirmedCommit = commit;
-    }
+    if (!err && _mayAdopt(commit, st)) { st.confirmed = ordered; st.confirmedCommit = commit; }
     if (seq !== st.seq) {                       // a later write owns this row now
       // …and once nothing else is out for it, the map owes the server's own last word
       if (st.inflight === 0 && !!ORDERED[key] !== st.confirmed) {
@@ -1301,6 +1317,7 @@ async function markGroupOrdered(items, ordered) {
     if (ordered) ORDERED[key] = true; else delete ORDERED[key];
     repaint = true;
   });
+  if (!err && commit === null) _resyncFlagsFromServer();   // same as saveOrderWrite
   if (err) {
     if (repaint) renderToOrder();        // roll the tab back BEFORE the message, never after
     toOrderSaveFailed('Hromadné označenie skupiny', err,

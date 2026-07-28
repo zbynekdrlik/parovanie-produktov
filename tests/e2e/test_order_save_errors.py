@@ -94,10 +94,18 @@ def _chip(alert, label):
 _HOLD_TEMPLATE = """
 window.__held = [];
 window.__settled = [];
+window.__commitSeq = 0;
 window.__realFetch = window.fetch.bind(window);
 window.fetch = (url, opts) => {
   const p = new URL(String(url), location.href).pathname;
   if (p === '__PATH__' && opts && opts.method === 'POST') {
+    // The commit number is taken when the POST is INTERCEPTED, i.e. in issue order: these
+    // tests are about answers arriving out of order for writes that committed in the
+    // ordinary order, which is what the real server does when nothing is racing inside its
+    // lock. A faked SUCCESS must carry one at all (#291) — an answer with no number says
+    // nothing about when it committed, and the client then re-reads the row from the
+    // server rather than guessing, which would wipe the very bookkeeping these tests pin.
+    const commitSeq = ++window.__commitSeq;
     return new Promise((resolve, reject) => window.__held.push((status, passthrough) => {
       if (status === 200 && passthrough) {
         window.__realFetch(url, opts).then(
@@ -106,7 +114,9 @@ window.fetch = (url, opts) => {
         return;
       }
       window.__settled.push(status || 500);
-      resolve(new Response(status === 200 ? '{"ok": true}' : '{"ok": false}',
+      resolve(new Response(status === 200
+                             ? JSON.stringify({ok: true, commitSeq})
+                             : '{"ok": false}',
                            {status: status || 500,
                             headers: {'Content-Type': 'application/json'}}));
     }));

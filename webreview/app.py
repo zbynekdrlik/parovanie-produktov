@@ -1697,7 +1697,13 @@ def _reserve_commit_seq(upto: int) -> None:
 
 def _seed_commit_seq() -> int:
     """Start (or restart) the clock above BOTH the wall clock and anything a previous
-    process may already have handed out."""
+    process may already have handed out.
+
+    Called LAZILY, from the first `_next_commit_seq()` — never at import. Seeding at import
+    made importing this module WRITE into OUT, which breaks the invariant the whole #261
+    story rests on: a script (or a dry run) that has not yet pointed `WEBREVIEW_OUT` at a
+    copy would touch the manager's live dir before its own guard could fire, and the import
+    would take the inter-process flock behind a running service."""
     global _flag_commit_seq
     state = _read_json_store(COMMIT_SEQ, {})
     prev = state.get("reserved") if isinstance(state, dict) else None
@@ -1708,9 +1714,6 @@ def _seed_commit_seq() -> int:
     return _flag_commit_seq
 
 
-_seed_commit_seq()
-
-
 def _next_commit_seq() -> int:
     """The commit number for the write being made. MUST be called inside the writer's own
     `with _lock:` block — called outside it, two writes could take the same number, or
@@ -1719,6 +1722,8 @@ def _next_commit_seq() -> int:
     `test_every_endpoint_takes_its_commit_number_while_holding_the_store_lock`, because no
     browser test can see it: writes issued one after another come out increasing either way."""
     global _flag_commit_seq
+    if not _flag_commit_seq:          # first write of this process — seed it now, in-lock
+        _seed_commit_seq()
     _flag_commit_seq += 1
     if _flag_commit_seq >= _flag_commit_reserved:
         _reserve_commit_seq(_flag_commit_seq + COMMIT_SEQ_BLOCK)
@@ -1863,8 +1868,12 @@ def _orders_by_openness(orders_csv):
       to have a `code` column too. Caught on the HEADER, before a single row is judged.
     * **a body that does not end in a newline** — it is incomplete by definition, and the
       row the cut landed in comes back with a truncated or missing status, i.e. a genuinely
-      OPEN order reading as closed. Only that last row is dropped; whole rows before it are
-      unaffected, which is what keeps „a cut export prunes FEWER keys" true.
+      OPEN order reading as closed. The trailing partial row is dropped. (Where the cut
+      lands INSIDE a quoted field the slice can keep a partial row — but `code`, `date` and
+      `statusName` are the export's first three columns and every multi-line field
+      (`remark`, `shopRemark`) sits far past them, so the status is still whole. That
+      column ORDER is what makes it safe; a future export template that moves `statusName`
+      behind a free-text column would break it silently.)
     * **`csv.Error`** — a bare CR in an unquoted field, or a field past
       `csv.field_size_limit`. It is neither `ValueError` nor `OSError`, so left to escape it
       would sail past the caller's housekeeping `except` and take the whole hourly sync
@@ -1881,7 +1890,11 @@ def _orders_by_openness(orders_csv):
     try:
         rd = csv.DictReader(io.StringIO(text), delimiter=";")
         if "statusName" not in (rd.fieldnames or []):
-            return set(), set(), {}, "no-status-column"
+            # count the orders anyway: an alarm has to return the number it fired on, or
+            # the operator is told „your export is wrong" with nothing to go and look at
+            # (`.claude/rules/automation-health.md` point 3)
+            got = {(r.get("code") or "").strip() for r in rd}
+            return {c for c in got if c}, set(), {}, "no-status-column"
         for r in rd:
             code = (r.get("code") or "").strip()
             if not code:
@@ -1945,8 +1958,10 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     all, so there is no client state for it to order against."""
     seen, still_open, dates, reason = _orders_by_openness(orders_csv)
     if reason:
-        return {"pruned": 0, "skipped": reason, "orders_seen": 0, "orders_open": 0,
-                "per_store": {}}
+        log.error("prune riadkových príznakov PRESKOČENÝ (%s): export nesie %d objednávok "
+                  "— nemaže sa nič", reason, len(seen))
+        return {"pruned": 0, "skipped": reason, "orders_seen": len(seen),
+                "orders_open": 0, "per_store": {}}
     if len(seen) < ORDERS_PRUNE_MIN_ORDERS:
         log.warning("prune riadkových príznakov PRESKOČENÝ: export nesie len %d objednávok "
                     "(minimum %d) — vyzerá neúplne, nemaže sa nič",
@@ -1961,6 +1976,9 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     # export, a filter left on. Neither the floor above (it counts only `seen`) nor the
     # `protect=True` shrink guard (the prune IS a legitimate read-modify-write) would stop
     # it, so this is the only thing standing between that and a wipe.
+    # A refusal here is SAFE but SILENT: `no-open-orders` / `no-status-column` are permanent
+    # states, so the stores go on growing with only a log line and a stat to show for it.
+    # Making the manager see it (card banner + ⚠ badge + E2E) is #293.
     if not still_open:
         log.error("prune riadkových príznakov PRESKOČENÝ: v exporte s %d objednávkami nie "
                   "je ani jedna so stavom Vybavuje sa — premenovaný stav alebo iný "
