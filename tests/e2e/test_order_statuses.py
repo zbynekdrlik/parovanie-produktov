@@ -270,3 +270,90 @@ def test_an_unusable_config_stops_the_reminders_LOUDLY(page, bad_status_config_s
     assert "Stavy objednávok" in text, text
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #297: adding a status to „spracúva sa" also enlarges the mailing list ──────
+# The set drives the tab, „Nedostupné" AND the customer reminders (deliberately — one notion
+# of „open", #209). The sharp edge: an added status makes every order in it older than 4 days
+# instantly mail-eligible, and the dedup store only ever stops the SECOND mail. Measured on
+# the live export (28.7.2026): adding „Vybavená" would reach 370 customers in one wave, under
+# a card answering „✅ Uložené". The whole value of the fix is what he SEES before saving, so
+# it needs browser coverage — the endpoint test proves only half (`automation-health.md` §3).
+def _dialog_spy(page, accept):
+    seen = []
+
+    def _on(d):
+        seen.append(d.message)
+        d.accept() if accept else d.dismiss()
+
+    page.on("dialog", _on)
+    return seen
+
+
+def test_widening_the_open_set_asks_FIRST_and_names_the_numbers(
+        page, sync_prune_blocked_server):
+    """The fixture export holds two „Čaká na dodávateľa" orders, 9 days old, each with an
+    internal note and a distinct address — a status classified NOWHERE today, so adding it to
+    the open set is a legal edit that really would put two customer mails in flight. He must
+    be told, in orders AND in addresses, before anything is written."""
+    console = _console(page)
+    _open_tab(page, sync_prune_blocked_server)
+    seen = _dialog_spy(page, accept=True)
+
+    page.locator('[data-testid="order-statuses-to_order"]').fill(
+        "Vybavuje sa\nČaká na dodávateľa")
+    with page.expect_response("**/api/order-statuses"):
+        page.locator('[data-testid="order-statuses-save"]').click()
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Uložené')")
+
+    assert len(seen) == 1, seen
+    assert "Čaká na dodávateľa" in seen[0], seen[0]
+    assert "2 objednávky" in seen[0], seen[0]      # 2–4 → nominative plural, not „objednávok"
+    assert "2 adresy" in seen[0], seen[0]          # DISTINCT customers, the number that matters
+    assert console == [], f"console not clean: {console}"
+
+
+def test_saying_NO_leaves_the_configuration_exactly_as_it_was(page,
+                                                              sync_prune_blocked_server):
+    """A confirmation that saves anyway is not a confirmation. Nothing may reach the store —
+    and the card must say so, rather than leaving him to guess from an unchanged panel."""
+    console = _console(page)
+    _open_tab(page, sync_prune_blocked_server)
+    seen = _dialog_spy(page, accept=False)
+
+    page.locator('[data-testid="order-statuses-to_order"]').fill(
+        "Vybavuje sa\nČaká na dodávateľa")
+    page.locator('[data-testid="order-statuses-save"]').click()
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Neuložené')")
+
+    assert len(seen) == 1, seen
+    assert page.request.get(sync_prune_blocked_server + "/api/order-statuses").json()[
+        "statuses"]["to_order"] == ["Vybavuje sa"]
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_save_that_reaches_NOBODY_new_is_not_interrupted(page, sync_prune_blocked_server):
+    """A dialog on every save is one he clicks away without reading, which costs exactly the
+    attention this exists to buy. Renaming the open status to a name no order carries reaches
+    nobody, so it must go through silently.
+
+    This one is the CONTROL: it passes before AND after the fix (verified by stashing
+    webreview/), which is the point — it is what tells a „no dialog ever" patch apart from a
+    real fix. The two tests above are the ones that fail without it."""
+    console = _console(page)
+    _open_tab(page, sync_prune_blocked_server)
+    seen = _dialog_spy(page, accept=True)
+
+    page.locator('[data-testid="order-statuses-to_order"]').fill("Spracúva sa")
+    with page.expect_response("**/api/order-statuses"):
+        page.locator('[data-testid="order-statuses-save"]').click()
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Uložené')")
+
+    assert seen == [], seen
+    assert console == [], f"console not clean: {console}"

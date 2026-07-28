@@ -8852,6 +8852,65 @@ def api_order_statuses():
     })
 
 
+@app.route("/api/order-statuses/impact", methods=["POST"])
+def api_order_statuses_impact():
+    """#297 — how many customers a CANDIDATE `to_order` set would newly reach with a
+    reminder mail. Read-only; nothing is saved and nothing is sent.
+
+    `to_order` drives three things at once — the „Na objednanie" tab, „Nedostupné" AND
+    `run_orders_reminder`. That is deliberate (#209: one notion of „open", not four, so a
+    rename cannot silently kill the mailing automation), but it leaves a sharp edge: adding a
+    status makes EVERY order in it older than `MIN_DAYS` instantly mail-eligible, and the
+    dedup store only stops the SECOND mail, never the first wave. Measured on the live export
+    (28.7.2026): adding „Kompletná" reaches 2 more orders, „Osob. odber" 3 — and „Vybavená"
+    387 orders / 370 distinct customers, all at once, under a card that answers „✅ Uložené".
+
+    Three numbers rather than one, because they answer different questions and a preview that
+    exaggerates is one the manager stops reading:
+
+    * `orders`   — how many orders the app would start watching;
+    * `mailable` — the honest UPPER BOUND on the wave: of those, the ones that carry an
+      internal note (a note-less order only ever surfaces as the red „nikto sa jej nedotkol"
+      alert — see orders_reminder's clean state machine), have an address to mail, and are
+      not already resolved in the dedup store. It cannot be exact: whether a noted order is
+      mailed is the AI classifier's verdict, which is not knowable without paying for it.
+    * `customers` — distinct addresses among those, which is what „how many people hear from
+      us" actually means.
+
+    An export we cannot read answers `unknown`, never a reassuring 0 — a zero would wave the
+    change through on no evidence at all, which is the opposite of the point."""
+    if not _admin_or_none():
+        return _forbidden()
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
+    candidate = frozenset(_clean_status_list(body.get("to_order")) or ())
+    added = sorted(candidate - _order_statuses()["to_order"])
+    out = {"ok": True, "added": added, "orders": 0, "mailable": 0, "customers": 0}
+    if not added:
+        return jsonify(out)
+    try:
+        csv_bytes = _orders_csv_cached()
+    except Exception as e:  # noqa: BLE001 — a preview must never be the reason a save fails
+        log.warning("náhľad dosahu stavov: objednávky sa nedajú prečítať (%r)", e)
+        return jsonify({**out, "unknown": True})
+    try:
+        # ONLY the added statuses: `select_orders` filters per status, so the orders it
+        # returns for them ARE the difference against the current set — no need to run it
+        # twice and subtract, which would also double the cost on a 55 MB export.
+        newly = orders_reminder.select_orders(csv_bytes, statuses=added)
+        with _lock:
+            done = _load_orders_reminder().get("orders") or {}
+    except Exception as e:  # noqa: BLE001 — same reason; an unreadable dedup store included
+        log.warning("náhľad dosahu stavov: nedá sa spočítať (%r)", e)
+        return jsonify({**out, "unknown": True})
+    resolved = {c for c, v in done.items() if isinstance(v, dict)
+                and v.get("status") in REMINDER_TERMINAL_STATUSES}
+    mailable = [o for o in newly if o["has_note"] and o["email"]
+                and o["code"] not in resolved]
+    return jsonify({**out, "orders": len(newly), "mailable": len(mailable),
+                    "customers": len({o["email"] for o in mailable})})
+
+
 @app.route("/api/order-statuses", methods=["POST"])
 def api_order_statuses_save():
     """Save all three sets at once. Admin-only.

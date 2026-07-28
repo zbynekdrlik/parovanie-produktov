@@ -1922,9 +1922,17 @@ function totalChip(spec) {
 // 2–4 → položky, 0 a 5+ → položiek. Jeden helper pre hlavičku kopírovaného e-mailu
 // (nominatív) aj pre súhrn nad zoznamom (akuzatív po „vybaviť"); líšia sa len v
 // jednotnom čísle. „(1 položiek)" išlo dodávateľovi do mailu — nie je to kozmetika.
+// The Slovak count rule in ONE place (1 → singular, 2–4 → plural, 0 and 5+ → genitive
+// plural). `itemsWord` was its only implementation until #297 needed the same rule for
+// orders and e-mail addresses — and a second copy of the rule beside this one is exactly
+// what #238/#240 were filed about (a genitive baked into a template, declining nothing).
+function pluralWord(n, one, few, many) {
+  if (n === 1) return one;
+  return (n >= 2 && n <= 4) ? few : many;
+}
+
 function itemsWord(n, acc) {
-  if (n === 1) return acc ? 'položku' : 'položka';
-  return (n >= 2 && n <= 4) ? 'položky' : 'položiek';
+  return pluralWord(n, acc ? 'položku' : 'položka', 'položky', 'položiek');
 }
 
 // The tab's own subtitle counts the same lines („7 otvorených položiek u dodávateľov"),
@@ -4315,6 +4323,42 @@ const ORDER_STATUS_BOXES = [
    + 'v zozname „Objednávka je ukončená".'],
 ];
 
+// #297 — ask the server what a CANDIDATE „objednávka sa spracúva" set would newly reach,
+// and let the manager confirm it before it is saved. Returns true when the save may proceed.
+//
+// It stays quiet when there is nothing to say (no status added, and therefore no new
+// customer reachable) — a dialog on every single save is one he clicks away without reading,
+// which would cost exactly the attention this exists to buy. An impact the server could not
+// compute asks ANYWAY: answering „0" on an unreadable export would wave the change through
+// on no evidence at all, which is the opposite of the point.
+async function confirmToOrderImpact(candidate) {
+  let j;
+  try {
+    const r = await fetch('/api/order-statuses/impact', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to_order: candidate }),
+    });
+    if (!r.ok) return true;          // not a gate — the save endpoint has its own refusals
+    j = await r.json();
+  } catch (_) {
+    return true;
+  }
+  if (!j || !(j.added || []).length) return true;
+  const head = 'Pridávaš do „objednávka sa spracúva“: ' + j.added.join(', ') + '\n\n';
+  if (j.unknown) {
+    return confirm(head + 'Koľkým zákazníkom tým môže hneď odísť pripomienkový e-mail, sa '
+      + 'teraz nedá zistiť — objednávky sa nedajú prečítať.\n\nUložiť?');
+  }
+  if (!j.orders) return true;
+  const lines = ['Appka tým začne sledovať ' + j.orders + ' '
+    + pluralWord(j.orders, 'objednávku', 'objednávky', 'objednávok') + '.'];
+  lines.push(j.customers
+    ? 'Pripomienkový e-mail môže hneď odísť na ' + j.customers + ' '
+      + pluralWord(j.customers, 'adresu', 'adresy', 'adries') + '.'
+    : 'Pripomienkový e-mail z nich zatiaľ nemôže odísť nikomu.');
+  return confirm(head + lines.join('\n') + '\n\nUložiť?');
+}
+
 function renderOrderStatusConfig() {
   // Its OWN css namespace on purpose: the automation-card classes (.autostatus/.autometa/
   // .autoerr) are what a dozen E2E tests locate strictly on these very tabs, and a second
@@ -4382,6 +4426,15 @@ function renderOrderStatusConfig() {
     }
     save.disabled = true;
     try {
+      // #297 — „objednávka sa spracúva" also selects who gets a reminder e-mail, so adding a
+      // status to it releases a wave of first mails the dedup store cannot stop (it only ever
+      // stops the SECOND one). Measured on the live export: adding „Vybavená" would reach 370
+      // customers at once. Nothing is forbidden here — it just must not be a surprise.
+      if (!(await confirmToOrderImpact(payload.to_order))) {
+        msg.className = 'statuscfg-msg';
+        msg.textContent = 'Neuložené — nechal si pôvodné stavy.';
+        return;
+      }
       const r = await fetch('/api/order-statuses', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
