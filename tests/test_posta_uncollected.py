@@ -700,3 +700,56 @@ def test_passing_NO_sets_keeps_the_module_standalone_on_its_own_literals():
             pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))] \
         == ["EF000000015SK"]
     assert pu.source_coverage(csv_txt, today=date(2026, 7, 27))["dispatched_orders"] == 1
+
+
+# ── #287: personal pickup is not a shipment at all ────────────────────────────
+# The blocklist named foreign couriers (#126) but not personal pickup, so an „Osobný odber"
+# order was treated as a Pošta shipment. Measured read-only on the live export (28.7.2026):
+# the SHIPPING pseudo-item carries exactly four distinct names — `Kuriér` (444 orders, = Pošta),
+# `DPD doručenie na adresu` (53), `Osobný odber - len na predajni v POPRADE!` (24) and
+# `DPD kuriér` (1). In the 30-day window 8 personal-pickup orders sat inside the automation's
+# eligible set and 3 of them counted towards the coverage alarm's denominator — where a package
+# number can never appear, because there is no parcel.
+_PICKUP = "Osobný odber - len na predajni v POPRADE!"
+
+
+def test_personal_pickup_is_not_a_posta_shipment():
+    """The live label, verbatim. It reaches the eligible set today only because it has no
+    package number; the moment one is typed in by mistake the automation starts chasing a
+    parcel that does not exist and mails its customer about it."""
+    csv_txt = _orders([(2, "Vybavená", "EF000000020SK", _PICKUP),
+                       (2, "Vybavená", "EF000000021SK", "Kuriér")])
+    s = pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))
+    assert [x["packageNumber"] for x in s] == ["EF000000021SK"]
+
+
+def test_personal_pickup_is_out_of_the_coverage_alarms_denominator():
+    """The measured harm: 3 of the alarm's 89 dispatched orders were pickups that can never
+    carry a number, permanently dragging coverage down. Today the 50 % floor absorbs it; a
+    shop pushing pickup harder (a promotion, a second collection point) moves the baseline
+    towards a false alarm — which is the alarm being trained away."""
+    rows = ([(2, "Vybavená", "", _PICKUP) for _ in range(6)]
+            + [(2, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(6)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27))
+    assert c["dispatched_orders"] == 6           # the six real ones only
+    assert c["dispatched_with_package"] == 6
+    assert c["degraded"] is False                # 100 % coverage, not 50 %
+
+
+def test_personal_pickup_matches_without_diacritics_too():
+    """`_is_non_posta_carrier` only lowercases — it folds no diacritics — and the shipping
+    label is free text the shop retypes. Both spellings are listed rather than assumed."""
+    csv_txt = _orders([(2, "Vybavená", "EF000000022SK", "Osobny odber na predajni")])
+    assert pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27)) == []
+
+
+def test_the_pickup_keyword_is_the_PHRASE_not_the_bare_word_odber():
+    """The caution #287 asks for (and #126 established): a blocklist excludes what we have
+    verified, never what merely looks similar. A bare „odber" would also swallow a delivery
+    service that IS a Pošta parcel — and a wrongly excluded shipment is a customer who is
+    never told their parcel is waiting, i.e. exactly the failure this automation exists for."""
+    assert "odber" not in pu.NON_POSTA_CARRIER_KEYWORDS
+    csv_txt = _orders([(2, "Vybavená", "EF000000023SK", "Doručenie na odberné miesto")])
+    assert [x["packageNumber"] for x in
+            pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))] \
+        == ["EF000000023SK"]
