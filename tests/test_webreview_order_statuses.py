@@ -868,3 +868,101 @@ def test_the_preview_is_READ_ONLY_and_admin_only(iso, monkeypatch):
                                  json={"to_order": ["Kompletná"]}).status_code == 403
     assert webapp.app.test_client().post("/api/order-statuses/impact",
                                          json={"to_order": ["X"]}).status_code == 401
+
+
+# ── PR #298 review: the SECOND customer-mail path, and previews of a broken config ─────────
+# `run_orders_reminder` was made fail-CLOSED on `bad-status-config` in PR #295's review
+# (automation-health §3): an unusable file must not silently restore the built-in „Vybavuje sa"
+# and re-arm mails to the very customers the manager excluded. The Pošta escalation is the same
+# kind of mail on the same configuration — and it was left fail-OPEN, because `_posta_statuses`
+# went through `_order_statuses()`, the wrapper that throws the reason away.
+_BROKEN = {"to_order": ["Vybavuje sa"], "terminal": ["Vybavuje sa", "Vybavená"],
+           "known_open": [], "cancelled": ["Stornovaná"]}       # one status in two lists
+
+
+def _posta_shipment_run(iso, tmp_path, monkeypatch):
+    """One shipment that WOULD be escalated, with the tracking round-trip stubbed out.
+    Returns (stats, mails) — `mails` is every _send_mail_html call the run made."""
+    monkeypatch.setattr(webapp, "POSTA_STATE", str(tmp_path / "posta.json"))
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: b"")
+    ship = {"code": "99004001", "packageNumber": "EF000000901SK"}
+    monkeypatch.setattr(webapp.posta_uncollected, "shipments_from_orders_csv",
+                        lambda *a, **k: [ship])
+    monkeypatch.setattr(webapp.posta_uncollected, "source_coverage", lambda *a, **k: {
+        "eligible_orders": 40, "dispatched_orders": 30, "dispatched_with_package": 30,
+        "dispatched_without_package": 0, "missing_package": 0,
+        "days_since_last_package": 1, "dispatched_status_unknown": False, "degraded": False})
+    monkeypatch.setattr(webapp, "_fetch_tracking", lambda pkg: {})
+    monkeypatch.setattr(webapp.posta_uncollected, "terminal_state", lambda tj: "")
+    monkeypatch.setattr(webapp.posta_uncollected, "evaluate_shipment", lambda s, tj, esc: {
+        "invalid": False, "send": True, "uncollected": True,
+        "orderCode": s["code"], "packageNumber": s["packageNumber"],
+        "email": "k@example.com", "email_subject": "Zásielka čaká", "email_body": "<p>x</p>",
+        "new_state_value": "1|2026-07-27", "count": 1, "last_sent": "", "call_needed": False,
+        "name": "Zákazník", "phone": "", "office_name": "Pošta 1", "office_addr": "Ulica 1",
+        "retained_till": "2026-08-03", "notified_since": "2026-07-20", "days_at_post": 3,
+        "tracking_link": "https://x/", "admin_link": "https://y/"})
+    mails = []
+    monkeypatch.setattr(webapp, "_send_mail_html",
+                        lambda *a, **k: (mails.append(a[0]), True)[1])
+    return webapp.run_posta_uncollected(), mails
+
+
+def test_a_BROKEN_status_config_sends_no_posta_escalation_mail_either(iso, tmp_path,
+                                                                     monkeypatch, caplog):
+    """The whole finding: with an unusable configuration the reminders stop (PR #295 review)
+    while Pošta went on mailing REAL CUSTOMERS off the built-in defaults. Both are the same
+    escalation to the same person on the same file, so both get the prune's answer — render,
+    do not act. Worse than a wasted mail: if the manager had correctly reconfigured a renamed
+    cancelled status, the defaults put cancelled orders back into the chased set."""
+    _write(iso, _BROKEN)
+    stats, mails = _posta_shipment_run(iso, tmp_path, monkeypatch)
+    assert mails == []                                  # not one customer heard from us
+    assert stats["status_config_broken"] is True
+    assert stats["source_degraded"] is True             # never a green ✅ over a blind run
+    assert stats["uncollected"] == 1                    # …but the row stays on the tab
+    assert any("nastavenie stavov" in r.message % r.args for r in caplog.records
+               if r.levelname == "ERROR")
+
+
+def test_a_HEALTHY_status_config_still_mails_the_customer(iso, tmp_path, monkeypatch):
+    """The control the fix above must not break: fail-closed is only worth anything if the
+    open path still works. A „never send" patch would be indistinguishable without it."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Stornovaná"],
+                 "known_open": [], "cancelled": ["Stornovaná"]})
+    stats, mails = _posta_shipment_run(iso, tmp_path, monkeypatch)
+    assert mails == ["k@example.com"]
+    assert stats["status_config_broken"] is False
+    assert stats["source_degraded"] is False
+
+
+def test_the_preview_measures_against_what_is_EFFECTIVE_not_what_the_loader_renders(
+        iso, monkeypatch):
+    """The preview's blind spot on the BIGGEST wave there is. With an unusable configuration
+    the reminders send NOTHING, so the effective open set is empty — but the preview subtracted
+    the DEFAULTS the loader renders, reported „nothing new" and let the whole backlog go out in
+    one wave the moment the manager repaired the file. Measured by the reviewer on a corrupt
+    store: preview 0, actually mail-eligible right after saving 37."""
+    _write(iso, _BROKEN)
+    _impact_export(monkeypatch, [_impact_row("Vybavuje sa", "99003020", email="a@example.com"),
+                                 _impact_row("Vybavuje sa", "99003021", email="b@example.com")])
+    j = _client_as(ADMIN).post("/api/order-statuses/impact",
+                               json={"to_order": ["Vybavuje sa"]}).get_json()
+    assert j["added"] == ["Vybavuje sa"]        # nothing is effective today, so all of it is new
+    assert j["orders"] == 2
+    assert j["customers"] == 2
+    assert j["config_broken"] is True           # so the dialog can say WHY the number is large
+
+
+def test_a_PARTIAL_payload_that_narrows_terminal_alone_is_still_cross_checked(iso):
+    """The cross-check ran only `if "cancelled" in body`, so an API call editing `terminal`
+    alone produced exactly the drift the check exists for: „Stornovaná" stays cancelled while
+    dropping out of terminal, `terminal − cancelled` subtracts nothing, and cancelled orders
+    return to the set the escalation chases."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Stornovaná"],
+                 "known_open": [], "cancelled": ["Stornovaná"]})
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"terminal": ["Vybavená"]})
+    assert r.status_code == 400, r.get_json()
+    assert "Stornovaná" in r.get_json()["error"]
+    # and the stored configuration is untouched by the refusal
+    assert webapp._order_statuses()["terminal"] == frozenset({"Vybavená", "Stornovaná"})
