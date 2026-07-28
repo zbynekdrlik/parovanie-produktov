@@ -5759,7 +5759,9 @@ def _do_upload_pairings(dry):
 
     if not new_keys and not new_order_codes:
         log.info("n8n pairings: 0 new pairings")
-        return {"ok": True, "count": 0, "products": [], "order_count": 0, "order_blocked": 0,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": [], "order_count": 0, "order_blocked": 0,
+                "confirmed_in_export": 0,
                 "missing_count": 0, "missing_in_eshop": [],
                 **_pairing_summary(uploaded)}, 200
 
@@ -5786,8 +5788,10 @@ def _do_upload_pairings(dry):
         # already owned by a reviewed decision (uploaded on an earlier night, so not
         # in `rows`) is excluded here too, which is precisely the point — it stays
         # "new" and blocked forever rather than reverting the eshop.
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": products,
                 "order_count": 0, "order_blocked": len(new_order_codes),
+                "confirmed_in_export": 0,
                 "message": "no import rows", "blocked": len(new_keys),
                 "missing_count": 0, "missing_in_eshop": [],
                 **_pairing_summary(uploaded)}, 200
@@ -5861,73 +5865,83 @@ def _do_upload_pairings(dry):
                     "neposielam ich (Shoptet by ich zakaždým odmietol): %s",
                     len(absent), sorted(absent)[:10])
 
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n pairings: another import already running")
-        return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n pairings: %d products, %d order codes, %d rows to send of %d "
-             "(chunks of %d), dry_run=%s", len(new_keys), len(new_order_codes),
-             len(send_rows), len(all_rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: import in chunks so no single large import overruns the browser
-        # redirect timeout. A HARD-failing chunk stops the batch; a partially
-        # accepted one does not (#257) — its rows are simply not credited from the
-        # log, they wait for the export to confirm them.
-        res = _import_rows_chunked(send_rows, import_builder.LINK_HEADER, dry,
-                                   prefix="import_links_", timeout=900)
-        # `partial` already forces a non-zero rc (so res["ok"] is False); the explicit
-        # term keeps that invariant local — a partially rejected push is never "ok".
-        ok = res["ok"] and not res["partial"]
-        success = res["success_codes"] | confirmed
-        if res["partial_codes"]:
-            log.warning("n8n pairings: %d riadkov čaká na potvrdenie z exportu "
-                        "(Shoptet ich prijal v čiastočne odmietnutej dávke): %s",
-                        len(res["partial_codes"]), sorted(res["partial_codes"])[:10])
-        # A decision key is recorded uploaded only when EVERY one of its written codes
-        # landed in a SUCCESSFUL chunk — a key straddling the failed boundary stays
-        # "new" (re-uploading its done codes next run is idempotent, same URL; marking
-        # it done would lose its un-uploaded codes, the #49 class). On partial failure
-        # this records the successful chunks so the next run only retries the rest
-        # (resumable), never all-or-nothing.
-        uploaded_keys = [
-            k for k in uploadable_keys
-            if (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])) <= success]
-        uploaded_order_codes = [c for c in new_order_codes
-                                if c in order_written_codes and c in success]
-        if not dry:
-            done = {k: (dec[k].get("url") or "").strip()      # keys fully imported OK
-                    for k in uploaded_keys}
-            done.update({f"order:{c}": (order_pairings[c] or "").strip()
-                         for c in uploaded_order_codes})      # order codes imported OK
-            uploaded = _record_uploaded(_load_uploaded, _save_uploaded, done)
-    finally:
-        _import_lock.release()
+    # #299 Task 10 — a CONFIRMED row is proof from the eshop's OWN export, not "our
+    # own say-so" (the #257 bug class this migration otherwise ends), so it is
+    # recorded RIGHT AWAY exactly as before this migration — the launching brief's
+    # explicit instruction was to leave this path unchanged. A decision key (or
+    # order code) is credited immediately only when EVERY one of its written codes
+    # is already confirmed; a key straddling confirmed+unconfirmed codes waits for
+    # the unconfirmed ones to clear the drain below (never partially credited —
+    # the #49 rule survives the migration unchanged).
+    uploaded_keys = [
+        k for k in uploadable_keys
+        if (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])) <= confirmed]
+    uploaded_order_codes = [c for c in new_order_codes
+                            if c in order_written_codes and c in confirmed]
+    if not dry:
+        done = {k: (dec[k].get("url") or "").strip()      # keys already confirmed
+                for k in uploaded_keys}
+        done.update({f"order:{c}": (order_pairings[c] or "").strip()
+                     for c in uploaded_order_codes})       # order codes already confirmed
+        uploaded = _record_uploaded(_load_uploaded, _save_uploaded, done)
 
-    err_msg = ""
-    if not ok:                               # clear, tab-surfaced message: which chunk + progress
-        err_msg = _chunk_error_msg(res, len(send_rows), confirms_from_export=True)
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_keys),
-              "rows": len(all_rows), "rows_sent": len(send_rows),
+    if dry:
+        # #299 Task 8/9 precedent (m3) — dry_run no longer reaches a real Shoptet
+        # dry-run import (there is no import left here to dry-run); the honest
+        # equivalent is a PREVIEW of how many field values WOULD be queued, while
+        # queueing (and crediting) nothing at all.
+        log.info("n8n pairings: dry run — %d rows would be queued, nothing written",
+                 len(send_rows))
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(send_rows),
+                "dry_run": True, "confirmed_in_export": len(confirmed),
+                "products": products, "blocked": len(blocked_keys),
+                **missing,
+                "order_count": 0, "order_blocked": len(blocked_order_codes),
+                **_pairing_summary(uploaded)}, 200
+
+    # Everything still needing a WRITE (`send_rows` — excludes both confirmed and
+    # absent codes, unchanged above) is no longer imported directly: it is QUEUED
+    # into the shared pending_shoptet table for the next hourly "Sync do Shoptetu"
+    # drain, which is the only place left that writes uploaded_pairings.json for a
+    # freshly-sent row (via `_credit_producer`, only once Shoptet's own import
+    # actually confirms it — never on this producer's own say-so). credit_group is
+    # keyed by CODE and carries the owning decision key (or `order:<code>`) so the
+    # drain credits the WHOLE group only once every one of ITS OWN queued codes is
+    # confirmed; credit_value MUST be the exact shape `new_pairing_keys`/
+    # `new_order_pairing_keys` compare against on the NEXT run (Task 8's C1 lesson:
+    # crediting a DIFFERENT shape than the comparison uses means the same link
+    # requeues to the live eshop forever and total_uploaded never moves).
+    credit_group = {}
+    credit_value = {}
+    for k in uploadable_keys:
+        for c in (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])):
+            credit_group[c] = k
+            credit_value[c] = (dec[k].get("url") or "").strip()
+    for c in order_written_codes:
+        credit_group[c] = f"order:{c}"
+        credit_value[c] = (order_pairings[c] or "").strip()
+    # queue_fields() takes a ";"-joined HEADER STRING (it splits on ";" itself,
+    # like every other producer's call site) — LINK_HEADER is a plain list, so
+    # this must be joined, never passed raw (`header.split(";")` on a list raises
+    # AttributeError — caught only by actually RUNNING this call, not by reading
+    # the task brief's own literal snippet, which passed the list unjoined).
+    queued = queue_shoptet_fields("parovania_eshop", ";".join(import_builder.LINK_HEADER),
+                                  send_rows, credit_group=credit_group,
+                                  credit_value=credit_value)
+
+    result = {"ok": True, "queued": queued, "count": len(uploaded_keys),
+              "would_queue": 0, "dry_run": False,
               "confirmed_in_export": len(confirmed),
-              "partial": res["partial"], "rejected": res["partial_failed"],
-              "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
-              "blocked": len(blocked_keys),
+              "products": products, "blocked": len(blocked_keys),
               **missing,
               "order_count": len(uploaded_order_codes),
               "order_blocked": len(blocked_order_codes),
               **_pairing_summary(uploaded)}
-    log.info("n8n pairings: rc=%s chunks=%d/%d processed=%s products=%d order_codes=%d "
-             "confirmed_from_export=%d rejected=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"],
-             len(uploaded_keys), len(uploaded_order_codes), len(confirmed),
-             res["partial_failed"])
-    if not ok:
-        log.error("n8n pairings FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    log.info("n8n pairings: queued %d field(s) of %d candidate rows, %d key(s) + "
+             "%d order code(s) confirmed immediately from export, %d blocked, "
+             "%d order_blocked", queued, len(send_rows), len(uploaded_keys),
+             len(uploaded_order_codes), len(blocked_keys), len(blocked_order_codes))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-pairings", methods=["POST"])
@@ -6038,7 +6052,8 @@ def _do_upload_suppliers(dry):
         # `obsolete_removed` / `obsolete_held` are part of the shape on EVERY path, so a
         # caller never has to tell „nothing was removed" from „this build does not report
         # it" — nor „nothing was obsolete" from „we refused to judge"
-        return {"ok": True, "count": 0, "products": [], "obsolete_removed": [],
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": [], "obsolete_removed": [],
                 "obsolete_held": [],
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
@@ -6091,7 +6106,8 @@ def _do_upload_suppliers(dry):
                     "no eshop write)", reason, len(export_codes), min_codes,
                     f"{export_age / 3600:.1f}" if export_age is not None else "?",
                     len(new_codes))
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
                 "obsolete_removed": [], "obsolete_held": [],
@@ -6231,61 +6247,50 @@ def _do_upload_suppliers(dry):
                     "(%d already have their own eshop supplier, %d held as absent "
                     "from the catalogue)",
                     len(new_codes), len(own_supplier & set(new_codes)), len(missing_codes))
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
                 "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
                 **_missing_report(missing_codes, assigns),
                 **_supplier_summary(uploaded, assigns)}, 200
 
-    # supplier_rows is 1:1 with codes (no product→variant indirection), but codes with
-    # their own eshop supplier — and, since #275, codes the catalogue does not carry —
-    # are excluded, so written_codes ⊆ new_codes. A held code therefore never enters
-    # `success` and so is never recorded uploaded: it is simply retried next run.
-    written_codes = {r[0] for r in rows}
+    if dry:
+        # #299 Task 8/9 precedent (m3) — dry_run no longer reaches a real Shoptet
+        # dry-run import; the honest equivalent is a PREVIEW of how many field
+        # values WOULD be queued, while queueing (and crediting) nothing.
+        log.info("n8n suppliers: dry run — %d rows would be queued, nothing written",
+                 len(rows))
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(rows),
+                "dry_run": True, "products": products,
+                "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
+                **_missing_report(missing_codes, assigns),
+                **_supplier_summary(uploaded, assigns)}, 200
 
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n suppliers: another import already running")
-        # this return sits AFTER the cleanup above, so it is the one path where a removal
-        # may already have happened — it has to say so like every other
-        return {"ok": False, "error": "import already running",
-                "obsolete_removed": obsolete_removed,
-                "obsolete_held": obsolete_held}, 409
-    log.info("n8n suppliers: %d codes, %d rows (chunks of %d), dry_run=%s",
-             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: chunked import (formula-injection guard applied per cell — supplier
-        # name is free text). FIRST failing chunk stops the batch; success_codes are
-        # the codes imported by a successful chunk (partial progress → resumable).
-        res = _import_rows_chunked(rows, import_builder.SUPPLIER_HEADER, dry,
-                                   prefix="import_suppliers_", csv_safe=True, timeout=900)
-        ok = res["ok"]
-        success = res["success_codes"]
-        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry:                          # record only codes that imported OK
-            uploaded = _record_uploaded(
-                _load_uploaded_suppliers, _save_uploaded_suppliers,
-                {c: (assigns[c] or "").strip() for c in uploaded_codes})
-    finally:
-        _import_lock.release()
-
-    err_msg = ""
-    if not ok:
-        err_msg = _chunk_error_msg(res, len(rows))
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
-              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
+    # #299 Task 10 — no longer imported directly: QUEUED into the shared
+    # pending_shoptet table for the next hourly "Sync do Shoptetu" drain, which is
+    # the only place left that writes uploaded_suppliers.json for a freshly-sent
+    # code (via `_credit_producer`, only once Shoptet's own import actually
+    # confirms it). 1:1 code↔group, like the externalCode/split-link write-backs —
+    # no cross-code grouping needed here. `source`/`store` is
+    # "parovania_eshop_suppliers" — a distinct name from the pairings push's
+    # "parovania_eshop" even though both share the SAME automation key on the
+    # runner, because they need distinct credit stores (uploaded_suppliers.json
+    # vs uploaded_pairings.json — see `_credit_producer`).
+    queued = queue_shoptet_fields(
+        "parovania_eshop_suppliers", ";".join(import_builder.SUPPLIER_HEADER), rows,
+        credit_group={r[0]: r[0] for r in rows},
+        # r[2] is supplier_rows' own `(sup or "").strip()` output — the EXACT shape
+        # new_supplier_keys compares against uploaded_suppliers.json on the next
+        # run (Task 8's C1 lesson: crediting anything else means the same
+        # assignment re-queues forever and total_uploaded never moves).
+        credit_value={r[0]: r[2] for r in rows})
+    result = {"ok": True, "queued": queued, "count": queued, "would_queue": 0,
+              "dry_run": False, "products": products,
               "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
               **_missing_report(missing_codes, assigns),
               **_supplier_summary(uploaded, assigns)}
-    log.info("n8n suppliers: rc=%s chunks=%d/%d processed=%s codes=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
-    if not ok:
-        log.error("n8n suppliers FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    log.info("n8n suppliers: queued %d field(s) for %d code(s)", queued, len(rows))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-suppliers", methods=["POST"])
@@ -7186,15 +7191,18 @@ CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links",
                    "restock_skladom", "stock_skladom")
 # #299 review I2 — producers already switched from their OLD direct-to-eshop
 # import onto `queue_shoptet_fields` (each task adds one here, in the SAME commit
-# that switches it — only "parovania_eshop" is still pending, a later task). Until
-# a producer is in here the cycle must NEVER run it: a producer NOT yet in this
-# tuple still writes straight to the live eshop on its OWN daily schedule, so
-# running it hourly TOO would turn a 1x/day automation into 24x/day writes to
-# forestshop.sk the moment a manager clicks ▶ Štart on "Sync do Shoptetu". Task 8
-# (#299) moved grube_externalcode and split_links onto the queue; Task 9 adds
-# restock_skladom and stock_skladom. All four start DISABLED (#93 contract), so
-# this is zero live-write risk until a manager opts one in.
-QUEUE_MIGRATED: tuple[str, ...] = ("grube_externalcode", "split_links",
+# that switches it). Until a producer is in here the cycle must NEVER run it: a
+# producer NOT yet in this tuple still writes straight to the live eshop on its
+# OWN daily schedule, so running it hourly TOO would turn a 1x/day automation
+# into 24x/day writes to forestshop.sk the moment a manager clicks ▶ Štart on
+# "Sync do Shoptetu". Task 8 (#299) moved grube_externalcode and split_links onto
+# the queue; Task 9 added restock_skladom and stock_skladom; Task 10 adds
+# parovania_eshop — the LAST of the five, and the only one already ENABLED on
+# forestshop.sk (the other four start DISABLED per the #93 contract). Its links
+# feed the automatic re-ordering, so it is the one migration where crediting the
+# wrong shape (Task 8's C1 lesson) silently freezes real reorder links forever.
+QUEUE_MIGRATED: tuple[str, ...] = ("parovania_eshop", "grube_externalcode",
+                                   "split_links",
                                    "restock_skladom", "stock_skladom")
 SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 # #299 review N3 — shoptet_sync and shoptet_upload share the SAME 60-minute
@@ -7396,8 +7404,17 @@ def run_shoptet_upload() -> dict:
 
 
 def _credit_producer(store: str, entries: dict) -> None:
-    """Write a producer's uploaded-state for groups the import confirmed."""
+    """Write a producer's uploaded-state for groups the import confirmed.
+
+    #299 Task 10 — "parovania_eshop" (pairing decisions + inline order pairings,
+    LINK_HEADER → internalNote) and "parovania_eshop_suppliers" (assigned supplier
+    names, SUPPLIER_HEADER → supplier) are TWO distinct sources sharing one
+    automation key on the runner (`run_parovania_eshop` calls both cores) — they
+    need distinct credit stores (uploaded_pairings.json vs uploaded_suppliers.json),
+    so they carry distinct `source`/`store` names here even though neither maps to
+    its own Automation registration."""
     path = {"parovania_eshop": PAIRINGS_STATE,
+            "parovania_eshop_suppliers": SUPPLIERS_STATE,
             "grube_externalcode": EXTERNALCODES_STATE,
             "split_links": VARIANT_LINKS_STATE}.get(store)
     if path is None:
@@ -7412,18 +7429,36 @@ def run_parovania_eshop() -> dict:
     """Nightly push (daily 21:00) of the workers' NEW pairings (reorder links →
     internalNote) + newly assigned suppliers (→ supplier field) to the Shoptet
     eshop — the in-app migration of the n8n „Forestshop — Párovania → eshop"
-    workflow (YuDugCCOnwejRfva, #109). Reuses the SAME careful upload path as the
-    two n8n endpoints (_do_upload_pairings / _do_upload_suppliers — no Shoptet
-    logic reimplemented). The write stays IDEMPOTENT: already-uploaded pairings/
-    suppliers are skipped via uploaded_pairings.json / uploaded_suppliers.json,
-    so a re-run never double-uploads. Records combined counts for the tab. Both
-    steps run sequentially (mirroring the n8n chain); a step that completes with
-    ok:false (import failed) or blocked is surfaced in the returned `status`
-    without crashing the run. A genuine exception propagates to the runner, which
+    workflow (YuDugCCOnwejRfva, #109). Reuses the SAME two cores as the n8n
+    endpoints (_do_upload_pairings / _do_upload_suppliers — no Shoptet logic
+    reimplemented).
+
+    Since #299 Task 10 this does NOT import directly: both cores only QUEUE their
+    candidate rows into the shared pending_shoptet table; the actual upload to
+    Shoptet, and the "nahraté" write to uploaded_pairings.json /
+    uploaded_suppliers.json for anything freshly QUEUED, are the hourly „Sync do
+    Shoptetu" drain's job (`run_shoptet_upload`), not this function's — this is the
+    ONLY one of the five #299 producers that was already ENABLED on forestshop.sk
+    (the other four start DISABLED), so this migration is a live-write change, not
+    a zero-risk one. A row the eshop's own export ALREADY carries (an
+    `_export_row_verdicts` "confirmed" row, pairings only) is still recorded RIGHT
+    AWAY as before this migration — that credit comes from Shoptet's own state, not
+    "our own say-so", so it does not need the drain.
+
+    Neither core can itself return a failed queueing outcome any more (#299
+    Task 8's I1 precedent — it always queues successfully or reports 0
+    candidates); the only way this step can fail is `queue_shoptet_fields`
+    refusing to write on top of an unreadable pending table (`StoreWipeRefused`)
+    or another genuine exception — that propagates straight to the runner, which
     records last_status='error' and keeps the app alive (degrade, never crash).
+    `blocked` (codes/keys that produced no row) is the only other-than-`ok` status
+    either step itself can report.
 
     Reads ONLY the manager's decision/assignment stores (what to push) — never
-    modifies them; its own progress lives in the two uploaded_*.json state files."""
+    modifies them; the WRITE-BACK progress this automation contributes to lives in
+    pending_shoptet.json → uploaded_pairings.json / uploaded_suppliers.json, both
+    owned by the hourly drain (except the immediately-confirmed pairings above),
+    not by this function."""
     pairings, _ps = _do_upload_pairings(dry=False)
     suppliers, _ss = _do_upload_suppliers(dry=False)
 
@@ -7451,6 +7486,10 @@ def run_parovania_eshop() -> dict:
         "status": status,
         "pairings": {
             "count": pairings.get("count", 0),
+            # #299 Task 10 — how many field values were QUEUED this run (pending the
+            # next hourly drain), distinct from `count` (keys already credited RIGHT
+            # AWAY because the export already confirmed them — see _do_upload_pairings).
+            "queued": int(pairings.get("queued") or 0),
             "total_uploaded": pairings.get("total_uploaded", 0),
             "total_products": pairings.get("total_products", 0),
             "remaining": pairings.get("remaining", 0),
@@ -7476,6 +7515,8 @@ def run_parovania_eshop() -> dict:
         },
         "suppliers": {
             "count": suppliers.get("count", 0),
+            # #299 Task 10 — see the matching note under "pairings" above.
+            "queued": int(suppliers.get("queued") or 0),
             "total_uploaded": suppliers.get("total_uploaded", 0),
             "total_assigned": suppliers.get("total_assigned", 0),
             "remaining": suppliers.get("remaining", 0),

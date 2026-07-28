@@ -947,6 +947,10 @@ def _arm_pairings(monkeypatch, tmp_path, decisions, token="secret-tok", order_pa
     monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded.json"))
+    # #299 Task 10: _do_upload_pairings now QUEUES into the shared pending_shoptet
+    # table instead of importing directly — isolate it like every other store here,
+    # never the live one.
+    monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending_shoptet.json"))
     # #38: isolate the manager's live order_pairings.json — never read the real one
     # (this box also runs the deployed app; an unmocked path would leak real data
     # into the test and make the "0 new pairings" tests flaky/failing).
@@ -974,47 +978,64 @@ def test_pairings_zero_new_returns_count_0(monkeypatch, tmp_path):
     assert r.status_code == 200 and r.get_json()["count"] == 0
 
 
-def test_pairings_uploads_link_csv_and_marks_uploaded(monkeypatch, tmp_path):
+def test_pairings_queues_link_fields_for_the_hourly_drain(monkeypatch, tmp_path):
+    """#299 Task 10 — `_do_upload_pairings` no longer imports directly: it QUEUES
+    into the shared pending_shoptet table for the next hourly "Sync do Shoptetu"
+    drain (`test_webreview_shoptet_upload.py` covers the drain + credit path).
+    `count` (keys credited immediately) stays 0 here — nothing is confirmed by an
+    eshop export in this fixture, so nothing is credited yet; `queued` reports
+    the field actually queued. Idempotency now belongs to the QUEUE+DRAIN, not
+    this producer: without a credited uploaded_pairings.json entry (only the
+    drain writes one, once Shoptet confirms), the SAME key is a "new" candidate
+    on every call — harmless, since re-queueing just overwrites the same pending
+    field with the same value."""
     dec = {"k1": {"status": "good", "url": "https://supplier/x"}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec)
-    seen = {}
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        seen["header"] = rd[0]
-        seen["rows"] = rd[1:]
-        return 0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""
-
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
     j = r.get_json()
-    assert r.status_code == 200 and j["ok"] and j["count"] == 1
-    # the import file carries internalNote (the reorder link) — NOT stripped
-    assert seen["header"] == ["code", "pairCode", "internalNote"]
-    assert ["A/1", "100", "https://supplier/x"] in seen["rows"]
+    # _arm_pairings' fixture product carries TWO variant codes (A/1, A/2) → 2 fields
+    assert r.status_code == 200 and j["ok"] and j["queued"] == 2 and j["count"] == 0
     assert j["products"][0]["supplier_url"] == "https://supplier/x"
-    # uploaded state recorded → a second call uploads nothing
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run again")))
+    pending = json.loads((tmp_path / "pending_shoptet.json").read_text(encoding="utf-8"))
+    assert pending["A/1"]["fields"]["internalNote"]["value"] == "https://supplier/x"
+    assert pending["A/1"]["fields"]["internalNote"]["source"] == "parovania_eshop"
+
+    # re-queued again on a second call — never marked uploaded (nothing confirmed it
+    # yet), so it stays a "new" candidate; the field value is unchanged, not doubled
     r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["count"] == 0
+    assert r2.get_json()["queued"] == 2
+    pending2 = json.loads((tmp_path / "pending_shoptet.json").read_text(encoding="utf-8"))
+    assert pending2["A/1"]["fields"]["internalNote"]["value"] == "https://supplier/x"
 
 
 def test_pairings_response_carries_summary_counts(monkeypatch, tmp_path):
     # The n8n notifier needs totals to post ONE summary Discord message instead of
-    # one-per-product: new (count), total uploaded, remaining, total products, review link.
+    # one-per-product: queued this run, total uploaded, remaining, total products,
+    # review link. #299 Task 10 — `total_uploaded`/`remaining` now only move once
+    # the hourly drain (or an immediate export-confirmed credit) actually records
+    # the key uploaded, not the moment it is merely queued.
     dec = {"k1": {"status": "good", "url": "https://supplier/x"}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec)
     monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""))
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     j = _client().post("/api/n8n/upload-pairings",
                        headers={"Authorization": f"Bearer {tok}"}).get_json()
-    assert j["count"] == 1                       # newly uploaded this run
-    assert j["total_products"] == 1              # PRODUCTS in the review set
-    assert j["total_uploaded"] == 1              # uploaded total now includes this run
-    assert j["remaining"] == 0                   # nothing left without a pairing
+    assert j["queued"] == 2                       # newly queued this run (2 variant codes)
+    assert j["count"] == 0                        # not credited yet — nothing confirmed it
+    assert j["total_products"] == 1               # PRODUCTS in the review set
+    assert j["total_uploaded"] == 0                # still waiting on the drain
+    assert j["remaining"] == 1
     assert j["review_url"].startswith("https://")
+
+    # once the drain confirms it (simulated directly — the drain itself is
+    # test_webreview_shoptet_upload.py's job), the totals move
+    webapp._credit_producer("parovania_eshop", {"k1": "https://supplier/x"})
+    j2 = _client().post("/api/n8n/upload-pairings",
+                        headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j2["queued"] == 0 and j2["count"] == 0   # already credited → no longer "new"
+    assert j2["total_uploaded"] == 1 and j2["remaining"] == 0
 
 
 def test_pairings_zero_new_still_reports_totals(monkeypatch, tmp_path):
@@ -1070,16 +1091,19 @@ def test_pairings_blocked_when_codes_missing(monkeypatch, tmp_path):
     assert j["count"] == 0 and j["blocked"] == 1 and j["total_products"] == 1
 
 
-def test_pairings_partial_batch_only_marks_keys_with_rows_uploaded(monkeypatch, tmp_path):
+def test_pairings_partial_batch_only_queues_the_coded_key(monkeypatch, tmp_path):
     # #49: a batch with ONE coded (uploadable) key and ONE code-less (blocked) key
-    # must mark ONLY the coded key as uploaded — the code-less key must stay "new"
-    # so a later run retries it, instead of being silently lost forever.
+    # must QUEUE only the coded key — the code-less key must stay "new" so a later
+    # run retries it, instead of being silently lost forever. #299 Task 10: nothing
+    # is credited here at all (no catalog export → nothing confirmed), so k1 is
+    # QUEUED, not marked uploaded — the drain credits it later.
     cred = tmp_path / ".shoptet_admin"
     cred.write_text("N8N_IMPORT_TOKEN=secret-tok\n", encoding="utf-8")
     monkeypatch.setattr(webapp, "CRED_PATH", str(cred))
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "PAIRINGS_STATE", str(tmp_path / "uploaded.json"))
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
+    monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending_shoptet.json"))
     monkeypatch.setattr(webapp, "PRODUCTS", [
         {"key": "k1", "name": "X1", "our_url": "u1", "variant_codes": ["A/1"]},
         {"key": "k2", "name": "X2", "our_url": "u2", "variant_codes": []},
@@ -1090,21 +1114,21 @@ def test_pairings_partial_batch_only_marks_keys_with_rows_uploaded(monkeypatch, 
         "k2": {"status": "good", "url": "https://supplier/x2"},
     })
     monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""))
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     j = _client().post("/api/n8n/upload-pairings",
                        headers={"Authorization": "Bearer secret-tok"}).get_json()
     assert j["ok"] is True
-    assert j["count"] == 1                # only k1 genuinely got a row uploaded
+    assert j["queued"] == 1                # only k1 genuinely got a row queued
+    assert j["count"] == 0                 # not credited yet — nothing confirmed it
     assert j["blocked"] == 1               # k2 surfaced as blocked, not silently dropped
-    uploaded = json.loads((tmp_path / "uploaded.json").read_text())
-    assert uploaded == {"k1": "https://supplier/x1"}   # k2 must NOT be recorded
+    assert not (tmp_path / "uploaded.json").exists()   # k2 must NOT be recorded, k1 not YET
+    pending = json.loads((tmp_path / "pending_shoptet.json").read_text())
+    assert pending["A/1"]["fields"]["internalNote"]["value"] == "https://supplier/x1"
 
-    # k2 must still be retried on the next run — it was never marked uploaded
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("k1 must not re-import")))
+    # k2 stays blocked on the next run too; k1 (never confirmed) is re-queued
     j2 = _client().post("/api/n8n/upload-pairings",
                         headers={"Authorization": "Bearer secret-tok"}).get_json()
-    assert j2["count"] == 0 and j2["blocked"] == 1     # k2 retried, still blocked (no codes)
+    assert j2["queued"] == 1 and j2["blocked"] == 1
 
 
 def test_pairings_rejects_wrong_token(monkeypatch, tmp_path):
@@ -1113,25 +1137,15 @@ def test_pairings_rejects_wrong_token(monkeypatch, tmp_path):
     assert r.status_code == 401
 
 
-def test_pairings_failed_import_does_not_mark_uploaded(monkeypatch, tmp_path):
-    # A FAILED import (rc != 0) must NOT record the pairing as uploaded — else it's
-    # silently lost and never retried.
-    dec = {"k1": {"status": "good", "url": "https://supplier/z"}}
-    tok = _arm_pairings(monkeypatch, tmp_path, dec)
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (2, "POZOR: zlyhania", "boom"))
-    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r.status_code == 502 and r.get_json()["ok"] is False
-    # not marked → a later (succeeding) call still sees it as new
-    calls = {"n": 0}
-
-    def ok_run(p, dry_run=False, timeout=300):
-        calls["n"] += 1
-        return 0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""
-
-    monkeypatch.setattr(webapp, "run_import", ok_run)
-    r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["count"] == 1 and calls["n"] == 1
+    # #299 Task 10 — `test_pairings_failed_import_does_not_mark_uploaded` deleted.
+    # `_do_upload_pairings` no longer imports directly (Shoptet import failures can
+    # only happen inside the hourly drain's OWN `_import_rows_chunked` call now),
+    # so "a FAILED import must not mark uploaded" is no longer this function's
+    # protection to carry. It lives on generically for EVERY producer in
+    # `test_webreview_shoptet_upload.py::test_a_pairing_key_whose_second_code_failed_is_NOT_credited`
+    # (a pairing-specific partial-failure scenario, added by this task) and in the
+    # drain's own chunk/lock tests (`test_the_import_is_skipped_when_another_import_is_already_running`
+    # et al., from Tasks 6/7).
 
 
 def _hard_error_stdout(err):
@@ -1142,80 +1156,82 @@ def _hard_error_stdout(err):
             f"CHYBA LOGU: {err}\n")
 
 
-def test_pairings_hard_error_surfaces_error_detail_and_does_not_mark_uploaded(monkeypatch, tmp_path):
-    # #23: a hard Shoptet error (aborted import, e.g. duplicate 'code') must be
-    # surfaced as error_detail AND must not mark the pairing uploaded — ask #3.
-    dec = {"k1": {"status": "good", "url": "https://supplier/z"}}
-    tok = _arm_pairings(monkeypatch, tmp_path, dec)
-    err = "Chyba | Číslo riadku: 7 - Data in column code are not unique"
-    # the real script always prints its own result marker first (the app parses only
-    # that slice — the raw stdout starts with the PREVIOUS Log entry, #196/#257)
-    out = _hard_error_stdout(err)
-    monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (2, out, "boom"))
-    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    j = r.get_json()
-    assert r.status_code == 502 and j["ok"] is False
-    assert j["processed"] is None
-    assert j["error_detail"] == err
-    assert (tmp_path / "uploaded.json").exists() is False   # nothing was ever marked uploaded
+# #299 Task 10 — `test_pairings_hard_error_surfaces_error_detail_and_does_not_mark_uploaded`
+# deleted. `_do_upload_pairings` no longer runs an import at all, so it can no
+# longer surface a hard Shoptet import error (`error_detail`/`processed` from a
+# parsed Shoptet log) — that surface now belongs entirely to the hourly drain
+# (`run_shoptet_upload`, whose `_import_rows_chunked` call is exercised by
+# `test_webreview_shoptet_upload.py`'s `cycle` fixture) and to
+# `_chunk_error_msg`'s own unit coverage in `test_import_builder.py` /
+# `test_webreview.py`'s generic n8n-import endpoint tests, neither of which this
+# task's migration touches.
 
 
 def test_pairings_whitespace_url_does_not_re_upload_forever(monkeypatch, tmp_path):
-    # A decision URL with surrounding whitespace must be normalized so it's marked
-    # uploaded and not re-selected every night.
+    # A decision URL with surrounding whitespace must be normalized so it is
+    # QUEUED with the stripped value and, once credited (the drain's job — the
+    # #257 lesson), never re-selected again. #299 Task 10: the credit itself is
+    # simulated directly (`_credit_producer`, exactly what the drain calls once
+    # Shoptet confirms) — the drain's OWN confirm→credit path is
+    # `test_webreview_shoptet_upload.py`'s job.
     dec = {"k1": {"status": "good", "url": "https://supplier/w  "}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec)
     monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (0, "spracované=2", ""))
-    assert _client().post("/api/n8n/upload-pairings",
-                          headers={"Authorization": f"Bearer {tok}"}).get_json()["count"] == 1
-    # second run: must be 0 (marked despite the trailing spaces)
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("re-uploaded!")))
-    assert _client().post("/api/n8n/upload-pairings",
-                          headers={"Authorization": f"Bearer {tok}"}).get_json()["count"] == 0
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
+    j = _client().post("/api/n8n/upload-pairings",
+                       headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j["queued"] == 2
+    pending = json.loads((tmp_path / "pending_shoptet.json").read_text())
+    # the QUEUED value is normalized (stripped) — never the raw whitespace-padded one
+    assert pending["A/1"]["fields"]["internalNote"]["value"] == "https://supplier/w"
+    webapp._credit_producer("parovania_eshop", {"k1": "https://supplier/w"})
+    # second run: must queue nothing (marked despite the trailing spaces)
+    j2 = _client().post("/api/n8n/upload-pairings",
+                        headers={"Authorization": f"Bearer {tok}"}).get_json()
+    assert j2["queued"] == 0
 
 
 def test_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
+    # #299 Task 10 — dry_run no longer reaches a real Shoptet dry-run import (there
+    # is no import left to dry-run); the honest equivalent is `would_queue`, a
+    # preview of the field count, while genuinely queueing nothing.
     dec = {"k1": {"status": "manual", "url": "https://supplier/y"}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec)
-    monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (0, "spracované=2", ""))
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("a dry run must never import"))
     r = _client().post("/api/n8n/upload-pairings?dry_run=1", headers={"Authorization": f"Bearer {tok}"})
-    assert r.get_json()["dry_run"] is True
-    # dry-run must NOT persist → still 1 new on the next (real) call
-    monkeypatch.setattr(webapp, "run_import", lambda p, dry_run=False, timeout=300: (0, "spracované=2", ""))
+    j = r.get_json()
+    assert j["dry_run"] is True
+    assert j["queued"] == 0 and j["would_queue"] == 2
+    assert not (tmp_path / "pending_shoptet.json").exists()
+    # dry-run must NOT persist → still 2 fields to queue on the next (real) call
     r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["count"] == 1
+    assert r2.get_json()["queued"] == 2
 
 
 # --- #38: nightly push ALSO covers order_pairings.json (inline 'Na objednanie' --- #
 # --- pairings, outside the review set) — same import run, own uploaded state.  --- #
-def test_order_pairings_uploaded_and_marked_under_order_namespace(monkeypatch, tmp_path):
+def test_order_pairings_queued_under_order_namespace(monkeypatch, tmp_path):
+    # #299 Task 10 — an inline order pairing now QUEUES exactly like a reviewed
+    # decision, credit_group `order:<code>`, and is credited by the drain, never
+    # by this producer.
     tok = _arm_pairings(monkeypatch, tmp_path, {},
                         order_pairings={"B/1": "https://supplier/inline"})
-    seen = {}
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        seen["header"] = rd[0]
-        seen["rows"] = rd[1:]
-        return 0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""
-
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
     j = r.get_json()
     assert r.status_code == 200 and j["ok"]
     assert j["count"] == 0                          # no decisions this run
-    assert j["order_count"] == 1 and j["order_blocked"] == 0
-    assert seen["header"] == ["code", "pairCode", "internalNote"]
-    assert ["B/1", "", "https://supplier/inline"] in seen["rows"]
-    uploaded = json.loads((tmp_path / "uploaded.json").read_text())
-    assert uploaded["order:B/1"] == "https://supplier/inline"
+    assert j["order_count"] == 0 and j["order_blocked"] == 0    # not credited yet
+    pending = json.loads((tmp_path / "pending_shoptet.json").read_text())
+    assert pending["B/1"]["fields"]["internalNote"]["value"] == "https://supplier/inline"
+    assert pending["B/1"]["fields"]["internalNote"]["credit"]["group"] == "order:B/1"
+    assert not (tmp_path / "uploaded.json").exists()
 
-    # unchanged on the next run → nothing pushed again
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run again")))
+    # once credited (the drain's job — simulated directly here), the code is no
+    # longer "new" at all — it queues (and reports) nothing further
+    webapp._credit_producer("parovania_eshop", {"order:B/1": "https://supplier/inline"})
     r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
     j2 = r2.get_json()
     assert j2["count"] == 0 and j2["order_count"] == 0
@@ -1224,27 +1240,20 @@ def test_order_pairings_uploaded_and_marked_under_order_namespace(monkeypatch, t
 def test_order_pairings_code_covered_by_decision_is_excluded_and_blocked(monkeypatch, tmp_path):
     # a code already covered by a reviewed decision this run must NOT be duplicated
     # in the same import CSV (Shoptet aborts the whole import on a duplicate code) —
-    # the reviewed decision wins, the order_pairing stays "blocked" (not uploaded).
+    # the reviewed decision wins, the order_pairing stays "blocked" (not queued).
     dec = {"k1": {"status": "good", "url": "https://supplier/x"}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec,
                         order_pairings={"A/1": "https://supplier/inline"})
-    calls = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        calls.append(rd[1:])
-        return 0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""
-
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
     j = r.get_json()
-    assert j["ok"] and j["count"] == 1               # k1's A/1+A/2 uploaded via the decision
+    assert j["ok"] and j["queued"] == 2              # k1's A/1+A/2 queued via the decision
     assert j["order_count"] == 0 and j["order_blocked"] == 1
-    rows = calls[0]
-    assert [row for row in rows if row[0] == "A/1"] == [["A/1", "100", "https://supplier/x"]]
-    uploaded = json.loads((tmp_path / "uploaded.json").read_text())
-    assert "order:A/1" not in uploaded
+    pending = json.loads((tmp_path / "pending_shoptet.json").read_text())
+    assert pending["A/1"]["fields"]["internalNote"]["value"] == "https://supplier/x"
+    # nothing confirmed this run → nothing credited at all yet, either way
+    assert not (tmp_path / "uploaded.json").exists()
 
 
 def test_a_decision_already_uploaded_still_outranks_a_stale_inline_pairing(monkeypatch, tmp_path):
@@ -1263,26 +1272,25 @@ def test_a_decision_already_uploaded_still_outranks_a_stale_inline_pairing(monke
     dec = {"k1": {"status": "manual", "url": "https://CORRECT.test/x"}}
     tok = _arm_pairings(monkeypatch, tmp_path, dec,
                         order_pairings={"A/1": "https://STALE-INLINE.test/x"})
-    runs = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        runs.append(rd[1:])
-        return 0, "VÝSLEDOK: spracované=2 upravené=2 zlyhania=0", ""
-
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-    # night 1 — the correction ships, the stale inline pairing is blocked
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
+    # night 1 — the correction is QUEUED, the stale inline pairing is blocked
     j1 = _client().post("/api/n8n/upload-pairings",
                         headers={"Authorization": f"Bearer {tok}"}).get_json()
-    assert j1["count"] == 1 and j1["order_count"] == 0 and j1["order_blocked"] == 1
-    assert runs[0] == [["A/1", "100", "https://CORRECT.test/x"],
-                       ["A/2", "100", "https://CORRECT.test/x"]]
+    assert j1["queued"] == 2 and j1["order_count"] == 0 and j1["order_blocked"] == 1
+    pending1 = json.loads((tmp_path / "pending_shoptet.json").read_text())
+    assert pending1["A/1"]["fields"]["internalNote"]["value"] == "https://CORRECT.test/x"
+    assert pending1["A/2"]["fields"]["internalNote"]["value"] == "https://CORRECT.test/x"
 
-    # night 2 — the decision is no longer "new", but it still OWNS A/1
+    # the drain confirms + credits k1 overnight (simulated directly — its own
+    # confirm→credit path is test_webreview_shoptet_upload.py's job)
+    webapp._credit_producer("parovania_eshop", {"k1": "https://CORRECT.test/x"})
+
+    # night 2 — the decision is no longer "new", but it still OWNS A/1: the stale
+    # inline pairing must stay blocked, never emitted to the live eshop
     j2 = _client().post("/api/n8n/upload-pairings",
                         headers={"Authorization": f"Bearer {tok}"}).get_json()
-    assert len(runs) == 1, f"night 2 reverted the eshop: {runs[1:]}"
+    assert j2["queued"] == 0, f"night 2 re-queued the eshop: {j2}"
     assert j2["order_count"] == 0 and j2["order_blocked"] == 1
     uploaded = json.loads((tmp_path / "uploaded.json").read_text())
     assert "order:A/1" not in uploaded          # never recorded → never silently final
@@ -1311,31 +1319,25 @@ def test_order_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
     tok = _arm_pairings(monkeypatch, tmp_path, {},
                         order_pairings={"B/1": "https://supplier/z"})
     monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (0, "spracované=1", ""))
+                        lambda *a, **k: pytest.fail("a dry run must never import"))
     r = _client().post("/api/n8n/upload-pairings?dry_run=1", headers={"Authorization": f"Bearer {tok}"})
-    assert r.get_json()["dry_run"] is True
+    j = r.get_json()
+    assert j["dry_run"] is True
+    assert j["would_queue"] == 1
     # dry-run must NOT persist → no state file written at all
     assert not (tmp_path / "uploaded.json").exists()
-    # dry-run must NOT persist → still 1 new order pairing on the next (real) call
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (0, "spracované=1", ""))
+    assert not (tmp_path / "pending_shoptet.json").exists()
+    # dry-run must NOT persist → still 1 new order pairing to queue on the next (real) call
     r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["order_count"] == 1
+    assert r2.get_json()["queued"] == 1
 
 
-def test_order_pairings_failed_import_does_not_mark_uploaded(monkeypatch, tmp_path):
-    tok = _arm_pairings(monkeypatch, tmp_path, {},
-                        order_pairings={"B/1": "https://supplier/z"})
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (2, "POZOR: zlyhania", "boom"))
-    r = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r.status_code == 502 and r.get_json()["ok"] is False
-    assert not (tmp_path / "uploaded.json").exists()
-    # not marked → a later (succeeding) call still sees it as new
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""))
-    r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["order_count"] == 1
+# #299 Task 10 — `test_order_pairings_failed_import_does_not_mark_uploaded` deleted.
+# `_do_upload_pairings` no longer imports directly, so it has no failed-import
+# branch left to guard for the order-pairings half either — that protection now
+# lives in `test_webreview_shoptet_upload.py::test_a_pairing_key_whose_second_code_failed_is_NOT_credited`
+# (generic across decision keys AND order codes, since both flow through the same
+# credit_group mechanism) and the drain's own chunk/lock tests.
 
 
 def test_import_dry_run_passthrough(monkeypatch, tmp_path):
@@ -1484,6 +1486,9 @@ def _arm_suppliers(monkeypatch, tmp_path, assigns, token="secret-tok"):
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "SUPPLIERS_STATE", str(tmp_path / "uploaded_suppliers.json"))
     monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "sa.json"))
+    # #299 Task 10: _do_upload_suppliers now QUEUES into the shared pending_shoptet
+    # table instead of importing directly.
+    monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending_shoptet.json"))
     monkeypatch.setattr(webapp, "CODE2PAIR", {"88/Z": "777"})
     # BUG 1 fail-closed: the write-back refuses to run without a catalog export. Provide a
     # minimal non-empty export where 88/Z has NO own supplier (empty column) → not excluded
@@ -1514,31 +1519,34 @@ def test_suppliers_zero_new_returns_count_0(monkeypatch, tmp_path):
     assert r.status_code == 200 and r.get_json()["count"] == 0
 
 
-def test_suppliers_uploads_csv_and_marks_uploaded(monkeypatch, tmp_path):
+def test_suppliers_queues_assignments_for_the_hourly_drain(monkeypatch, tmp_path):
+    """#299 Task 10 — `_do_upload_suppliers` no longer imports directly: it QUEUES
+    into the shared pending_shoptet table, source "parovania_eshop_suppliers"
+    (distinct from the pairings push's "parovania_eshop" — see `_credit_producer`).
+    Unlike pairings, suppliers has NO export-confirmed fast path (every candidate
+    always goes through the queue, matching the grube_externalcode/split_links
+    precedent from Task 8), so `count` is simply an alias for `queued` — but
+    `total_uploaded`/`remaining` (built from the PERSISTED uploaded_suppliers.json)
+    stay untouched until the drain actually credits it."""
     tok = _arm_suppliers(monkeypatch, tmp_path, {"88/Z": "BETALOV"})
-    seen = {}
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        seen["header"] = rd[0]
-        seen["rows"] = rd[1:]
-        return 0, "VÝSLEDOK: spracované=1 upravené=1 zlyhania=0", ""
-
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     j = _client().post("/api/n8n/upload-suppliers",
                        headers={"Authorization": f"Bearer {tok}"}).get_json()
-    assert j["ok"] and j["count"] == 1
-    # the import file carries ONLY code;pairCode;supplier (no internalNote/state → safe)
-    assert seen["header"] == ["code", "pairCode", "supplier"]
-    assert ["88/Z", "777", "BETALOV"] in seen["rows"]
+    assert j["ok"] and j["queued"] == 1 and j["count"] == 1
     assert j["products"][0] == {"code": "88/Z", "supplier": "BETALOV"}
-    assert j["total_assigned"] == 1 and j["total_uploaded"] == 1 and j["remaining"] == 0
-    # uploaded state recorded → a second call sends nothing
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run again")))
+    assert j["total_assigned"] == 1 and j["total_uploaded"] == 0 and j["remaining"] == 1
+    pending = json.loads((tmp_path / "pending_shoptet.json").read_text())
+    # the queued field carries ONLY the supplier cell (no internalNote/state → safe)
+    assert set(pending["88/Z"]["fields"]) == {"supplier"}
+    assert pending["88/Z"]["fields"]["supplier"]["value"] == "BETALOV"
+
+    # once the drain confirms + credits it (simulated directly), nothing queues again
+    webapp._credit_producer("parovania_eshop_suppliers", {"88/Z": "BETALOV"})
     r2 = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["count"] == 0
+    j2 = r2.get_json()
+    assert j2["queued"] == 0
+    assert j2["total_uploaded"] == 1 and j2["remaining"] == 0
 
 
 def test_suppliers_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
@@ -1552,29 +1560,11 @@ def test_suppliers_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
     assert r2.get_json()["count"] == 1
 
 
-def test_suppliers_failed_import_does_not_mark_uploaded(monkeypatch, tmp_path):
-    # A FAILED import (rc != 0) must NOT record the assignment as uploaded.
-    tok = _arm_suppliers(monkeypatch, tmp_path, {"88/Z": "ODIMON"})
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (1, "chyba", "boom"))
-    r = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
-    assert r.status_code == 502 and r.get_json()["ok"] is False
-    # not marked → a later successful call still sends it
-    ok_run = lambda p, dry_run=False, timeout=300: (0, "spracované=1", "")  # noqa: E731
-    monkeypatch.setattr(webapp, "run_import", ok_run)
-    r2 = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["count"] == 1
-
-
-def test_suppliers_hard_error_surfaces_error_detail(monkeypatch, tmp_path):
-    # #23: same hard-error surfacing for the supplier write-back endpoint.
-    tok = _arm_suppliers(monkeypatch, tmp_path, {"88/Z": "BETALOV"})
-    err = "Chyba | Číslo riadku: 3 - Data in column code are not unique"
-    out = _hard_error_stdout(err)
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (2, out, "boom"))
-    r = _client().post("/api/n8n/upload-suppliers", headers={"Authorization": f"Bearer {tok}"})
-    j = r.get_json()
-    assert r.status_code == 502 and j["ok"] is False
-    assert j["processed"] is None
-    assert j["error_detail"] == err
+# #299 Task 10 — `test_suppliers_failed_import_does_not_mark_uploaded` and
+# `test_suppliers_hard_error_surfaces_error_detail` deleted. `_do_upload_suppliers`
+# no longer imports directly, so it has no failed/hard-error import branch left to
+# guard — that surface now belongs entirely to the hourly drain
+# (`run_shoptet_upload`) and its own coverage in `test_webreview_shoptet_upload.py`,
+# plus `test_a_pairing_key_whose_second_code_failed_is_NOT_credited` for the
+# generic partial-credit-withheld shape (same credit_group mechanism suppliers
+# use, per-code instead of per-decision-key).
