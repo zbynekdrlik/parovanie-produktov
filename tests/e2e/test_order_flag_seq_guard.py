@@ -145,13 +145,22 @@ def test_a_refused_ordered_ON_cannot_leave_the_row_looking_ordered(
 
 def test_a_status_write_leaves_the_ordered_sequence_untouched(page, toorder_server):
     """The invariant behind both regressions, asserted directly on the bookkeeping: a
-    write may only stamp the sequence numbers of the flags it CLAIMED. „čaká sa" claims
-    all three axis-B flags (turning one on clears the other two, #211) and never
-    „objednané" — so `ordered` must come out of a status write with a virgin guard.
+    write may only stamp the guard of the flags it CLAIMED. „čaká sa" claims all three
+    axis-B flags (turning one on clears the other two, #211) and never „objednané" — so
+    `ordered` must come out of a status write with a virgin guard.
 
     Kept alongside the two browser sequences on purpose: they prove the CONSEQUENCE, this
     pins the CAUSE, so a future refactor that reintroduces the foreign stamp fails here
     with a readable reason instead of only as a mysterious flag divergence.
+
+    #291 moved the guard's NUMBER: it used to be the client's own per-(flag, row) ISSUE
+    counter (`confirmedSeq`), which is not the order the server committed in, so it is now
+    the server's own commit number (`confirmedCommit`). The invariant this test exists for
+    is untouched — a write may still only stamp what it claimed — so only the field name
+    moves with it. The second assertion changes shape because the two numbers no longer
+    live in the same space: an issue counter could be compared against `seq`, a global
+    commit clock cannot, so what it pins now is that the claimed flag carries a REAL
+    server number (a stamp of 0/undefined would mean the answer was never adopted at all).
     """
     _open(page, toorder_server)
     _click_status(page)
@@ -161,12 +170,14 @@ def test_a_status_write_leaves_the_ordered_sequence_untouched(page, toorder_serv
       const out = {};
       for (const f of ['ordered', 'waiting', 'instock', 'unavailable']) {
         const e = _flagWrites[f + '\\u0000' + key];
-        out[f] = e ? {seq: e.seq, confirmedSeq: e.confirmedSeq} : null;
+        out[f] = e ? {seq: e.seq, confirmedCommit: e.confirmedCommit} : null;
       }
       return out;
     }""", _KEY)
 
-    assert stamped["ordered"] is None or stamped["ordered"]["confirmedSeq"] == 0, (
-        "a 'caka sa' write stamped the 'objednane' guard with a sequence number that flag "
+    assert stamped["ordered"] is None or stamped["ordered"]["confirmedCommit"] == 0, (
+        "a 'caka sa' write stamped the 'objednane' guard with a commit number that flag "
         "never claimed", stamped)
-    assert stamped["waiting"]["confirmedSeq"] <= stamped["waiting"]["seq"], stamped
+    assert stamped["waiting"]["confirmedCommit"] > 0, (
+        "the clicked flag's guard was never stamped with the server's commit number — its "
+        "accepted write was not adopted at all", stamped)
