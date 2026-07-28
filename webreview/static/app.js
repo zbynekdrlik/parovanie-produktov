@@ -4305,6 +4305,14 @@ const ORDER_STATUS_BOXES = [
   ['known_open', 'Ostatné známe stavy (nie sú ukončené)',
    'Stavy, o ktorých vieš, ale ktoré neznamenajú ukončenie. Značky pri nich ostávajú; '
    + 'sem patria, aby ich appka nehlásila ako neznáme.'],
+  // #296 — a REFINEMENT of „ukončená", not a fourth independent bucket: it says which of
+  // the finished statuses mean „odvolaná" instead of „odoslaná". „Odoslaná" is derived as
+  // the rest of „ukončená" and deliberately has no box, so a rename stays ONE edit.
+  ['cancelled', 'Objednávka je zrušená',
+   'Podmnožina ukončených — ktoré z nich znamenajú zrušenie. Takým objednávkam Pošta '
+   + 'neposiela upozornenia na nevyzdvihnutú zásielku a nepočíta ich do kontroly podacích '
+   + 'čísel. Zvyšok ukončených berie ako odoslané. Každý stav odtiaľto musí byť aj '
+   + 'v zozname „Objednávka je ukončená".'],
 ];
 
 function renderOrderStatusConfig() {

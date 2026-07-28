@@ -666,15 +666,27 @@ def test_an_EMPTIED_cancelled_is_refused_like_the_other_load_bearing_sets(iso):
     assert "zrušen" in r.get_json()["error"].lower()
 
 
-def test_a_hand_edited_cancelled_outside_terminal_DISARMS_the_prune(iso):
-    """Same rule on the loader — the endpoint is the door, the loader is the lock. A file the
-    app cannot use must report `bad-status-config` (red banner + ⚠ + no deleting), never
-    silently substitute a default and re-arm the prune on statuses the manager removed."""
-    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená"],
-                 "known_open": [], "cancelled": ["Zrušená"]})
+def test_a_config_written_BEFORE_this_set_existed_is_not_broken_by_the_upgrade(iso):
+    """The invariant is an endpoint rule, NOT a loader rule, and this is why. Every stored
+    configuration predating #296 has no `cancelled` key, so the default steps in — and if that
+    default is not inside a `terminal` the manager had legitimately narrowed, a loader-level
+    check would red-banner it and DISARM the prune on upgrade, for a state nobody caused.
+    Nothing dangerous follows from the mismatch: `dispatched` is `terminal − cancelled`, so a
+    name that is not in `terminal` simply subtracts nothing."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená"], "known_open": []})
     sets, reason = webapp._order_statuses_state()
-    assert reason == "bad-status-config"
-    assert sets == {k: frozenset(v) for k, v in webapp.ORDER_STATUS_DEFAULTS.items()}
+    assert reason == ""                                   # prune stays armed
+    assert sets["cancelled"] == frozenset({"Stornovaná"})
+    assert webapp._posta_statuses() == (frozenset({"Stornovaná"}), frozenset({"Vybavená"}))
+
+
+def test_a_PARTIAL_payload_that_never_mentions_cancelled_is_not_refused(iso):
+    """Same reason, on the write path: a caller editing only `to_order` must not be rejected
+    over a set it did not touch. The panel always posts all four boxes, so the mis-edit the
+    rule exists for is still fully covered."""
+    r = _client_as(ADMIN).post("/api/order-statuses",
+                               json={"to_order": ["Spracúva sa"], "terminal": ["Hotová"]})
+    assert r.status_code == 200, r.get_json()
 
 
 def test_an_ABSENT_cancelled_key_is_a_fresh_install_not_a_broken_config(iso):

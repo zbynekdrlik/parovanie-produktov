@@ -38,6 +38,8 @@ import io
 from datetime import date, timedelta
 from html import escape
 
+from parovanie.export_helpers import norm_status
+
 # Non-Pošta courier names recognised in the SHIPPING pseudo-item's itemName
 # (case-insensitive substring match). DPD is the one confirmed live (#126);
 # the rest are common SK couriers kept out defensively per the issue's "DPD +
@@ -59,11 +61,29 @@ ADMIN_ORDER_LINK = ("https://www.forestshop.sk/admin/vyhladavanie/"
 SOURCE_WINDOW_DAYS = 30
 MAX_EMAILS = 4
 
-# The order status that means „už odoslaná" — the only orders that MUST already carry a package
-# number. An order still being picked („Vybavuje sa") legitimately has none yet, and counting
-# those would light the coverage alarm below every single day. Rare statuses are deliberately not
-# guessed at (same discipline as TERMINAL_STATE_CODES: only vocabulary we have actually seen).
-DISPATCHED_STATUS = "vybavená"
+# The two order statuses this automation has to recognise. Both are DEFAULTS: since #296 the web
+# app passes the sets the manager configured on the „Sync zo Shoptetu" card (`order_statuses.json`,
+# #209), because Shoptet's status names are a text field the shop owner edits and a rename used to
+# reach this module unchanged. Measured read-only on the live export (28.7.2026): renaming
+# „Vybavená" took `dispatched_orders` from 89 to 0 and flipped `degraded` from True to FALSE — the
+# alarm built against silent death went quietly green over a genuinely dead source; renaming
+# „Stornovaná" put 16 cancelled orders back into the set this automation chases.
+#
+# They stay here so the module remains standalone and unit-testable, and so a caller that passes
+# nothing behaves exactly as it did before #296.
+#
+#   DISPATCHED — „už odoslaná": the only orders that MUST already carry a package number. An order
+#     still being picked („Vybavuje sa") legitimately has none yet, and counting those would light
+#     the coverage alarm below every single day. The app derives this set as `terminal − cancelled`
+#     rather than offering a box of its own — see webreview/app.py `_posta_statuses`.
+#   CANCELLED — never nag a customer who cancelled (#93). It is a subset of the app's `terminal`
+#     set, and the app enforces that at both ends so the two can never drift apart.
+#
+# Names are compared through `export_helpers.norm_status` (NFC + strip) on BOTH sides — the trap
+# #296 names: this module used to lowercase, while the configuration carries the exact names the
+# manager typed, and a decomposed name is byte-different, renders identically and matches nothing.
+DISPATCHED_STATUSES = frozenset({"Vybavená"})
+CANCELLED_STATUSES = frozenset({"Stornovaná"})
 
 # ── the coverage alarm (#282) ────────────────────────────────────────────────────────────────
 # The ONLY source of shipments is the export's `packageNumber` column. On 2026-07-02 it stopped
@@ -127,7 +147,18 @@ def _is_non_posta_carrier(name: str) -> bool:
     return any(k in n for k in NON_POSTA_CARRIER_KEYWORDS)
 
 
-def _eligible_orders(orders_csv, today: date | None = None) -> list[tuple[dict, date, str]]:
+def _status_set(statuses, default: frozenset) -> frozenset:
+    """A caller-supplied set of status names → the ONE form both sides compare in, or the
+    module default when the caller passed nothing. `None` and the default are deliberately
+    different from an EMPTY set: the app never sends an empty one (its endpoint and loader
+    both refuse it), so an empty set here means „the caller really means nothing matches"."""
+    if statuses is None:
+        return default
+    return frozenset(norm_status(s) for s in statuses) - {""}
+
+
+def _eligible_orders(orders_csv, today: date | None = None,
+                     cancelled_statuses=None) -> list[tuple[dict, date, str]]:
     """Every order this automation is responsible for, WITHOUT the packageNumber filter →
     [(row, order_date, packageNumber), …].
 
@@ -135,10 +166,13 @@ def _eligible_orders(orders_csv, today: date | None = None) -> list[tuple[dict, 
     order fields on every item line), the order is not cancelled, it did not ship with a non-Pošta
     courier, and its date is inside the 30-day source window. Both the shipment source below and
     the coverage alarm read it, so the alarm can never end up counting a different set of orders
-    than the automation actually chases."""
+    than the automation actually chases.
+
+    `cancelled_statuses` defaults to CANCELLED_STATUSES — see there for why it is configuration."""
     text = (orders_csv.decode("cp1250", errors="replace")
             if isinstance(orders_csv, bytes) else orders_csv)
     today = today or date.today()
+    cancelled = _status_set(cancelled_statuses, CANCELLED_STATUSES)
     cutoff = today - timedelta(days=SOURCE_WINDOW_DAYS)
     rows = list(csv.DictReader(io.StringIO(text), delimiter=";"))
     carriers = _order_carriers(rows)
@@ -148,7 +182,7 @@ def _eligible_orders(orders_csv, today: date | None = None) -> list[tuple[dict, 
         if not code or code in seen:
             continue
         seen.add(code)
-        if (r.get("statusName") or "").strip().lower() == "stornovaná":
+        if norm_status(r.get("statusName")) in cancelled:
             continue
         if _is_non_posta_carrier(carriers.get(code, "")):
             continue
@@ -159,14 +193,16 @@ def _eligible_orders(orders_csv, today: date | None = None) -> list[tuple[dict, 
     return out
 
 
-def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dict]:
+def shipments_from_orders_csv(orders_csv, today: date | None = None,
+                              cancelled_statuses=None) -> list[dict]:
     """Shoptet orders.csv (cp1250 bytes or str) → one shipment per ORDER.
 
     Port of the n8n 'Filter' + 'Remove Duplicates' nodes: packageNumber
     non-empty AND order date within the last 30 days, first row per order code
     wins (the export repeats order fields on every item line). One deliberate
-    deviation from n8n: a cancelled order (Stornovaná) is skipped — nagging a
-    customer who cancelled would be wrong (documented on #93). Second
+    deviation from n8n: a cancelled order (`cancelled_statuses`, „Stornovaná" by
+    default) is skipped — nagging a customer who cancelled would be wrong
+    (documented on #93; configurable since #296). Second
     deviation (#126): orders shipped via a non-Pošta courier (DPD etc., see
     _is_non_posta_carrier) are excluded entirely — this automation is Pošta
     SK only."""
@@ -177,10 +213,11 @@ def shipments_from_orders_csv(orders_csv, today: date | None = None) -> list[dic
         "email": (r.get("email") or "").strip(),
         "phone": (r.get("phone") or "").strip(),
         "billFullName": (r.get("billFullName") or "").strip(),
-    } for r, od, pkg in _eligible_orders(orders_csv, today) if pkg]
+    } for r, od, pkg in _eligible_orders(orders_csv, today, cancelled_statuses) if pkg]
 
 
-def source_coverage(orders_csv, today: date | None = None) -> dict:
+def source_coverage(orders_csv, today: date | None = None,
+                    cancelled_statuses=None, dispatched_statuses=None) -> dict:
     """Is the shipment SOURCE still alive? → counts + a `degraded` verdict (#282).
 
     Everything here is counted over the same eligible orders the automation chases
@@ -203,9 +240,10 @@ def source_coverage(orders_csv, today: date | None = None) -> dict:
     entirely normal reasons; and it never touches the escalation. This is a pure counter: it reads
     the export, sends nothing, and never widens the set of shipments that get e-mailed."""
     today = today or date.today()
-    eligible = _eligible_orders(orders_csv, today)
+    eligible = _eligible_orders(orders_csv, today, cancelled_statuses)
+    wanted = _status_set(dispatched_statuses, DISPATCHED_STATUSES)
     dispatched = [(od, pkg) for r, od, pkg in eligible
-                  if (r.get("statusName") or "").strip().lower() == DISPATCHED_STATUS]
+                  if norm_status(r.get("statusName")) in wanted]
     with_pkg = sum(1 for _, pkg in dispatched if pkg)
     # Only orders dated TODAY OR EARLIER count, for the numbers AND for the dispatch reference. A
     # future-dated row (a mistyped order date, a clock jump on the export side) would otherwise
@@ -234,10 +272,13 @@ def source_coverage(orders_csv, today: date | None = None) -> dict:
         # for the human reading the banner: „when did we last see a number at all". The RULE uses
         # the dispatch-relative gap below, which is a different (and fairer) question.
         "days_since_last_package": (today - last_pkg).days if last_pkg else None,
-        # The alarm's own blind spot, surfaced rather than hidden: every count here hangs off one
-        # hard-coded Shoptet status string. If that vocabulary ever changes, `dispatched_orders`
-        # silently falls to 0 and this alarm — built against silent death — would itself go
-        # quietly green forever. Eligible orders but not one of them dispatched is the signature.
+        # The alarm's own blind spot, surfaced rather than hidden: every count here hangs off the
+        # dispatched status NAMES. Since #296 those come from the manager's configuration rather
+        # than from a literal in this file, so a rename is now a one-line edit on the card — but
+        # the signal stays, because a name can still be edited WRONG (a typo, a status renamed in
+        # Shoptet and not here). If the vocabulary stops matching, `dispatched_orders` silently
+        # falls to 0 and this alarm — built against silent death — would itself go quietly green
+        # forever. Eligible orders but not one of them dispatched is the signature.
         "dispatched_status_unknown": (len(eligible) >= MIN_DISPATCHED_FOR_ALARM
                                       and not dispatched),
         "degraded": False,
