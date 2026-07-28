@@ -68,17 +68,30 @@ sa dá zapísať len cez detail objednávky v administrácii, jedna po druhej.
 ## 3. Architektúra
 
 ```
-automatizácie (výpočty ostávajú)          jedna tabuľka            hodinový cyklus
-─────────────────────────────────         ──────────────           ────────────────
+automatizácie (výpočty ostávajú,          jedna tabuľka            hodinový cyklus
+každá na SVOJOM rozvrhu)                  ──────────────           ────────────────
+─────────────────────────────────
 parovania_eshop  ─┐
 dodavatelia      ─┤                                                1. stiahnuť
-grube_externalcode├─ queue_shoptet_fields ─► pending_shoptet.json ─ 2. spustiť producentov
-split_links      ─┤                          (kód → polia)          3. JEDEN import
-restock_skladom  ─┤                                                 4. overiť z Logu
-stock_skladom    ─┘                                                 5. stiahnuť znova
+grube_externalcode├─ queue_shoptet_fields ─► pending_shoptet.json ─ 2. JEDEN import z toho,
+split_links      ─┤                          (kód → polia)            čo je vo fronte
+restock_skladom  ─┤                                                 3. overiť z Logu
+stock_skladom    ─┘                                                 4. vyprázdniť potvrdené
+                                                                     5. stiahnuť znova
 
 order_comments.json ──────────────────────► vlastná dráha ────────  6. poznámky per objednávka
 ```
+
+**Opravné kolo 1 (#299 review I2) zrušilo krok „spustiť producentov"** — cyklus
+NIKDY nespúšťa žiadneho producenta (`CYCLE_PRODUCERS`/`QUEUE_MIGRATED` gate aj
+konštanty sú preč aj z kódu). Každý z piatich producentov zaraďuje sám, na
+VLASTNOM rozvrhu (bez zmeny); cyklus len sťahuje, nahrá JEDNÝM importom to, čo je
+práve vo fronte, overí, vyprázdni potvrdené a stiahne znova. Dôvod: pôvodný krok
+"spustiť producentov" nenápadne premenil `parovania_eshop` — jediného producenta,
+ktorý je na forestshop.sk už zapnutý, normálne 1×/deň o 21:00 — na beh 24×/deň
+vždy, keď manažér zapol túto hodinovú automatizáciu, vrátane deštruktívneho
+prepisovania manuálne priradených dodávateľov 24×/deň namiesto 1×/deň. Presný
+kód: `run_shoptet_upload` v `webreview/app.py`.
 
 ### 3.1 Tabuľka čakajúcich zmien — `data/out/pending_shoptet.json`
 
@@ -144,34 +157,49 @@ schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
 run_fn=run_shoptet_upload)`, registrovaná v `AUTOMATIONS_REG`
 (`webreview/app.py:8578`), **default vypnutá**.
 
-Kroky jedného behu:
+Kroky jedného behu (funkcia `run_shoptet_upload`, `webreview/app.py`) — **cyklus
+NIKDY nespúšťa producentov**, viď poznámka nad diagramom v 3.:
 
-1. **Stiahnuť** — zavolá `RUNNER.run_now("shoptet_sync")`, aby si `shoptet_sync`
-   zapísal vlastný stav do svojej karty. Preskočí sa, ak jeho posledný úspešný beh
-   je mladší než 10 minút (zbytočne by sťahoval 57 MB katalógu druhý raz).
-2. **Spustiť producentov** — postupne `RUNNER.run_now(key)` pre každého zapnutého
-   producenta v poradí `parovania_eshop`, `grube_externalcode`, `split_links`,
-   `restock_skladom`, `stock_skladom`. Beží sekvenčne; zlyhanie jedného producenta
-   cyklus nezastaví, len sa zapíše do jeho karty a do súhrnu behu.
-3. **Postaviť JEDEN importný súbor** z tabuľky: stĺpce = `code;pairCode` + zjednotenie
-   všetkých čakajúcich polí, prázdna bunka = pole sa nemení. Riadky, ktorých kód
-   katalóg nemá, sa cez existujúcu bránu `_export_row_verdicts` (`app.py:5495`)
-   **nezaradia** a dostanú `blocked`.
-4. **Nahrať** cez `_import_rows_chunked` (dávky ≤300) a **overiť z Logu** — počet
-   `Spracované: N` musí sedieť s počtom odoslaných riadkov (`pick_result_row`,
-   `src/parovanie/shoptet_import.py:248`). Nepotvrdená dávka = riadky ostávajú
-   v tabuľke, `attempts += 1`.
-5. **Vyprázdniť potvrdené** — potvrdené polia sa z tabuľky odstránia a ich
-   `dedup_key` sa dopíšu do príslušných `uploaded_*.json` (teraz to robí drain,
-   nie producent — dedup tak nikdy nepredbehne skutočný zápis).
-6. **Stiahnuť znova** — `RUNNER.run_now("shoptet_sync")`. **Preskočí sa, keď sa
-   nahralo 0 riadkov** (väčšina hodín) — ušetrí 57 MB katalógu za beh.
-7. **Poznámky k objednávkam** (vlastná dráha, viď 3.4).
+1. **Stiahnuť** — `RUNNER.run_sync("shoptet_sync")` (SYNCHRÓNNE, nie
+   fire-and-forget `run_now` — cyklus musí počkať, kým je export naozaj na
+   disku, skôr než ho číta). Preskočí sa, ak je export už čerstvejší než
+   `SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S` (15 min) — obe automatizácie
+   zdieľajú tú istú 60-min periódu, takže `shoptet_sync` zvyčajne stihne
+   sťahovanie tesne pred týmto tikom.
+2. **Postaviť JEDEN importný súbor** z tabuľky (`shoptet_outbox.build_import`):
+   stĺpce = `code;pairCode` + zjednotenie všetkých čakajúcich polí, prázdna
+   bunka = pole sa nemení. Riadky, ktorých kód katalóg nemá, sa cez existujúcu
+   bránu `_export_row_verdicts` **nezaradia** a dostanú `blocked`.
+3. **Nahrať** cez `_import_rows_chunked` (dávky ≤300, pod `_import_lock` — inak
+   by mohol súbežne bežať aj manuálny import ešte NEmigrovaného producenta) a
+   **overiť z Logu** — počet `Spracované: N` musí sedieť s počtom odoslaných
+   riadkov. Nepotvrdená dávka = riadky ostávajú v tabuľke, `attempts += 1`.
+4. **Vyprázdniť potvrdené** (`shoptet_outbox.settle`) — potvrdené polia sa
+   z tabuľky odstránia a ich kredit sa dopíše do príslušných `uploaded_*.json`
+   cez `_credit_producer` (teraz to robí drain, nie producent — dedup tak
+   nikdy nepredbehne skutočný zápis).
+5. **Stiahnuť znova** — `RUNNER.run_sync("shoptet_sync")`. **Preskočí sa, keď sa
+   nepotvrdilo 0 riadkov** (`SECOND_SYNC_SKIP_WHEN_NOTHING_SENT`, väčšina
+   hodín) — ušetrí 57 MB katalógu za beh.
+6. **Poznámky k objednávkam** — plánovaný krok (#189), zatiaľ neimplementovaný;
+   viď 3.4.
+
+**#299 Task 11 — `degraded`/`warnings`.** Výsledok navyše nesie `degraded: bool`
+a `warnings: list[str]` (slovenské vety) pre stavy, ktoré `ok` samo nepokryje:
+producent, ktorého vlastný zdroj tri hodinové behy po sebe nezaradil do tabuľky
+nič (`_note_empty_producers`, počítadlo v `upload_empty_streak.json`), alebo
+druhé stiahnutie preskočené napriek tomu, že sa niečo posielalo. A samostatne,
+mimo tohto výsledku úplne — pretože táto automatizácia sa nasadzuje **vypnutá**
+a je JEDINOU cestou do eshopu (opravné kolo 1 vyššie): `/api/automations`
+dopočíta `queue_stale_warning` (`_queue_stale_while_disabled_warning`) z tabuľky
+čakajúcich zmien a z toho, či je automatizácia zapnutá — nikdy z výsledku behu,
+lebo vypnutá automatizácia nikdy nebeží. Karta aj bočný panel to hlásia aj keď
+`shoptet_upload` ešte nikdy nebežal.
 
 Celý cyklus drží **jeden nárok** (`fcntl.flock` na `data/out/.shoptet_cycle.lock`,
-rovnaký vzor ako `.scheduler.lock`, `app.py:8722`), aby sa samostatne spustené
-hodinové sťahovanie nedostalo doprostred cyklu. `shoptet_sync` si pred behom nárok
-overí a keď ho drží cyklus, preskočí sa (nie zlyhá).
+rovnaký vzor ako `.scheduler.lock`), aby sa samostatne spustené hodinové
+sťahovanie nedostalo doprostred cyklu. `shoptet_sync` si pred behom nárok overí
+a keď ho drží cyklus, preskočí sa (nie zlyhá).
 
 ### 3.4 Poznámky k objednávkam (#189)
 

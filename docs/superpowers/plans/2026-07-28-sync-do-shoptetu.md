@@ -712,14 +712,29 @@ git commit -m "feat: one cross-process claim for the whole Shoptet cycle (#299)"
 
 ### Task 6: Hodinový cyklus `run_shoptet_upload` + registrácia automatizácie
 
+> **ZASTARANÉ — opravné kolo 1 (#299 review I2) zrušilo krok „spustiť
+> producentov" tento task nižšie zaviedol.** `CYCLE_PRODUCERS`/`QUEUE_MIGRATED`
+> aj celý `RUNNER.run_now(key)`-per-producenta krok sú preč z kódu — cyklus
+> NIKDY nespúšťa producenta, len sťahuje, nahrá JEDNÝM importom to, čo je
+> vo fronte, overí, vyprázdni potvrdené a stiahne znova. Dôvod: ten krok
+> nenápadne premenil `parovania_eshop` (jediný producent už zapnutý na
+> forestshop.sk, normálne 1×/deň) na beh 24×/deň hneď, ako manažér zapol túto
+> hodinovú automatizáciu — vrátane deštruktívneho prepisovania manuálnych
+> priradení dodávateľov 24×/deň namiesto 1×/deň. Nižšie uvedený kód (Step 1–5)
+> je PÔVODNÝ návrh Tasku 6 a v tejto podobe už NEZODPOVEDÁ skutočnému kódu —
+> aktuálny stav a dôvod zmeny je zdokumentovaný v
+> `docs/superpowers/specs/2026-07-28-sync-do-shoptetu-design.md` §3/§3.3 a
+> priamo v docstringu `run_shoptet_upload` (`webreview/app.py`). Neimplementuj
+> podľa tohto Tasku doslovne — over najprv aktuálny kód.
+
 **Files:**
 - Modify: `webreview/app.py` (funkcia vedľa `run_shoptet_sync`, `app.py:6966`; registrácia v `AUTOMATIONS_REG`, `app.py:8578`; popis v `AUTOMATION_DESCRIPTIONS`, `app.py:8521`; `NAV_KEYS`, `app.py:8794`)
 - Modify: `tests/test_webreview_shoptet_upload.py`
 
-**Interfaces:**
+**Interfaces (pôvodné, PRED opravným kolom 1 — viď poznámka vyššie):**
 - Consumes: `_load_pending`, `_save_pending`, `_shoptet_cycle_claim`, `_export_row_verdicts`, `_import_rows_chunked`, `RUNNER.run_now`, `shoptet_outbox.build_import/settle/stale_blocked`.
 - Produces: `run_shoptet_upload() -> dict` s kľúčmi `ok, queued, sent, confirmed, blocked, stale_blocked, producers, resynced, skipped_second_sync, unconfirmed, error`.
-- Produces: `CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links", "restock_skladom", "stock_skladom")`
+- Produces: `CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links", "restock_skladom", "stock_skladom")` — **odstránené opravným kolom 1, viď poznámka vyššie.**
 
 - [ ] **Step 1: Napísať padajúci test**
 
@@ -799,6 +814,12 @@ Run: `WEBREVIEW_NO_SCHEDULER=1 MAIL_HOST="" WEBREVIEW_OUT=/tmp/wr-t6 .venv/bin/p
 Expected: FAIL — `AttributeError: module 'webreview.app' has no attribute 'run_shoptet_upload'`
 
 - [ ] **Step 3: Implementovať**
+
+**ZASTARANÉ SNIPPET — neplatí, viď poznámka na začiatku Tasku 6.** `CYCLE_PRODUCERS`
+a krok „spustiť producentov" (`for key in CYCLE_PRODUCERS: ... RUNNER.run_now(key)`
+nižšie) opravné kolo 1 zrušilo úplne — cyklus dnes len sťahuje, importuje to, čo
+je vo fronte, overí a vyprázdni. Skutočný kód: `run_shoptet_upload` v
+`webreview/app.py`.
 
 ```python
 # webreview/app.py — vedľa run_shoptet_sync (app.py:6966)
