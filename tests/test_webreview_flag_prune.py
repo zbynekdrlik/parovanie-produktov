@@ -259,6 +259,99 @@ def test_a_freshly_closed_order_keeps_its_marks_for_a_while(stores):
         assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
 
 
+# ── closure is decided by an ALLOW-LIST of finished statuses (PR #292 review #2) ──
+
+# Every status the live 90-day export actually carries (2026-07-28), with the verdict the
+# prune must reach for it. Measured counts, so the table is the shop's reality and not a
+# guess: Vybavená 387 · Stornovaná 63 · Vybavuje sa 57 · Vybavená výmena 4 · Osob. odber 3
+# · Vybavený Dobropis 3 · Kompletná 2 · Vratený tovar 1 · Výmena tovaru 1.
+#
+# The four that prune are the ones this shop marks as FINISHED, and two independent
+# signals agree on exactly them: the naming convention (a „Vybavená/Vybavený" prefix marks
+# the completed form — „Vybavená výmena" against „Výmena tovaru", „Vybavený Dobropis"
+# against „Vratený tovar") and the tracking number, i.e. the goods physically left:
+# Vybavená 250/387, Vybavená výmena 4/4, Vybavený Dobropis 3/3 — against Kompletná 0/2,
+# Vratený tovar 0/1, Výmena tovaru 0/1, Osob. odber 0/3. „Stornovaná" is the exception that
+# proves it (1/63 — a cancelled order has nothing to dispatch) and is unambiguously over.
+_LIVE_STATUSES = {
+    "Vybavená": True,
+    "Stornovaná": True,
+    "Vybavená výmena": True,
+    "Vybavený Dobropis": True,
+    "Vybavuje sa": False,        # the open literal itself
+    "Osob. odber": False,        # waiting for the customer to collect — live
+    "Výmena tovaru": False,      # an exchange still being handled
+    "Vratený tovar": False,      # goods came back, the credit note is not issued yet
+    "Kompletná": False,          # both live ones are 2 and 5 days old with no tracking
+}
+
+
+@pytest.mark.parametrize("status,prunes", sorted(_LIVE_STATUSES.items()))
+def test_only_a_status_that_MEANS_finished_prunes_its_keys(stores, status, prunes):
+    """Closure must be POSITIVE membership in the finished set, never „anything that is not
+    the one open literal". Every status this shop actually uses, one verdict each."""
+    row = "99002002;{};{};B1;Ciapka\r\n".format(
+        (date.today() - timedelta(days=120)).isoformat() + " 09:00:00", status)
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW, row]))
+
+    assert res["skipped"] == "", (status, res)
+    assert res["pruned"] == (4 if prunes else 0), (status, res)
+    kept = sorted([_OPEN, _UNSEEN]) if prunes else sorted([_OPEN, _CLOSED, _UNSEEN])
+    for path in stores.values():
+        assert _keys(path) == kept, (status, path.name)
+
+
+def test_a_status_the_shop_ADDS_or_renames_into_is_never_pruned(stores):
+    """The blocker. `closed = seen - still_open` reads every unknown status as finished, and
+    the „no open orders at all" guard only fires on a TOTAL rename — a PARTIAL one walks
+    straight through it.
+
+    Shoptet's status names are shop-configurable TEXT. Rename the open status while a single
+    order is left on the old literal (or simply add a new open status like „Čaká na
+    dodávateľa"), and `still_open` is non-empty, the floor counts only `seen`, and the
+    `protect=True` shrink guard cannot fire because the prune IS a legitimate
+    read-modify-write. Measured on the manager's live stores, that scenario deleted 94 keys
+    from orders that are still open (176/12/13/16 -> 99/6/9/9).
+    """
+    renamed = "99002002;{};Čaká na dodávateľa;B1;Ciapka\r\n".format(
+        (date.today() - timedelta(days=45)).isoformat() + " 09:00:00")
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW, renamed]))
+
+    assert res["skipped"] == "", res      # the source is fine — the status is just not over
+    assert res["pruned"] == 0, res
+    for path in stores.values():
+        assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
+
+
+def test_one_unfinished_row_keeps_the_WHOLE_order(stores):
+    """`statusName` is the whole order's status repeated on every line, so a mixed order
+    should not exist — but if one ever does, the answer must be the conservative one: a
+    single row that is not a finished status keeps every key of that order."""
+    old = (date.today() - timedelta(days=120)).isoformat() + " 09:00:00"
+    mixed = ["99002002;{};Vybavená;B1;Ciapka\r\n".format(old),
+             "99002002;{};Osob. odber;B2;Rukavice\r\n".format(old)]
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW] + mixed))
+
+    assert res["pruned"] == 0, res
+    for path in stores.values():
+        assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
+
+
+def test_the_run_reports_the_statuses_it_did_not_RECOGNISE(stores):
+    """An added status silently narrows what gets pruned, which is the failure this
+    allow-list trades for the old one. It must not be invisible: the run names the statuses
+    it has no verdict for, so a human can decide whether one belongs on the list."""
+    row = "99002002;{};Čaká na dodávateľa;B1;Ciapka\r\n".format(
+        (date.today() - timedelta(days=45)).isoformat() + " 09:00:00")
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW, row]))
+
+    assert res["unknown_statuses"] == ["Čaká na dodávateľa"], res
+
+
 def test_an_order_with_no_usable_date_is_never_pruned(stores):
     """Age is the grace period, so a row whose `date` cannot be read is a row whose age we
     do not know — and an unknown age must not be treated as „old enough"."""
