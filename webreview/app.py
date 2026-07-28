@@ -39,7 +39,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
     __version__, config, image_health, import_builder, nedostupne, orders_reminder,
-    posta_uncollected, restock_skladom, riziko_vypadku, stock_skladom,
+    posta_uncollected, restock_skladom, riziko_vypadku, shoptet_outbox, stock_skladom,
     supplier_stock, vystavy_imap, writer)
 from parovanie.automation_runner import (
     Automation, AutomationRunner, AutomationStateCorrupt)
@@ -5629,6 +5629,46 @@ def n8n_shoptet_import():
         log.error("n8n import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
                   res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
     return jsonify(result), (200 if res["ok"] else 502)
+
+
+# --------------------------------------------------------------------------- #
+# #299 — the ONE table between our decisions and the eshop. Producers queue the
+# field values they want; the hourly `shoptet_upload` cycle turns the whole table
+# into a single import. protect=True: a queued change that is lost never reaches
+# the eshop and nothing notices, which is exactly the silent loss the table exists
+# to end.
+# --------------------------------------------------------------------------- #
+PENDING_SHOPTET = _store("pending_shoptet.json")
+
+
+def _load_pending() -> dict:
+    return _read_json_store(PENDING_SHOPTET, {})
+
+
+def _save_pending(d: dict) -> None:
+    _atomic_write_json(PENDING_SHOPTET, d, protect=True)
+
+
+def queue_shoptet_fields(source, header, rows, credit_group=None,
+                         credit_value=None) -> int:
+    """Queue rows for the next hourly upload. Returns how many field values landed."""
+    if not rows:
+        return 0
+    now = datetime.now().isoformat(timespec="seconds")
+    with _lock:
+        pending, from_disk = _read_json_store_state(PENDING_SHOPTET, {})
+        if not from_disk and os.path.exists(os.fspath(PENDING_SHOPTET)):
+            # a table we could not read is NOT an empty table — queueing on top of
+            # the default would silently drop everything already waiting
+            raise RuntimeError(
+                "pending_shoptet.json sa nedá prečítať — nezaraďujem nič, kým sa "
+                "neopraví (inak by sa stratili už čakajúce zmeny)")
+        pending, n = shoptet_outbox.queue_fields(
+            pending, source, header, rows,
+            credit_group=credit_group, credit_value=credit_value, now=now)
+        _save_pending(pending)
+    log.info("outbox: %s zaradil %d polí (%d kódov)", source, n, len(rows))
+    return n
 
 
 # --------------------------------------------------------------------------- #
