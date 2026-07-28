@@ -359,7 +359,7 @@ git commit -m "feat: build one Shoptet import from the whole pending table (#299
 - Consumes: `queue_fields`, `build_import`.
 - Produces:
   - `settle(pending, success_codes, blocked, now="") -> tuple[dict, dict]` — `(pending, credits)`. `credits` je `{store_name: {group: value}}`, obsahuje LEN skupiny, ktorých všetky zaradené kódy sú potvrdené.
-  - `stale_blocked(pending, min_attempts=3) -> list[str]` — kódy, ktoré čakajú zablokované aspoň `min_attempts` behov.
+  - `stale_blocked(pending, min_attempts=3) -> list[str]` — kódy, ktoré čakajú zablokované aspoň `min_attempts` behov. Číta VLASTNÉ počítadlo `blocked_runs` (nuluje sa, len čo kód prestane byť zablokovaný) — nie `attempts`, ktoré rastie každému nepotvrdenému riadku a hlásilo by falošné poplachy (oprava zadania po revízii Task 3).
 
 - [ ] **Step 1: Napísať padajúci test**
 
