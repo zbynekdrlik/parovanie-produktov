@@ -45,7 +45,7 @@ from parovanie.automation_runner import (
     Automation, AutomationRunner, AutomationStateCorrupt)
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
-from parovanie.export_helpers import current_of, resync_current
+from parovanie.export_helpers import current_of, norm_status, resync_current
 from parovanie.shoptet_import import chunk_outcome, parse_result_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1962,21 +1962,40 @@ ORDER_STATUS_LABELS = {
 ORDER_STATUS_REQUIRED = ("to_order", "terminal")
 
 
+# A status name is free text the shop owner types, and it lands in `log.info(...)`, in the
+# prune's `", ".join(open_statuses)` and in `automations.json`. An interior newline in it
+# forges a log line; a NUL or an ANSI escape corrupts a terminal reading the log. None of
+# them can occur in a real Shoptet status, so they are simply not names (PR #295 review).
+_STATUS_CTRL = re.compile(r"[\x00-\x1f\x7f]")
+
+
 def _clean_status_list(value):
     """A stored/posted set of status names → a clean, bounded, de-duplicated list.
 
-    `None` when the value is not a usable list of names at all (wrong type, or nothing but
-    blanks) — the caller then falls back to the measured default rather than to an EMPTY
-    set. Emptiness is never a usable answer here: an empty `to_order` blanks the tab, the
-    „Nedostupné" view and the customer reminders, and an empty `terminal` silently disarms
-    the prune. A file this app cannot read is not permission to invent behaviour."""
+    `None` ONLY when the value is not a list at all. An empty RESULT is returned as `[]`,
+    because „absent" and „deliberately emptied" are different answers and only the caller
+    knows which sets may be empty (PR #295 review, B4): `known_open: []` is an outcome the
+    POST explicitly supports — it means „report every unclassified status" — and the loader
+    used to replace it with the four built-in defaults, i.e. silently do the opposite. The
+    two LOAD-BEARING sets still cannot be empty (`ORDER_STATUS_REQUIRED`), and that is
+    decided by the resolver, not here.
+
+    Names are NFC-normalised (`export_helpers.norm_status`, the same form the export side
+    uses — a decomposed name is byte-different, looks identical and matches nothing) and
+    names carrying control characters are DROPPED rather than logged."""
     if not isinstance(value, list):
         return None
     out, seen = [], set()
     for v in value:
         if not isinstance(v, str):
             continue
-        s = v.strip()[:ORDERS_UNKNOWN_STATUS_MAXLEN]
+        s = norm_status(v)[:ORDERS_UNKNOWN_STATUS_MAXLEN]
+        if _STATUS_CTRL.search(s):
+            # a hand-edited file is invited by the docstring above, and the endpoint
+            # refuses this at the door — so reaching here means the FILE carries it
+            log.error("nastavenie stavov: názov stavu obsahuje riadiace znaky (%r) — "
+                      "vynechávam ho, aby sa nedostal do logu", s)
+            continue
         # dedup through a SET and stop at the cap: this runs on the stored file on every
         # request path (to-order tab, „Nedostupné", the prune, the reminders), and the
         # docstring above invites a hand-edited file, so a pasted list must not turn into
@@ -1986,7 +2005,7 @@ def _clean_status_list(value):
             out.append(s)
             if len(out) >= ORDER_STATUS_MAX:
                 break
-    return out or None
+    return out
 
 
 def _status_overlap(sets) -> list:
@@ -2030,33 +2049,63 @@ def _order_statuses_state() -> tuple:
     An individual set that is unusable falls back to its own default; a configuration whose
     sets OVERLAP is discarded WHOLE, because patching one side of it would leave the
     manager running a configuration he never wrote. Both are reported as a reason."""
-    raw = _read_json_store(ORDER_STATUSES, {})
-    out, why = {}, ""
-    for key, default in ORDER_STATUS_DEFAULTS.items():
-        vals = _clean_status_list(raw.get(key))
-        # An empty `known_open` is a legitimate answer („I have classified nothing else"),
-        # so only the two LOAD-BEARING sets count as broken when they come back unusable:
-        # an empty `to_order` blanks the tab and the customer mails, an empty `terminal`
-        # silently disarms the prune.
-        if vals is None and key in raw and key in ORDER_STATUS_REQUIRED:
-            why = why or "zoznam „%s“ sa nedá použiť" % ORDER_STATUS_LABELS[key]
-        out[key] = frozenset(vals) if vals else frozenset(default)
-    # `_read_json_store` answers `{}` for BOTH „no file" and „file there but corrupt", so
-    # the file itself is what tells the two apart. A file present with nothing usable in it
-    # is not a fresh install.
-    if not raw and os.path.exists(os.fspath(ORDER_STATUSES)):
-        why = "súbor s nastavením sa nedá prečítať"
-    clash = _status_overlap(out)
-    if clash:
-        why = "stav %s je naraz vo viacerých zoznamoch" % ", ".join(clash)
-        out = {k: frozenset(v) for k, v in ORDER_STATUS_DEFAULTS.items()}
+    try:
+        raw = _read_json_store(ORDER_STATUSES, {})
+        missing = not os.path.exists(os.fspath(ORDER_STATUSES))
+    except OSError as e:
+        # `_read_json_store` propagates an I/O error on a file that IS there, deliberately:
+        # „unreadable" is not evidence that the manager did no work. Every other store
+        # breaks ONE tab that way; this one is read by /api/orders, /api/nedostupne,
+        # /api/nedostupne/<code> and the prune, so an unhandled OSError here 500s four read
+        # paths at once (PR #295 review, B6). It is exactly the „present but unusable"
+        # case this function already has an answer for — take it, loudly.
+        log.error("nastavenie stavov objednávok sa nedá prečítať (%r) — bežím na "
+                  "PREDVOLENÝCH stavoch a mazanie starých značiek sa zastavuje", e)
+        raw, missing = {}, False
+    sets, why = _resolve_status_sets(raw, missing)
     if why:
         # ONE reason code for the refusal (they all send the manager to the same panel),
         # the specific cause in the log — the operator needs the detail, the card needs a
         # single case to render (store-prune §7).
         log.error("nastavenie stavov objednávok sa nedá použiť (%s) — mazanie starých "
                   "značiek sa zastavuje, kým sa to neopraví", why)
-    return out, ("bad-status-config" if why else "")
+    return sets, ("bad-status-config" if why else "")
+
+
+def _resolve_status_sets(raw, missing=False) -> tuple:
+    """`(sets, why)` for a CANDIDATE configuration dict — the resolution alone, with no
+    file access and no logging.
+
+    Split out of `_order_statuses_state` so the SAVE endpoint can run the very rule the
+    loader will run, on the configuration it is about to write (PR #295 review, B3). The
+    endpoint used to validate the payload AS POSTED, while the loader re-read the file and
+    substituted DEFAULTS for anything it found unusable — defaults that then clashed with
+    the sets the manager DID write, and a clash discards the configuration WHOLE. The card
+    answered „✅ Uložené. Platí to hneď pre celú appku." while the rename reverted, the
+    mails went to nobody and the prune was disarmed under a banner naming a „contradictory
+    list" the panel rendered as EMPTY — a state unreachable from the screen that caused it.
+
+    `missing=True` means „no file at all" = a fresh install, which is NOT a broken
+    configuration (`_read_json_store` answers `{}` to both)."""
+    out, why = {}, ""
+    for key, default in ORDER_STATUS_DEFAULTS.items():
+        vals = _clean_status_list(raw.get(key))
+        # `[]` is now a real answer, and only the two LOAD-BEARING sets refuse it: an empty
+        # `to_order` blanks the tab and the customer mails, an empty `terminal` silently
+        # disarms the prune. An empty `known_open` is a legitimate „report EVERY status I
+        # have not classified" and is honoured (PR #295 review, B4).
+        usable = vals is not None and (vals or key not in ORDER_STATUS_REQUIRED)
+        if not usable and key in raw:
+            why = why or "zoznam „%s“ sa nedá použiť" % ORDER_STATUS_LABELS[key]
+        out[key] = frozenset(vals) if usable else frozenset(default)
+    # A file present with nothing usable in it is not a fresh install.
+    if not raw and not missing:
+        why = "súbor s nastavením sa nedá prečítať"
+    clash = _status_overlap(out)
+    if clash:
+        why = "stav %s je naraz vo viacerých zoznamoch" % ", ".join(clash)
+        out = {k: frozenset(v) for k, v in ORDER_STATUS_DEFAULTS.items()}
+    return out, why
 
 
 def _order_statuses() -> dict:
@@ -2226,7 +2275,10 @@ def _orders_by_openness(orders_csv, state=None):
             if not code:
                 continue
             seen.add(code)
-            status = (r.get("statusName") or "").strip()
+            # NFC + strip, the SAME form the configuration is stored in — a decomposed
+            # name is byte-different, renders identically and matches nothing (PR #295
+            # review, B5). `export_helpers.norm_status` is that one form.
+            status = norm_status(r.get("statusName"))
             if status in open_set:
                 still_open.add(code)
             if status not in terminal:
@@ -2810,10 +2862,11 @@ def build_to_order_rows(orders_csv, products, decisions, code2pair, variant_link
     # routes on `reviewKey`, so advertising a status without a key would send the
     # correction to order_pairings — the silent no-op #242 exists to remove.
     code2owner = {s[0]: (s[3], s[4]) for s in specs if s[3]}
-    open_set = _order_statuses()["to_order"] if statuses is None else frozenset(statuses)
+    open_set = (_order_statuses()["to_order"] if statuses is None
+                else frozenset(norm_status(s) for s in statuses) - {""})
     rows = []
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
-        if (r.get("statusName") or "").strip() not in open_set:
+        if norm_status(r.get("statusName")) not in open_set:
             continue
         code = (r.get("itemCode") or "").strip()
         if not code or re.match(r"^(SHIPPING|BILLING)", code, re.I):
@@ -8682,6 +8735,34 @@ def api_ui_label():
     return jsonify({"ok": True, "label": label})
 
 
+def _export_status_names() -> list:
+    """The DISTINCT `statusName` values the cached orders export actually carries.
+
+    Without it a status name that matches NOTHING is invisible: the manager types it, the
+    card echoes it back exactly as typed, and the tab, „Nedostupné" and the reminders just
+    go empty (PR #295 review, B5). With it the panel can say „this one matches 0 orders",
+    which is the only way a typo, a rename or a normalisation mismatch ever surfaces.
+
+    Read-only, bounded, and never able to break the card it decorates: it decorates the one
+    screen the manager reaches WHEN THINGS ARE ALREADY BROKEN, so an unreadable export is
+    an empty list, not a 500."""
+    try:
+        text = _orders_csv_cached().decode("cp1250", errors="replace")
+        rd = csv.DictReader(io.StringIO(text), delimiter=";")
+        if "statusName" not in (rd.fieldnames or []):
+            return []
+        got = set()
+        for r in rd:
+            got.add(norm_status(r.get("statusName"))[:ORDERS_UNKNOWN_STATUS_MAXLEN]
+                    or ORDERS_BLANK_STATUS_LABEL)
+            if len(got) > ORDER_STATUS_MAX:
+                break
+        return sorted(got)[:ORDER_STATUS_MAX]
+    except Exception as e:  # noqa: BLE001 — decoration only; never break the panel
+        log.warning("stavy z exportu sa nepodarilo zistiť (%r)", e)
+        return []
+
+
 @app.route("/api/order-statuses")
 def api_order_statuses():
     """#209 — the three order-status sets the app is ACTUALLY using, plus the built-in
@@ -8698,6 +8779,8 @@ def api_order_statuses():
         # for a file we could not read". Without it the panel renders the built-in list as
         # though the manager had typed it, on the one card where he would go to fix it.
         "reason": reason,
+        # …and what the EXPORT really carries, so a name matching nothing can be flagged
+        "export_statuses": _export_status_names(),
     })
 
 
@@ -8716,7 +8799,16 @@ def api_order_statuses_save():
       prevent.
 
     A set that is merely omitted from the payload keeps its stored value, so a screen that
-    only edits one box cannot wipe the other two."""
+    only edits one box cannot wipe the other two.
+
+    And whatever survives all of that is put through the LOADER'S OWN resolution before it
+    is written (PR #295 review, B3). Validating the payload as posted is not enough: the
+    loader re-reads the file and substitutes defaults for anything it finds unusable, and
+    those defaults can clash with the sets that WERE written — a clash discards the
+    configuration whole. The card then says „✅ Uložené. Platí to hneď pre celú appku."
+    while the rename reverts, the mails go to nobody and the prune is disarmed under a
+    banner naming a „contradictory list" this very panel renders as empty. Accepted-then-
+    discarded is the one answer this endpoint must never give."""
     me = _admin_or_none()
     if not me:
         return _forbidden()
@@ -8746,17 +8838,25 @@ def api_order_statuses_save():
                 return jsonify({"ok": False, "error": (
                     "názov stavu môže mať najviac %d znakov (v zozname „%s“ je dlhší)"
                     % (ORDERS_UNKNOWN_STATUS_MAXLEN, ORDER_STATUS_LABELS[key]))}), 400
+            # A status name is free text that ends up in `log.info(...)` and in the prune's
+            # „nothing is open" message; an interior newline forges a log line, a NUL or an
+            # ANSI escape corrupts a terminal reading it. Refused at the door rather than
+            # silently dropped, for the same reason the two cuts above are (PR #295, B7).
+            if [v for v in raw if isinstance(v, str) and _STATUS_CTRL.search(v)]:
+                return jsonify({"ok": False, "error": (
+                    "názov stavu nesmie obsahovať riadiace znaky (nový riadok a podobne) "
+                    "— v zozname „%s“ taký je" % ORDER_STATUS_LABELS[key])}), 400
         raw = body.get(key, stored.get(key))
         vals = _clean_status_list(raw)
-        if vals is None and key in body and key in ORDER_STATUS_REQUIRED:
+        # `[]` now comes back as `[]`, so „unusable" and „deliberately emptied" are
+        # distinguishable here too (PR #295, B4): the two load-bearing sets refuse both,
+        # `known_open` accepts the empty one and the store keeps it.
+        if key in body and key in ORDER_STATUS_REQUIRED and not vals:
             return jsonify({"ok": False, "error": (
                 "zoznam „%s“ nesmie byť prázdny — bez neho by appka nevedela, ktoré "
                 "objednávky sú rozpracované a ktoré ukončené"
                 % ORDER_STATUS_LABELS[key])}), 400
-        if vals is None and key in body:
-            out[key] = []          # explicitly emptied (only reachable for known_open)
-        else:
-            out[key] = vals if vals is not None else list(ORDER_STATUS_DEFAULTS[key])
+        out[key] = vals if vals is not None else list(ORDER_STATUS_DEFAULTS[key])
     clash = _status_overlap({k: set(v) for k, v in out.items()})
     if clash:
         return jsonify({"ok": False, "error": (
@@ -8766,10 +8866,18 @@ def api_order_statuses_save():
     with _lock:
         d = _read_json_store(ORDER_STATUSES, {})
         d.update(out)
+        # THE candidate file, resolved by the rule the loader will apply to it. Anything
+        # that would not survive is refused here, where the manager can still act on it.
+        _sets, why = _resolve_status_sets(d)
+        if why:
+            return jsonify({"ok": False, "error": (
+                "takto uložené nastavenie by appka nevedela použiť (%s) — oprav zoznamy a "
+                "skús to znova" % why)}), 400
         _atomic_write_json(ORDER_STATUSES, d, protect=True)
     log.info("order-statuses: %s set to_order=%s terminal=%s known_open=%s",
              me["email"], out["to_order"], out["terminal"], out["known_open"])
-    return jsonify({"ok": True, "statuses": {k: sorted(v) for k, v in out.items()}})
+    return jsonify({"ok": True, "statuses": {k: sorted(v) for k, v in out.items()},
+                    "export_statuses": _export_status_names()})
 
 
 @app.route("/api/automations/<key>/toggle", methods=["POST"])

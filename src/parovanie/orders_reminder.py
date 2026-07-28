@@ -37,6 +37,7 @@ from html import escape
 # came from a Google Sheet). The one GET deep-link the Shoptet admin supports is the global search
 # — verified live 2026-07-22 (see posta_uncollected.ADMIN_ORDER_LINK). Reused verbatim so both
 # order automations link to the admin the same, verified way.
+from parovanie.export_helpers import norm_status
 from parovanie.posta_uncollected import ADMIN_ORDER_LINK
 
 ORDER_STATUS = "Vybavuje sa"          # n8n „Filter": statusName == 'Vybavuje sa'
@@ -79,8 +80,10 @@ def select_orders(orders_csv, now: datetime | None = None,
     # module's own literal. A rename in the Shoptet admin must not leave this automation
     # mailing nobody in silence (automation-health.md §3); it is the SAME set the to-order
     # tab and „Nedostupné" use, so there is one notion of „open", not three.
-    wanted = frozenset({ORDER_STATUS}) if statuses is None else frozenset(
-        s for s in statuses if s)
+    # NFC + strip on BOTH sides (PR #295 review) — see `export_helpers.norm_status`; a
+    # decomposed name here means the reminder silently reaches nobody.
+    wanted = (frozenset({ORDER_STATUS}) if statuses is None
+              else frozenset(norm_status(s) for s in statuses) - {""})
     cutoff = timedelta(days=min_days)
     out, seen = [], set()
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
@@ -88,7 +91,7 @@ def select_orders(orders_csv, now: datetime | None = None,
         if not code or code in seen:
             continue
         seen.add(code)
-        if (r.get("statusName") or "").strip() not in wanted:
+        if norm_status(r.get("statusName")) not in wanted:
             continue
         od = _parse_dt(r.get("date"))
         if od is None or (now - od) <= cutoff:

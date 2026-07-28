@@ -527,10 +527,14 @@ def test_a_status_typed_in_NFD_still_matches_the_export(iso):
 
 
 def test_an_export_status_in_NFD_still_matches_the_configuration(iso):
-    """…and the same from the other side: the EXPORT is the untrusted input here."""
+    """…and the same from the other side: the EXPORT is the untrusted input here.
+
+    Fed as TEXT, not cp1250 bytes — cp1250 has no combining marks, so the decomposed form
+    cannot even be encoded in it. Both readers accept `str` (that is their documented
+    seam), and normalising there is what makes the comparison independent of whatever
+    encoding a future export template arrives in."""
     _write(iso, {"to_order": ["Vybavuje sa čaká"]})
-    export = (_HEAD + _order_row(
-        unicodedata.normalize("NFD", "Vybavuje sa čaká"))).encode("cp1250")
+    export = _HEAD + _order_row(unicodedata.normalize("NFD", "Vybavuje sa čaká"))
 
     assert len(webapp.build_to_order_rows(export, [], {}, {}, {})) == 1
     picked = orders_reminder.select_orders(

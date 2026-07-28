@@ -25,6 +25,25 @@ def slug(name: str, strip_leading_number: bool = False) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
+def norm_status(value) -> str:
+    """An order-status name reduced to the ONE form both sides compare in (#209, PR #295
+    review): NFC-normalised and stripped.
+
+    Shoptet's status names are free text the shop owner types, and they reach this app
+    twice — once through the manager's configuration panel and once through the export's
+    `statusName` column. „Vybavuje sa" pasted from a source that DECOMPOSES its diacritics
+    is byte-different from the same name typed normally, renders identically on screen, and
+    matches nothing. For `to_order` there is no signal at all when that happens: the
+    to-order tab, „Nedostupné" and the customer reminders simply go quiet.
+
+    It lives here because all three consumers must agree — `webreview/app.py`,
+    `nedostupne.affected_orders` and `orders_reminder.select_orders` — and a private copy
+    in any one of them is a set that drifts (the four-copies-of-a-literal problem #209 was
+    filed for). A non-string is „no status": the callers already treat a missing column
+    that way."""
+    return unicodedata.normalize("NFC", value).strip() if isinstance(value, str) else ""
+
+
 def state_of(visibility: str, availability: str) -> int:
     """The three eshop states (see .claude/skills/shoptet):
       1 = Skladom (predajný), 2 = Nie je skladom (Vypredané / nedostupné),

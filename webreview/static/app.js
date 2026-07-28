@@ -4335,6 +4335,18 @@ function renderOrderStatusConfig() {
     const values = (ORDER_STATUSES.statuses || {})[key] || [];
     box.appendChild(el('div', 'statuscfg-label', `<b>${escapeHtml(title)}</b>`));
     box.appendChild(el('div', 'statuscfg-help', escapeHtml(help)));
+    // PR #295 review — a name that matches NOTHING is otherwise invisible: it is echoed
+    // back exactly as typed while the tab, „Nedostupné" and the reminders quietly go
+    // empty. The server sends what the cached export really carries, so say which of his
+    // names are not in it (a typo, a rename in Shoptet, a paste with odd characters).
+    const inExport = ORDER_STATUSES.export_statuses;
+    if (Array.isArray(inExport) && inExport.length) {
+      const orphans = values.filter(v => !inExport.includes(v));
+      if (orphans.length) box.appendChild(el('div', 'statuscfg-warn',
+        '⚠️ V objednávkach sa nenachádza: ' + escapeHtml(orphans.join(' · '))
+        + ' — preklep alebo premenovaný stav? Export teraz nesie: '
+        + escapeHtml(inExport.join(' · '))));
+    }
     if (admin) {
       const ta = document.createElement('textarea');
       ta.className = 'statusset';

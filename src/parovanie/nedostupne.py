@@ -24,6 +24,8 @@ import io
 from datetime import datetime
 from html import escape
 
+from parovanie.export_helpers import norm_status
+
 ORDER_STATUS = "Vybavuje sa"          # only currently-processing orders have customers to notify
 
 # The two e-mail types. Kept as constants so the store dedup key (``<orderCode>|<type>``) and the
@@ -58,9 +60,12 @@ def _status_set(order_status) -> frozenset:
     #209: the shop's status names are editable text, so „open" is a CONFIGURED SET the web
     app passes in. A plain string keeps working (this module's own default, and every
     caller that only ever had one), which is why the parameter is not simply retyped."""
+    # NFC + strip on BOTH sides (PR #295 review) — a decomposed status name looks
+    # identical and matches nothing, and here that is silent: the customer simply never
+    # appears in the „Nedostupné" list. `export_helpers.norm_status` is the one form.
     if isinstance(order_status, str):
-        return frozenset({order_status})
-    return frozenset(s for s in order_status if s)
+        return frozenset({norm_status(order_status)}) - {""}
+    return frozenset(norm_status(s) for s in order_status) - {""}
 
 
 def affected_orders(orders_csv, item_codes, order_status=ORDER_STATUS) -> dict:
@@ -79,7 +84,7 @@ def affected_orders(orders_csv, item_codes, order_status=ORDER_STATUS) -> dict:
     if not want:
         return out
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
-        if (r.get("statusName") or "").strip() not in statuses:
+        if norm_status(r.get("statusName")) not in statuses:
             continue
         code = (r.get("itemCode") or "").strip()
         if not code or code not in want:
