@@ -69,3 +69,30 @@ def queue_fields(pending, source, header, rows, credit_group=None,
         entry["fields"] = fields
         out[code] = entry
     return out, queued
+
+
+def build_import(pending, absent_codes=frozenset()):
+    """Build ONE Shoptet import out of the whole table.
+
+    Shoptet's import takes every column at once and treats an empty cell as
+    "leave this field alone", so all queued fields for all codes ride in a
+    single file — one login, one log read-back per cycle.
+
+    A code the catalogue does not carry can never import (Shoptet rejects that
+    row on every run, forever — #270), so it is held back and REPORTED, never
+    dropped: it stays in the table with a reason and reappears in the import the
+    moment the code shows up in the catalogue.
+    """
+    blocked = {c: "not-in-catalog" for c in sorted(pending) if c in absent_codes}
+    sendable = [c for c in sorted(pending) if c not in blocked]
+    cols = sorted({f for c in sendable for f in (pending[c].get("fields") or {})})
+    header = ";".join([*KEY_COLUMNS, *cols])
+    rows = []
+    for code in sendable:
+        entry = pending[code]
+        fields = entry.get("fields") or {}
+        if not fields:
+            continue
+        rows.append([code, entry.get("pairCode") or ""]
+                    + [(fields.get(col) or {}).get("value", "") for col in cols])
+    return header, rows, blocked
