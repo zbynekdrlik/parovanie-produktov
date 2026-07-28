@@ -240,6 +240,34 @@ def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
     assert result2["pairings"]["queued"] == 0 and result2["pairings"]["order_count"] == 0
 
 
+# ── #299 opravné kolo 1 review m4 (Minor) — the pairing-decision group and the ─
+# ── inline order-pairing group must land ATOMICALLY: before this fix they went ─
+# ── up via TWO INDEPENDENT `queue_shoptet_fields` calls (two separate locked ── #
+# ── read-modify-writes), so a failure queueing the SECOND group left the FIRST ─
+# ── already committed to disk — a partial queue the caller could never see, ── #
+# ── since the call never returned at all. ───────────────────────────────────── #
+def test_a_failure_queueing_the_order_group_leaves_NOTHING_half_queued(iso, monkeypatch):
+    _seed_pairing()
+    _seed_order_pairing()
+    real_queue_fields = webapp.shoptet_outbox.queue_fields
+    calls = []
+
+    def spy(pending, source, header, rows, **kw):
+        calls.append(rows)
+        if len(calls) == 2:             # the order-pairing group, queued SECOND
+            raise RuntimeError("boom")
+        return real_queue_fields(pending, source, header, rows, **kw)
+    monkeypatch.setattr(webapp.shoptet_outbox, "queue_fields", spy)
+
+    with pytest.raises(RuntimeError):
+        webapp._do_upload_pairings(dry=False)
+
+    assert len(calls) == 2, "both groups must have been attempted"
+    assert webapp._load_pending() == {}, (
+        "a failure queueing the SECOND group must not leave the FIRST group "
+        "already committed to disk — either both land or neither does")
+
+
 # ── BUG 1: the nightly supplier write-back must NOT overwrite a REAL eshop
 #    supplier with a (possibly stale) manual assignment. A per-product assignment
 #    is meant to FILL IN a supplier for an order line that arrived WITHOUT one —

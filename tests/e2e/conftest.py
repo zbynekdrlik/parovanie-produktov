@@ -71,7 +71,7 @@ _SERVER_FIXTURES = ("live_server", "matched_server",
                     "imgflood_server", "dev_server",
                     "nedostupne_server", "vystavy_server", "toorder_server",
                     "toorder_wide_server", "bad_status_config_server",
-                    "shoptet_upload_server")
+                    "shoptet_upload_server", "shoptet_upload_stale_disabled_server")
 
 
 @pytest.fixture(autouse=True)
@@ -949,6 +949,58 @@ def shoptet_upload_server(tmp_path_factory):
             "fields": {"internalNote": {"value": "https://dodavatel.example/c",
                                         "source": "test_source",
                                         "queued_at": _ago(90)}},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(out / "no_products_here.csv"),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def shoptet_upload_stale_disabled_server(tmp_path_factory):
+    """#299 opravné kolo 1 review I3 — every existing test for the disabled-cycle
+    stale-queue alarm injects it via `page.evaluate` (`AUTOMATIONS.find(...).
+    queue_stale_warning = '...'`), so none of them exercises the REAL path this
+    alarm exists for: a genuinely OLD field sitting in `pending_shoptet.json`,
+    the cycle genuinely never started (`automations.json` deliberately absent,
+    same #93 default as `shoptet_upload_server`), `/api/automations` computing
+    the warning server-side on its own poll, and the sidebar + card rendering
+    it from THAT real response — zero injection anywhere.
+
+    Deliberately a SEPARATE fixture from `shoptet_upload_server`, not a shared
+    one with a parameter: that one's `queued_at` values are intentionally kept
+    well UNDER `QUEUE_STALE_WHILE_DISABLED_AFTER_S` (its own docstring explains
+    why — proving the alarm stays quiet on a healthy queue), so reusing it here
+    would either break those tests or need the alarm re-armed mid-test, both
+    messier than one small dedicated fixture."""
+    now = datetime.now().astimezone()
+    old = (now - timedelta(hours=4)).isoformat(timespec="seconds")   # past the 3h threshold
+
+    out = tmp_path_factory.mktemp("wr_shoptet_upload_stale_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "pending_shoptet.json").write_text(json.dumps({
+        "TESTSTALE1": {
+            "pairCode": "", "blocked": None, "attempts": 0,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/z",
+                                        "source": "test_source", "queued_at": old}},
         },
     }, ensure_ascii=False), encoding="utf-8")
     env = {

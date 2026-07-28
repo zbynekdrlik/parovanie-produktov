@@ -202,3 +202,29 @@ def test_run_warnings_render_as_their_own_banner_and_light_the_badge(
     assert "DEGRADOVANÝ" in page.locator(".autostatus .autometa").inner_text()
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #299 opravné kolo 1 review I3 (Important) — every test above proves the ─── #
+# ── RENDERING of this alarm by INJECTING it via `page.evaluate`; none of them ─
+# ── ever exercises the REAL path the whole alarm exists for: an old field ──── #
+# ── genuinely sitting in `pending_shoptet.json`, the cycle genuinely never ─── #
+# ── started, `/api/automations` computing the warning server-side, and the ─── #
+# ── sidebar + card rendering it from THAT real response. Zero injection here. #
+def test_the_real_stale_disabled_path_lights_the_badge_and_banner_from_a_genuine_poll(
+        shoptet_upload_stale_disabled_server, page):
+    console = _console(page)
+    page.goto(shoptet_upload_stale_disabled_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    # the sidebar badge is lit from the FIRST real `/api/automations` poll at
+    # page load — before the "Sync do Shoptetu" tab is even opened.
+    expect(page.locator(
+        '.tabs .navrow:has-text("Sync do Shoptetu") .navwarn')).to_have_count(1)
+
+    page.get_by_role("button", name="Sync do Shoptetu").click()
+    banner = page.locator('[data-testid="shoptet-upload-stale-disabled"]')
+    expect(banner).to_be_visible()
+    text = banner.inner_text()
+    assert "vypnutý" in text and "Sync do Shoptetu" in text and "h" in text, text
+
+    assert console == [], f"console not clean: {console}"

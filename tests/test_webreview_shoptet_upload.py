@@ -117,14 +117,16 @@ def test_the_claim_is_released_even_when_the_body_raises(claim):
 def cycle(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending.json"))
     monkeypatch.setattr(webapp, "CYCLE_CLAIM", str(tmp_path / ".cycle.lock"))
-    # #299 Task 11 — the empty-producer streak store must be as test-isolated as
-    # PENDING_SHOPTET above: it is a NEW module-level `_store(...)` path, and
-    # without this every test in the session would share ONE streak file (the
-    # backend suite only isolates WEBREVIEW_OUT once, for the whole run —
-    # conftest.py's own comment on that). Left un-isolated, three separate tests
-    # calling run_shoptet_upload once each could accumulate into a false streak.
-    monkeypatch.setattr(webapp, "UPLOAD_EMPTY_STREAK_STATE",
-                        str(tmp_path / "upload_empty_streak.json"))
+    # #299 opravné kolo 1 review C1 — `run_shoptet_upload` now reads
+    # `RUNNER.status()` (via `_stale_producer_warnings`/`_disabled_producer_names`),
+    # which is backed by the CROSS-PROCESS `automations.json` state — isolate it
+    # exactly like `automations_iso` does below, or the session-wide default file
+    # (the backend suite only isolates `WEBREVIEW_OUT` once, for the whole run)
+    # would leak `enabled`/`last_run` between unrelated tests. With a FRESH,
+    # empty state file every automation defaults to disabled (the #93 contract's
+    # own default), so every existing test below keeps seeing an empty
+    # `warnings`/`producers_disabled` contribution from this unless it opts in.
+    monkeypatch.setattr(webapp.RUNNER, "state_path", str(tmp_path / "automations.json"))
     calls = {"import": [], "run_sync": []}
     monkeypatch.setattr(webapp, "_import_rows_chunked",
                         lambda rows, header, dry, prefix, csv_safe=False, timeout=900: (
@@ -177,26 +179,108 @@ def test_unconfirmed_rows_make_the_run_degraded_with_a_slovak_warning(cycle, mon
     assert any("nepotvrdil" in w for w in res["warnings"])
 
 
-def test_an_enabled_producer_that_queues_nothing_three_runs_in_a_row_is_reported(cycle):
-    for _ in range(3):
+# ── #299 opravné kolo 1 review C1 (Critical) — replaces the deleted queue-based ─
+# ── streak signal ("3 hourly cycles with 0 fields of its own queued"), which ── #
+# ── fired on EVERY healthy install: these producers run DAILY, this drain runs ─
+# ── HOURLY, and a confirmed field drops out of the queue on the very next ──── #
+# ── settle — so 3 empty hourly cycles was the NORMAL state, not a symptom. ─── #
+# ── The replacement measures ONLY `RUNNER.status()` — last_run + enabled — ─── #
+# ── never the queue at all. `_fake_status` below stands in for RUNNER.status() ─
+# ── so each test controls exactly one producer's enabled/last_run without ──── #
+# ── touching the other four or any real automation state. ──────────────────── #
+def _fake_status(overrides):
+    """A `RUNNER.status()`-shaped list built from the REAL registered automations
+    (so names/keys always match production), with `enabled`/`last_run`/
+    `last_result` overridden per key. Every other field is a harmless default —
+    `_stale_producer_warnings`/`_disabled_producer_names` never read them."""
+    out = []
+    for key, a in webapp.RUNNER.automations.items():
+        ov = overrides.get(key, {})
+        out.append({"key": key, "name": a.name, "enabled": ov.get("enabled", False),
+                    "running": False, "last_run": ov.get("last_run", ""),
+                    "last_status": ov.get("last_status", ""), "last_error": "",
+                    "last_result": ov.get("last_result", {}), "next_run": ""})
+    return out
+
+
+def test_a_healthy_daily_producer_does_not_alarm_on_repeated_hourly_drains(
+        cycle, monkeypatch):
+    """The exact false-positive the deleted signal reproduced: an ENABLED
+    producer that just ran (well inside its own daily schedule) must not
+    degrade the cycle no matter how many times the hourly drain itself runs
+    with nothing new queued."""
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {k: {"enabled": True, "last_run": now_iso}
+         for k in webapp.PRODUCER_QUEUE_KEYS}))
+    for _ in range(4):
         res = webapp.run_shoptet_upload()
-    assert any("nezaradil" in w for w in res["warnings"])
+    assert res["degraded"] is False
+    assert res["warnings"] == []
+    assert res["producers_disabled"] == []
 
 
-def test_a_producer_that_queues_something_resets_its_empty_streak(cycle):
-    """The streak must genuinely RESET on activity, not just count up forever —
-    otherwise a producer that goes quiet for 2 runs, queues something, then goes
-    quiet again for 2 more would wrongly report a "3 in a row" streak on run 5
-    even though it was never 3 CONSECUTIVE empty runs."""
-    webapp.run_shoptet_upload()
-    webapp.run_shoptet_upload()
-    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
-                                [["A", "P", "https://x"]])
-    webapp.run_shoptet_upload()          # parovania_eshop had something THIS run
-    webapp.run_shoptet_upload()
+def test_an_enabled_producer_stale_past_its_own_schedule_is_reported(cycle, monkeypatch):
+    old = (datetime.now(timezone.utc)
+           - timedelta(hours=24 * webapp.PRODUCER_STALE_RUN_MULTIPLIER + 1)
+           ).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"parovania_eshop": {"enabled": True, "last_run": old}}))
     res = webapp.run_shoptet_upload()
-    assert not any("parovania_eshop" in w or "Párovania" in w for w in res["warnings"]), (
+    assert res["degraded"] is True
+    assert any("Párovania" in w and "zapnutá" in w for w in res["warnings"]), res["warnings"]
+
+
+def test_an_enabled_producer_well_within_its_schedule_is_not_reported(cycle, monkeypatch):
+    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"parovania_eshop": {"enabled": True, "last_run": recent}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is False
+    assert res["warnings"] == []
+
+
+def test_an_enabled_producer_that_has_never_run_is_reported(cycle, monkeypatch):
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"grube_externalcode": {"enabled": True, "last_run": ""}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is True
+    assert any("GRUBE" in w and "ešte ani raz nebežala" in w for w in res["warnings"]), (
         res["warnings"])
+
+
+def test_an_enabled_producer_with_an_unparsable_last_run_is_reported_loud(
+        cycle, monkeypatch):
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"restock_skladom": {"enabled": True, "last_run": "not-a-date"}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is True
+    assert any("nečitateľný" in w for w in res["warnings"]), res["warnings"]
+
+
+def test_a_disabled_producer_is_its_own_category_never_a_warning(cycle, monkeypatch):
+    """#299 opravné kolo 1 review C1 — "producent, ktorý je VYPNUTÝ, je vlastná
+    kategória (nie chyba, ale nech je to vidieť)": a disabled producer, however
+    long it has never run, must not contribute to `warnings`/`degraded` — it is
+    surfaced separately, in `producers_disabled`."""
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"stock_skladom": {"enabled": False, "last_run": ""}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is False
+    assert res["warnings"] == []
+    assert webapp.RUNNER.automations["stock_skladom"].name in res["producers_disabled"]
+
+
+def test_a_renamed_or_removed_producer_key_never_crashes_the_cycle(cycle, monkeypatch):
+    """#299 opravné kolo 1 review m5 — the OLD code indexed
+    `RUNNER.automations[k].name` over a hard-coded key list and would raise
+    `KeyError` the moment a producer key was renamed/removed. The replacement
+    reads names straight off `RUNNER.status()` and simply skips a key that is
+    no longer a registered automation."""
+    monkeypatch.setattr(webapp, "PRODUCER_QUEUE_KEYS",
+                        webapp.PRODUCER_QUEUE_KEYS + ("no_longer_exists",))
+    res = webapp.run_shoptet_upload()          # must not raise
+    assert res["ok"] is True
 
 
 # ── #299 Task 11 — the NAJDÔLEŽITEJŠIA POŽIADAVKA: the hourly cycle deploys ─── #
@@ -254,6 +338,115 @@ def test_queue_stale_warning_an_unparsable_timestamp_fires_loud_not_silent(pend)
         "value": "u", "source": "parovania_eshop", "queued_at": "not-a-date"}}}}),
         encoding="utf-8")
     assert webapp._queue_stale_while_disabled_warning(enabled=False) != ""
+
+
+# ── #299 opravné kolo 1 review I1 (Important) — a genuinely UNREADABLE queue ── #
+def test_queue_stale_warning_an_unreadable_pending_table_fires_loud_not_silent(pend):
+    """Before this fix `_load_pending` degraded a corrupt/unparsable
+    `pending_shoptet.json` to `{}` — indistinguishable from a legitimately
+    EMPTY queue, so this alarm silently read "nothing waiting" for the one
+    input state it genuinely cannot judge. Loud is the correct direction:
+    the file IS there, we just cannot read it."""
+    pend.write_text("{ this is not json", encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w != "" and "nedá prečítať" in w, w
+
+
+def test_queue_stale_warning_a_missing_file_stays_quiet_a_fresh_install(pend):
+    """The mirror check for I1: a MISSING file (fresh install, nothing ever
+    queued) is legitimately silent — `os.path.exists` is what tells the two
+    apart, never `from_disk` alone (missing and corrupt both read `from_disk=
+    False`)."""
+    assert not pend.exists()
+    assert webapp._queue_stale_while_disabled_warning(enabled=False) == ""
+
+
+# ── #299 opravné kolo 1 review I2 (Important) — a field with NO queued_at ───── #
+def test_queue_stale_warning_a_missing_timestamp_fires_loud_not_silent(pend):
+    """`if f.get("queued_at")` used to silently DROP a field with no timestamp
+    from the "oldest" computation — if EVERY field lacked one, the whole alarm
+    read "nothing queued" even with real work waiting. Must behave exactly
+    like an unparsable timestamp: loud."""
+    pend.write_text(json.dumps({"A": {"fields": {"internalNote": {
+        "value": "u", "source": "parovania_eshop"}}}}), encoding="utf-8")   # no queued_at at all
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w != "" and "čitateľný čas zaradenia" in w, w
+
+
+# ── #299 opravné kolo 1 review m1 (Minor) — min() over ISO STRINGS is ───────── #
+# ── lexicographic, not chronological; a UTC-offset difference (e.g. across a ── #
+# ── DST boundary) can sort backwards from the real elapsed time. ────────────── #
+def test_queue_stale_warning_compares_REAL_elapsed_time_not_iso_string_order(pend):
+    """Two fields, ONE genuinely past the threshold and ONE genuinely well
+    inside it — but written with a ±10h UTC-offset SWING (a real, if extreme,
+    case of what a DST boundary does on a smaller scale) chosen so the
+    genuinely-stale field's ISO STRING sorts AFTER the genuinely-fresh one's,
+    the OPPOSITE of their real chronological order. Old code's `min()` over
+    the raw strings would pick the fresh field's string as "oldest", read it
+    as well inside the threshold, and silence the alarm — even though the
+    OTHER field genuinely is stale. This is deliberately NOT a 1-hour DST-sized
+    swing (flaky near the exact boundary the review's own wording implies);
+    a ±10h swing safely dominates the threshold gap regardless of the moment
+    `now()` is captured, while proving the identical class of bug."""
+    now = datetime.now(timezone.utc)
+    threshold = webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S
+    # genuinely STALE (past the threshold), rendered at UTC+10:00 — its LOCAL
+    # wall-clock digits read far HIGHER than the fresh field's below, even
+    # though this moment is REALLY earlier.
+    really_stale = (now - timedelta(seconds=threshold + 60)).astimezone(
+        timezone(timedelta(hours=10)))
+    # genuinely FRESH (well inside the threshold), rendered at UTC-10:00 — its
+    # LOCAL wall-clock digits read far LOWER, so the raw ISO STRING sorts
+    # BEFORE the stale field's string above — exactly backwards from real time.
+    really_fresh = (now - timedelta(seconds=60)).astimezone(
+        timezone(timedelta(hours=-10)))
+    stale_str = really_stale.isoformat(timespec="seconds")
+    fresh_str = really_fresh.isoformat(timespec="seconds")
+    assert fresh_str < stale_str, (
+        "test setup check: the FRESH field's string must sort BEFORE the "
+        "STALE field's — otherwise this does not reproduce m1 at all",
+        fresh_str, stale_str)
+    pend.write_text(json.dumps({
+        "A": {"fields": {"internalNote": {
+            "value": "u", "source": "s", "queued_at": stale_str}}},
+        "B": {"fields": {"internalNote": {
+            "value": "u", "source": "s", "queued_at": fresh_str}}},
+    }), encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w != "", (
+        "the genuinely stale field must fire the alarm even though its ISO "
+        "STRING sorts BEFORE the fresh field's", stale_str, fresh_str)
+
+
+# ── #299 opravné kolo 1 review C2 (Critical) — `queued_at` must be the time ── #
+# ── of the FIRST queue of a field's CURRENT value, never overwritten by a ──── #
+# ── later re-queue of the SAME value (the disabled-cycle alarm above reads ── #
+# ── exactly this field, so a re-queue that keeps resetting it silences the ── #
+# ── alarm forever without the cycle ever actually running). Pure-logic unit ── #
+# ── coverage of `shoptet_outbox.queue_fields` itself lives in ──────────────── #
+# ── test_shoptet_outbox.py (controlled `now=` values, no wall-clock race); ── #
+# ── this end-to-end test proves the ACTUAL regression it fixes: the alarm ─── #
+# ── this module owns. ────────────────────────────────────────────────────── #
+def test_a_disabled_cycles_stale_alarm_survives_repeated_same_value_requeues_end_to_end(
+        pend):
+    """The actual regression C2 fixes, proven end to end: an old field, queued
+    again and again with the SAME value while the cycle stays disabled (exactly
+    `run_parovania_eshop`'s daily re-send of its whole backlog, per the
+    review's own repro) — the alarm must stay lit throughout, not go dark the
+    moment ANY producer happens to run."""
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S + 60)
+           ).isoformat(timespec="seconds")
+    _queue_one_field(pend, old)
+    assert webapp._queue_stale_while_disabled_warning(enabled=False) != ""
+
+    # a producer re-queues the identical value — simulating its own daily tick
+    # while the cycle is still disabled and never confirms anything
+    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
+                                [["A", "P", "u"]])
+
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w != "", "a re-queue of the SAME value must not silence the alarm"
 
 
 def test_api_automations_surfaces_the_stale_warning_for_shoptet_upload(pend, automations_iso):
@@ -341,6 +534,41 @@ def test_resynced_reflects_run_sync_s_ACTUAL_return_value_not_a_hard_coded_guess
     res = webapp.run_shoptet_upload()
     assert res["resynced"] == 0
     assert res["skipped_second_sync"] is True   # nothing was sent -> no 2nd sync attempted
+
+
+# ── #299 opravné kolo 1 review m3 (Minor) — a REFUSED catalogue download must ─ #
+# ── not count as a real sync, even though `run_shoptet_sync` reports its own ── #
+# ── run as `ok` for it (PR #280's deliberate non-fatal `ExportDownloadRefused` ─
+# ── — the run keeps serving the on-disk copy). Runs the REAL `shoptet_sync` ─── #
+# ── automation (its `run_fn` stubbed) rather than the `cycle` fixture's ────── #
+# ── `RUNNER.run_sync` stub, so its state is genuinely persisted and ────────── #
+# ── `_sync_downloaded_fresh_export` reads it back for real. ─────────────────── #
+def test_resynced_does_not_count_a_refused_download_as_a_real_sync(
+        pend, automations_iso, monkeypatch):
+    monkeypatch.setattr(webapp, "CYCLE_CLAIM", str(pend.parent / ".cycle.lock"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    monkeypatch.setattr(webapp.RUNNER.automations["shoptet_sync"], "run_fn",
+                        lambda: {"catalog_codes": 1, "export_error": "refused: stale"})
+
+    res = webapp.run_shoptet_upload()
+
+    assert res["resynced"] == 0, "a REFUSED download must not be counted as a real sync"
+    assert res["skipped_second_sync"] is True     # nothing queued -> nothing sent
+
+
+def test_resynced_still_counts_a_genuine_successful_download(
+        pend, automations_iso, monkeypatch):
+    """The other side of m3 — a run that genuinely downloaded (no export_error at
+    all) must still count, proving the fix does not just zero `resynced` out
+    unconditionally."""
+    monkeypatch.setattr(webapp, "CYCLE_CLAIM", str(pend.parent / ".cycle.lock"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    monkeypatch.setattr(webapp.RUNNER.automations["shoptet_sync"], "run_fn",
+                        lambda: {"catalog_codes": 5})
+
+    res = webapp.run_shoptet_upload()
+
+    assert res["resynced"] == 1
 
 
 # ── #299 review N3 — shoptet_sync and shoptet_upload share the same 60-minute ─ #

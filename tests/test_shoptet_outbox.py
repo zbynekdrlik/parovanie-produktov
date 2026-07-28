@@ -44,7 +44,64 @@ def test_a_second_source_adds_its_own_field_to_the_same_code():
     assert p["A"]["fields"]["availabilityInStock"]["source"] == "restock_skladom"
 
 
+# ── #299 opravné kolo 1 review C2 (Critical) — `queued_at` is the time a ────── #
+# ── field's CURRENT value was FIRST queued, never the time of the LATEST ───── #
+# ── call that happened to queue the same value again (same discipline as ──── #
+# ── settle()'s own `blocked.since`, further down this file). ───────────────── #
+def test_requeueing_the_SAME_value_keeps_the_ORIGINAL_queued_at():
+    p, _ = ob.queue_fields({}, source="parovania_eshop",
+                           header="code;pairCode;internalNote",
+                           rows=[["A", "P", "https://x"]], now="T1")
+    p, _ = ob.queue_fields(p, source="parovania_eshop",
+                           header="code;pairCode;internalNote",
+                           rows=[["A", "P", "https://x"]], now="T2")   # SAME value
+    f = p["A"]["fields"]["internalNote"]
+    assert f["value"] == "https://x"
+    assert f["queued_at"] == "T1", (
+        "a re-queue of the SAME value must not push queued_at forward to T2")
+
+
+def test_requeueing_a_CHANGED_value_gets_a_fresh_queued_at():
+    p, _ = ob.queue_fields({}, source="parovania_eshop",
+                           header="code;pairCode;internalNote",
+                           rows=[["A", "P", "https://x"]], now="T1")
+    p, _ = ob.queue_fields(p, source="parovania_eshop",
+                           header="code;pairCode;internalNote",
+                           rows=[["A", "P", "https://y"]], now="T2")   # DIFFERENT value
+    f = p["A"]["fields"]["internalNote"]
+    assert f["value"] == "https://y"
+    assert f["queued_at"] == "T2", "a genuinely NEW value must get the fresh time"
+
+
+def test_requeueing_the_same_value_from_a_DIFFERENT_source_still_preserves_the_time():
+    p, _ = ob.queue_fields({}, source="parovania_eshop",
+                           header="code;pairCode;internalNote",
+                           rows=[["A", "P", "https://x"]], now="T1")
+    p, _ = ob.queue_fields(p, source="split_links",
+                           header="code;pairCode;internalNote",
+                           rows=[["A", "P", "https://x"]], now="T2")
+    f = p["A"]["fields"]["internalNote"]
+    assert f["source"] == "split_links", "source still updates to the latest queuer"
+    assert f["queued_at"] == "T1", "but the timestamp is about the VALUE, not the caller"
+
+
+def test_a_first_time_queue_with_no_prior_field_uses_now_not_a_crash():
+    # prev_field is None the very first time a (code, column) is ever queued —
+    # must fall back cleanly to `now`, never raise on a missing prior field.
+    p, _ = ob.queue_fields({}, source="s", header="code;pairCode;internalNote",
+                           rows=[["A", "P", "u"]], now="T1")
+    assert p["A"]["fields"]["internalNote"]["queued_at"] == "T1"
+
+
 def test_the_later_write_of_the_SAME_field_wins_and_keeps_its_own_source():
+    """#299 opravné kolo 1 review C2 — adapted (per this project's own
+    `toorder-e2e.md` §6: a foreign test pinning the OLD semantics gets fixed in
+    its own note, never silently weakened). This is the SAME value ("Skladom")
+    written by TWO real producers that can legitimately both send it for the
+    same code (restock_skladom / stock_skladom) — `source` still tracks
+    whoever wrote it LAST, but `queued_at` no longer does: C2 keeps the time
+    the value was FIRST queued when a later write does not actually change
+    it (see the dedicated C2 tests above)."""
     p, _ = ob.queue_fields({}, source="restock_skladom",
                            header="code;pairCode;availabilityInStock",
                            rows=[["A", "P", "Skladom"]], now="T1")
@@ -53,7 +110,7 @@ def test_the_later_write_of_the_SAME_field_wins_and_keeps_its_own_source():
                            rows=[["A", "P", "Skladom"]], now="T2")
     f = p["A"]["fields"]["availabilityInStock"]
     assert f["source"] == "stock_skladom"
-    assert f["queued_at"] == "T2"
+    assert f["queued_at"] == "T1"
 
 
 def test_credit_group_and_value_ride_with_the_field():
