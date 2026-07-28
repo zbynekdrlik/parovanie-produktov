@@ -357,3 +357,104 @@ def test_a_save_that_reaches_NOBODY_new_is_not_interrupted(page, sync_prune_bloc
 
     assert seen == [], seen
     assert console == [], f"console not clean: {console}"
+
+
+# ── PR #298 review, A4/A5/B-F4: the gate itself must not be the thing that fails open ──────
+# The preview is a GATE on a save that releases customer mail, and it was fail-OPEN in both
+# directions a gate can fail: a non-2xx answer (an expired session, a 500) and a network error
+# both `return true`, letting the save through with no dialog at all — silently, which is the
+# one outcome #297 exists to prevent. And nothing told him it was even working: the button sat
+# disabled with no message while the preview may go and refresh the orders export.
+_IMPACT = "**/api/order-statuses/impact"
+
+
+def _fill_and_save(page, value="Vybavuje sa\nČaká na dodávateľa"):
+    page.locator('[data-testid="order-statuses-to_order"]').fill(value)
+    page.locator('[data-testid="order-statuses-save"]').click()
+
+
+def test_a_preview_that_ERRORS_asks_anyway_instead_of_waving_the_save_through(
+        page, sync_prune_blocked_server):
+    """`if (!r.ok) return true` — an expired session (403) or a server error let the widest
+    change there is through in silence. „I could not work out the impact" is a reason to ask,
+    exactly like the `unknown` answer already is."""
+    _open_tab(page, sync_prune_blocked_server)
+    page.route(_IMPACT, lambda route: route.fulfill(
+        status=500, content_type="application/json", body='{"ok": false}'))
+    seen = _dialog_spy(page, accept=False)
+
+    _fill_and_save(page)
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Neuložené')")
+
+    assert len(seen) == 1, seen
+    assert "nedá zistiť" in seen[0], seen[0]
+    assert page.request.get(sync_prune_blocked_server + "/api/order-statuses").json()[
+        "statuses"]["to_order"] == ["Vybavuje sa"]
+
+
+def test_a_preview_that_never_ANSWERS_is_bounded_and_says_it_is_working(
+        page, sync_prune_blocked_server):
+    """The preview calls `_orders_csv_cached()`, which re-downloads the export when the shared
+    copy has aged out (timeout 60 s). Awaited on a disabled button with no message, that is a
+    card the manager reads as broken. It must say it is working and give up on its own — and
+    giving up lands on the branch above, never on a silent save."""
+    _open_tab(page, sync_prune_blocked_server)
+    page.route(_IMPACT, lambda route: None)          # deliberately never answered
+    seen = _dialog_spy(page, accept=False)
+
+    _fill_and_save(page)
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Zisťujem')")
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Neuložené')", timeout=15000)
+
+    assert len(seen) == 1, seen
+    assert "nedá zistiť" in seen[0], seen[0]
+
+
+def test_the_dialog_names_the_UPPER_BOUND_it_was_given(page, sync_prune_blocked_server):
+    """`mailable` is computed, sent and then dropped on the floor — the dialog showed only
+    „orders" and „addresses". It is the honest upper bound on the first wave (has a note, has
+    an address, not already resolved), so it is the number that stands between „the app starts
+    watching 387 orders" and „37 people hear from us"; without it the two figures look
+    unrelated and the wide one looks like the scary one."""
+    _open_tab(page, sync_prune_blocked_server)
+    page.route(_IMPACT, lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"ok": true, "added": ["Čaká na dodávateľa"], "orders": 387,'
+             ' "mailable": 40, "customers": 37, "config_broken": false}'))
+    seen = _dialog_spy(page, accept=False)
+
+    _fill_and_save(page)
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Neuložené')")
+
+    assert len(seen) == 1, seen
+    assert "387" in seen[0] and "40" in seen[0] and "37" in seen[0], seen[0]
+
+
+def test_the_dialog_says_when_the_number_is_large_because_NOTHING_is_running(
+        page, sync_prune_blocked_server):
+    """With an unusable configuration the reminders are stopped, so the preview measures
+    against an EMPTY effective set (review A3) and the number is the whole backlog rather than
+    a difference. Handing him that figure with no explanation is how a preview gets a
+    reputation for exaggerating — and a preview he distrusts is one he clicks away."""
+    _open_tab(page, sync_prune_blocked_server)
+    page.route(_IMPACT, lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body='{"ok": true, "added": ["Vybavuje sa"], "orders": 37,'
+             ' "mailable": 37, "customers": 37, "config_broken": true}'))
+    seen = _dialog_spy(page, accept=False)
+
+    _fill_and_save(page, "Vybavuje sa")
+    page.wait_for_function(
+        "() => document.querySelector('[data-testid=order-statuses-msg]')"
+        ".textContent.includes('Neuložené')")
+
+    assert len(seen) == 1, seen
+    assert "neposielajú" in seen[0], seen[0]
