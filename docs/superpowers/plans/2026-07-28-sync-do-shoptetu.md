@@ -574,18 +574,22 @@ def queue_shoptet_fields(source, header, rows, credit_group=None,
     """Queue rows for the next hourly upload. Returns how many field values landed."""
     if not rows:
         return 0
-    now = datetime.now().isoformat(timespec="seconds")
+    now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     with _lock:
-        pending, from_disk = _read_json_store_state(PENDING_SHOPTET, {})
-        if not from_disk and os.path.exists(os.fspath(PENDING_SHOPTET)):
-            # a table we could not read is NOT an empty table — queueing on top of
-            # the default would silently drop everything already waiting
-            raise RuntimeError(
-                "pending_shoptet.json sa nedá prečítať — nezaraďujem nič, kým sa "
-                "neopraví (inak by sa stratili už čakajúce zmeny)")
+        # A table we could not read is NOT an empty table — queueing on top of the
+        # default would silently drop everything already waiting. That refusal is
+        # NOT hand-rolled here: `_atomic_write_json(protect=True)` in `_save_pending`
+        # already refuses the wipe, quarantines the corrupt file and raises
+        # StoreWipeRefused, which the app turns into a 503 with instructions. A
+        # hand-rolled `raise` in front of it short-circuits exactly that machinery
+        # (no quarantine, wrong exception type, and an empty file — a real
+        # post-crash shape — would brick queueing for ever).
+        pending = _read_json_store(PENDING_SHOPTET, {})
         pending, n = shoptet_outbox.queue_fields(
             pending, source, header, rows,
             credit_group=credit_group, credit_value=credit_value, now=now)
+        if not n:
+            return 0          # nothing queued → never rewrite a protected store
         _save_pending(pending)
     log.info("outbox: %s zaradil %d polí (%d kódov)", source, n, len(rows))
     return n
