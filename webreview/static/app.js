@@ -4811,31 +4811,35 @@ function renderParovaniaEshop() {
     const [label, cls] = _PAROVANIA_STATUS[lr.status] || [lr.status, 'ok'];
     const box = el('div', 'autoresult ' + cls);
     box.appendChild(el('div', 'autoresult-head', label));
+    // #299 opravné kolo 1 review I1/m3 — this producer only QUEUES (since Task
+    // 10 it never imports), so the headline must say "zaradených do frontu"
+    // (queued == `p.queued`/`s.queued`, the SAME field name and the SAME
+    // meaning on both halves — mirrors renderGrubeExternalcode/renderSplitLinks
+    // below), never "nových" off `count` — pairings' `count` means something
+    // ELSE entirely (keys credited RIGHT AWAY from the export match, see
+    // `_do_upload_pairings`), and the card must never conflate the two.
     box.appendChild(el('div', '',
-      `🔗 Párovania: +${p.count ?? 0} nových`
+      `🔗 Párovania: ${p.queued ?? 0} zaradených do frontu`
       + (p.blocked ? ` · ${p.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${p.total_uploaded ?? 0} / ${p.total_products ?? 0} napárovaných`
       + ` · chýba ${p.remaining ?? 0}`));
-    // #257: the two facts a partially-accepted push turns on. Both come from the API
-    // result and were invisible here, so the manager could not see that Shoptet had
-    // rejected rows at all — only the generic error line below (if any).
-    //   • potvrdené z exportu = rows the eshop already had exactly as we would write
-    //     them, credited from its own export and NOT re-sent;
-    //   • odmietol = rows Shoptet refused out of the ones we did send (they stay
-    //     pending and are re-sent until the export confirms them).
+    // #257 / #299 opravné kolo 1 review I1 — the ONE fact this producer can still
+    // honestly claim: rows the eshop's OWN export already showed exactly as we
+    // would write them, credited right away without going through the queue.
+    // Whether Shoptet later ACCEPTS or REJECTS a queued row is now decided by
+    // the hourly "Sync do Shoptetu" drain, not here — a producer that only
+    // queues must never claim to know an outcome that hasn't happened yet (the
+    // "⛔ Shoptet odmietol: 0 riadkov" line this used to show every single run
+    // was always false — it was a promise, not a fact).
     box.appendChild(el('div', 'sub2',
-      `✔ Už v eshope (potvrdené z exportu): ${p.confirmed_in_export ?? 0}`
-      + ` · ⛔ Shoptet odmietol: ${p.rejected ?? 0} riadkov`
-      + (p.partial ? ' · časť dávky odmietnutá — zvyšok sa potvrdí z exportu' : '')));
-    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
-    // successful chunks ARE saved → the next run only retries the rest)
+      `✔ Už v eshope (potvrdené z exportu): ${p.confirmed_in_export ?? 0}`));
     if (p.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(p.error)));
     // #38: inline páry pridané priamo na riadku „Na objednanie" (mimo review setu)
     box.appendChild(el('div', '',
       `📦 Inline páry: +${p.order_count ?? 0} nových`
       + (p.order_blocked ? ` · ${p.order_blocked} prekrytých recenziou` : '')));
     box.appendChild(el('div', '',
-      `🏷️ Dodávatelia: +${s.count ?? 0} nových`
+      `🏷️ Dodávatelia: ${s.queued ?? 0} zaradených do frontu`
       + (s.blocked ? ` · ${s.blocked} zablokovaných${gateBlockedWhy(s.gate_blocked)}` : '')
       + ` · spolu ${s.total_uploaded ?? 0} / ${s.total_assigned ?? 0} doplnených`
       + ` · chýba ${s.remaining ?? 0}`));

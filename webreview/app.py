@@ -5838,17 +5838,33 @@ def _do_upload_pairings(dry):
     # rows Shoptet accepted inside a partially-rejected batch (whose identity the
     # import log never reveals) get credited on the next run instead of being
     # rebuilt and re-sent every night forever.
-    # #270: the mirror image — a code the catalogue does NOT carry at all can never
-    # import (Shoptet rejects that row on every run, for ever). Hold it back and LIST
-    # it with the URL we tried to write, so the manager can fix the code instead of
-    # reading a bare „Shoptet odmietol 2 riadkov" every morning. Never credited, so
-    # the moment the code appears in the catalogue it is written.
+    # #270 / #299 opravné kolo 1 review C1: the mirror image — a code the catalogue
+    # does NOT carry at all can never import (Shoptet rejects that row on every
+    # run, for ever). It is QUEUED anyway, together with the rest of its key's
+    # codes — never excluded from `send_rows` below — so `credit_group`/
+    # `credit_value` (built from `written_codes`, upstream of this verdict split)
+    # still carry it. The hourly drain's OWN `build_import` independently marks it
+    # `not-in-catalog` and holds it out of the actual Shoptet import; `settle` then
+    # sees an unconfirmed code inside the group and withholds the WHOLE key's
+    # credit, exactly the #49 rule this producer exists to keep. Queueing it also
+    # keeps it growing `blocked_runs` in the shared table until `stale_blocked`
+    # catches it, and it stays listed below (`_missing_report`) so the manager can
+    # fix the code. C1 (opravné kolo 1): before this fix the row was excluded from
+    # `send_rows` here while `credit_group` still carried it (built earlier, from
+    # `written_codes`) — so the OTHER codes of the same key got queued, Shoptet
+    # confirmed them, and the whole key was credited even though this code's link
+    # was never actually written to the eshop — a silent, permanent loss of the
+    # #49 protection, and the code vanished from „chýba v eshope" too since a
+    # credited key is no longer „new".
     verdicts = _export_row_verdicts(all_rows)
     confirmed = verdicts["confirmed"]
     # (the two sets are disjoint by construction — confirmed ⊆ notes ⊆ codes, absent is
     # „not in codes" — the subtraction is belt-and-braces against a future verdict change)
     absent = verdicts["absent"] - confirmed
-    send_rows = [r for r in all_rows if r[0] not in confirmed and r[0] not in absent]
+    # Only a CONFIRMED row is excluded from what gets queued — an ABSENT one IS
+    # queued (see the #270/C1 comment above); the drain, not this producer,
+    # decides whether it can actually reach Shoptet.
+    send_rows = [r for r in all_rows if r[0] not in confirmed]
     missing = _missing_report(sorted(absent), {r[0]: r[2] for r in all_rows})
     if confirmed:
         log.info("n8n pairings: %d z %d riadkov už eshop má presne tak, ako by sme "
@@ -5856,13 +5872,16 @@ def _do_upload_pairings(dry):
                  len(confirmed), len(all_rows))
     if absent:
         # A review key with SEVERAL variant codes, one of them absent, can never be
-        # recorded uploaded (its landed codes get confirmed, the absent one never
-        # enters `success`, and a key is credited only when ALL its written codes did
-        # — the #49 rule). It therefore stays „new" and reports +0 nových every night
-        # until the code is fixed. That is the safe direction, and the card names the
-        # exact offending code below, which is what the manager has to act on.
+        # recorded uploaded (its landed codes get confirmed once the drain sends and
+        # Shoptet confirms them; the absent one is queued too, but the drain blocks
+        # it as not-in-catalog and it never enters `success` — a key is credited
+        # only when ALL its written codes did, the #49 rule, kept intact since C1's
+        # fix). It therefore stays „new" and reports +0 nových every night until the
+        # code is fixed. That is the safe direction, and the card names the exact
+        # offending code below, which is what the manager has to act on.
         log.warning("n8n pairings: %d kódov eshop v katalógu vôbec nemá — "
-                    "neposielam ich (Shoptet by ich zakaždým odmietol): %s",
+                    "zaraďujem ich do frontu, no hodinový cyklus ich zablokuje "
+                    "(Shoptet by ich zakaždým odmietol): %s",
                     len(absent), sorted(absent)[:10])
 
     # #299 Task 10 — a CONFIRMED row is proof from the eshop's OWN export, not "our
@@ -5899,9 +5918,10 @@ def _do_upload_pairings(dry):
                 "order_count": 0, "order_blocked": len(blocked_order_codes),
                 **_pairing_summary(uploaded)}, 200
 
-    # Everything still needing a WRITE (`send_rows` — excludes both confirmed and
-    # absent codes, unchanged above) is no longer imported directly: it is QUEUED
-    # into the shared pending_shoptet table for the next hourly "Sync do Shoptetu"
+    # Everything not already confirmed from the export (`send_rows` — excludes
+    # confirmed codes only; an absent code IS included, see the #270/C1 comment
+    # above) is no longer imported directly: it is QUEUED into the shared
+    # pending_shoptet table for the next hourly "Sync do Shoptetu"
     # drain, which is the only place left that writes uploaded_pairings.json for a
     # freshly-sent row (via `_credit_producer`, only once Shoptet's own import
     # actually confirms it — never on this producer's own say-so). credit_group is
@@ -7184,26 +7204,6 @@ def run_shoptet_sync() -> dict:
     return result
 
 
-# The order matters: pairings first (they define what a product IS), then the
-# code/link producers, then the availability ones — so a product that gains a
-# supplier link in the same cycle is already linked when it goes on sale.
-CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links",
-                   "restock_skladom", "stock_skladom")
-# #299 review I2 — producers already switched from their OLD direct-to-eshop
-# import onto `queue_shoptet_fields` (each task adds one here, in the SAME commit
-# that switches it). Until a producer is in here the cycle must NEVER run it: a
-# producer NOT yet in this tuple still writes straight to the live eshop on its
-# OWN daily schedule, so running it hourly TOO would turn a 1x/day automation
-# into 24x/day writes to forestshop.sk the moment a manager clicks ▶ Štart on
-# "Sync do Shoptetu". Task 8 (#299) moved grube_externalcode and split_links onto
-# the queue; Task 9 added restock_skladom and stock_skladom; Task 10 adds
-# parovania_eshop — the LAST of the five, and the only one already ENABLED on
-# forestshop.sk (the other four start DISABLED per the #93 contract). Its links
-# feed the automatic re-ordering, so it is the one migration where crediting the
-# wrong shape (Task 8's C1 lesson) silently freezes real reorder links forever.
-QUEUE_MIGRATED: tuple[str, ...] = ("parovania_eshop", "grube_externalcode",
-                                   "split_links",
-                                   "restock_skladom", "stock_skladom")
 SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 # #299 review N3 — shoptet_sync and shoptet_upload share the SAME 60-minute
 # schedule, so their scheduler ticks synchronize: without this, the cycle's own
@@ -7217,28 +7217,36 @@ SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
 
 
-def _enabled_automations() -> set:
-    return {a["key"] for a in RUNNER.status() if a.get("enabled")}
-
-
 def run_shoptet_upload() -> dict:
-    """#299 — the hourly cycle: download → let the producers queue → ONE import →
-    settle → download again.
+    """#299 — the hourly cycle: download → ONE import of whatever the producers
+    already queued → settle → download again.
 
-    It writes nothing to the eshop itself: producers queue into pending_shoptet,
-    and only rows the import log confirmed AND still hold their sent value are
+    #299 opravné kolo 1 review I2 — this cycle used to ALSO run each queue-
+    migrated producer (`RUNNER.run_sync(key)` for every key in a `QUEUE_MIGRATED`
+    gate) before importing. That silently turned `parovania_eshop` — the ONE
+    producer already ENABLED on forestshop.sk, normally a 1x/day 21:00 push — into
+    a 24x/day run the moment a manager enabled this hourly automation, INCLUDING
+    `_do_upload_suppliers`'s #215 removal of the manager's own manual supplier
+    assignments (deštruktívny zápis, 24x/day instead of 1x/day) — a side effect
+    the brief and the first implementation never mentioned or tested. Fixed by
+    removing producer-running from the cycle entirely: each producer queues on
+    its OWN schedule (unchanged), and this cycle ONLY drains whatever is already
+    in the shared table — download, import once, settle, download again. Nothing
+    here decides which producers ran or when; `QUEUE_MIGRATED`/`CYCLE_PRODUCERS`
+    are gone with their sole consumer. It writes nothing to the eshop itself:
+    only rows the import log confirmed AND still hold their sent value are
     credited and dropped (see `sent_fields` below — #299 review C1). The second
     download is skipped when nothing went up (most hours) — it would re-fetch the
     57 MB catalogue for no reason.
 
     Every step below waits for its automation to actually finish
     (`RUNNER.run_sync`, #299 review I3) — the download really is on disk before
-    the export is read, and a queue-migrated producer really has queued before
-    the pending table is read; `RUNNER.run_now`'s background thread only made
-    that ordering look true. `resynced` counts the REAL outcome of each
-    `run_sync` call (0, 1 or 2), never a hard-coded guess — a `shoptet_sync`
-    already in flight from its own hourly schedule returns False and must not
-    be reported as "downloaded".
+    the export is read; `RUNNER.run_now`'s background thread only made that
+    ordering look true. `resynced` counts the REAL outcome of each `run_sync`
+    call (0, 1 or 2), never a hard-coded guess — a `shoptet_sync` already in
+    flight from its own hourly schedule returns False and must not be reported
+    as "downloaded". (Opravné kolo 1 review I2 removed the THIRD thing this used
+    to wait for — running each queue-migrated producer — see above.)
 
     #299 review C1 — `pending` is read once here to build the import, then read
     AGAIN under `_lock` right before `settle`: a producer can legitimately queue
@@ -7285,7 +7293,7 @@ def run_shoptet_upload() -> dict:
         if not got:
             return {"ok": False, "error": "cyklus už beží", "queued": 0, "sent": 0,
                     "confirmed": 0, "blocked": 0, "stale_blocked": [],
-                    "producers": {}, "resynced": 0,
+                    "resynced": 0,
                     "skipped_second_sync": True, "unconfirmed": 0}
 
         presync_age = _export_age_s()
@@ -7301,13 +7309,6 @@ def run_shoptet_upload() -> dict:
             log.info("sync do Shoptetu: predimportné stiahnutie spúšťam (vek "
                       "exportu %s)", "neznámy" if presync_age is None
                       else f"{presync_age / 60:.1f} min")
-
-        enabled = _enabled_automations()
-        producers = {}
-        for key in CYCLE_PRODUCERS:
-            if key not in QUEUE_MIGRATED or key not in enabled:
-                continue
-            producers[key] = bool(RUNNER.run_sync(key))
 
         # M5: build_import(pending) once — not once for the verdict pass and
         # once more for the actual send — and filter `absent` over the result
@@ -7344,9 +7345,10 @@ def run_shoptet_upload() -> dict:
         # the brief's original sketch; added here because skipping it would let a
         # manual "Spustiť teraz" of a producer still bypassing the queue — since
         # #299 Task 10 that is only the raw n8n restock feed (n8n_shoptet_import,
-        # #158) and any future direct import; all five CYCLE_PRODUCERS are queue-
-        # migrated as of Task 10 — race this cycle's own import against the very
-        # same Shoptet session.
+        # #158) and any future direct import; all five producers (parovania_eshop,
+        # grube_externalcode, split_links, restock_skladom, stock_skladom) are
+        # queue-migrated as of Task 10 and never import directly at all any more —
+        # race this cycle's own import against the very same Shoptet session.
         res = None
         import_busy = False
         if rows:
@@ -7356,9 +7358,8 @@ def run_shoptet_upload() -> dict:
                            "sa preskakuje, riadky ostávajú v tabuľke na ďalší beh")
             else:
                 try:
-                    # M3: three of the five (still direct-import) producers this
-                    # cycle will eventually replace already send csv_safe=True —
-                    # the combined import must not lose that formula-injection guard.
+                    # M3: the combined import must not lose the formula-injection
+                    # guard every direct-import producer used to send on its own.
                     res = _import_rows_chunked(rows, header, False,
                                                prefix="import_sync_", csv_safe=True,
                                                timeout=900)
@@ -7400,7 +7401,7 @@ def run_shoptet_upload() -> dict:
                 "nepotvrdené alebo zablokované riadky"
         return {"ok": ok, "queued": len(pending), "sent": sent,
                 "confirmed": confirmed, "blocked": len(blocked),
-                "stale_blocked": stale, "producers": producers,
+                "stale_blocked": stale,
                 "resynced": resynced, "skipped_second_sync": skipped,
                 "unconfirmed": unconfirmed, "error": error}
 
@@ -7506,12 +7507,15 @@ def run_parovania_eshop() -> dict:
             "missing_count": _missing(pairings),
             "missing_in_eshop": pairings.get("missing_in_eshop") or [],
             # #257: how many rows the eshop already had exactly as we would write
-            # them (proven from its export → credited, not re-sent), and how many
-            # Shoptet REJECTED out of the ones we did send. Both were invisible
-            # while a partially-accepted batch was booked as a plain failure.
+            # them — proven from its OWN export, so credited right away without
+            # going through the queue. #299 opravné kolo 1 review I1 — `rejected`/
+            # `partial` used to live here too, but since this producer only QUEUES
+            # (it never imports), it cannot know what Shoptet accepts or rejects —
+            # that verdict belongs solely to the hourly "Sync do Shoptetu" drain.
+            # Both fields were always 0/false after the Task 10 migration (this
+            # producer never set them), so they were removed rather than kept as a
+            # standing lie the card could still read.
             "confirmed_in_export": int(pairings.get("confirmed_in_export") or 0),
-            "rejected": int(pairings.get("rejected") or 0),
-            "partial": bool(pairings.get("partial")),
             "ok": p_ok,
             "error": pairings.get("error", ""),
         },
@@ -8973,20 +8977,28 @@ AUTOMATION_DESCRIPTIONS = {
         "review kartách. Zmaže pritom značky pri riadkoch tých objednávok, ktoré sú už "
         "vybavené a na tabe sa nedajú zobraziť — nič iné z tvojej práce nemení.",
     "shoptet_upload":
-        # #299 review I1 — Task 8 migrated the first two producers (grube_
-        # externalcode, split_links) onto this table; Task 9/10 will move the
-        # rest. This description must say WHICH automations already write here
-        # today, not "nikto zatiaľ" — keep it in sync as each Task migrates one.
+        # #299 opravné kolo 1 review I2 — all five producers finished migrating
+        # (Task 10 added the last one, parovania_eshop); this cycle no longer runs
+        # any of them — each queues on its OWN schedule, this description must say
+        # that plainly (it used to name only 2 of 5 and implied the rest were
+        # still direct-import, which stopped being true).
         "Každú hodinu stiahne čerstvý stav zo Shoptetu, jedným importom nahrá do "
         "eshopu všetko, čo je zapísané v tabuľke čakajúcich zmien, a potom stav "
         "stiahne znova. Nahraté označí až vtedy, keď to Shoptet potvrdí; čo eshop "
-        "v katalógu nemá, ostane čakať a je to tu vidieť. Zatiaľ do nej zapisujú "
-        "„GRUBE kódy → eshop“ a „Veľkostné linky → eshop“ — ostatné automatizácie "
-        "zatiaľ nahrávajú do eshopu priamo samy a prechádzajú na túto tabuľku "
-        "postupne, jedna po druhej.",
+        "v katalógu nemá, ostane čakať a je to tu vidieť. Do tabuľky zapisuje "
+        "všetkých päť automatizácií („Párovania → eshop“, „GRUBE kódy → eshop“, "
+        "„Veľkostné linky → eshop“, „Vypredané → Skladom“, „Máme skladom → "
+        "Skladom“) — každá na svojom vlastnom rozvrhu; táto automatizácia ich "
+        "nespúšťa, len raz za hodinu nahrá, čo medzičasom zaradili.",
     "parovania_eshop":
-        "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
-        "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
+        # #299 opravné kolo 1 review I2 — since this migration it only ZARADÍ
+        # (queues) into the shared table; the hourly „Sync do Shoptetu“
+        # automation does the actual upload up to an hour later, same as
+        # grube_externalcode/split_links below.
+        "Denne o 21:00 zaradí nové napárované produkty a doplnených dodávateľov do "
+        "spoločnej tabuľky čakajúcich zmien — do eshopu ich potom nahrá hodinová "
+        "automatizácia „Sync do Shoptetu“ (musí byť tiež zapnutá). Zapisuje "
+        "doobjednávacie odkazy do poznámky produktu.",
     "grube_externalcode":
         # #299 review I1 — since Task 8 this only ZARADÍ (queues) into the shared
         # table; the hourly „Sync do Shoptetu“ automation does the actual upload
