@@ -638,13 +638,14 @@ def test_cancelled_defaults_to_the_measured_live_status(iso):
 def test_dispatched_is_DERIVED_as_terminal_minus_cancelled(iso):
     """No fourth editable box. Renaming a dispatched status is ONE edit — of `terminal`, the
     box the prune already forces the manager to keep correct."""
-    cancelled, dispatched = webapp._posta_statuses()
+    cancelled, dispatched, reason = webapp._posta_statuses()
     assert cancelled == frozenset({"Stornovaná"})
     assert dispatched == frozenset({"Vybavená", "Vybavená výmena", "Vybavený Dobropis"})
+    assert reason == ""
     c = _client_as(ADMIN).post("/api/order-statuses", json={
         "terminal": ["Expedovaná", "Zrušená"], "cancelled": ["Zrušená"]})
     assert c.status_code == 200, c.get_json()
-    assert webapp._posta_statuses() == (frozenset({"Zrušená"}), frozenset({"Expedovaná"}))
+    assert webapp._posta_statuses() == (frozenset({"Zrušená"}), frozenset({"Expedovaná"}), "")
 
 
 def test_a_cancelled_status_OUTSIDE_terminal_is_REFUSED_by_the_endpoint(iso):
@@ -677,7 +678,7 @@ def test_a_config_written_BEFORE_this_set_existed_is_not_broken_by_the_upgrade(i
     sets, reason = webapp._order_statuses_state()
     assert reason == ""                                   # prune stays armed
     assert sets["cancelled"] == frozenset({"Stornovaná"})
-    assert webapp._posta_statuses() == (frozenset({"Stornovaná"}), frozenset({"Vybavená"}))
+    assert webapp._posta_statuses() == (frozenset({"Stornovaná"}), frozenset({"Vybavená"}), "")
 
 
 def test_a_PARTIAL_payload_that_never_mentions_cancelled_is_not_refused(iso):
