@@ -213,6 +213,30 @@ def test_a_claim_file_that_cannot_be_opened_skips_the_run_instead_of_crashing(
     assert cycle["run_now"] == []               # nothing was even attempted
 
 
+def test_the_import_is_skipped_when_another_import_is_already_running(cycle, monkeypatch):
+    """`_import_rows_chunked`'s own docstring: the caller MUST hold `_import_lock`
+    across the call — every other of its 7 call sites in this module does. Not
+    holding it here would let this cycle's import race a manual "Spustiť teraz"
+    of a producer still on its OLD direct-import path (parovania_eshop etc. are
+    migrated to the queue in a later task). Simulate that race by making the lock
+    already held: the cycle must skip ITS import (never call
+    `_import_rows_chunked`), leave the row queued for the next hour, and report
+    a non-ok, non-crashing result."""
+    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
+                                [["A", "P", "https://x"]])
+    assert webapp._import_lock.acquire(blocking=False) is True
+    try:
+        res = webapp.run_shoptet_upload()
+    finally:
+        webapp._import_lock.release()
+
+    assert res["ok"] is False
+    assert res["confirmed"] == 0
+    assert res["sent"] == 1
+    assert cycle["import"] == []                     # _import_rows_chunked never ran
+    assert "A" in webapp._load_pending()              # row stays queued for next hour
+
+
 def test_note_col_none_asks_only_whether_the_code_is_in_the_catalogue(tmp_path, monkeypatch):
     """The combined-import verdict pass has no single fixed note column (every row
     in the drain can carry a different set of queued fields), so it must never
