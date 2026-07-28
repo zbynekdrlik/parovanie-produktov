@@ -628,8 +628,11 @@ vlastného scrapovania — kopíruj ho, nevymýšľaj vlastnú signalizáciu.
 
 ### WRITE-JOIN automatizácia (JOIN + zápis do eshopu) — vzor `restock_skladom` (#108)
 
-JOIN-automatizácia ako #107, ale namiesto read-only **PÍŠE do živého eshopu** (napr.
-reštok Vypredané→Skladom). Pure detekcia je v `src/parovanie/restock_skladom.py`
+JOIN-automatizácia ako #107, ale namiesto read-only napokon **PÍŠE do živého eshopu**
+(napr. reštok Vypredané→Skladom) — od **#299 Task 9** ale NEPRIAMO: `run_<key>()` sám
+Shoptet import nespúšťa, len **zaraďuje riadky do zdieľanej fronty** (`pending_shoptet`),
+ktorú do eshopu zapíše až hodinový drain `run_shoptet_upload` („Sync do Shoptetu").
+Pure detekcia je v `src/parovanie/restock_skladom.py`
 (`compute_candidates(csv_text, supplier_rows, now, max_pair_age_h)`) — mirror
 `compute_risk`, len opačný smer: náš produkt `vis=='visible'` A **stav 2** (Vypredané)
 cez zdieľaný `export_helpers.state_of` (NIKDY nekopíruj klasifikáciu; `state_of==2`
@@ -640,23 +643,37 @@ než doslovný n8n `availabilityInStock=='Vypredané'`), A dodávateľ `ok && av
 `now.tzinfo`). Idempotencia = stav-2-only detekcia (už-Skladom produkt sa nikdy neflipne znova,
 keď sa export obnoví); netreba osobitný „flipped codes" store.
 
-- **Zápis = REUSE careful importu, NEreimplementuj**: `import_builder.restock_rows(candidates,
+- **Zápis = QUEUE, nie priamy import (od #299 Task 9)**: `import_builder.restock_rows(candidates,
   code2pair)` postaví riadky vo whiteliste `RESTOCK_COLS` (OBE polia dostupnosti → `Skladom`,
-  `visible`, `stock 5` — CEO 2026-07-14, dedup kódov ako `link_rows`). `run_<key>()` zapíše CSV
-  v kánonickom dialekte (`utf-8-sig` BOM, `;`, CRLF, header=`RESTOCK_COLS`) a spustí PRIAMO
-  `run_import` (ten istý ako `/api/n8n/shoptet-import` — záloha + safe-mode + #23 read-back),
-  žiaden self-HTTP/bearer.
-- **Bezpečné zlyhanie (ako `parovania_eshop`)**: `run_<key>()` NEVYHADZUJE výnimku pri zlyhanom
-  importe — degraduje na `status='error'` (z `parse_import_log` read-backu, nie tiché „success");
-  `_import_lock.acquire(blocking=False)` → ak beží iný import, `status='busy'` (preskočí, nie
-  dvojitý import). `TimeoutExpired` z `run_import` → `rc=1`. Kandidáti sa ukladajú VŽDY (aj pri
-  zlyhaní tab ukáže čo sa PROBOVALO naskladniť).
-- **Default DISABLED je tu obzvlášť dôležité** (píše do prod eshopu) — deploy over LEN že tab
-  existuje + Zastavené + tlačidlá; NIKDY neklikaj Štart ani Spustiť teraz (reálny prod zápis).
-  `automations.json` bez kľúča = disabled (over že kľúč tam PO deployi NIE je).
-- Testy: pure JOIN + `restock_rows` (hermetic), Flask wiring incl. **zlyhaný import → status=error**,
-  **busy lock**, no-supplier-data → nič neflipne, both-availability-fields na import riadku,
-  manager-store izolácia; e2e = `automations_server` s pred-vypočítaným `restock_skladom.json`.
+  `visible`, `stock 5` — CEO 2026-07-14, dedup kódov ako `link_rows`); `run_<key>()` ich odovzdá
+  `queue_shoptet_fields("restock_skladom", ";".join(RESTOCK_COLS), rows)`, ktorý ich zapíše do
+  zdieľanej `pending_shoptet` tabuľky (prázdna bunka sa PRESKOČÍ, nikdy nezaradí). Skutočný
+  Shoptet import (rovnaký `_import_rows_chunked` chunker ako predtým, s `run_import` pod
+  `_import_lock` — záloha + safe-mode + #23 read-back) sa deje len raz za hodinu, v
+  `run_shoptet_upload`, nad CELOU tabuľkou naraz naprieč všetkými producentmi.
+  `_restock_candidate_rows(candidates)` (a analogický `_stock_skladom_candidate_rows`) sú ČISTÉ —
+  žiadne I/O — a berú candidates z JEDNÉHO `_restock_candidates()` volania, ktoré `run_<key>()`
+  spraví raz (#299 Task 9 review I1: dve nezávislé čítania exportu/supplier_stock by sa mohli
+  rozísť, ak `run_shoptet_sync` súbor medzitým atomicky vymení).
+- **Export-age brána (#299 Task 9 review I2)**: PRED čítaním JOIN-u sa overí
+  `_export_age_gate_reason(_export_age_s())` — zdieľaná `EXPORT_MAX_AGE_S` (6 h) konštanta a
+  `_export_age_s()`, rovnaké ako inde v súbore. Starý export ALEBO neznámy vek (`None`) →
+  `run_<key>()` NEZARADÍ NIČ a vráti `{"ok": False, "error": <slovenský dôvod>}` — nikdy tichý
+  úspech s nulou. Táto automatika rozhoduje o PREDAJNOSTI výlučne z exportu, takže starý export
+  by mohol vrátiť na predaj tovar, ktorý sa medzitým reálne vypredal.
+- **Bezpečné zlyhanie**: `run_<key>()` NEVYHADZUJE výnimku — jediný spôsob zlyhania po migrácii
+  je `queue_shoptet_fields` odmietajúci zápis nad nečitateľnou `pending_shoptet` tabuľkou
+  (`StoreWipeRefused`); runner to zaznamená ako `last_status='error'` s neprázdnym `last_error`.
+  Kandidáti sa ukladajú VŽDY (aj keď sa nič nezaradilo — tab ukáže čo bolo NÁJDENÉ).
+- **Default DISABLED je tu obzvlášť dôležité** (napokon píše do prod eshopu, hoci nepriamo cez
+  frontu) — deploy over LEN že tab existuje + Zastavené + tlačidlá; NIKDY neklikaj Štart ani
+  Spustiť teraz (reálny prod zápis o hodinu neskôr). `automations.json` bez kľúča = disabled
+  (over že kľúč tam PO deployi NIE je).
+- Testy: pure JOIN + `restock_rows` (hermetic), Flask wiring incl. **musí NEIMPORTOVAŤ priamo**,
+  **žiadny kredit/dedup store**, prázdna bunka v riadku sa nezaradí, **corrupt pending table →
+  status=error**, no-supplier-data → nič neflipne, **jedno čítanie exportu/supplier_stock** (I1),
+  **stará/neznáma vek exportu → ok:False, nič sa nezaradí** (I2), manager-store izolácia; e2e =
+  `automations_server` s pred-vypočítaným `restock_skladom.json`.
 
 - **Review „↩ Vrátiť" (undo) NEROBÍ re-enable do eshopu — to robí LEN táto nočná automatika (#97).**
   Review karta pri stave `unavailable` (Vypredané, stock 0) má pod „↩ Vrátiť" nenápadnú `.reenote`

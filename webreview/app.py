@@ -7908,20 +7908,47 @@ def _restock_candidates() -> tuple:
     return candidates, has_data, stock
 
 
-def _restock_candidate_rows() -> list:
-    """This run's restock CSV rows, `import_builder.RESTOCK_COLS` order — the ONE
-    place `run_restock_skladom` gets what to queue. Extracted #299 Task 9,
-    zero-arg on purpose: a test can substitute the WHOLE detection→row pipeline in
-    one call to isolate the queueing contract (must not import, must not credit,
-    must skip empty cells) from the JOIN logic (`_restock_candidates`, exercised
-    on its own by test_webreview_restock_skladom.py). Recomputes the JOIN via a
-    fresh `_restock_candidates()` call independent of whatever
-    `run_restock_skladom` already computed for the review-tab store below — a
-    second full CSV/JSON read over data already read once this run, negligible
-    next to a once-a-day automation (the same trade every other #106/#107/#108
-    automation already makes by independently re-reading the whole export)."""
-    candidates, _has_data, _stock = _restock_candidates()
+def _restock_candidate_rows(candidates) -> list:
+    """Convert an ALREADY-COMPUTED `candidates` list (from `_restock_candidates()`)
+    into restock CSV rows, `import_builder.RESTOCK_COLS` order. Pure — no I/O of its
+    own, so it can never observe a different products.csv/supplier_stock.json than
+    the one `run_restock_skladom` already read for the review-tab store below.
+
+    #299 Task 9 review I1: the previous zero-arg version recomputed the WHOLE JOIN a
+    SECOND time (its own `_restock_candidates()` call — a second read of the export
+    and supplier_stock.json), purely as a testing seam. Between the two reads
+    `run_shoptet_sync` could atomically swap products.csv (it has its own hourly
+    schedule and is not mutually exclusive with this producer), so what actually got
+    queued could diverge from what the audit/store/card recorded — for automations
+    that decide whether a product is SELLABLE, "we wrote something different than we
+    logged" is exactly the class of bug that takes a week to find. A test that wants
+    to control the row shape now monkeypatches this function WITH the `candidates`
+    parameter (a param carrying preloaded data — see test_webreview_shoptet_upload.py
+    and test_webreview_restock_skladom.py), never the JOIN itself."""
     return import_builder.restock_rows(candidates, CODE2PAIR)
+
+
+def _export_age_gate_reason(age) -> str | None:
+    """Slovak reason `run_restock_skladom`/`run_stock_skladom` must refuse to queue
+    ANYTHING this run, or `None` when the export is fresh enough to trust (#299 Task
+    9 review I2). Both automations decide product SALEABILITY *purely* from the
+    catalog export (stock_skladom has no other signal at all; restock_skladom's own
+    48h supplier-freshness check, MAX_PAIR_AGE_H, only ever makes the JOIN narrower —
+    it cannot rescue a stale export). Unlike the write-back gates elsewhere
+    (`_export_row_verdicts`, `_do_upload_suppliers`) that merely HOLD or re-send a
+    write, flipping Vypredané→Skladom on stale data can put a sold-out product back
+    on sale. Reuses the SAME constant + measurement as every other export-age gate
+    in this file (`EXPORT_MAX_AGE_S`, `_export_age_s()`) — no second threshold, no
+    second clock. Unknown age (`None` — file missing / unstat-able) is NEVER treated
+    as fresh; that is the same fail-closed stance every other EXPORT_MAX_AGE_S gate
+    takes, and it is deliberate: a missing export could mean anything, and „we don't
+    know" must never read as „it's fine"."""
+    if age is None:
+        return "vek exportu sa nedá zistiť (chýba data/products.csv?)"
+    if age > EXPORT_MAX_AGE_S:
+        return (f"export je starý {age / 3600:.1f} h (limit "
+                f"{EXPORT_MAX_AGE_S / 3600:.1f} h)")
+    return None
 
 
 def run_restock_skladom() -> dict:
@@ -7943,6 +7970,16 @@ def run_restock_skladom() -> dict:
     changes to Skladom and `_restock_candidates` simply stops selecting it — no
     separate "already uploaded" bookkeeping needed, and none is written.
 
+    #299 Task 9 review I2 — a NEW gate ahead of everything else: the queueing
+    migration adds up to another hour of delay between this decision and the actual
+    eshop write (the next hourly drain), so an export gone stale here is even more
+    dangerous than before. `_export_age_gate_reason` refuses to queue ANYTHING (not
+    even a partial batch) and reports `ok: False` with a Slovak reason — a silent
+    `candidates: 0` would look like a healthy "nothing to do" run instead of "I could
+    not tell". How the manager gets to SEE this failure (banner/⚠ badge) is Task 11
+    (`.claude/rules/automation-health.md` §3); this run only needs to make the wrong
+    thing impossible and leave a record that it refused.
+
     Two DELIBERATELY DIFFERENT counts are returned/stored, named unambiguously (#299
     Task 8 review finding: the sibling `_do_upload_externalcodes`/
     `_do_upload_variant_links`'s `would_queue` conflated a ROW count in its dry-run
@@ -7961,9 +7998,25 @@ def run_restock_skladom() -> dict:
     Idempotent — only state-2 (Vypredané) products are candidates, so a product already
     Skladom is never re-flipped once the export refreshes. Reads ONLY its own store +
     the export + supplier_stock; never touches the manager's decision stores."""
-    candidates, has_data, stock = _restock_candidates()
     now = datetime.now(timezone.utc).astimezone()
-    rows = _restock_candidate_rows()
+    gate_reason = _export_age_gate_reason(_export_age_s())
+    if gate_reason:
+        msg = f"{gate_reason} — nezaraďujem nič, radšej počkám na čerstvý export"
+        log.warning("restock_skladom: %s", msg)
+        with _lock:
+            _save_restock({
+                "last_check": now.isoformat(timespec="seconds"),
+                "has_supplier_data": False,
+                "status": "error",
+                "error": msg,
+                "candidates": [],
+                "queued": 0,
+            })
+        return {"ok": False, "error": msg, "status": "error",
+                "candidates": 0, "queued": 0, "has_supplier_data": False}
+
+    candidates, has_data, stock = _restock_candidates()
+    rows = _restock_candidate_rows(candidates)
 
     queued = 0
     if rows:
@@ -8026,16 +8079,12 @@ def _stock_skladom_candidates() -> list:
     return stock_skladom.compute_candidates(csv_text)
 
 
-def _stock_skladom_candidate_rows() -> list:
-    """This run's auto-skladom CSV rows, `import_builder.SKLADOM_COLS` order —
-    mirrors `_restock_candidate_rows`'s #299 Task 9 extraction: zero-arg so a test
-    can substitute the whole detection→row pipeline to isolate the queueing
-    contract from the JOIN logic (`_stock_skladom_candidates`, exercised on its
-    own by test_webreview_stock_skladom.py). Recomputes the JOIN via a fresh
-    `_stock_skladom_candidates()` call — a second export read over data already
-    read once this run; see `_restock_candidate_rows`'s docstring for why that
-    trade is acceptable for a once-a-day automation."""
-    candidates = _stock_skladom_candidates()
+def _stock_skladom_candidate_rows(candidates) -> list:
+    """Convert an ALREADY-COMPUTED `candidates` list (from `_stock_skladom_candidates()`)
+    into auto-skladom CSV rows, `import_builder.SKLADOM_COLS` order. Pure — no I/O of
+    its own; mirrors `_restock_candidate_rows` (#299 Task 9 review I1 — see its
+    docstring for why the previous zero-arg/second-read version was a real bug, not
+    just a wasted export read, for an automation that decides saleability)."""
     return import_builder.skladom_rows(candidates, CODE2PAIR)
 
 
@@ -8070,10 +8119,33 @@ def run_stock_skladom() -> dict:
     hidden = state 3) or an already-Skladom one (state 1) is never a candidate, so a
     residual unit on a discontinued product is never re-listed and a live product is
     never re-flipped (idempotent). Reads ONLY its own store + the export; never
-    touches the manager's decision stores."""
-    candidates = _stock_skladom_candidates()
+    touches the manager's decision stores.
+
+    #299 Task 9 review I2 — same export-age gate as `run_restock_skladom` (see its
+    docstring), and MORE load-bearing here: this automation's ONLY signal is the
+    export (no supplier confirmation to fall back on), and it decides saleability
+    from stock>0 directly — a stale export could put a product back on sale that
+    has since sold out for real. `_export_age_gate_reason` refuses to queue
+    ANYTHING and reports `ok: False` with a Slovak reason; surfacing that to the
+    manager (banner/⚠ badge) is Task 11."""
     now = datetime.now(timezone.utc).astimezone()
-    rows = _stock_skladom_candidate_rows()
+    gate_reason = _export_age_gate_reason(_export_age_s())
+    if gate_reason:
+        msg = f"{gate_reason} — nezaraďujem nič, radšej počkám na čerstvý export"
+        log.warning("stock_skladom: %s", msg)
+        with _lock:
+            _save_stock_skladom({
+                "last_check": now.isoformat(timespec="seconds"),
+                "status": "error",
+                "error": msg,
+                "candidates": [],
+                "queued": 0,
+            })
+        return {"ok": False, "error": msg, "status": "error",
+                "candidates": 0, "queued": 0}
+
+    candidates = _stock_skladom_candidates()
+    rows = _stock_skladom_candidate_rows(candidates)
 
     queued = 0
     if rows:

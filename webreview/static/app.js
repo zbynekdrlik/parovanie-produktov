@@ -5262,10 +5262,13 @@ function renderRestockSkladom() {
   // pending_shoptet table now; the hourly „Sync do Shoptetu" drain does the
   // actual write, so there is no import outcome (processed/updated/failed) to
   // show here any more — just how many field values THIS run queued.
+  // #299 Task 9 review m3 — "zaradené" is NOT "nahraté": the drain can still
+  // BLOCK a row (not-in-catalog/stale/import-busy), so the text must not
+  // promise an upload it cannot guarantee.
   if (r.last_check && (r.candidates || []).length) {
     st.appendChild(el('div', 'muted',
-      `📦 Zaradené do frontu: ${r.queued ?? 0} — nahranie prebehne pri najbližšom `
-      + '„Sync do Shoptetu" (do hodiny).'));
+      `📦 Zaradené do frontu: ${r.queued ?? 0} — o zápis sa pokúsi najbližší `
+      + '„Sync do Shoptetu" (do hodiny); nemusí sa podariť pre každú položku.'));
   }
 
   if (!r.has_supplier_data) {
@@ -5352,10 +5355,11 @@ function renderStockSkladom() {
   const r = STOCK_SKLADOM || {};
   // #299 Task 9 — same change as renderRestockSkladom above: this producer only
   // QUEUES now, so there is no import outcome to show — just what THIS run queued.
+  // #299 Task 9 review m3 — same wording fix as renderRestockSkladom above.
   if (r.last_check && (r.candidates || []).length) {
     st.appendChild(el('div', 'muted',
-      `📦 Zaradené do frontu: ${r.queued ?? 0} — nahranie prebehne pri najbližšom `
-      + '„Sync do Shoptetu" (do hodiny).'));
+      `📦 Zaradené do frontu: ${r.queued ?? 0} — o zápis sa pokúsi najbližší `
+      + '„Sync do Shoptetu" (do hodiny); nemusí sa podariť pre každú položku.'));
   }
 
   const cands = r.candidates || [];
