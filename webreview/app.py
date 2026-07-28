@@ -7206,6 +7206,16 @@ CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links",
 # forestshop.sk the moment a manager clicks ▶ Štart on "Sync do Shoptetu".
 QUEUE_MIGRATED: tuple[str, ...] = ()
 SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
+# #299 review N3 — shoptet_sync and shoptet_upload share the SAME 60-minute
+# schedule, so their scheduler ticks synchronize: without this, the cycle's own
+# PRE-import download re-fetches the 57 MB catalogue a second time in the same
+# tick shoptet_sync already refreshed it on its own schedule. Skip the PRE-
+# import download ONLY when the export is still fresh (younger than this) —
+# an export that age can only have come from THIS tick's own shoptet_sync run,
+# never a stale leftover, so nothing is lost by not re-downloading it. The
+# POST-import download is NEVER skipped by this — that one is the whole point
+# of "the database is reconciled right away" after an upload.
+SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
 
 
 def _enabled_automations() -> set:
@@ -7240,6 +7250,13 @@ def run_shoptet_upload() -> dict:
     merely happens to belong to a code Shoptet confirmed. A field that changed
     mid-flight is kept and goes out again next hour; its credit does not fire.
 
+    #299 review N2 — `sent_credits` is the same kind of send-time snapshot as
+    `sent_fields`, built from the SAME `pending` read that produced `rows`, and
+    carries what a field's `credit` dict looked like when it was sent. A
+    re-queue mid-import can leave a field's plain VALUE unchanged (so it is not
+    dirty and IS confirmed) while writing a NEW `credit.value` — `settle` must
+    still credit the value Shoptet actually saw, never whatever `fresh` holds.
+
     #299 review (Task 4 minor, deferred to Task 6 — M2): the drain reads the table
     through `_load_pending`, which DEGRADES a corrupt/unreadable file to `{}` —
     same as every other reader in this module. That degrade is safe HERE, on
@@ -7254,7 +7271,17 @@ def run_shoptet_upload() -> dict:
     nothing while looking like a clean, empty hour. Skipping that final write
     when `settled` happens to be empty (to avoid a "redundant" save) would throw
     this refusal away and turn a corrupt table into a silent no-op every single
-    hour; that is exactly why it is never skipped."""
+    hour; that is exactly why it is never skipped.
+
+    #299 review N3 — the PRE-import download is skipped when the on-disk export
+    is already fresher than `SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S`: on the
+    shared 60-minute schedule, shoptet_sync's own tick usually lands moments
+    before this cycle's, so re-downloading here is a second 57 MB fetch of a
+    catalogue that is already current. An unknown age (no export on disk, or a
+    test double) is NEVER treated as fresh — the download always runs then, the
+    same fail-safe direction `_export_age_s`/`_export_row_verdicts` already
+    take. The POST-import download is untouched by this — it is what actually
+    reconciles the database right after an upload."""
     with _shoptet_cycle_claim() as got:
         if not got:
             return {"ok": False, "error": "cyklus už beží", "queued": 0, "sent": 0,
@@ -7262,7 +7289,19 @@ def run_shoptet_upload() -> dict:
                     "producers": {}, "resynced": 0,
                     "skipped_second_sync": True, "unconfirmed": 0}
 
-        resynced = int(bool(RUNNER.run_sync("shoptet_sync")))
+        presync_age = _export_age_s()
+        presync_fresh = (presync_age is not None
+                          and presync_age < SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S)
+        if presync_fresh:
+            resynced = 0
+            log.info("sync do Shoptetu: export je čerstvý (%.1f min, limit %.1f "
+                      "min) — preskakujem predimportné stiahnutie",
+                      presync_age / 60, SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S / 60)
+        else:
+            resynced = int(bool(RUNNER.run_sync("shoptet_sync")))
+            log.info("sync do Shoptetu: predimportné stiahnutie spúšťam (vek "
+                      "exportu %s)", "neznámy" if presync_age is None
+                      else f"{presync_age / 60:.1f} min")
 
         enabled = _enabled_automations()
         producers = {}
@@ -7286,6 +7325,18 @@ def run_shoptet_upload() -> dict:
         cols = header.split(";")[len(shoptet_outbox.KEY_COLUMNS):]
         sent_fields = {r[0]: dict(zip(cols, r[len(shoptet_outbox.KEY_COLUMNS):]))
                        for r in rows}
+        # #299 review N2 — the credit VALUE settle() may award must come from
+        # this same send-time snapshot, never from `fresh` below: a producer
+        # that re-queues the SAME field value but a NEW credit_value mid-import
+        # must not have that new value picked up, since Shoptet never saw it.
+        # Built from THIS `pending` (the one that produced `rows`), never from
+        # `fresh` — exactly like `sent_fields` above.
+        sent_credits = {}
+        for code, entry in pending.items():
+            for col, field in (entry.get("fields") or {}).items():
+                c = field.get("credit")
+                if c:
+                    sent_credits.setdefault(code, {})[col] = c
 
         # _import_rows_chunked's own contract (its docstring): the caller MUST hold
         # _import_lock across the call and release it in a `finally` — every other
@@ -7317,7 +7368,8 @@ def run_shoptet_upload() -> dict:
         with _lock:
             fresh = _load_pending()
             settled, credits = shoptet_outbox.settle(fresh, success, blocked,
-                                                      sent_fields, now=now)
+                                                      sent_fields, sent_credits,
+                                                      now=now)
             _save_pending(settled, prev=fresh)
         for store, entries in credits.items():
             _credit_producer(store, entries)

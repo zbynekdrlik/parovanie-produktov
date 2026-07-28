@@ -98,7 +98,7 @@ def build_import(pending, absent_codes=frozenset()):
     return header, rows, blocked
 
 
-def settle(pending, success_codes, blocked, sent_fields, now=""):
+def settle(pending, success_codes, blocked, sent_fields, sent_credits, now=""):
     """Drop what Shoptet confirmed, keep the rest, and hand back the credits.
 
     A producer's uploaded-store is written HERE — after the import log confirmed
@@ -123,6 +123,22 @@ def settle(pending, success_codes, blocked, sent_fields, now=""):
     dirty code in the group withholds the whole group's credit, never just its
     own field, because the group's credited value came from ONE of those codes
     and there is no way to tell which one without re-introducing the #257 bug.
+
+    `sent_credits` is the SAME kind of send-time snapshot as `sent_fields`, but
+    for the `credit` dict each field carried when the import was built —
+    ``{code: {col: {"store": ..., "group": ..., "value": ...}}}``, built by the
+    caller from the SAME `pending` read that produced the sent rows (#299
+    review N2). A field's plain `value` and its `credit.value` are two
+    independent pieces of a producer's queue write — a re-queue during the
+    import can leave `value` unchanged (so the field is NOT dirty and IS
+    dropped as confirmed) while still writing a NEW `credit.value`. Reading the
+    credit from `pending` (the table reloaded right before `settle` runs) would
+    then credit a value Shoptet never saw — the #257 bug in the same new shape
+    C1 already closed for `value`. So the credited value for a (store, group)
+    always prefers the SENT credit for whichever code first establishes that
+    group; `pending`'s own (possibly newer) credit is only a fallback for a
+    field that was never part of the sent snapshot at all (already excluded
+    from credit anyway, since such a field is always dirty).
 
     When a group's queued codes carry different credit values, the value that
     wins depends on dict iteration order over `pending` — callers must queue
@@ -152,12 +168,14 @@ def settle(pending, success_codes, blocked, sent_fields, now=""):
 
     groups = {}
     for code, entry in pending.items():
-        for field in (entry.get("fields") or {}).values():
+        for col, field in (entry.get("fields") or {}).items():
             c = field.get("credit")
             if not c:
                 continue
+            sent_c = (sent_credits.get(code) or {}).get(col)
+            value = sent_c["value"] if sent_c else c["value"]
             g = groups.setdefault((c["store"], c["group"]),
-                                  {"value": c["value"], "codes": set()})
+                                  {"value": value, "codes": set()})
             g["codes"].add(code)
     for (store, group), g in groups.items():
         if g["codes"] <= set(success_codes) and not (g["codes"] & dirty):
