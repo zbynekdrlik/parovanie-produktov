@@ -142,8 +142,8 @@ Odkedy jeden POST hýbe viacerými príznakmi riadku (#211: zapnutie stavu zhasn
 A ešte: **odpoveď servera so stavom riadku treba naozaj PREČÍTAŤ.** Dva zápisy vydané v
 jednom round-tripe idú po dvoch spojeniach a ich serverové vlákna si vezmú `with _lock:`
 v ľubovoľnom poradí — klientske poradie vydania teda NIE JE poradie commitov. Prijmi
-`flags` cez tú istú bránu `confirmed`/`confirmedSeq` (staršia odpoveď neprebije novšiu) a
-mapu prepíš len keď na ňu nič iné neletí.
+`flags` cez tú istú bránu `confirmed`/`confirmedCommit` (staršia odpoveď neprebije novšiu)
+a mapu prepíš len keď na ňu nič iné neletí.
 
 ## 9. `confirmedSeq` príznaku smie stampnúť LEN číslo, ktoré si TEN príznak nárokoval
 
@@ -226,3 +226,41 @@ navyše. `/api/*` nie je CSRF-gated (JSON + session cookie stačí — pozri fix
 Drobnosť z tej istej vlny: v **Python** literáli neuzatváraj slovenské `„…“` ASCII
 úvodzovkou — `"… „skladom" …"` reťazec ukončí a zhodí zber testov na `SyntaxError:
 invalid character '„'`. Buď použi pravú `“`, alebo v hláškach assertu píš bez úvodzoviek.
+
+## 13. Poradie VYDANIA nie je poradie COMMITOV — a dá sa to vyriešiť, len nie na klientovi (#291)
+
+Body 8 a 9 hovoria „odpovede mimo poradia sú z princípu neriešiteľné na strane klienta".
+Platilo to, kým server o svojom poradí nič nepovedal. **Odkedy každý zápis príznaku vracia
+`commitSeq` (monotónny čítač inkrementovaný VNÚTRI toho istého `with _lock:`, v ktorom sa
+zapisuje), riešiteľné to je** — a brána `confirmed` sa riadi ním, nie klientskym `seq`.
+Pole sa preto volá `confirmedCommit`; `seq` si ponechal svoju DRUHÚ úlohu (kto vlastní
+(príznak, riadok) pre rollback a pre HLÁSENIE), ktorá naozaj je o poslednom ÚMYSLE manažéra.
+
+- **Nikdy nemiešaj tie dve čísla v jednom poli.** `seq` je nezávislý čítač na dvojicu
+  (príznak, riadok), `commitSeq` je jedny globálne hodiny — medzi nimi neexistuje
+  usporiadanie. Odpoveď BEZ `commitSeq` (úspech, ktorého telo sa nedalo prečítať) preto
+  neprijíma NIČ; „fallback na poradie vydania" znie neškodne, ale znamená, že raz stampnuté
+  commit-číslo už žiadne issue-číslo neprebije a dovtedy potichu rozhoduje poradie vydania.
+  Prvý pokus to tak mal a zhodil ho `test_a_straggler_from_an_older_burst_cannot_poison_a_later_click`.
+- **Čítač nasaď na wall-clock v ms, nie na 0.** Reštart služby pod otvorenou kartou by inak
+  klientovi s číslom 4 812 posielal samé „staršie" odpovede a ten by ich do konca života
+  stránky odmietal — teda zamrznutý `confirmed`, čo je tvar chyby z PR #290 cez iné dvere.
+- **Obmedzenie „stampuj len nárokované príznaky" ostáva**, hoci pri globálnych hodinách už
+  nie je nosné pre korektnosť: bráni `_flagEntry` založiť účtovníctvo pre príznak, ktorý sa
+  nikdy nezapisoval.
+- **Stub v cudzom teste kodifikuje DRÔT.** `page.route`, ktorý si vymyslí `{ok, flags}` bez
+  `commitSeq`, spadne na tom, že odpoveď bez commit-čísla sa neprijíma — nie na kliente.
+  Taký stub uprav v samostatnom `test:` commite (je spätne kompatibilný, prejde aj proti
+  neopravenému klientovi) — pozri bod 6.
+
+### Ako divergenciu v teste VYROBIŤ (a čím si zavesíš celý beh)
+
+Klikaním sa nedosiahne — obe poradia si takmer vždy sadnú. Obal `window.fetch` cez
+`add_init_script` (teda skôr, než sa načíta `app.js`) a PODRŽ prvý POST na hranici siete,
+kým druhý neskončí; server tak commitne B a potom A. Vzor:
+`tests/e2e/test_order_flag_commit_order.py` (`window.__posts.issued/done` + `window.__release()`).
+
+**PASCA: `page.evaluate` nemá žiadny predvolený timeout.** Test, ktorý v tej istej stránke
+`await`-uje POST, ktorý obal drží, sa nezasekne na 30 s — visí, kým ho nezabije celý beh
+(u nás 600 s SIGTERM, bez jediného riadku výstupu). Testy, ktoré si svoje zápisy awaitujú,
+drž MIMO tej fixtúry (vlastný `page`), nie „len opatrne".
