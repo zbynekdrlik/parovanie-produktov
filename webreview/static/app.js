@@ -849,7 +849,7 @@ async function loadOrders() {
 let _toOrderFails = [];
 
 const _failIdent = (f) => [f.what, f.where || '', f.detail || '',
-                           String(f.value == null ? '' : f.value)].join(' ');
+                           String(f.value == null ? '' : f.value)].join('\u0000');
 
 // The banner lives in the TOP BAR (`#toFails` in index.html), never inside `#list`. Every
 // rollback repaints the list BEFORE it reports, so a banner in there would be wiped by the
@@ -983,13 +983,34 @@ function _flagEntry(field, key, map) {
 // SAME gate the client's bookkeeping uses, so an answer that committed EARLIER can never
 // overwrite one that committed later (`confirmedSeq`), and so a map another write is still
 // holding optimistically is left alone (`inflight`). Returns true if anything moved.
-function _mirrorServerFlags(body, key, seq) {
+//
+// `claimed` = {field: the sequence number THAT FIELD took for this write}. The answer
+// describes all four flags, but only the ones the write actually claimed may be stamped
+// with it: `seq` is an INDEPENDENT counter per (flag, row) — that independence is the
+// whole point of `_flagWrites` — so the numbers are NOT comparable across flags. Stamping
+// every answered flag with the CLICKED flag's number wrote a foreign, higher value into
+// the guard of a flag whose own counter was behind; that guard then rejected that flag's
+// own accepted writes, `confirmed` froze on stale data, and the next REFUSED write "rolled
+// back" to the stale value, i.e. did not roll back — leaving the row shown un-ordered
+// while the server held it (and the mirror image). The invariant, in one line: a flag's
+// `confirmedSeq` may only ever be set from a sequence number THAT flag claimed.
+//
+// Nothing is lost by the restriction, because no endpoint writes across the axes: a write
+// can only ever change the flags it claimed. `/api/ordered` touches `ordered` alone (axis A
+// clears nothing) and `_write_status_flag` only the three axis-B stores — and turning an
+// axis-B status ON already claims all three of them (`toggleStatusFlag`), which is exactly
+// the reverse-commit-order case this mirror was added for.
+function _mirrorServerFlags(body, key, claimed) {
   const flags = body && body.flags;
   if (!flags) return false;
   const maps = { ordered: ORDERED, waiting: WAITING, instock: INSTOCK, unavailable: UNAVAIL };
   let moved = false;
   for (const field of Object.keys(maps)) {
     if (typeof flags[field] !== 'boolean') continue;
+    const seq = claimed[field];
+    // an unclaimed flag is not even LOOKED UP: `_flagEntry` creates the entry on demand,
+    // so touching one here would materialise bookkeeping for a flag this write never wrote
+    if (seq === undefined) continue;
     const map = maps[field];
     const st = _flagEntry(field, key, map);
     if (_flagWrites[st.wk] !== st || seq < st.confirmedSeq) continue;
@@ -1015,6 +1036,10 @@ async function saveOrderWrite(path, payload, writes, key, what) {
   const ans = {};
   const sts = writes.map(w => _flagEntry(w.field, key, w.map));
   const seqs = sts.map(st => ++st.seq);
+  // what this write CLAIMED, each flag under the number IT took — the only numbers that
+  // may ever reach these flags' guards (see `_mirrorServerFlags`)
+  const claimed = {};
+  writes.forEach((w, i) => { claimed[w.field] = seqs[i]; });
   sts.forEach(st => { st.inflight += 1; });
   let err;
   // the decrement must be unskippable: postToOrder swallows every throw today, but a
@@ -1057,8 +1082,9 @@ async function saveOrderWrite(path, payload, writes, key, what) {
   // `with _lock:` in the REVERSE order, so both succeed and the server's final state is
   // the one that committed LAST — not the one the client issued last. Mirror the answered
   // flags through the SAME confirmed/confirmedSeq gate, so a stale answer can never
-  // overwrite a newer one, and only touch a map with nothing else in flight for it.
-  const mirrored = live && !err && _mirrorServerFlags(ans.json, key, seqs[0]);
+  // overwrite a newer one, and only touch a map with nothing else in flight for it —
+  // each flag under the sequence number IT claimed, never the clicked flag's.
+  const mirrored = live && !err && _mirrorServerFlags(ans.json, key, claimed);
   if (!live || !owner) {          // superseded by a newer write, or disowned by a reload
     if (repaint || mirrored) renderToOrder();
     // A write the reload DISOWNED has no map left to roll back — but it still failed, and
@@ -2368,7 +2394,7 @@ function editorSnapHasWork(s, o) {
 // null-prototype: the key is built from a `data-editor` attribute + a store key, so this
 // map must not inherit `constructor` / `toString` (same reason as `_EDITORS`).
 const _pendingEditors = Object.create(null);
-const _editorSnapKey = (s) => s.kind + ' ' + s.key;
+const _editorSnapKey = (s) => s.kind + '\u0000' + s.key;
 
 function restoreOpenEditors(snaps) {
   // parked snapshots ride along with every restore pass. A LIVE snapshot for the same
