@@ -139,7 +139,9 @@ def cycle(tmp_path, monkeypatch):
     # RUNNER.run_sync (never the fire-and-forget run_now) — see automation_runner.py.
     monkeypatch.setattr(webapp.RUNNER, "run_sync",
                         lambda key: calls["run_sync"].append(key) or True)
-    monkeypatch.setattr(webapp.RUNNER, "status", lambda: [])
+    # (Opravné kolo 1 review I2 removed the cycle's own producer-running loop, so
+    # `RUNNER.status()` is no longer read by run_shoptet_upload at all — the old
+    # `RUNNER.status` stub that lived here has nothing left to serve.)
     return calls
 
 
@@ -323,49 +325,27 @@ def test_note_col_none_asks_only_whether_the_code_is_in_the_catalogue(tmp_path, 
     assert v == {"confirmed": set(), "absent": {"B"}}
 
 
-# ── #299 review I1 — the producer half of the cycle had ZERO tests: the ────── #
-# ── `cycle` fixture stubs RUNNER.status to [], so CYCLE_PRODUCERS never ran, ── #
-# ── and no queued row ever carried a credit_group, so _credit_producer was ─── #
-# ── never even called. Three mutations survived a green suite because of it. ─ #
+# ── #299 opravné kolo 1 review I2 — the cycle no longer runs producers at all ─ #
+# ── (each queues on its OWN schedule now; see run_shoptet_upload's docstring). #
+# ── The two tests that used to live here —                                    #
+# ── test_only_an_ENABLED_and_QUEUE_MIGRATED_producer_runs_and_producers_       #
+# ── reflects_it and                                                           #
+# ── test_a_producer_not_yet_migrated_to_the_queue_never_runs_even_when_        #
+# ── enabled — pinned the `QUEUE_MIGRATED`/`CYCLE_PRODUCERS` gate that decided  #
+# ── WHICH producer this cycle was allowed to start. That whole code path is   #
+# ── gone (deleted together with the two constants), so there is nothing left  #
+# ── for those tests to guard — REMOVED, not weakened. What they protected     #
+# ── against (a still-direct-import producer running 24x/day, or a DISABLED    #
+# ── one running at all) is now structurally impossible: this cycle never      #
+# ── calls RUNNER.run_sync on a producer key, full stop. `_credit_producer`'s   #
+# ── own tests below still pin that a QUEUED, CONFIRMED group is credited      #
+# ── correctly, and each producer's own "must not call _import_rows_chunked    #
+# ── directly" test (scattered per-producer through this file and              #
+# ── test_webreview_restock_skladom.py / test_webreview_stock_skladom.py)      #
+# ── still pins that no producer imports on its own — together a STRONGER      #
+# ── guarantee than the old gate (per the review's own instruction).           #
 
-def test_only_an_ENABLED_and_QUEUE_MIGRATED_producer_runs_and_producers_reflects_it(
-        cycle, monkeypatch):
-    """Kills the mutation that deletes `if key not in enabled: continue` — without
-    it the cycle would start DISABLED automations that write to the live eshop
-    every single hour, a direct hole in the #93 contract."""
-    monkeypatch.setattr(webapp, "QUEUE_MIGRATED",
-                        ("parovania_eshop", "grube_externalcode"))
-    monkeypatch.setattr(webapp.RUNNER, "status", lambda: [
-        {"key": "parovania_eshop", "enabled": True},
-        {"key": "grube_externalcode", "enabled": False},
-    ])
-    res = webapp.run_shoptet_upload()
-    assert cycle["run_sync"].count("parovania_eshop") == 1
-    assert "grube_externalcode" not in cycle["run_sync"]
-    assert res["producers"] == {"parovania_eshop": True}
 
-
-def test_a_producer_not_yet_migrated_to_the_queue_never_runs_even_when_enabled(
-        cycle, monkeypatch):
-    """#299 review I2 — a producer not yet in QUEUE_MIGRATED still writes straight to
-    the live eshop on its own daily schedule. The cycle must NEVER start an
-    unmigrated producer just because a manager enabled it in the meantime — that
-    would turn a 1x/day automation into 24x/day writes to forestshop.sk. Kills the
-    mutation that deletes the `QUEUE_MIGRATED` membership check.
-
-    #299 Task 10 migrated the fifth and last producer (parovania_eshop), so this
-    test can no longer rely on a REAL still-unmigrated key to prove the gate — it
-    monkeypatches QUEUE_MIGRATED to a state where parovania_eshop is (hypothetically)
-    not yet in it, mirroring exactly the state Tasks 8/9 tested against their own
-    still-pending producers."""
-    monkeypatch.setattr(webapp, "QUEUE_MIGRATED",
-                        ("grube_externalcode", "split_links",
-                         "restock_skladom", "stock_skladom"))
-    monkeypatch.setattr(webapp.RUNNER, "status",
-                        lambda: [{"key": "parovania_eshop", "enabled": True}])
-    res = webapp.run_shoptet_upload()
-    assert "parovania_eshop" not in cycle["run_sync"]
-    assert res["producers"] == {}
 
 
 def test_a_confirmed_credit_for_parovania_eshop_actually_writes_PAIRINGS_STATE(
@@ -531,38 +511,13 @@ def test_split_links_producer_never_credits_itself(pend, monkeypatch):
     assert res["queued"] == 1
 
 
-def test_all_five_migrated_producers_are_open_in_the_queue_migration_gate(cycle, monkeypatch):
-    """#299 review m4 — the old version of this test asserted membership in the
-    QUEUE_MIGRATED tuple directly (`assert "x" in webapp.QUEUE_MIGRATED`), which is
-    an assert about a CONSTANT, not about BEHAVIOUR: a mutation that emptied
-    QUEUE_MIGRATED entirely was the only thing it could ever catch, and the gate's
-    real behaviour (a producer missing from the gate never runs even when enabled)
-    was already independently pinned by
-    `test_a_producer_not_yet_migrated_to_the_queue_never_runs_even_when_enabled`.
-    Rewritten to exercise `run_shoptet_upload` itself with all five migrated
-    producers (Task 8's grube_externalcode/split_links, Task 9's
-    restock_skladom/stock_skladom, Task 10's parovania_eshop) ENABLED against the
-    REAL (unmonkeypatched) QUEUE_MIGRATED — so a regression that drops ANY of the
-    five keys out of the gate leaves that producer's key missing from
-    `cycle["run_sync"]`/`res["producers"]`, which this test can actually observe.
-    Kills a regression that removes any of the five from QUEUE_MIGRATED (verified
-    by mutation, not by inspection — see the report)."""
-    monkeypatch.setattr(webapp.RUNNER, "status", lambda: [
-        {"key": "parovania_eshop", "enabled": True},
-        {"key": "grube_externalcode", "enabled": True},
-        {"key": "split_links", "enabled": True},
-        {"key": "restock_skladom", "enabled": True},
-        {"key": "stock_skladom", "enabled": True},
-    ])
-    res = webapp.run_shoptet_upload()
-    assert cycle["run_sync"].count("parovania_eshop") == 1
-    assert cycle["run_sync"].count("grube_externalcode") == 1
-    assert cycle["run_sync"].count("split_links") == 1
-    assert cycle["run_sync"].count("restock_skladom") == 1
-    assert cycle["run_sync"].count("stock_skladom") == 1
-    assert res["producers"] == {"parovania_eshop": True, "grube_externalcode": True,
-                                 "split_links": True,
-                                 "restock_skladom": True, "stock_skladom": True}
+# #299 opravné kolo 1 review I2/m4 — `test_all_five_migrated_producers_are_open_
+# in_the_queue_migration_gate` used to live here, exercising `QUEUE_MIGRATED`/
+# `CYCLE_PRODUCERS` end-to-end with all five producers ENABLED. Both constants
+# and the loop that read them are gone (the cycle never runs a producer at all
+# any more), so there is nothing left for it to guard — REMOVED, not weakened;
+# see the longer note above `test_a_confirmed_credit_for_parovania_eshop_
+# actually_writes_PAIRINGS_STATE`'s section header for what still covers this.
 
 
 def test_a_confirmed_credit_for_grube_externalcode_actually_writes_EXTERNALCODES_STATE(
@@ -817,6 +772,11 @@ def test_parovania_eshop_pairings_producer_queues_instead_of_importing(pairings_
     assert status == 200
     assert res["queued"] == 1
     d = webapp._load_pending()
+    assert d["1/M"]["pairCode"] == "P1"                # #299 opravné kolo 1 review m2 —
+    # the pre-migration producer-level test asserted the whole row shape it sent to
+    # import, INCLUDING pairCode; the equivalent post-migration check is that the
+    # queued entry carries it too (queue_fields() stores it on the entry itself,
+    # never inside `fields`).
     assert d["1/M"]["fields"]["internalNote"]["value"] == "https://supplier/x"
     assert d["1/M"]["fields"]["internalNote"]["source"] == "parovania_eshop"
     assert d["1/M"]["fields"]["internalNote"]["credit"]["group"] == "BETALOV|P1"
@@ -857,6 +817,66 @@ def test_a_confirmed_pairing_row_is_credited_immediately_without_going_through_t
     d = json.loads((pairings_iso / "uploaded_pairings.json").read_text(encoding="utf-8"))
     assert d == {"BETALOV|P1": "https://supplier/x"}
     assert webapp._load_pending() == {}
+
+
+def test_a_key_with_an_absent_code_is_not_credited_until_the_missing_code_is_fixed(
+        pairings_iso, monkeypatch):
+    """#299 opravné kolo 1 review C1 (Critical) — a decision key whose codes span
+    a REAL code and one the eshop's catalogue does not carry at all must not be
+    credited just because the real code's queued field got confirmed. Before this
+    fix `send_rows` excluded the absent code entirely, while `credit_group` (built
+    upstream, from `written_codes`) still carried it for the SAME key — so once
+    the drain confirmed the other code, the WHOLE key was credited even though the
+    absent code's link was never written to the eshop, and the code silently
+    dropped out of "chýba v eshope" too (a credited key is no longer "new"). The
+    fix queues the absent code as well; the drain's own `build_import` holds it as
+    `not-in-catalog`, so `settle` sees the group straddling a confirmed and an
+    unconfirmed code and withholds the WHOLE key's credit (the #49 rule)."""
+    monkeypatch.setattr(webapp, "PRODUCTS", [
+        {"key": "BETALOV|P1", "name": "X", "our_url": "u",
+         "variant_codes": ["1/M", "2/L"]}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"1/M": "P1", "2/L": "P1"})
+    # the producer's own check (_do_upload_pairings) sees 2/L as absent from the catalogue
+    monkeypatch.setattr(webapp, "_export_row_verdicts",
+                        lambda rows, note_col=2: {"confirmed": set(), "absent": {"2/L"}})
+
+    res, status = webapp._do_upload_pairings(dry=False)
+
+    assert status == 200
+    assert res["queued"] == 2, "BOTH codes must be queued — this is C1's actual fix"
+    assert res["count"] == 0, "nothing may be credited yet — 2/L is still unconfirmed"
+    assert res["missing_count"] == 1
+    assert res["missing_in_eshop"][0]["code"] == "2/L"
+    d = webapp._load_pending()
+    assert set(d) == {"1/M", "2/L"}
+    assert d["1/M"]["fields"]["internalNote"]["credit"]["group"] == "BETALOV|P1"
+    assert d["2/L"]["fields"]["internalNote"]["credit"]["group"] == "BETALOV|P1"
+    assert not (pairings_iso / "uploaded_pairings.json").exists()
+
+    # now the hourly drain: its OWN catalogue check (note_col=None) sees 2/L as
+    # absent too (same export, same catalogue) — 1/M is sent and Shoptet confirms
+    # it, 2/L never enters `success`.
+    monkeypatch.setattr(webapp, "CYCLE_CLAIM", str(pairings_iso / ".cycle.lock"))
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    monkeypatch.setattr(webapp.RUNNER, "run_sync", lambda key: True)
+    monkeypatch.setattr(webapp, "_export_row_verdicts",
+                        lambda rows, note_col=None: {"confirmed": set(), "absent": {"2/L"}})
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda rows, header, dry, prefix, csv_safe=False, timeout=900: {
+                            "ok": True, "partial": False, "success_codes": {"1/M"},
+                            "partial_codes": set(), "partial_failed": 0,
+                            "chunks_total": 1, "chunks_ok": 1, "processed": 1,
+                            "updated": 1, "failed": 0, "rc": 0, "error_detail": None,
+                            "stdout_tail": "", "err": "", "unreadable": False})
+
+    webapp.run_shoptet_upload()
+
+    assert not (pairings_iso / "uploaded_pairings.json").exists(), (
+        "the key must NOT be credited — 2/L is still unconfirmed")
+    pending = webapp._load_pending()
+    assert set(pending) == {"2/L"}, "1/M is confirmed+unchanged and drops out; 2/L stays"
+    assert pending["2/L"]["blocked"]["reason"] == "not-in-catalog"
+    assert pending["2/L"]["blocked_runs"] == 1
 
 
 def test_parovania_eshop_pairing_GRUBE_credit_value_is_RAW_not_normalized(
@@ -928,6 +948,9 @@ def test_do_upload_suppliers_producer_queues_instead_of_importing(suppliers_iso,
     assert res["queued"] == 1
     assert res["count"] == res["queued"]
     d = webapp._load_pending()
+    assert d["9/Z"]["pairCode"] == "777"               # #299 opravné kolo 1 review m2 —
+    # see the matching note on the pairings producer's own "queues instead of
+    # importing" test above.
     assert d["9/Z"]["fields"]["supplier"]["value"] == "BETALOV"
     assert d["9/Z"]["fields"]["supplier"]["source"] == "parovania_eshop_suppliers"
     assert d["9/Z"]["fields"]["supplier"]["credit"]["group"] == "9/Z"

@@ -81,13 +81,16 @@ def test_run_now_zero_new_reports_ok_without_touching_eshop(page, automations_se
     # #38: the result box also reports the inline order_pairings push (0 seeded here)
     result_text = page.locator(".autoresult").inner_text()
     assert "Inline páry" in result_text and "+0 nových" in result_text
+    assert "zaradených do frontu" in result_text          # #299 Task 10 — queues, not uploads
 
-    # PR #271 review: the two facts a partially-accepted push turns on — how many rows
-    # the eshop already had (credited from its export, never re-sent) and how many
-    # Shoptet REJECTED — are in the API result but were invisible on the card, so the
-    # manager could not see "Shoptet odmietol N z M riadkov" at all.
+    # PR #271 review: the ONE fact this producer can still honestly report — how many
+    # rows the eshop already had exactly as we would write them, credited from its own
+    # export without going through the queue. #299 opravné kolo 1 review I1 — the card
+    # used to ALSO claim "Shoptet odmietol N riadkov" here, but since Task 10 this
+    # producer only queues and never imports, so it cannot know what Shoptet rejects —
+    # that verdict belongs to the hourly "Sync do Shoptetu" drain, not this card.
     assert "potvrdené z exportu" in result_text
-    assert "Shoptet odmietol" in result_text
+    assert "Shoptet odmietol" not in result_text
 
     # the app itself survived (no crash) — other tabs stay usable
     page.get_by_role("button", name="Nevyzdvihnuté zásielky").click()
@@ -116,12 +119,12 @@ def test_a_gate_blocked_run_names_the_export_not_missing_codes(page, automations
                    enabled: false, running: false, schedule: 'denne o 21:00',
                    last_run: '2026-07-27T21:00:00+00:00', last_status: 'ok',
                    last_result: {status: 'blocked',
-                     pairings: {count: 0, total_uploaded: 0, total_products: 0,
+                     pairings: {count: 0, queued: 0, total_uploaded: 0, total_products: 0,
                                 remaining: 0, blocked: 0, order_count: 0,
                                 order_blocked: 0, missing_count: 0, missing_in_eshop: [],
-                                confirmed_in_export: 0, rejected: 0, partial: false,
+                                confirmed_in_export: 0,
                                 ok: true, error: ''},
-                     suppliers: {count: 0, total_uploaded: 0, total_assigned: 3,
+                     suppliers: {count: 0, queued: 0, total_uploaded: 0, total_assigned: 3,
                                  remaining: 3, blocked: 3, missing_count: 0,
                                  missing_in_eshop: [], gate_blocked: gate,
                                  ok: true, error: ''}}}];

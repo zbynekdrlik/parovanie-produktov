@@ -85,7 +85,7 @@ def test_a_last_status_ok_run_that_actually_failed_still_shows_red(
       a.last_error = '';
       a.last_result = {ok: false, error: 'iný import práve beží', queued: 3,
                        sent: 0, confirmed: 0, blocked: 1, stale_blocked: [],
-                       producers: {}, resynced: 1, skipped_second_sync: false,
+                       resynced: 1, skipped_second_sync: false,
                        unconfirmed: 0};
       renderTabs();
       renderShoptetUpload();
@@ -101,7 +101,7 @@ def test_a_last_status_ok_run_that_actually_failed_still_shows_red(
     page.evaluate("""() => {
       const a = AUTOMATIONS.find(x => x.key === 'shoptet_upload');
       a.last_result = {ok: true, error: '', queued: 0, sent: 0, confirmed: 0,
-                       blocked: 0, stale_blocked: [], producers: {},
+                       blocked: 0, stale_blocked: [],
                        resynced: 1, skipped_second_sync: true, unconfirmed: 0};
       renderTabs();
       renderShoptetUpload();

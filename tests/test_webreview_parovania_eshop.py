@@ -1062,14 +1062,29 @@ def test_a_code_the_catalogue_does_not_have_is_held_back_and_listed(iso, monkeyp
 
 def test_a_code_that_reappears_in_the_catalogue_is_sent_on_the_next_run(iso, monkeypatch):
     """Holding a row back is never permanent: it is not credited, so once the
-    manager fixes the code in the eshop the very next run QUEUES it."""
+    manager fixes the code in the eshop the very next run still QUEUES it (idempotent
+    re-write of the same field value).
+
+    #299 opravné kolo 1 review C1 — before that fix `_do_upload_pairings` itself
+    excluded an absent code from what it queued (`r1["queued"] == 0` here). C1
+    changed that: the producer now queues an absent code too (this key has only
+    ONE variant code, so C1's actual bug — several codes sharing a key, one
+    absent — never showed up on THIS single-code test; see
+    `test_a_key_with_an_absent_code_is_not_credited_until_the_missing_code_is_fixed`
+    in test_webreview_shoptet_upload.py for the multi-code regression). Holding the
+    row back is now the DRAIN's job (`build_import`'s `not-in-catalog`), not this
+    producer's — this producer only decides WHAT is not-yet-confirmed."""
     _seed_pairing()
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines(_export({"9/Z": ""})))
     monkeypatch.setattr(webapp, "run_import",
                         lambda *a, **k: pytest.fail("must not import — must queue"))
     r1, _s1 = webapp._do_upload_pairings(dry=False)
-    assert r1["queued"] == 0
+    assert r1["queued"] == 1
+    assert r1["missing_count"] == 1          # still reported "chýba v eshope"
+    assert webapp._load_pending()["1/M"]["fields"]["internalNote"]["value"] == \
+        "https://supplier/x"
+    assert not (iso["tmp"] / "uploaded_pairings.json").exists()
 
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines(_export({"9/Z": "", "1/M": ""})))
