@@ -5526,7 +5526,14 @@ def _export_row_verdicts(rows, note_col=2) -> dict:
     optimisation „read the export once, pass it down" could credit rows from bytes
     whose age was never checked — the guard below can only hold while the read and
     the freshness check stay in the same place. The same guard now protects the
-    `absent` verdict, which is a WRITE condition too (it withholds a row)."""
+    `absent` verdict, which is a WRITE condition too (it withholds a row).
+
+    `note_col=None` (#299 — the combined-import verdict pass over the WHOLE pending
+    table, which has no single fixed column layout: every row can carry a different
+    set of queued fields) skips the `confirmed` comparison entirely — there is no
+    single column that means "internalNote" across a header built from `sorted(cols)`
+    over an arbitrary field set — and returns only `absent`. Never index `r[note_col]`
+    when it is `None`; every other caller keeps the default `2` and is unaffected."""
     none = {"confirmed": set(), "absent": set()}
     age = _export_age_s()
     if age is not None and age > EXPORT_MAX_AGE_S:
@@ -5544,8 +5551,11 @@ def _export_row_verdicts(rows, note_col=2) -> dict:
             log.warning("export nesie len %d kódov (limit %d) — vyzerá neúplne, "
                         "nepotvrdzujem ani nezadržiavam nič", len(codes), floor)
         return none
-    confirmed = {r[0] for r in rows
-                 if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
+    if note_col is None:
+        confirmed = set()
+    else:
+        confirmed = {r[0] for r in rows
+                     if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
     absent = {r[0] for r in rows if r[0] not in codes}
     return {"confirmed": confirmed, "absent": absent}
 
@@ -5646,8 +5656,16 @@ def _load_pending() -> dict:
     return _read_json_store(PENDING_SHOPTET, {})
 
 
-def _save_pending(d: dict) -> None:
-    _atomic_write_json(PENDING_SHOPTET, d, protect=True)
+def _save_pending(d: dict, *, prev: dict | None = None) -> None:
+    """`prev=` names the read `d` was DERIVED from (#299 Task 6): `queue_fields`
+    always GROWS or holds the count (an existing code only ever gains fields), so
+    the shrink-guard's `new >= was` skip covers every queueing write without it.
+    `settle` is the one caller that legitimately SHRINKS the table (confirmed rows
+    drop out) — it hands back a brand-new dict, not the object `_load_pending`
+    read, so without `prev=` naming that read the guard cannot tell this shrink
+    apart from an unrelated smaller map and correctly refuses it (store-prune.md
+    §3: "ak staviaš NOVÚ mapu, musíš pridať prev=d0")."""
+    _atomic_write_json(PENDING_SHOPTET, d, protect=True, prev=prev)
 
 
 def queue_shoptet_fields(source, header, rows, credit_group=None,
@@ -7175,6 +7193,138 @@ def run_shoptet_sync() -> dict:
     return result
 
 
+# The order matters: pairings first (they define what a product IS), then the
+# code/link producers, then the availability ones — so a product that gains a
+# supplier link in the same cycle is already linked when it goes on sale.
+CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links",
+                   "restock_skladom", "stock_skladom")
+SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
+
+
+def _enabled_automations() -> set:
+    return {a["key"] for a in RUNNER.status() if a.get("enabled")}
+
+
+def run_shoptet_upload() -> dict:
+    """#299 — the hourly cycle: download → let the producers queue → ONE import →
+    settle → download again.
+
+    It writes nothing to the eshop itself: producers queue into pending_shoptet,
+    and only rows the import log confirmed are credited and dropped. The second
+    download is skipped when nothing went up (most hours) — it would re-fetch the
+    57 MB catalogue for no reason.
+
+    #299 review (Task 4 minor, deferred to Task 6 — M2): the drain reads the table
+    through `_load_pending`, which DEGRADES a corrupt/unreadable file to `{}` —
+    same as every other reader in this module. That degrade is safe HERE, on
+    purpose, and deliberately NOT special-cased: the two `_load_pending()` calls
+    below only ever decide what THIS run attempts to send; the strictness that
+    matters is at the END of the cycle, where `_save_pending(settled)` runs
+    UNCONDITIONALLY. `_atomic_write_json(protect=True)` re-reads the file straight
+    off disk at write time (never trusts what an earlier read handed back), so a
+    genuinely corrupt table still makes this run raise `StoreWipeRefused` out of
+    this function — the exact same refusal `queue_shoptet_fields` gets from the
+    same guard — instead of quietly completing a run that settled and credited
+    nothing while looking like a clean, empty hour. Skipping that final write
+    when `settled` happens to be empty (to avoid a "redundant" save) would throw
+    this refusal away and turn a corrupt table into a silent no-op every single
+    hour; that is exactly why it is never skipped."""
+    with _shoptet_cycle_claim() as got:
+        if not got:
+            return {"ok": False, "error": "cycle-busy", "queued": 0, "sent": 0,
+                    "confirmed": 0, "blocked": 0, "stale_blocked": [],
+                    "producers": {}, "resynced": 0,
+                    "skipped_second_sync": True, "unconfirmed": 0}
+
+        RUNNER.run_now("shoptet_sync")
+        resynced = 1
+
+        enabled = _enabled_automations()
+        producers = {}
+        for key in CYCLE_PRODUCERS:
+            if key not in enabled:
+                continue
+            producers[key] = bool(RUNNER.run_now(key))
+
+        pending = _load_pending()
+        header_all, rows_all, _ = shoptet_outbox.build_import(pending)
+        verdicts = _export_row_verdicts(rows_all, note_col=None) if rows_all else \
+            {"confirmed": set(), "absent": set()}
+        header, rows, blocked = shoptet_outbox.build_import(
+            pending, absent_codes=verdicts["absent"])
+
+        # _import_rows_chunked's own contract (its docstring): the caller MUST hold
+        # _import_lock across the call and release it in a `finally` — every other
+        # of its 7 call sites in this module does exactly this, because it drives a
+        # single shared browser automation that cannot run twice at once. Not in
+        # the brief's original sketch; added here because skipping it would let a
+        # manual "Spustiť teraz" of parovania_eshop/grube_externalcode/... (still on
+        # their OLD direct-import path — #299's producer migration is a later task)
+        # race this cycle's own import against the very same Shoptet session.
+        res = None
+        import_busy = False
+        if rows:
+            if not _import_lock.acquire(blocking=False):
+                import_busy = True
+                log.warning("sync do Shoptetu: iný import práve beží — táto vlna "
+                           "sa preskakuje, riadky ostávajú v tabuľke na ďalší beh")
+            else:
+                try:
+                    res = _import_rows_chunked(rows, header, False,
+                                               prefix="import_sync_", timeout=900)
+                finally:
+                    _import_lock.release()
+        success = set(res["success_codes"]) if res else set()
+        now = datetime.now().isoformat(timespec="seconds")
+        with _lock:
+            fresh = _load_pending()
+            settled, credits = shoptet_outbox.settle(fresh, success, blocked, now=now)
+            _save_pending(settled, prev=fresh)
+        for store, entries in credits.items():
+            _credit_producer(store, entries)
+
+        sent, confirmed = len(rows), len(success)
+        unconfirmed = sent - confirmed
+        skipped = SECOND_SYNC_SKIP_WHEN_NOTHING_SENT and confirmed == 0
+        if not skipped:
+            RUNNER.run_now("shoptet_sync")
+            resynced = 2
+
+        stale = shoptet_outbox.stale_blocked(settled)
+        ok = (not import_busy) and (res is None or (res["ok"] and not res["partial"])) \
+            and not stale
+        if unconfirmed:
+            if import_busy:
+                log.error("sync do Shoptetu: %d riadkov čaká, lebo iný import práve "
+                          "bežal — pôjdu v ďalšom hodinovom behu", unconfirmed)
+            else:
+                log.error("sync do Shoptetu: %d z %d riadkov Shoptet nepotvrdil — "
+                          "ostávajú v tabuľke a pôjdu znova", unconfirmed, sent)
+        if stale:
+            log.error("sync do Shoptetu: %d kódov je zablokovaných 3 a viac behov "
+                      "(eshop ich v katalógu nemá): %s", len(stale), stale[:10])
+        error = ""
+        if not ok:
+            error = "iný import práve beží" if import_busy else \
+                "nepotvrdené alebo zablokované riadky"
+        return {"ok": ok, "queued": len(pending), "sent": sent,
+                "confirmed": confirmed, "blocked": len(blocked),
+                "stale_blocked": stale, "producers": producers,
+                "resynced": resynced, "skipped_second_sync": skipped,
+                "unconfirmed": unconfirmed, "error": error}
+
+
+def _credit_producer(store: str, entries: dict) -> None:
+    """Write a producer's uploaded-state for groups the import confirmed."""
+    path = {"parovania_eshop": PAIRINGS_STATE}.get(store)
+    if path is None:
+        log.warning("outbox: neznámy kredit store %s (%d skupín)", store, len(entries))
+        return
+    _record_uploaded(lambda: _read_json_store(path, {}),
+                     lambda d: _atomic_write_json(path, d, protect=True),
+                     entries)
+
+
 def run_parovania_eshop() -> dict:
     """Nightly push (daily 21:00) of the workers' NEW pairings (reorder links →
     internalNote) + newly assigned suppliers (→ supplier field) to the Shoptet
@@ -8576,6 +8726,11 @@ AUTOMATION_DESCRIPTIONS = {
         # tab could never show him again.
         "review kartách. Zmaže pritom značky pri riadkoch tých objednávok, ktoré sú už "
         "vybavené a na tabe sa nedajú zobraziť — nič iné z tvojej práce nemení.",
+    "shoptet_upload":
+        "Každú hodinu stiahne čerstvý stav zo Shoptetu, nechá zapnuté automatizácie "
+        "zapísať ich zmeny do tabuľky čakajúcich zmien, všetko naraz nahrá do eshopu "
+        "jedným importom a potom stav stiahne znova. Nahraté označí až vtedy, keď to "
+        "Shoptet potvrdí; čo eshop v katalógu nemá, ostane čakať a je to tu vidieť.",
     "parovania_eshop":
         "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
         "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
@@ -8634,6 +8789,12 @@ AUTOMATIONS_REG = [
                name="Sync zo Shoptetu",
                schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
                run_fn=run_shoptet_sync),
+    # #299 — the write-side counterpart of shoptet_sync. Starts DISABLED (#93):
+    # it pushes to the live eshop, so the manager turns it on himself.
+    Automation(key="shoptet_upload",
+               name="Sync do Shoptetu",
+               schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
+               run_fn=run_shoptet_upload),
     # #109 — nightly push of new pairings + assigned suppliers to the Shoptet
     # eshop (migrated from n8n YuDugCCOnwejRfva). SAFETY (#93 contract): starts
     # DISABLED — this one WRITES to the live production eshop, so it runs ONLY
@@ -8861,9 +9022,25 @@ def _shoptet_cycle_claim():
     when another process already holds it (the caller must skip this run, never
     proceed anyway). The claim is ALWAYS released when the `with` block exits —
     including on an exception — so a crashed cycle never wedges the next hourly
-    run open forever."""
+    run open forever.
+
+    #299 review (Task 5 minor, deferred to Task 6): opening the claim file itself
+    can fail — a full disk, wrong permissions, a missing/unwritable data dir — and
+    that is NOT the same event as another process already holding the claim. Left
+    unguarded, an hourly `os.open` failure would raise straight out of this
+    generator and crash the WHOLE automation (recorded as a hard error) instead of
+    the same clean "skip this run, try again next hour" the busy-claim branch
+    already gives. Same yield-`False` shape, so a caller cannot tell the two apart
+    from the return value alone — that is fine, since both mean exactly the same
+    thing to the caller (skip this hour); the log line is what tells them apart."""
     p = os.fspath(CYCLE_CLAIM)
-    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        log.error("sync do Shoptetu: claim súbor %s sa nedá otvoriť (%r) — cyklus "
+                  "preskakujem, o hodinu znova", p, e)
+        yield False
+        return
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -8888,6 +9065,16 @@ def _shoptet_cycle_claim():
 # is ever looked up by UI_LABELS on the frontend (_navButton/PAGE_TITLES key on
 # the nav key). Keep this set in sync with app.js's TABS/AUTOMATION_TABS keys
 # whenever a nav tab is added/renamed-in-code.
+#
+# "shoptet_upload" (#299) is DELIBERATELY absent here even though it is a full
+# Automation — same reason the three vystavy_* chains above are absent: it has
+# NO nav tab of its own yet. test_nav_keys_match_appjs (test_webreview_ui_labels.py)
+# cross-checks this exact set against app.js's TABS/AUTOMATION_TABS/SYSTEM_TABS
+# arrays and fails on ANY key present on only one side — adding it here without
+# app.js's matching #tab-shoptet_upload card, NAV_ICONS entry and PAGE_TITLE (the
+# plan's own Task 7) would 400 every rename attempt at the SAME key from the UI
+# and break that drift guard immediately. Add it here in the SAME commit that adds
+# the app.js card, never before.
 NAV_KEYS = {
     "toorder", "nedostupne", "vystavy", "search", "notes", "review",     # TABS
     "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
