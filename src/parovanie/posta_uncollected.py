@@ -92,8 +92,17 @@ MAX_EMAILS = 4
 #     still being picked („Vybavuje sa") legitimately has none yet, and counting those would light
 #     the coverage alarm below every single day. The app derives this set as `terminal − cancelled`
 #     rather than offering a box of its own — see webreview/app.py `_posta_statuses`.
-#   CANCELLED — never nag a customer who cancelled (#93). It is a subset of the app's `terminal`
-#     set, and the app enforces that at both ends so the two can never drift apart.
+#   CANCELLED — never nag a customer who cancelled (#93). It is meant to be a subset of the
+#     app's `terminal` set, but „the app enforces that at both ends so the two can never drift
+#     apart" was never true and is corrected here (PR #298 review, B-F3). The SAVE endpoint
+#     enforces it — on the resulting configuration, whenever a request touches `terminal` or
+#     `cancelled` (review A6). The LOADER deliberately does not (`_resolve_status_sets`): a
+#     stored configuration written before this set existed would otherwise turn into a red
+#     banner with the prune disarmed, on upgrade, for a state nobody caused. So one drift path
+#     stays open by design — a `cancelled` nobody ever configured, left at this version's
+#     default, against a `terminal` the manager legitimately narrowed. Nothing dangerous
+#     follows: „dispatched" is `terminal − cancelled`, so a name outside `terminal` subtracts
+#     nothing, and the cancelled filter keeps working off the names it was given.
 #
 # Names are compared through `export_helpers.norm_status` (NFC + strip) on BOTH sides — the trap
 # #296 names: this module used to lowercase, while the configuration carries the exact names the

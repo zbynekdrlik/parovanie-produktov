@@ -8918,7 +8918,9 @@ def api_order_statuses_impact():
     status makes EVERY order in it older than `MIN_DAYS` instantly mail-eligible, and the
     dedup store only stops the SECOND mail, never the first wave. Measured on the live export
     (28.7.2026): adding „Kompletná" reaches 2 more orders, „Osob. odber" 3 — and „Vybavená"
-    387 orders / 370 distinct customers, all at once, under a card that answers „✅ Uložené".
+    387 orders, 250 of them with a note and an address = 237 distinct customers, all at once,
+    under a card that answers „✅ Uložené". (370 is the address count WITHOUT the note filter
+    — the over-count this endpoint's three numbers exist to avoid; PR #298 review, B-F2.)
 
     Three numbers rather than one, because they answer different questions and a preview that
     exaggerates is one the manager stops reading:
@@ -8963,7 +8965,8 @@ def api_order_statuses_impact():
     try:
         # ONLY the added statuses: `select_orders` filters per status, so the orders it
         # returns for them ARE the difference against the current set — no need to run it
-        # twice and subtract, which would also double the cost on a 55 MB export.
+        # twice and subtract, which would also double the cost of reading the export. (It is
+        # the ~1.1 MB ORDERS export here, not the ~55 MB catalog one — PR #298 review, B-F5.)
         newly = orders_reminder.select_orders(csv_bytes, statuses=added)
         with _lock:
             done = _load_orders_reminder().get("orders") or {}

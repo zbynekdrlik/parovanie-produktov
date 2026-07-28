@@ -762,8 +762,9 @@ def test_the_blind_spot_ERROR_stops_claiming_ANI_JEDNA_when_a_few_survive(iso):
 # reminder mails (deliberately: one notion of „open", not four). The sharp edge is that adding
 # a status makes EVERY order in it older than 4 days instantly mail-eligible, with no preview,
 # no count and no cap on the first run. Measured on the live export (28.7.2026): adding
-# „Kompletná" reaches 2 more orders, „Osob. odber" 3 — and „Vybavená" 387 orders / 370
-# distinct customers, in one wave, under a card that answers „✅ Uložené".
+# „Kompletná" reaches 2 more orders, „Osob. odber" 3 — and „Vybavená" 387 orders, of which
+# 250 carry a note and an address = 237 distinct customers, in one wave, under a card that
+# answers „✅ Uložené". (370 is the same count WITHOUT the note filter; PR #298 review, B-F2.)
 _IMPACT_HEAD = ("code;date;statusName;email;phone;billFullName;itemCode;itemName;"
                 "itemAmount;totalPriceWithVat;shopRemark\r\n")
 

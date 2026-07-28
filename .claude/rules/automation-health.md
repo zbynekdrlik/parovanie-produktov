@@ -174,6 +174,77 @@ Alarm musí ostať **iba počítadlom**: nesmie nič odoslať ani rozšíriť mn
 do eskalácie — pripni to testom (`test_posta_source_alarm_never_widens_what_gets_mailed`). Pri
 Pošte je to kritické: keď sa zdroj opraví, 130 doteraz neviditeľných zásielok sa objaví naraz.
 
+### Signál slepoty napísaný pre JEDNOPRVKOVÚ množinu po zovšeobecnení PRESTANE platiť
+
+Najdrahší nález revízie PR #298 a trieda chyby, ktorá sa bude opakovať pri každej ďalšej
+konštante, z ktorej sa stane množina. `dispatched_status_unknown` detegoval premenovanie
+stavu podmienkou „množina rozpoznaných je PRÁZDNA" — a bola to správna detekcia presne
+dovtedy, kým bola množina jednoprvková (`DISPATCHED_STATUS = "Vybavená"`), lebo vtedy
+„obchod premenoval stav" a „nič sa nezhoduje" boli JEDNA udalosť. Po odvodení množiny
+(`terminal − cancelled`, tri živé názvy) sa udalosti rozišli: stačí, aby prežil jeden
+zriedkavý názov, a podmienka je nesplniteľná navždy. Namerané: 100 objednávok premenovaných
++ 1 dobropis + 1 výmena = `dispatched_orders=2`, alarm ticho, hoci na maine zaznel.
+
+- **Keď z konštanty robíš množinu, prejdi KAŽDÝ test „je to prázdne / je to rovné X" nad ňou**
+  a spýtaj sa, čo ten test naozaj meria. Prázdnota jednoprvkovej množiny je „vokabulár sa
+  rozpadol"; prázdnota trojprvkovej je len „rozpadol sa CELÝ", čo je najmenej pravdepodobný
+  spôsob, akým sa rozpadá.
+- **Formuluj signál cez to, čo alarm potrebuje na PRÁCU, nie cez tvar konfigurácie.** Tu:
+  „mám okno, ktoré sa oplatí posúdiť, a nerozpoznám v ňom dosť objednávok, aby som ho
+  posúdil" — čiže tá istá dôkazná hranica, pod ktorou už alarm odmieta počítať. Dve výroky
+  sa tým stanú VYČERPÁVAJÚCE (okno je buď posúdené, alebo vyhlásené za slepé) a medzi nimi
+  nezostane pásmo, ktoré je ticho v oboch smeroch. Pripni to testom nad ROZSAHOM hodnôt
+  (`for n in range(0, 9)`), nie jedným prípadom — diera bola práve v intervale 1–4.
+- **Porovnanie „konfigurované názvy vs. názvy v exporte" znie ako riešenie a nie je ním.**
+  Pri premenovaní hlavného stavu sú zvyšné dva v exporte stále prítomné (prienik neprázdny =
+  ticho), a opačná verzia („chýba hociktorý") je trvalý šum, lebo zriedkavý stav v 30-dňovom
+  okne legitímne chýba (`Vybavený Dobropis` = 10 riadkov za 90 dní).
+- **Nová hranica sa kalibruje ako každá iná (bod 2), meraním nad kĺzavými oknami** — tu
+  `MIN_ELIGIBLE_FOR_BLIND_SPOT = 20` proti nameranému pomeru, ktorý cez 120 okien neklesol
+  pod 0,63 — a v teste nechaj KONTROLU na pokojné malé okno, inak sa „hlás vždy slepotu"
+  nedá odlíšiť od opravy.
+- **Hláška musí ísť s tým** — keď signál po zovšeobecnení pokrýva aj 1–4 rozpoznaných, veta
+  „ANI JEDNA nemá stav…" je nepravdivá práve v novej vetve (bod 4, posledný odsek).
+
+### Druhá cesta zákazníckeho mailu musí byť fail-closed ROVNAKO ako prvá
+
+Odsek vyššie („Fail-closed pre MAZANIE ešte neznamená fail-closed pre MAIL") uzavrel
+`run_orders_reminder`. Revízia PR #298 našla, že tá istá konfigurácia má DRUHÉHO
+odosielateľa — eskalácie Pošty — a ten ostal fail-OPEN, lebo si sety bral cez
+`_posta_statuses()`, teda cez ďalší wrapper nad `_order_statuses()`. Oprava jednej cesty
+teda nie je oprava triedy chyby.
+
+- **Keď zavrieš jednu cestu, VYGREPUJ všetkých konzumentov toho istého nastavenia**
+  (`grep -n "_order_statuses()" webreview/app.py`) a rozhodni o KAŽDOM: posiela, maže, alebo
+  len kreslí? Prvé dve musia dostať dôvod.
+- **Wrapper, ktorý dôvod nenesie, je nová fail-open cesta — aj keď ho píšeš ty sám o dva
+  tickety neskôr.** Preto `_posta_statuses()` vracia `(cancelled, dispatched, reason)`:
+  bezdôvodová verzia jednoducho neexistuje, takže sa na ňu nedá zabudnúť. Cudzie testy,
+  ktoré tú n-ticu rozbaľujú, uprav vo vlastnom commite (`toorder-e2e.md` bod 6).
+- **Zablokovaný mail nie je zlyhaný mail.** Nepripočítavaj ho k `emails_failed` — schová to
+  príčinu za číslo, ktoré vyzerá ako problém SMTP. Vlastné počítadlo (`emails_blocked`) plus
+  príznak na banner, a prihlás sa do `source_degraded` (bod 3), nie do nového kľúča.
+
+### Náhľad dopadu porovnávaj proti REÁLNE ÚČINNEJ konfigurácii
+
+Tretí nález tej istej revízie a najzradnejší z nich: náhľad z bodu 5 odpočítaval to, čo
+loader VYKRESLÍ (predvolby), nie to, čo reálne UČINKUJE. Pri pokazenej konfigurácii sa
+neposiela nič, čiže účinná množina je PRÁZDNA a celý kandidát je nový — náhľad však hlásil
+„nič nepribudne" presne pri najväčšej vlne, akú vie appka vypustiť (namerané: 0 vs. 37).
+
+- **Spýtaj sa „čo by sa stalo, keby to teraz bežalo", nie „čo je v konfigurácii".** Keď je
+  odosielateľ fail-closed, jeho účinná množina pri pokazenom nastavení je prázdna.
+- **`unknown` tu NIE JE bezpečná odpoveď.** Číslo sa dá spočítať; schovať ho práve vtedy,
+  keď je najväčšie, je tá istá slepota v inom kabáte.
+- **Pošli so sebou aj DÔVOD** (`config_broken`) a nechaj dialóg povedať, prečo je to číslo
+  celý zoznam a nie rozdiel. Nevysvetlené veľké číslo si manažér preloží ako nadhodnotenie —
+  a náhľad, ktorému neverí, je náhľad, ktorý preklikáva.
+- **Brána sama nesmie zlyhať OTVORENE.** `if (!r.ok) return true` (a rovnako `catch`) spraví
+  z potvrdenia pri 403/500/výpadku siete no-op — čiže presne to tiché prepustenie, proti
+  ktorému brána vznikla. Nedá sa zistiť = pýtaj sa. A keďže náhľad vie siahnuť na stiahnutie
+  exportu, ohranič čakanie (`AbortController`) a napíš do karty, že pracuješ — inak manažér
+  pozerá na mŕtve tlačidlo.
+
 ## 4. Hodnota, ktorá ide zákazníkovi do mailu — typuj ju, neprepisuj ju „fail-soft"
 
 Pri `retainedTill` (#283) sa neznáma hodnota držala „radšej ukázať než zahodiť". To je pri DÁTUME
@@ -211,8 +282,11 @@ jedno nastavenie, ktoré ticho ROZŠÍRI množinu ľudí, ktorým niečo odíde.
 záložku, „Nedostupné" AJ pripomienkové maily (zámerne — jedna predstava o „otvorenej"
 objednávke, nie štyri), takže pridanie stavu spraví zo VŠETKÝCH objednávok v ňom starších
 než 4 dni okamžite mailovateľné. Dedup store zastaví až DRUHÝ mail, prvú vlnu nikdy.
-Namerané nad živým exportom: pridanie `Vybavená` = 387 objednávok / **370 zákazníkov** naraz,
-pod kartou, ktorá odpovie „✅ Uložené".
+Namerané nad živým exportom: pridanie `Vybavená` = 387 objednávok, z toho 250 s poznámkou
+aj adresou = **237 rôznych zákazníkov** naraz, pod kartou, ktorá odpovie „✅ Uložené".
+(370 je počet rôznych adries BEZ filtra „má poznámku" — čiže presne to nadhodnotenie,
+proti ktorému tento bod píše „rozlíš, koľko toho pribudne, od toho, koľkým to reálne
+môže odísť". Revízia PR #298, B-F2: aj tento playbook to číslo raz uviedol zle.)
 
 Keď nastavenie rozhoduje o tom, komu sa niečo POŠLE, ukáž dôsledok PRED uložením:
 
