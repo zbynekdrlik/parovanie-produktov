@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from webreview import app as webapp
@@ -116,6 +117,14 @@ def test_the_claim_is_released_even_when_the_body_raises(claim):
 def cycle(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending.json"))
     monkeypatch.setattr(webapp, "CYCLE_CLAIM", str(tmp_path / ".cycle.lock"))
+    # #299 Task 11 — the empty-producer streak store must be as test-isolated as
+    # PENDING_SHOPTET above: it is a NEW module-level `_store(...)` path, and
+    # without this every test in the session would share ONE streak file (the
+    # backend suite only isolates WEBREVIEW_OUT once, for the whole run —
+    # conftest.py's own comment on that). Left un-isolated, three separate tests
+    # calling run_shoptet_upload once each could accumulate into a false streak.
+    monkeypatch.setattr(webapp, "UPLOAD_EMPTY_STREAK_STATE",
+                        str(tmp_path / "upload_empty_streak.json"))
     calls = {"import": [], "run_sync": []}
     monkeypatch.setattr(webapp, "_import_rows_chunked",
                         lambda rows, header, dry, prefix, csv_safe=False, timeout=900: (
@@ -143,6 +152,135 @@ def cycle(tmp_path, monkeypatch):
     # `RUNNER.status()` is no longer read by run_shoptet_upload at all — the old
     # `RUNNER.status` stub that lived here has nothing left to serve.)
     return calls
+
+
+# ── #299 Task 11 — "hlasné tiché smrti": say out loud what a run could not do ─ #
+def test_unconfirmed_rows_make_the_run_degraded_with_a_slovak_warning(cycle, monkeypatch):
+    # The brief's own literal lambda signature (`rows, header, dry, prefix,
+    # timeout=900`) predates M3's `csv_safe=True` kwarg on the real call site
+    # (`run_shoptet_upload`'s `_import_rows_chunked(rows, header, False,
+    # prefix="import_sync_", csv_safe=True, timeout=900)`) — without `csv_safe`
+    # in the signature this stub raises `TypeError: unexpected keyword argument
+    # 'csv_safe'` the moment the cycle actually calls it. Matches the `cycle`
+    # fixture's own stub signature instead.
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda rows, header, dry, prefix, csv_safe=False, timeout=900: {
+                            "ok": False, "partial": True, "success_codes": set(),
+                            "partial_codes": {"A"}, "partial_failed": 1,
+                            "chunks_total": 1, "chunks_ok": 0, "processed": 0,
+                            "updated": 0, "failed": 1, "rc": 1, "error_detail": None,
+                            "stdout_tail": "", "err": "", "unreadable": False})
+    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
+                                [["A", "P", "u"]])
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is True
+    assert any("nepotvrdil" in w for w in res["warnings"])
+
+
+def test_an_enabled_producer_that_queues_nothing_three_runs_in_a_row_is_reported(cycle):
+    for _ in range(3):
+        res = webapp.run_shoptet_upload()
+    assert any("nezaradil" in w for w in res["warnings"])
+
+
+def test_a_producer_that_queues_something_resets_its_empty_streak(cycle):
+    """The streak must genuinely RESET on activity, not just count up forever —
+    otherwise a producer that goes quiet for 2 runs, queues something, then goes
+    quiet again for 2 more would wrongly report a "3 in a row" streak on run 5
+    even though it was never 3 CONSECUTIVE empty runs."""
+    webapp.run_shoptet_upload()
+    webapp.run_shoptet_upload()
+    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
+                                [["A", "P", "https://x"]])
+    webapp.run_shoptet_upload()          # parovania_eshop had something THIS run
+    webapp.run_shoptet_upload()
+    res = webapp.run_shoptet_upload()
+    assert not any("parovania_eshop" in w or "Párovania" in w for w in res["warnings"]), (
+        res["warnings"])
+
+
+# ── #299 Task 11 — the NAJDÔLEŽITEJŠIA POŽIADAVKA: the hourly cycle deploys ─── #
+# ── DISABLED and is the ONLY path anything reaches the eshop by. The alarm ─── #
+# ── below must fire from the pending table + the `enabled` flag ALONE — it ─── #
+# ── must NEVER need the disabled cycle itself to run (a safeguard guarding ─── #
+# ── itself is no safeguard at all). ─────────────────────────────────────────── #
+@pytest.fixture
+def automations_iso(tmp_path, monkeypatch):
+    """`_queue_stale_while_disabled_warning` reads `RUNNER`'s `enabled` flag
+    through `api_automations`, which persists to the CROSS-PROCESS automations
+    state — isolate it exactly like `test_webreview_automations.py`'s own `iso`
+    fixture does, or the session-wide default `automations.json` would leak
+    `enabled` between unrelated tests (the backend suite only isolates
+    `WEBREVIEW_OUT` once, for the whole session — conftest.py's own comment)."""
+    monkeypatch.setattr(webapp.RUNNER, "state_path", str(tmp_path / "automations.json"))
+
+
+def _queue_one_field(pend, queued_at):
+    pend.write_text(json.dumps({"A": {"fields": {"internalNote": {
+        "value": "u", "source": "parovania_eshop", "queued_at": queued_at}}}}),
+        encoding="utf-8")
+
+
+def test_queue_stale_warning_is_empty_when_the_cycle_is_enabled(pend):
+    _queue_one_field(pend, "2000-01-01T00:00:00+00:00")   # ancient, but ENABLED
+    assert webapp._queue_stale_while_disabled_warning(enabled=True) == ""
+
+
+def test_queue_stale_warning_is_empty_when_the_queue_is_empty(pend):
+    assert webapp._queue_stale_while_disabled_warning(enabled=False) == ""
+
+
+def test_queue_stale_warning_is_empty_while_still_fresh(pend):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    _queue_one_field(pend, now)
+    assert webapp._queue_stale_while_disabled_warning(enabled=False) == ""
+
+
+def test_queue_stale_warning_fires_past_the_threshold_while_disabled(pend):
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S + 60)
+           ).isoformat(timespec="seconds")
+    _queue_one_field(pend, old)
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w and "vypnutý" in w and "Sync do Shoptetu" in w
+
+
+def test_queue_stale_warning_an_unparsable_timestamp_fires_loud_not_silent(pend):
+    """A corrupt/unexpected `queued_at` must never read as "must be fine" — the
+    fail-safe direction for THIS alarm is loud, the opposite of every other
+    degrade-to-empty reader in this module (deliberately: staying quiet here is
+    exactly the silent death this task exists to end)."""
+    pend.write_text(json.dumps({"A": {"fields": {"internalNote": {
+        "value": "u", "source": "parovania_eshop", "queued_at": "not-a-date"}}}}),
+        encoding="utf-8")
+    assert webapp._queue_stale_while_disabled_warning(enabled=False) != ""
+
+
+def test_api_automations_surfaces_the_stale_warning_for_shoptet_upload(pend, automations_iso):
+    """The end-to-end wiring the sidebar badge + card actually depend on:
+    `/api/automations` must carry `queue_stale_warning` on the `shoptet_upload`
+    entry EVEN THOUGH that automation has never run (no `run_shoptet_upload`
+    call anywhere in this test) — and starting the cycle (never anything else)
+    is what silences it on the very next poll."""
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S + 60)
+           ).isoformat(timespec="seconds")
+    _queue_one_field(pend, old)
+    with webapp.app.test_request_context():
+        j = webapp.api_automations().get_json()
+    (a,) = [x for x in j["automations"] if x["key"] == "shoptet_upload"]
+    assert a["last_run"] == "", "this alarm must fire even if the cycle NEVER ran"
+    assert a["queue_stale_warning"]
+
+    # Turning the cycle ON silences the alarm on the very NEXT poll. Nothing
+    # else does — this is the "cannot be silenced by renaming state or turning
+    # off the reporter" property: `/api/automations` itself is not a toggle,
+    # and the warning has no enable/disable knob of its own.
+    webapp.RUNNER.set_enabled("shoptet_upload", True)
+    with webapp.app.test_request_context():
+        j2 = webapp.api_automations().get_json()
+    (a2,) = [x for x in j2["automations"] if x["key"] == "shoptet_upload"]
+    assert a2["queue_stale_warning"] == ""
 
 
 def test_an_empty_table_uploads_nothing_and_skips_the_second_download(cycle):

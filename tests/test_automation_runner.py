@@ -155,7 +155,11 @@ def test_run_error_captured_and_runner_survives(tmp_path):
     def boom():
         raise RuntimeError("SHOPTET_ORDERS_URL chýba")
     r = _runner(tmp_path, run_fn=boom)
-    assert r._execute("demo") is True
+    # #299 Task 11 finding 1 — a run that RAISED must report False (it did not
+    # succeed), not the pre-fix unconditional True that made a caller counting
+    # on this return value (the hourly Shoptet cycle's `resynced`) believe a
+    # failed run had gone fine.
+    assert r._execute("demo") is False
     st = r.status()[0]
     assert st["last_status"] == "error"
     assert "SHOPTET_ORDERS_URL" in st["last_error"]
@@ -211,7 +215,13 @@ def test_run_sync_reports_the_run_s_own_failure_without_raising(tmp_path):
     def boom():
         raise RuntimeError("boom")
     r = _runner(tmp_path, run_fn=boom)
-    assert r.run_sync("demo") is True          # the RUN was attempted, not "it succeeded"
+    # #299 Task 11 finding 1 — this used to assert `is True` ("the RUN was
+    # attempted, not 'it succeeded'"), which is exactly the bug: the hourly
+    # Shoptet cycle's `resynced = int(bool(RUNNER.run_sync(...)))` had no other
+    # way to tell a failed download from a real one and reported "stiahnuté"
+    # for a download that never landed. `run_sync` never raises (still true —
+    # the failure is recorded, not thrown) but now reports it truthfully.
+    assert r.run_sync("demo") is False
     st = r.status()[0]
     assert st["last_status"] == "error"
     assert "boom" in st["last_error"]

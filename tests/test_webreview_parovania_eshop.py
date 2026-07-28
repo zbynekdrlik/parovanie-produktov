@@ -206,7 +206,14 @@ def test_run_pushes_pairings_and_suppliers_and_records_counts(iso, monkeypatch):
 #    _do_upload_pairings core, no new HTTP round-trip / no duplicated logic) ────
 def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
     """#299 Task 10 — an inline order pairing now QUEUES exactly like a reviewed
-    decision, credit_group `order:<code>`; credited only by the drain."""
+    decision, credit_group `order:<code>`; credited only by the drain.
+
+    #299 Task 11 finding 3 — `order_count` used to be
+    `len(uploaded_order_codes)` (codes confirmed RIGHT AWAY from the export
+    match), so it read 0 here even though "7/Y" genuinely queued this run — the
+    card's "📦 Inline páry: +0 nových" was always zero. It now reports what THIS
+    run actually queued for the inline-order bucket, so it is 1 here (the one
+    order pairing this test seeds)."""
     _seed_pairing()
     _seed_order_pairing()
     monkeypatch.setattr(webapp, "run_import",
@@ -215,7 +222,7 @@ def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
     result = webapp.run_parovania_eshop()
 
     assert result["status"] == "ok"
-    assert result["pairings"]["order_count"] == 0     # not credited yet
+    assert result["pairings"]["order_count"] == 1     # "7/Y" queued this run
     assert result["pairings"]["order_blocked"] == 0
     pending = webapp._load_pending()
     assert pending["7/Y"]["fields"]["internalNote"]["value"] == "https://supplier/inline"
@@ -734,7 +741,11 @@ def test_run_via_runner_records_error_when_queueing_raises(iso, monkeypatch):
     with open(webapp.PENDING_SHOPTET, "w", encoding="utf-8") as f:
         f.write("{ this is not json")
 
-    assert webapp.RUNNER._execute("parovania_eshop") is True    # runner survives
+    # #299 Task 11 finding 1 — the RETURN value now reports whether the run
+    # SUCCEEDED, not merely whether it ran; this run raised, so it is False.
+    # The runner surviving (not crashing, `last_status`/`last_error` recorded)
+    # is still pinned by the assertions right below.
+    assert webapp.RUNNER._execute("parovania_eshop") is False
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "parovania_eshop"]
     assert st["last_status"] == "error"
     assert st["running"] is False

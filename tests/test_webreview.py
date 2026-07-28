@@ -1215,6 +1215,12 @@ def test_order_pairings_queued_under_order_namespace(monkeypatch, tmp_path):
     # #299 Task 10 — an inline order pairing now QUEUES exactly like a reviewed
     # decision, credit_group `order:<code>`, and is credited by the drain, never
     # by this producer.
+    #
+    # #299 Task 11 finding 3 — `order_count` used to be codes confirmed RIGHT
+    # AWAY from the export match (`len(uploaded_order_codes)`), so it read 0
+    # here even though "B/1" genuinely queued this run — the "📦 Inline páry"
+    # card counter was always zero. It now reports what THIS run actually
+    # queued for the inline-order bucket.
     tok = _arm_pairings(monkeypatch, tmp_path, {},
                         order_pairings={"B/1": "https://supplier/inline"})
     monkeypatch.setattr(webapp, "run_import",
@@ -1223,7 +1229,7 @@ def test_order_pairings_queued_under_order_namespace(monkeypatch, tmp_path):
     j = r.get_json()
     assert r.status_code == 200 and j["ok"]
     assert j["count"] == 0                          # no decisions this run
-    assert j["order_count"] == 0 and j["order_blocked"] == 0    # not credited yet
+    assert j["order_count"] == 1 and j["order_blocked"] == 0    # "B/1" queued this run
     pending = json.loads((tmp_path / "pending_shoptet.json").read_text())
     assert pending["B/1"]["fields"]["internalNote"]["value"] == "https://supplier/inline"
     assert pending["B/1"]["fields"]["internalNote"]["credit"]["group"] == "order:B/1"
@@ -1329,7 +1335,11 @@ def test_order_pairings_dry_run_does_not_mark_uploaded(monkeypatch, tmp_path):
     assert not (tmp_path / "pending_shoptet.json").exists()
     # dry-run must NOT persist → still 1 new order pairing to queue on the next (real) call
     r2 = _client().post("/api/n8n/upload-pairings", headers={"Authorization": f"Bearer {tok}"})
-    assert r2.get_json()["queued"] == 1
+    # #299 Task 11 finding 3 — this scenario is order-pairing-only (no reviewed
+    # decisions), so the DECISION bucket ("queued") is 0 and the inline-order
+    # bucket ("order_count") is the 1 that actually queued.
+    j2 = r2.get_json()
+    assert j2["queued"] == 0 and j2["order_count"] == 1
 
 
 # #299 Task 10 — `test_order_pairings_failed_import_does_not_mark_uploaded` deleted.

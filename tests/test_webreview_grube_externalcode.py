@@ -170,7 +170,11 @@ def test_a_corrupt_pending_table_makes_the_runner_record_error_not_crash(iso):
     with open(webapp.PENDING_SHOPTET, "w", encoding="utf-8") as f:
         f.write("{ this is not json")
 
-    assert webapp.RUNNER._execute("grube_externalcode") is True    # runner survives
+    # #299 Task 11 finding 1 — the RETURN value now reports whether the run
+    # SUCCEEDED, not merely whether it ran; this run raised, so it is False.
+    # The runner surviving (not crashing, `last_status`/`last_error` recorded)
+    # is still pinned by the assertions right below.
+    assert webapp.RUNNER._execute("grube_externalcode") is False
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "grube_externalcode"]
     assert st["last_status"] == "error"
     assert st["running"] is False

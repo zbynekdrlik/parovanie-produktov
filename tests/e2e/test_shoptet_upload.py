@@ -111,3 +111,94 @@ def test_a_last_status_ok_run_that_actually_failed_still_shows_red(
         '.tabs .navrow:has-text("Sync do Shoptetu") .navwarn').count() == 0
 
     assert console == [], f"console not clean: {console}"
+
+
+# ── #299 Task 11 — the NAJDÔLEŽITEJŠIA POŽIADAVKA: the hourly cycle deploys ─── #
+# ── DISABLED and is the ONLY path anything reaches the eshop by. A manager ─── #
+# ── who forgets to turn it on must not be able to miss it — EVEN THOUGH the ── #
+# ── cycle itself has never run (queue_stale_warning lives OUTSIDE last_result, ─
+# ── see `_queue_stale_while_disabled_warning` in app.py). ────────────────────── #
+def test_the_disabled_cycle_stale_queue_alarm_lights_the_badge_and_the_card(
+        shoptet_upload_server, page):
+    console = _console(page)
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.get_by_role("button", name="Sync do Shoptetu").click()
+    page.wait_for_selector('[data-testid="shoptet-upload-status"]')
+
+    # dark before the alarm — nothing simulated yet (mirrors the sibling test's
+    # own "before" check, same pattern).
+    assert page.locator('[data-testid="shoptet-upload-stale-disabled"]').count() == 0
+    assert page.locator(
+        '.tabs .navrow:has-text("Sync do Shoptetu") .navwarn').count() == 0
+
+    page.evaluate("""() => {
+      const a = AUTOMATIONS.find(x => x.key === 'shoptet_upload');
+      a.queue_stale_warning = 'Hodinový cyklus „Sync do Shoptetu“ je vypnutý a '
+        + 'vo fronte na neho čaká práca už 5 h — nič z toho sa nedostane do '
+        + 'eshopu, kým ho nezapneš (▶ Štart na karte „Sync do Shoptetu“).';
+      renderTabs();
+      renderShoptetUpload();
+    }""")
+
+    banner = page.locator('[data-testid="shoptet-upload-stale-disabled"]').inner_text()
+    assert "vypnutý" in banner and "5 h" in banner, banner
+    assert page.locator(
+        '.tabs .navrow:has-text("Sync do Shoptetu") .navwarn').count() == 1
+
+    # …and it goes dark once the alarm clears (cycle started, or queue emptied)
+    # — a live signal, never permanently on.
+    page.evaluate("""() => {
+      const a = AUTOMATIONS.find(x => x.key === 'shoptet_upload');
+      a.queue_stale_warning = '';
+      renderTabs();
+      renderShoptetUpload();
+    }""")
+    assert page.locator('[data-testid="shoptet-upload-stale-disabled"]').count() == 0
+    assert page.locator(
+        '.tabs .navrow:has-text("Sync do Shoptetu") .navwarn').count() == 0
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_run_warnings_render_as_their_own_banner_and_light_the_badge(
+        shoptet_upload_server, page):
+    """`last_result.warnings` (#299 Task 11) — a run that itself reports
+    `ok: true` (nothing THIS cycle attempted failed) can still be `degraded`
+    (a producer's empty streak, a skipped second download). Each sentence
+    renders as its own `.uploadwarn` block, and the sidebar badge lights from
+    `last_result.degraded`, not from `ok`."""
+    console = _console(page)
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+    page.get_by_role("button", name="Sync do Shoptetu").click()
+    page.wait_for_selector('[data-testid="shoptet-upload-status"]')
+
+    page.evaluate("""() => {
+      const a = AUTOMATIONS.find(x => x.key === 'shoptet_upload');
+      a.last_run = '2026-07-28T10:00:00+02:00';
+      a.last_status = 'ok';
+      a.last_error = '';
+      a.last_result = {ok: true, error: '', queued: 0, sent: 0, confirmed: 0,
+                       blocked: 0, stale_blocked: [], resynced: 1,
+                       skipped_second_sync: true, unconfirmed: 0,
+                       degraded: true,
+                       warnings: ['Automatizácie, ktoré majú zásobovať frontu, '
+                                  + 'nezaradili 3 hodinové behy po sebe nič: '
+                                  + 'GRUBE kódy → eshop — over, či sú zapnuté '
+                                  + 'a či im nezlyhal zdroj dát.']};
+      renderTabs();
+      renderShoptetUpload();
+    }""")
+
+    warn = page.locator('[data-testid="shoptet-upload-warning"]')
+    expect_text = "nezaradili 3 hodinové behy"
+    assert expect_text in warn.inner_text(), warn.inner_text()
+    # `degraded: true` lights the badge even though `ok: true` — the whole
+    # point of the widened predicate in navError().
+    assert page.locator(
+        '.tabs .navrow:has-text("Sync do Shoptetu") .navwarn').count() == 1
+    # "Posledný beh" must read DEGRADOVANÝ, never OK, for a degraded run.
+    assert "DEGRADOVANÝ" in page.locator(".autostatus .autometa").inner_text()
+
+    assert console == [], f"console not clean: {console}"

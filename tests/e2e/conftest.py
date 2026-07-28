@@ -912,7 +912,20 @@ def shoptet_upload_server(tmp_path_factory):
     public catalogue identifiers with no customer link, so any obviously-fake shape
     is fine. `automations.json` is deliberately absent: the tab must render its
     default 'Zastavené' state (#93 SAFETY contract) with no file on disk at all,
-    same as every other fresh-install automation fixture."""
+    same as every other fresh-install automation fixture.
+
+    #299 Task 11 — `queued_at` is computed RELATIVE TO NOW (well under the
+    `QUEUE_STALE_WHILE_DISABLED_AFTER_S` 3h alarm threshold), never a fixed
+    calendar date. A fixed date is exactly the kind of fixture that silently
+    rots: this one used to read `2026-07-28T09:00...` and passed for months,
+    then quietly started tripping the NEW "queue is old + cycle is disabled"
+    sidebar alarm the moment real time drifted more than 3h past that literal
+    string — a fixture bug this task's own new alarm exposed, not caused."""
+    now = datetime.now().astimezone()
+
+    def _ago(minutes):
+        return (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
     out = tmp_path_factory.mktemp("wr_shoptet_upload_out")
     port = _free_port()
     base = f"http://127.0.0.1:{port}"
@@ -921,21 +934,21 @@ def shoptet_upload_server(tmp_path_factory):
             "pairCode": "", "blocked": None, "attempts": 0,
             "fields": {"internalNote": {"value": "https://dodavatel.example/a",
                                         "source": "test_source",
-                                        "queued_at": "2026-07-28T09:00:00+02:00"}},
+                                        "queued_at": _ago(10)}},
         },
         "TESTUP2": {
             "pairCode": "", "blocked": None, "attempts": 0,
             "fields": {"internalNote": {"value": "https://dodavatel.example/b",
                                         "source": "test_source",
-                                        "queued_at": "2026-07-28T09:05:00+02:00"}},
+                                        "queued_at": _ago(5)}},
         },
         "TESTUP3": {
             "pairCode": "",
-            "blocked": {"reason": "not-in-catalog", "since": "2026-07-27T09:00:00+02:00"},
+            "blocked": {"reason": "not-in-catalog", "since": _ago(60)},
             "blocked_runs": 3, "attempts": 3,
             "fields": {"internalNote": {"value": "https://dodavatel.example/c",
                                         "source": "test_source",
-                                        "queued_at": "2026-07-26T09:00:00+02:00"}},
+                                        "queued_at": _ago(90)}},
         },
     }, ensure_ascii=False), encoding="utf-8")
     env = {
