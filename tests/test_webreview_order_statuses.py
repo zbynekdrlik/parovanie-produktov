@@ -23,6 +23,7 @@ What is pinned here:
 import json
 import os
 import sys
+import unicodedata
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -156,8 +157,15 @@ def test_the_openness_signal_and_the_prune_read_the_SAME_configured_sets(iso):
 
 def test_a_status_in_NONE_of_the_three_sets_is_reported_as_unknown(iso):
     """The point of the third set: „unknown" must mean genuinely UNJUDGED. A status the
-    manager has not classified anywhere is the one case the signal exists for."""
-    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená"], "known_open": []})
+    manager has not classified anywhere is the one case the signal exists for.
+
+    `known_open` is written NON-empty on purpose (PR #295 review): this test used to send
+    `[]`, which the loader silently replaced with the four built-in defaults — so it passed
+    only because its probe status happened not to be one of them, and it proved nothing
+    about the third set at all. What `[]` really means now has its own test
+    (`test_an_emptied_known_open_makes_its_statuses_UNKNOWN_again`)."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená"],
+                 "known_open": ["Osob. odber"]})
     body = (_order_row("Vybavuje sa")
             + _order_row("Čaká na dodávateľa", code="99002002", item="B1"))
 
@@ -393,3 +401,215 @@ def test_the_prune_result_NAMES_the_configured_open_statuses(iso, tmp_path, monk
 
     assert res["skipped"] == "no-open-orders", res
     assert res["open_statuses"] == ["Spracúva sa"], res
+
+
+# ── 6. PR #295 review — what the endpoint ACCEPTS, the loader must then USE ─────
+#    B3: the POST validates the payload as written; the loader then re-reads the file and
+#    substitutes DEFAULTS for a set it finds unusable — including one the manager
+#    deliberately emptied. Those defaults can clash with the sets he DID write, and a clash
+#    discards the whole configuration. The card answers „✅ Uložené. Platí to hneď pre celú
+#    appku." while the rename reverts, the mails go to nobody, and the prune is disarmed
+#    with a banner naming a „contradictory list" the panel renders as EMPTY — a state he
+#    cannot fix from the screen at all.
+
+@pytest.mark.parametrize("payload", [
+    # moved „Kompletná" from the default `known_open` into `terminal` and emptied the box
+    # it came from — the exact shape the panel produces from three textareas
+    {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Kompletná"], "known_open": []},
+    # …and the same with the third box merely omitted from the payload
+    {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Vratený tovar"]},
+])
+def test_a_configuration_the_endpoint_ACCEPTS_is_the_one_the_app_then_USES(iso, payload):
+    """The invariant, whichever way it is satisfied: either the POST refuses with a
+    sentence the manager can act on, or what he saved is exactly what the app runs on.
+    „Accepted, then silently discarded by the loader" is the one answer that must not
+    exist."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json=payload)
+
+    if r.status_code == 400:
+        assert (r.get_json().get("error") or "").strip(), r.get_json()
+        return
+    assert r.status_code == 200, r.get_json()
+    saved = r.get_json()["statuses"]
+    sets, reason = webapp._order_statuses_state()
+
+    assert reason == "", (reason, saved, {k: sorted(v) for k, v in sets.items()})
+    for key, values in saved.items():
+        assert sets[key] == frozenset(values), (key, saved, sets)
+
+
+def test_the_card_never_reports_saved_for_a_configuration_that_reverts(iso):
+    """The reported symptom in one assertion: the panel's own GET must agree with what the
+    save answered, or „✅ Uložené. Platí to hneď pre celú appku." is false."""
+    c = _client_as(ADMIN)
+    r = c.post("/api/order-statuses", json={"to_order": ["Vybavuje sa"],
+                                            "terminal": ["Vybavená", "Kompletná"],
+                                            "known_open": []})
+    if r.status_code == 400:
+        return                                    # refused at the door is also correct
+    assert c.get("/api/order-statuses").get_json()["statuses"] == r.get_json()["statuses"]
+
+
+# ── 7. B4 — „absent" and „deliberately empty" are different answers ─────────────
+#    `_clean_status_list` returns None for `[]`, so the loader cannot tell an unusable set
+#    from one the manager emptied on purpose — and `known_open: []` is an explicitly
+#    supported POST outcome the loader never honoured.
+
+def test_an_explicitly_EMPTIED_known_open_stays_empty(iso):
+    """He cleared the box because he wants every unclassified status reported. Restoring
+    the four built-ins instead makes the „unknown" signal permanently quiet about them —
+    the exact opposite of what he asked for."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"known_open": []})
+
+    assert r.status_code == 200, r.get_json()
+    assert webapp._order_statuses()["known_open"] == frozenset(), \
+        webapp._order_statuses()["known_open"]
+    # …and it survives the round trip through the file, which is where it was lost
+    assert _client_as(USER).get("/api/order-statuses").get_json()["statuses"]["known_open"] \
+        == []
+
+
+def test_an_emptied_known_open_makes_its_statuses_UNKNOWN_again(iso):
+    """The observable consequence, so the test cannot pass on a default that merely
+    happens not to contain the probe status (the flaw in
+    test_a_status_in_NONE_of_the_three_sets_is_reported_as_unknown)."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená"], "known_open": []})
+    body = _order_row("Vybavuje sa") + _order_row("Kompletná", code="99002002", item="B1")
+
+    *_rest, unknown, reason = webapp._orders_by_openness((_HEAD + body).encode("cp1250"))
+
+    assert reason == "", reason
+    # „Kompletná" IS one of the built-in known_open statuses — with the box emptied it must
+    # be reported, or the emptying did nothing
+    assert unknown == {"Kompletná"}, unknown
+
+
+@pytest.mark.parametrize("key", ["to_order", "terminal"])
+def test_the_two_LOAD_BEARING_sets_still_refuse_to_be_emptied(iso, key):
+    """B4 must not become „empty means empty" for the two sets that cannot be empty: an
+    empty `to_order` blanks the tab and the customer mails, an empty `terminal` disarms the
+    prune."""
+    assert _client_as(ADMIN).post("/api/order-statuses",
+                                  json={key: []}).status_code == 400
+    _write(iso, {key: []})
+    assert webapp._order_statuses()[key] == frozenset(webapp.ORDER_STATUS_DEFAULTS[key])
+    assert webapp._order_statuses_state()[1] == "bad-status-config"
+
+
+def test_an_ABSENT_set_still_means_the_default(iso):
+    """The other half of the distinction — a file that never mentions a set is not a file
+    that emptied it."""
+    _write(iso, {"to_order": ["Vybavuje sa"]})
+
+    assert webapp._order_statuses()["known_open"] \
+        == frozenset(webapp.ORDER_STATUS_DEFAULTS["known_open"])
+
+
+# ── 8. B5 — the same status name must COMPARE equal to the export's ────────────
+#    `_clean_status_list` strips but does not normalise, so an NFD status name is stored
+#    and echoed back looking identical while matching nothing. For `to_order` NOTHING
+#    surfaces it: the tab, „Nedostupné" and the mails simply go empty.
+
+def test_a_status_typed_in_NFD_still_matches_the_export(iso):
+    """„Vybavuje sa" pasted from a source that decomposes its diacritics is byte-different
+    and looks identical on screen. Normalise both sides, or the tab empties in silence."""
+    nfd = unicodedata.normalize("NFD", "Vybavuje sa čaká")
+    assert nfd != "Vybavuje sa čaká"
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"to_order": [nfd]})
+    assert r.status_code == 200, r.get_json()
+
+    export = (_HEAD + _order_row("Vybavuje sa čaká")).encode("cp1250")
+
+    assert [x["key"] for x in webapp.build_to_order_rows(export, [], {}, {}, {})] \
+        == ["99002001|A1"]
+    seen, still_open, *_rest = webapp._orders_by_openness(export)
+    assert still_open == {"99002001"}, still_open
+
+
+def test_an_export_status_in_NFD_still_matches_the_configuration(iso):
+    """…and the same from the other side: the EXPORT is the untrusted input here."""
+    _write(iso, {"to_order": ["Vybavuje sa čaká"]})
+    export = (_HEAD + _order_row(
+        unicodedata.normalize("NFD", "Vybavuje sa čaká"))).encode("cp1250")
+
+    assert len(webapp.build_to_order_rows(export, [], {}, {}, {})) == 1
+    picked = orders_reminder.select_orders(
+        export, now=datetime.now() + timedelta(days=30),
+        statuses=webapp._order_statuses()["to_order"])
+    assert [o["code"] for o in picked] == ["99002001"], picked
+
+
+def test_the_API_reports_which_statuses_the_EXPORT_actually_carries(iso, monkeypatch):
+    """A name that matches nothing is otherwise invisible. The panel can only flag „this
+    status matches 0 orders" if it is told what the export contains."""
+    body = (_order_row("Vybavuje sa") + _order_row("Vybavená", code="99002002", item="B1")
+            + _order_row("Osob. odber", code="99002003", item="C1"))
+    monkeypatch.setattr(webapp, "_orders_csv_cached",
+                        lambda: (_HEAD + body).encode("cp1250"))
+
+    got = _client_as(USER).get("/api/order-statuses").get_json()
+
+    assert got["export_statuses"] == ["Osob. odber", "Vybavená", "Vybavuje sa"], got
+    saved = _client_as(ADMIN).post("/api/order-statuses",
+                                   json={"known_open": ["Osob. odber"]}).get_json()
+    assert saved["export_statuses"] == got["export_statuses"], saved
+
+
+def test_an_unreadable_export_leaves_the_endpoint_working(iso, monkeypatch):
+    """The extra field is a convenience — it must never be able to break the card the
+    manager goes to when things are already broken."""
+    def boom():
+        raise OSError("no export here")
+    monkeypatch.setattr(webapp, "_orders_csv_cached", boom)
+
+    r = _client_as(USER).get("/api/order-statuses")
+
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert r.get_json()["export_statuses"] == []
+
+
+# ── 9. B6 — one unreadable file must not 500 four tabs ─────────────────────────
+
+def test_an_UNREADABLE_config_file_degrades_instead_of_500ing_every_tab(iso, monkeypatch):
+    """`_read_json_store` propagates an I/O error on purpose, and `_order_statuses()`
+    catches nothing — so a permissions problem on THIS one file 500s /api/orders,
+    /api/nedostupne and /api/nedostupne/<code>. Every other store breaks one tab."""
+    p = iso / "order_statuses.json"
+    p.write_text(json.dumps({"to_order": ["Vybavuje sa"]}), encoding="utf-8")
+    p.chmod(0o000)
+    monkeypatch.setattr(webapp, "_orders_csv_cached",
+                        lambda: (_HEAD + _order_row("Vybavuje sa")).encode("cp1250"))
+    try:
+        sets, reason = webapp._order_statuses_state()
+        c = _client_as(USER)
+        assert c.get("/api/orders").status_code == 200
+        assert c.get("/api/nedostupne").status_code == 200
+    finally:
+        p.chmod(0o600)
+
+    # …and it is the „present but unusable" answer, not a silent fresh-install fallback
+    assert reason == "bad-status-config", reason
+    assert sets["to_order"] == frozenset(webapp.ORDER_STATUS_DEFAULTS["to_order"]), sets
+
+
+# ── 10. B7 — a status name is untrusted text that reaches the log ──────────────
+
+@pytest.mark.parametrize("bad", ["Vybavená\nINFO fake log line", "Vybavuje\rsa", "a\x00b",
+                                 "x\x1b[31m"])
+def test_a_status_name_with_CONTROL_characters_is_refused(iso, bad):
+    """`_clean_status_list` only `.strip()`s, so an interior newline survives the POST and
+    lands unescaped in `log.info(...)` and in the prune's `", ".join(open_statuses)` — log
+    forgery through an authenticated API call or a hand edit."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"known_open": [bad]})
+
+    assert r.status_code == 400, r.get_json()
+    assert (r.get_json().get("error") or "").strip(), r.get_json()
+
+
+def test_a_hand_edited_control_character_is_DROPPED_by_the_loader(iso):
+    """The endpoint can refuse; the file can be edited by hand, so the loader has to
+    defend the log too."""
+    _write(iso, {"known_open": ["Dobrý stav", "zlý\nstav"]})
+
+    assert webapp._order_statuses()["known_open"] == frozenset({"Dobrý stav"}), \
+        webapp._order_statuses()["known_open"]
