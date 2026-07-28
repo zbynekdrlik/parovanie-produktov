@@ -97,3 +97,43 @@ def test_queue_fields_returned_table_does_not_share_nested_dicts_with_the_input(
                                 rows=[["B", "P", "FOREST"]], now="T2")
     assert after["A"]["fields"] is not before["A"]["fields"]
     assert after["A"]["fields"]["internalNote"] is not before["A"]["fields"]["internalNote"]
+
+
+def _pending_two_codes():
+    p, _ = ob.queue_fields({}, source="parovania_eshop",
+                           header="code;pairCode;internalNote",
+                           rows=[["A", "PA", "https://x"]], now="T")
+    p, _ = ob.queue_fields(p, source="restock_skladom",
+                           header="code;pairCode;availabilityInStock;stock",
+                           rows=[["B", "PB", "Skladom", "5"]], now="T")
+    return p
+
+
+def test_build_import_merges_every_queued_field_into_ONE_header():
+    header, rows, blocked = ob.build_import(_pending_two_codes())
+    assert header == "code;pairCode;availabilityInStock;internalNote;stock"
+    assert blocked == {}
+    by_code = {r[0]: r for r in rows}
+    assert by_code["A"] == ["A", "PA", "", "https://x", ""]
+    assert by_code["B"] == ["B", "PB", "Skladom", "", "5"]
+
+
+def test_a_code_the_catalogue_does_not_carry_is_blocked_not_sent():
+    header, rows, blocked = ob.build_import(_pending_two_codes(),
+                                            absent_codes={"B"})
+    assert [r[0] for r in rows] == ["A"]
+    assert blocked == {"B": "not-in-catalog"}
+    # the blocked code's own columns must not widen the header of what IS sent
+    assert header == "code;pairCode;internalNote"
+
+
+def test_an_empty_table_builds_nothing_rather_than_an_empty_import():
+    header, rows, blocked = ob.build_import({})
+    assert rows == []
+    assert blocked == {}
+    assert header == "code;pairCode"
+
+
+def test_rows_come_out_in_a_stable_order_so_two_runs_are_comparable():
+    p = _pending_two_codes()
+    assert [r[0] for r in ob.build_import(p)[1]] == ["A", "B"]
