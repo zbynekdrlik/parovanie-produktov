@@ -3995,10 +3995,7 @@ function renderPosta() {
     const degraded = !!lr.source_degraded;
     const meta = el('div', 'autometa');
     const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
-    bits.push('Posledný beh: ' + (a.last_run
-      ? `${fmtDt(a.last_run)} — ${a.last_status !== 'ok' ? '❌ CHYBA'
-          : (degraded ? '⚠️ DEGRADOVANÝ' : '✅ OK')}`
-      : 'zatiaľ nikdy'));
+    bits.push('Posledný beh: ' + lastRunLabel(a, degraded));
     if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
     meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
     st.appendChild(meta);
@@ -4093,41 +4090,65 @@ function renderPosta() {
   }
 }
 
-// ---- Automatizácie (#119): tab „Sync zo Shoptetu" -------------------------- //
-// Plain status-only tab (no per-item table like posta — a sync run has nothing
 // #293 — the prune refused, and the refusal is PERMANENT until someone fixes the export.
-// Every reason gets its OWN sentence because they send the manager to different places, and
-// every one carries the number it fired on: „your export is wrong" with no number leaves him
-// nothing to go and look at (`.claude/rules/automation-health.md` §3, store-prune §7).
+// Every reason gets its OWN sentence AND its own place to go and look, because they are four
+// different faults; and every one carries the number it fired on — „your export is wrong"
+// with no number leaves him nothing to check (`.claude/rules/automation-health.md` §3,
+// store-prune §7).
 function flagPruneBlockedWarning(lr) {
-  const seen = Number(lr.flags_orders_seen ?? 0);
-  const open = Number(lr.flags_orders_open ?? 0);
-  const why = {
-    'no-open-orders':
-      `export nesie ${seen} objednávok, ale ani jednu v stave „Vybavuje sa" — v Shoptete sa `
-      + 'pravdepodobne premenoval stav objednávky, alebo je v nastaveniach prehodená adresa '
-      + 'exportu',
-    'no-status-column':
-      'export vôbec nemá stĺpec so stavom objednávky — zmenila sa jeho šablóna v Shoptete, '
-      + `alebo je prehodená adresa exportu (načítalo sa z neho ${seen} objednávok)`,
-    'unparsable-source':
-      'stiahnutý export sa nedá prečítať — namiesto tabuľky prišlo niečo iné (chybová '
-      + 'stránka, prázdny alebo poškodený súbor)',
-    'implausible-source':
-      `export nesie len ${seen} objednávok, čo je príliš málo na to, aby bol úplný — `
-      + 'sťahovanie pravdepodobne skončilo v polovici',
-  }[lr.flags_prune_skipped]
-    // an unexpected reason (the housekeeping try/except passes the exception through) must
-    // still reach him — silently rendering nothing is the exact failure this banner fixes
-    || `neočakávaná chyba: ${lr.flags_prune_skipped}`;
+  // a refusal recorded BEFORE this field existed carries no counts. Say nothing rather than
+  // coerce the absent value to 0 and state „export nesie 0 objednávok" as THE number the
+  // refusal fired on — a confident wrong fact until the next hourly run.
+  const seen = lr.flags_orders_seen == null ? null : Number(lr.flags_orders_seen);
+  const count = seen == null ? '' : ` (${seen} objednávok)`;
+  const reason = lr.flags_prune_skipped;
+  const CASES = {
+    'no-open-orders': {
+      why: `v exporte${count} nie je ani jedna objednávka v stave „Vybavuje sa"`,
+      look: 'skontroluj v Shoptete názvy stavov objednávok (asi sa niektorý premenoval) '
+            + 'a adresu exportu v nastaveniach',
+    },
+    'no-status-column': {
+      why: `export${count} vôbec nemá stĺpec so stavom objednávky`,
+      look: 'skontroluj v Shoptete šablónu exportu objednávok — chýba v nej stĺpec so '
+            + 'stavom, alebo je v nastaveniach prehodená adresa exportu',
+    },
+    'unparsable-source': {
+      why: 'stiahnutý export sa nedá prečítať — namiesto tabuľky prišlo niečo iné',
+      look: 'skús export objednávok stiahnuť ručne zo Shoptetu a pozri sa, čo príde '
+            + '(chybová stránka, prihlásenie, prázdny súbor)',
+    },
+    'implausible-source': {
+      why: `export${count} nesie príliš málo objednávok na to, aby bol úplný`,
+      look: 'sťahovanie pravdepodobne skončilo v polovici — skontroluj pripojenie a '
+            + 'skús export stiahnuť ručne',
+    },
+  };
+  // an unexpected reason (the housekeeping try/except passes the exception repr through)
+  // must still reach him — rendering nothing is the exact failure this banner fixes. It is
+  // the one dynamic value here that is not a fixed literal, so it is ESCAPED.
+  const c = CASES[reason] || {
+    why: 'neočakávaná chyba: ' + escapeHtml(String(reason)),
+    look: 'pozri sa do logu služby, čo presne zlyhalo',
+  };
   return el('div', 'autoerr',
-    `⛔ Upratovanie starých značiek pri riadkoch objednávok je zastavené: ${why}. `
+    `⛔ Upratovanie starých značiek pri riadkoch objednávok je zastavené: ${c.why}. `
     + 'Značky „objednané u dodávateľa" / „čaká sa" / „skladom" / „nedostupné" sa zatiaľ '
-    + 'nemažú, takže ich bude stále pribúdať. Nič sa nestratilo — skontroluj v Shoptete '
-    + 'export objednávok'
-    + (open ? '.' : ' a názvy stavov objednávok.'));
+    + `nemažú, takže ich bude stále pribúdať. Nič sa nestratilo — ${c.look}.`);
 }
 
+// „Posledný beh: <čas> — <verdict>". DEGRADED is its own verdict, not a flavour of OK: the
+// run did not throw, but a part of it could not see its own input (#282 Pošta, #293 sync).
+// Shared so a third automation cannot quietly invent a fourth spelling of it.
+function lastRunLabel(a, degraded) {
+  if (!a.last_run) return 'zatiaľ nikdy';
+  const verdict = a.last_status !== 'ok' ? '❌ CHYBA'
+    : (degraded ? '⚠️ DEGRADOVANÝ' : '✅ OK');
+  return `${fmtDt(a.last_run)} — ${verdict}`;
+}
+
+// ---- Automatizácie (#119): tab „Sync zo Shoptetu" -------------------------- //
+// Plain status-only tab (no per-item table like posta — a sync run has nothing
 // to list, just counts) — status/controls come straight from AUTOMATIONS
 // (last_result), no dedicated display endpoint needed.
 function renderShoptetSync() {
@@ -4168,10 +4189,7 @@ function renderShoptetSync() {
   const degraded = !!lr.source_degraded;
   const meta = el('div', 'autometa');
   const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
-  bits.push('Posledný beh: ' + (a.last_run
-    ? `${fmtDt(a.last_run)} — ${a.last_status !== 'ok' ? '❌ CHYBA'
-        : (degraded ? '⚠️ DEGRADOVANÝ' : '✅ OK')}`
-    : 'zatiaľ nikdy'));
+  bits.push('Posledný beh: ' + lastRunLabel(a, degraded));
   if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
   meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
   st.appendChild(meta);

@@ -1871,6 +1871,25 @@ ORDERS_TERMINAL_STATUSES = frozenset({
     "Vybavená", "Vybavená výmena", "Vybavený Dobropis", "Stornovaná",
 })
 
+# The statuses we know about and have deliberately judged NOT finished. They are not
+# reported as „unknown": the unknown list exists so a genuinely NEW status is noticed, and a
+# signal that fires permanently on four expected values is noise that hides the one case it
+# was built for. Adding a status here is a claim that somebody weighed it — see the comment
+# above for how the four below were weighed.
+ORDERS_KNOWN_OPEN_STATUSES = frozenset({
+    "Vybavuje sa", "Osob. odber", "Výmena tovaru", "Vratený tovar", "Kompletná",
+})
+
+# `statusName` is an untrusted CSV cell: a shifted or corrupt export puts arbitrary row
+# content there, and whatever lands in the unknown list is logged, persisted into
+# `automations.json` and rendered on the card. Bound both axes so a broken export can never
+# dump its contents — possibly customer data — into the manager's automation store for good.
+ORDERS_UNKNOWN_STATUS_MAX = 20
+ORDERS_UNKNOWN_STATUS_MAXLEN = 80
+# a blank status is not falsy-therefore-ignorable: it is an unreadable one, and dropping it
+# would narrow the prune with no trace anywhere. It gets a name instead.
+ORDERS_BLANK_STATUS_LABEL = "(prázdny stav)"
+
 # A floor on the age of the ORDER ITSELF — and the name says that, because it is NOT the
 # reopen grace it was first written as, and cannot be one.
 #
@@ -1958,8 +1977,9 @@ def _orders_by_openness(orders_csv):
                 still_open.add(code)
             if status not in ORDERS_TERMINAL_STATUSES:
                 unfinished.add(code)
-                if status and status != "Vybavuje sa":
-                    unknown.add(status)
+                if status not in ORDERS_KNOWN_OPEN_STATUSES:
+                    unknown.add(status[:ORDERS_UNKNOWN_STATUS_MAXLEN] if status
+                                else ORDERS_BLANK_STATUS_LABEL)
             if code not in dates:
                 dates[code] = (r.get("date") or "").strip()[:10]
     except csv.Error as e:
@@ -1969,9 +1989,14 @@ def _orders_by_openness(orders_csv):
 
 
 def _order_is_old_enough(day: str) -> bool:
-    """Is this order past the reopen grace period? An unreadable or missing date means we
-    do NOT know its age — and an unknown age is never „old enough" (the same stance
-    `_parse_date`'s callers take for a date going to a customer)."""
+    """Is this order past the order-age floor (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`)? Note the
+    name: it is the age of the ORDER, not time since it closed, and it is therefore NOT the
+    reopen grace it was first written as — the export carries no status-change date, so that
+    needs a store of its own (#294).
+
+    An unreadable or missing date means we do NOT know its age — and an unknown age is never
+    „old enough" (the same stance `_parse_date`'s callers take for a date going to a
+    customer)."""
     try:
         placed = date.fromisoformat((day or "").strip())
     except ValueError:
@@ -2020,7 +2045,7 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     watching it, and a pruned key belongs to an order the tab can no longer display at
     all, so there is no client state for it to order against."""
     seen, still_open, finished, dates, unknown, reason = _orders_by_openness(orders_csv)
-    unknown_statuses = sorted(unknown)
+    unknown_statuses = sorted(unknown)[:ORDERS_UNKNOWN_STATUS_MAX]
     if reason:
         log.error("prune riadkových príznakov PRESKOČENÝ (%s): export nesie %d objednávok "
                   "— nemaže sa nič", reason, len(seen))
@@ -7750,8 +7775,8 @@ AUTOMATION_DESCRIPTIONS = {
         # one the manager actually reads on the card — and it promised the very thing the
         # prune stopped being true: it does now remove his markings, just only the ones the
         # tab could never show him again.
-        "review kartách. Rozhodnutia nemení — len upratuje značky pri riadkoch objednávok, "
-        "ktoré sú už vybavené a na tabe sa nedajú zobraziť.",
+        "review kartách. Zmaže pritom značky pri riadkoch tých objednávok, ktoré sú už "
+        "vybavené a na tabe sa nedajú zobraziť — nič iné z tvojej práce nemení.",
     "parovania_eshop":
         "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
         "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",

@@ -24,8 +24,11 @@ Formuluj podmienku tak, aby na mazanie bolo treba dôkaz, že vec zanikla:
 ```python
 # #212, ordered/waiting/instock/unavailable (kľúč '<orderCode>|<itemCode>')
 gone = [k for k in d if "|" in k and k.split("|", 1)[0] in closed]
-#   closed = seen - still_open      ← objednávka JE v exporte a už nie je „Vybavuje sa"
+#   closed = seen - unfinished      ← objednávka JE v exporte a KAŽDÝ jej riadok nesie stav
+#                                     z ORDERS_TERMINAL_STATUSES (pozitívny dôkaz, bod 1a)
 #   NIE:    not in still_open       ← zmazalo by aj všetko mimo 90-dňového okna
+#   NIE:    seen - still_open       ← „všetko, čo nie je ten otvorený literál" = neznámy
+#                                     stav sa počíta ako zaniknutý (bod 1a, blokujúca 🔴)
 ```
 
 Tá formulácia navyše dáva **odolnosť voči useknutiu zadarmo**: `statusName` je stav CELEJ
@@ -68,6 +71,15 @@ NEUKONČENÉ a značky prežijú. Zoznam nehádaj — over ho na živých dátac
   stav neskôr s dôkazom sa dá, zmazanie sa vrátiť nedá.
 - **Zoznam sa nesmie zúžiť potichu.** Beh vráti a zaloguje stavy, ktoré NEPOZNÁ, a karta ich
   ukáže — ako informáciu, nie ako poplach (sú legitímne a trvalé, banner by bol večný šum).
+- **„Nepoznám" znamená naozaj NEPOSÚDENÝ.** Veď si aj druhý zoznam — stavy, ktoré si vážil a
+  vedome nechal mimo koncových (`ORDERS_KNOWN_OPEN_STATUSES`). Bez neho hlási signál trvale
+  tie isté štyri očakávané hodnoty a JEDINÝ prípad, pre ktorý vznikol — naozaj nový stav —
+  sa v tom šume stratí. Prázdny stav nie je „falsy, teda ignoruj": je to NEČITATEĽNÝ stav,
+  daj mu meno (`(prázdny stav)`), inak zúži prune bez stopy.
+- **Ohranič ho.** Stav je needitovaný CSV stĺpec — pri posunutom exporte v ňom je ľubovoľný
+  text z riadku, ktorý potom loguješ, ukladáš do `automations.json` a vykresľuješ na karte.
+  Strop na počet aj na dĺžku, nech pokazený zdroj nevie natrvalo vysypať svoj obsah (možno aj
+  zákaznícke dáta) do manažérovho úložiska.
 
 ### A test na ÚPLNÉ premenovanie NEPOKRÝVA čiastočné
 
@@ -80,9 +92,13 @@ Vzor: `test_a_status_the_shop_ADDS_or_renames_into_is_never_pruned` a tabuľkov�
 
 ## 1b. „Nič nie je otvorené" NIE JE odpoveď — je to signál, že čítaš iný zdroj
 
-Bod 1 odvodzuje zaniknuté ako `videné − stále_otvorené`. Tá formulácia má dieru, ktorú
-prah z bodu 2 NECHYTÍ a `protect` guard tiež nie (prune je legitímny read-modify-write):
-**čokoľvek, čo vyprázdni `stále_otvorené`, spraví zo VŠETKÉHO v okne „zaniknuté".**
+Odkedy platí bod 1a, je táto kontrola opasok k trakám — zaniknutosť sa už neodvodzuje od
+množiny otvorených, takže samotné premenovanie stavu z toho wipe spraviť nevie. Ostáva
+preto, že je to najlacnejší signál, že sa zdroj pod nami zmenil, a že pomenuje poruchu
+namiesto toho, aby beh vyzeral zdravo a nemazal nič. (Pôvodná diera, kým sa počítalo
+`videné − stále_otvorené`: čokoľvek, čo vyprázdnilo množinu otvorených, spravilo zo VŠETKÉHO
+v okne „zaniknuté" — a prah z bodu 2 to NECHYTÍ, ani `protect` guard, lebo prune je
+legitímny read-modify-write.)
 
 Reálne spúšťače, oba lacné:
 
