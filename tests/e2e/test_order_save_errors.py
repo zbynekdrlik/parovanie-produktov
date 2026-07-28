@@ -12,36 +12,63 @@ Both halves are pinned here with Playwright request interception (500 for a reje
 write, abort for a dead network): the manager is told, and an optimistic flag is rolled
 back so what he sees is what the server holds.
 
-`window.alert` is replaced by a SPY rather than driven through `page.on("dialog")`, for
-two reasons: a real alert() blocks the page's JS thread, so nothing can inspect the DOM
-while it is up — and the DOM *at alert time* is exactly what pins the "roll the tab back
-BEFORE telling him" ordering (an error message over a row that still shows the refused
-flag is the half-fix). The spy records the message together with that snapshot.
+#234 replaced the blocking `alert()` with a NON-BLOCKING cumulative banner (`#toFails`):
+during a partial outage the manager works down a supplier group, so 3-5 refusals in a
+couple of seconds is the normal shape — and that used to be 3-5 modals to dismiss one by
+one before he could reach the next row. The reporting CONTRACT is unchanged (every failed
+write reports itself, naming its row; the same write re-clicked inside 5 s does not repeat)
+— only the output is.
+
+`toOrderSaveFailed` is wrapped by a SPY rather than asserted purely through the DOM, for
+one reason that survived the alert: the DOM *at report time* is what pins the "roll the tab
+back BEFORE telling him" ordering (a message over a row that still shows the refused flag
+is the half-fix). The spy snapshots the DOM BEFORE calling through, then records the line
+the manager actually got — and only when a line was really added, so a suppressed duplicate
+is not counted as a message he saw.
 """
 import json
 
 import pytest
 
-# Records every alert together with the DOM state AT THE MOMENT it fired.
-_ALERT_SPY = """
-window.__alerts = [];
-window.alert = (m) => {
-  const cls = (sel) => { const e = document.querySelector(sel); return e ? e.className : null; };
-  window.__alerts.push({
-    msg: String(m),
-    C1: cls("[data-code='C1']"),
-    N1: cls("[data-code='N1']"),
-    chips: [...document.querySelectorAll('#filters button')]
-      .map(b => b.textContent + '||' + b.className),
-  });
-};
+# Records every failure the manager is actually SHOWN, together with the DOM state AT THE
+# MOMENT it was reported. Installed AFTER load on purpose: `toOrderSaveFailed` is a plain
+# function declaration in a classic script, so it only exists once app.js has run (and a
+# declaration binds the global directly, bypassing any defineProperty trap laid earlier).
+# `_open` waits for the first row before installing, so no write can have failed by then.
+_FAIL_SPY = """
+() => {
+  window.__alerts = [];
+  const real = toOrderSaveFailed;
+  const lines = () => document.querySelectorAll('#toFails .tofail');
+  toOrderSaveFailed = function (what, detail, where, value) {
+    const cls = (sel) => { const e = document.querySelector(sel); return e ? e.className : null; };
+    const snap = {
+      C1: cls("[data-code='C1']"),
+      N1: cls("[data-code='N1']"),
+      chips: [...document.querySelectorAll('#filters button')]
+        .map(b => b.textContent + '||' + b.className),
+    };
+    const before = lines().length;
+    const r = real(what, detail, where, value);
+    const now = lines();
+    // A write whose message was SUPPRESSED as a duplicate added no line — the manager saw
+    // nothing new, so it is not recorded as a message. The headline carries the „nepodarilo
+    // sa uložiť" wording and the line carries the row, so the pair is what he read.
+    if (now.length > before) {
+      const head = document.querySelector('#toFails .tofail-head');
+      snap.msg = (head ? head.textContent + ' ' : '') + now[now.length - 1].textContent;
+      window.__alerts.push(snap);
+    }
+    return r;
+  };
+}
 """
 
 
 def _open(page, base):
-    page.add_init_script(_ALERT_SPY)
     page.goto(base + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
+    page.evaluate(_FAIL_SPY)
 
 
 def _fail(page, path, status=500, body='{"ok": false}'):
@@ -379,8 +406,14 @@ def test_a_straggler_from_an_older_burst_cannot_poison_a_later_click(page, toord
     # its own), so without this the rule the code and the playbook both call load-bearing
     # would be unpinned prose. One row, one flag → exactly one entry, and it SURVIVES the
     # burst settling; only `loadOrders()` may ever clear the bookkeeping.
-    assert page.evaluate("() => Object.keys(_flagWrites).length") == 1, \
-        "the (flag, row) entry was dropped when its burst settled"
+    # An axis-B ON click claims ALL THREE status flags of the row (#211 — the two it
+    # clears are part of the same write and must be sequenced with it), so the expected
+    # set is those three, not one. What is pinned is unchanged: the entries SURVIVE the
+    # burst settling — everything below still passes with delete-on-settle put back.
+    assert sorted(page.evaluate(
+        "() => Object.keys(_flagWrites).map(k => k.split('\u0000')[0]).sort()")) == \
+        ["instock", "unavailable", "waiting"], \
+        "the (flag, row) entries were dropped when their burst settled"
 
     page.locator(".toorder-row[data-code='N1'] .to-instock").click()   # burst 2, write #3
     page.wait_for_function("() => window.__held.length === 3", timeout=3000)
@@ -651,9 +684,7 @@ def test_a_per_row_write_issued_DURING_the_bulk_flight_is_not_inverted(page, too
     server ends up holding the row un-ordered. Crowning the bulk at RESPONSE time made it
     supersede them anyway: the tab painted the row ordered, `_reconcileFlag` forced the map
     to the bulk's value on settle, and not one alert said anything happened."""
-    page.add_init_script(_ALERT_SPY)
-    page.goto(toorder_server + "/?tab=toorder")
-    page.wait_for_selector(".toorder-row")
+    _open(page, toorder_server)
     page.evaluate(_hold_multi("/api/ordered", "/api/ordered/bulk"))
 
     _click_group_bulk(page)                      # bulk: ordered = true  (held)
@@ -687,9 +718,7 @@ def test_a_bulk_that_LANDED_still_owns_the_row_when_the_later_writes_all_fail(pa
     both per-row writes that followed are REFUSED, so the server holds the row ordered.
     The bulk's acceptance is the newest server truth for that row, so the rollback of the
     last refused write must land on it — not on the pre-bulk baseline."""
-    page.add_init_script(_ALERT_SPY)
-    page.goto(toorder_server + "/?tab=toorder")
-    page.wait_for_selector(".toorder-row")
+    _open(page, toorder_server)
     page.evaluate(_hold_multi("/api/ordered", "/api/ordered/bulk"))
 
     _click_group_bulk(page)
@@ -726,9 +755,7 @@ def test_a_refused_bulk_settling_LAST_clears_the_refused_per_row_value(page, too
     per-row failure was silent, and only a manual reload could clear it — #214's phantom
     flag, mirrored into the bulk path. The reverse settle order self-heals via
     `_reconcileFlag`, which is why the two direction tests above pass around this."""
-    page.add_init_script(_ALERT_SPY)
-    page.goto(toorder_server + "/?tab=toorder")
-    page.wait_for_selector(".toorder-row")
+    _open(page, toorder_server)
     page.evaluate(_hold_multi("/api/ordered", "/api/ordered/bulk"))
 
     # per-row FIRST (seq 1), bulk SECOND (seq 2 → it owns the row)
@@ -836,3 +863,306 @@ def test_a_failed_EMPTY_comment_save_gives_the_open_editor_back(page, toorder_se
     box = page.locator(".toorder-row[data-code='C1'] .to-cominput")
     assert box.count() == 1, "the editor the manager was working in was never given back"
     assert box.input_value() == "", "his cleared box came back with the old text in it"
+
+
+# --- #234: the report is a NON-BLOCKING cumulative banner, not one modal per row ------ #
+#
+# The reporting contract of #214 is unchanged (every failed write reports itself and names
+# its row; the same write re-clicked inside 5 s stays quiet) — these pin the OUTPUT: a
+# partial outage while the manager works down a supplier group produced 3-5 native modals,
+# each of which BLOCKS the page until he dismisses it, before he could reach the next row.
+
+_MODAL_SENTINEL = """
+window.__modals = [];
+window.alert = (m) => { window.__modals.push(String(m)); };
+"""
+
+
+def _banner_lines(page):
+    return page.evaluate(
+        "() => [...document.querySelectorAll('#toFails .tofail')].map(e => e.textContent)")
+
+
+def test_a_failed_write_reports_through_the_banner_and_never_a_modal(page, toorder_server):
+    """alert() is modal AND synchronous: it freezes the tab until it is clicked away. The
+    same information has to reach him without taking the page hostage."""
+    page.add_init_script(_MODAL_SENTINEL)
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+
+    lines = _banner_lines(page)
+    assert len(lines) == 1, lines
+    assert "C1" in lines[0], lines
+    assert "chyba 500" in lines[0], lines
+    assert page.evaluate("() => window.__modals") == [], "a blocking modal was still used"
+    # and the write was still rolled back — the banner reports, it never replaces the fix
+    assert page.locator(".toorder-row.instock").count() == 0
+
+
+def test_the_banner_accumulates_every_failing_row_at_once(page, toorder_server):
+    """The shape this issue is about: three rows refused within a couple of seconds. As
+    modals that was three interruptions in sequence, only ever ONE of them readable at a
+    time. As a banner all three stand there together, so he can see exactly which rows he
+    has to redo."""
+    page.add_init_script(_MODAL_SENTINEL)
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+
+    for i, code in enumerate(("C1", "C2", "C3")):
+        page.locator(f".toorder-row[data-code='{code}'] .to-instock").click()
+        page.wait_for_function("n => document.querySelectorAll('#toFails .tofail').length === n",
+                               arg=i + 1, timeout=3000)
+
+    lines = _banner_lines(page)
+    assert len(lines) == 3, lines
+    for code in ("C1", "C2", "C3"):
+        assert sum(1 for line in lines if code in line) == 1, (code, lines)
+    assert page.evaluate("() => window.__modals") == []
+    # the count is in the headline, so he knows how many without counting the lines
+    assert "3" in page.locator("#toFails .tofail-head").inner_text()
+
+
+def test_the_same_refused_write_adds_no_second_banner_line(page, toorder_server):
+    """The #214 dedup is per WRITE and must survive the move off alert(): re-clicking the
+    same refused toggle inside the window is one event, not two."""
+    _open(page, toorder_server)
+    posts = []
+
+    def refuse(route):
+        posts.append(1)
+        route.fulfill(status=500, content_type="application/json", body='{"ok": false}')
+
+    page.route("**/api/instock", refuse)
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()   # same write again
+    page.wait_for_function(
+        "() => document.querySelectorAll('.toorder-row.instock').length === 0", timeout=3000)
+
+    assert len(posts) == 2, posts                  # the second write really happened…
+    assert len(_banner_lines(page)) == 1, _banner_lines(page)   # …and stayed quiet
+
+
+def test_the_banner_outlives_the_repaint_a_later_rollback_causes(page, toorder_server):
+    """Every rollback repaints the whole tab before it reports, so a banner living inside
+    `#list` would be wiped by the NEXT failure — and the manager would end an outage
+    holding only the last row's name. It sits in the top bar for exactly that reason."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+    page.locator(".toorder-row[data-code='C2'] .to-instock").click()
+    page.wait_for_function("() => document.querySelectorAll('#toFails .tofail').length === 2",
+                           timeout=3000)
+
+    lines = _banner_lines(page)
+    assert any("C1" in line for line in lines), lines
+    assert any("C2" in line for line in lines), lines
+
+
+def test_redoing_the_failed_write_takes_the_banner_away(page, toorder_server):
+    """It is a report about work that still needs redoing, so once he HAS redone it the
+    banner must go — a stale warning above a tab that is saving fine again is noise he
+    learns to ignore, and the next real one goes unread.
+
+    Originally this let a write on a DIFFERENT row clear it, which the adversarial review
+    showed is wrong in the one situation the banner exists for: during a partial outage the
+    first row he successfully redoes would erase the names of all the others he still has
+    to. The row that succeeds now clears its OWN line (and the banner with it, once that
+    was the last one) — `test_a_successful_write_clears_only_ITS_OWN_banner_line` pins the
+    other half."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+
+    page.unroute("**/api/instock")                 # the outage is over
+    with page.expect_response(
+            lambda r: "/api/instock" in r.url and r.request.method == "POST"):
+        page.locator(".toorder-row[data-code='C1'] .to-instock").click()   # he redoes it
+    page.wait_for_selector("#toFails", state="hidden", timeout=3000)
+    assert _banner_lines(page) == []
+
+
+def test_the_banner_can_be_dismissed(page, toorder_server):
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+
+    page.locator("#toFails .tofail-close").click()
+    page.wait_for_selector("#toFails", state="hidden", timeout=3000)
+    assert _banner_lines(page) == []
+
+
+def test_a_reload_clears_the_banner(page, toorder_server):
+    """A reload re-reads every flag from the server, so nothing on screen is still an
+    unsaved intent — there is no lost work left for the banner to be about."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+
+    page.reload()
+    page.wait_for_selector(".toorder-row")
+    assert _banner_lines(page) == []
+
+
+def test_the_banner_is_announced_and_hidden_on_the_other_tab(page, toorder_server):
+    """It is a status message, not an alert dialog — `aria-live="polite"` is what lets a
+    screen reader read it WITHOUT interrupting, which is the whole point of the change.
+    And it belongs to this tab: the review tab shares the top bar (`setEmptyText`'s
+    lesson), so a leftover warning about order lines must not follow him there."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+
+    box = page.locator("#toFails")
+    assert box.get_attribute("role") == "status"
+    assert box.get_attribute("aria-live") == "polite"
+
+    page.get_by_role("button", name="Kontrola párovania").click()
+    page.wait_for_function("() => ACTIVE_TAB === 'review'", timeout=3000)
+    assert box.is_hidden()
+
+
+# --- adversariálna revízia PR #290 (#211 + #234) ------------------------------------- #
+
+def test_a_refused_write_cannot_resurrect_a_status_a_LATER_write_cleared(page, toorder_server):
+    """THE critical one. The clear-list was built from the CLIENT maps, so a flag the client
+    had ALREADY optimistically cleared never claimed a sequence number in the next write —
+    and a refused OLDER write then rolled it back to life over a newer ACCEPTED one.
+
+    Server holds „čaká sa". Click „✓ Skladom" (held), then „✗ Nedostupné" (lands, and the
+    server clears „čaká sa" off its OWN state), then refuse the held one. „čaká sa" belonged
+    to nobody but the refused write, so its rollback put it back: the row showed „čaká sa +
+    nedostupné" — the exact contradiction #211 removes — while the server held only
+    „nedostupné", and every later failure on that row rolled back to that poisoned baseline."""
+    _open(page, toorder_server)
+    row = page.locator(".toorder-row[data-code='C1']")
+    with page.expect_response("**/api/waiting"):
+        row.locator(".to-wait").click()
+
+    page.evaluate(_HOLD_INSTOCK)                       # only /api/instock is held
+    row.locator(".to-instock").click()
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+
+    with page.expect_response("**/api/unavailable"):   # lands for real, clears the rest
+        row.locator(".to-unavail").click()
+    page.evaluate("() => window.__held[0](500)")       # …and now the older write is refused
+    page.wait_for_function("() => window.__settled.length === 1", timeout=3000)
+    page.wait_for_timeout(300)
+
+    srv = page.evaluate("""() => Promise.all(
+      ['/api/waiting', '/api/instock', '/api/unavailable']
+        .map(u => window.__realFetch(u).then(r => r.json())))
+      .then(([w, i, u]) => ({waiting: Object.keys(w.waiting),
+                             instock: Object.keys(i.instock),
+                             unavailable: Object.keys(u.unavailable)}))""")
+    assert srv == {"waiting": [], "instock": [], "unavailable": ["20260910|C1"]}, srv
+
+    cls = set((row.get_attribute("class") or "").split())
+    assert "unavail" in cls, cls
+    assert "waiting" not in cls, ("a refused write resurrected a status the server cleared", cls)
+    assert "instock" not in cls, cls
+    assert len([c for c in cls if c in ("waiting", "instock", "unavail")]) == 1, cls
+
+
+def test_the_client_adopts_the_flags_the_SERVER_answers_with(page, toorder_server):
+    """The server is the authority, and it says what the row now IS in every answer. Two
+    axis-B writes issued within one round-trip can commit on the server in the reverse
+    order (each queues behind the other's `with _lock:`), so the client's own issue-order
+    bookkeeping is not by itself enough — the answered `flags` have to be mirrored."""
+    _open(page, toorder_server)
+    # the server answers OK, but with a state the client did not predict
+    page.route("**/api/instock", lambda r: r.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps({"ok": True, "flags": {"ordered": False, "waiting": True,
+                                               "instock": False, "unavailable": False}}))
+        if r.request.method == "POST" else r.continue_())
+
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_function(
+        "() => document.querySelector(`.toorder-row[data-code='C1']`).classList.contains('waiting')",
+        timeout=3000)
+
+    cls = set((page.locator(".toorder-row[data-code='C1']").get_attribute("class") or "").split())
+    assert "waiting" in cls and "instock" not in cls, cls
+
+
+def test_a_successful_write_clears_only_ITS_OWN_banner_line(page, toorder_server):
+    """The banner exists because he needs to see EVERY row he still has to redo. Wiping the
+    whole list on the first write that happens to succeed takes the other rows' names away
+    at exactly the moment he starts working through them."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+    for code in ("C1", "C2"):
+        page.locator(f".toorder-row[data-code='{code}'] .to-instock").click()
+    page.wait_for_function("() => document.querySelectorAll('#toFails .tofail').length === 2",
+                           timeout=3000)
+
+    page.unroute("**/api/instock")
+    with page.expect_response(
+            lambda r: "/api/instock" in r.url and r.request.method == "POST"):
+        page.locator(".toorder-row[data-code='C1'] .to-instock").click()   # C1 redone, lands
+    page.wait_for_function("() => document.querySelectorAll('#toFails .tofail').length === 1",
+                           timeout=3000)
+
+    lines = _banner_lines(page)
+    assert any("C2" in line for line in lines), ("the row still to redo was dropped", lines)
+    assert not any("C1" in line for line in lines), lines
+
+
+def test_a_failure_reported_after_the_banner_was_cleared_is_shown_again(page, toorder_server):
+    """The dedup collapses repeats into one VISIBLE line. Once no line is visible any more,
+    the next failure has to render — otherwise a retry inside the old 5 s window was
+    swallowed with an EMPTY banner, which is the silent-lost-write of #214 all over again."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+
+    page.locator("#toFails .tofail-close").click()          # he acknowledges it
+    page.wait_for_selector("#toFails", state="hidden", timeout=3000)
+
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()   # same write, refused again
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+    assert len(_banner_lines(page)) == 1, _banner_lines(page)
+
+
+def test_retrying_one_refused_row_never_counts_it_twice(page, toorder_server):
+    """The headline count is „how many rows to redo", so the same row retried three times
+    during a long outage must not read as three rows."""
+    _open(page, toorder_server)
+    _fail(page, "/api/instock")
+    for _ in range(3):
+        page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+        page.wait_for_timeout(120)
+
+    lines = _banner_lines(page)
+    assert len(lines) == 1, lines
+    assert "1 položku" in page.locator("#toFails .tofail-head").inner_text(), \
+        page.locator("#toFails .tofail-head").inner_text()
+
+
+def test_a_failure_arriving_after_a_tab_switch_stays_off_the_review_tab(page, toorder_server):
+    """The top bar is SHARED with „Kontrola párovania" (the `setEmptyText` lesson). A write
+    that fails two seconds after he left would otherwise pop „Nepodarilo sa uložiť…" over
+    the review tab, where it reads as failed REVIEW saves."""
+    _open(page, toorder_server)
+    page.evaluate(_HOLD_INSTOCK)
+    page.locator(".toorder-row[data-code='C1'] .to-instock").click()
+    page.wait_for_function("() => window.__held.length === 1", timeout=3000)
+
+    page.get_by_role("button", name="Kontrola párovania").click()
+    page.wait_for_function("() => ACTIVE_TAB === 'review'", timeout=3000)
+    page.evaluate("() => window.__held[0](500)")           # the refusal lands here
+    page.wait_for_function("() => window.__settled.length === 1", timeout=3000)
+    page.wait_for_timeout(200)
+
+    assert page.locator("#toFails").is_hidden(), "the order-tab warning followed him to review"

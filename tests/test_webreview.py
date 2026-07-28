@@ -8,6 +8,8 @@ import json
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
@@ -225,6 +227,180 @@ def test_instock_unavailable_tolerate_corrupt_store(monkeypatch, tmp_path):
     monkeypatch.setattr(webapp, "UNAVAIL", str(unf))
     assert webapp._load_instock() == {}
     assert webapp._load_unavailable() == {}
+
+
+# --- #211: the STATUS flags are mutually exclusive; the SERVER enforces it ------ #
+#
+# Two axes, decided from the manager's own live data (27 rows carried a combination and
+# EVERY one of them involved „objednané"; „čaká sa"/„skladom"/„nedostupné" never once
+# overlapped each other):
+#   axis A  „objednané"  = we placed the order — independent, coexists with anything
+#   axis B  „čaká sa" ⊕ „skladom" ⊕ „nedostupné" = the line's status — mutually exclusive
+# Setting an axis-B flag clears the other two IN THE SAME `with _lock:` write, so no
+# reader can ever observe a row holding two contradictory statuses.
+def _flag_paths(monkeypatch, tmp_path):
+    for name, fn in (("ORDERED", "o.json"), ("WAITING", "w.json"),
+                     ("INSTOCK", "is.json"), ("UNAVAIL", "un.json")):
+        monkeypatch.setattr(webapp, name, str(tmp_path / fn))
+
+
+_STATUS = [("/api/waiting", "waiting"), ("/api/instock", "instock"),
+           ("/api/unavailable", "unavailable")]
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
+def test_setting_a_status_flag_clears_the_other_two(monkeypatch, tmp_path, path, field):
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "90000001|TESTKOD-A"
+    for p, f in _STATUS:            # start from every other status already set
+        if p != path:
+            c.post(p, json={"key": key, f: True})
+    r = c.post(path, json={"key": key, field: True})
+    assert r.status_code == 200
+    for p, f in _STATUS:
+        got = c.get(p).get_json()[f]
+        assert (key in got) is (p == path), (p, got)
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
+def test_a_status_flag_never_clears_objednane(monkeypatch, tmp_path, path, field):
+    """„objednané" is the OTHER axis: objednané + čaká sa na dodávateľa (the row button's
+    own tooltip) and objednané + už prišlo are both real states the manager uses. Clearing
+    it here would delete markings he made on purpose."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "90000001|TESTKOD-A"
+    c.post("/api/ordered", json={"key": key, "ordered": True})
+    c.post(path, json={"key": key, field: True})
+    assert c.get("/api/ordered").get_json()["ordered"][key] is True
+    # …and the reverse: marking it ordered afterwards leaves the status flag alone
+    c.post("/api/ordered", json={"key": key, "ordered": True})
+    assert key in c.get(path).get_json()[field]
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
+def test_turning_a_status_flag_OFF_clears_nothing_else(monkeypatch, tmp_path, path, field):
+    """Only switching a flag ON is a statement about the line's status. Switching one OFF
+    just makes the line unhandled again — it must not reach into the other stores."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key, other = "90000001|TESTKOD-A", "90000001|TESTKOD-B"
+    c.post("/api/ordered", json={"key": key, "ordered": True})
+    # A DIFFERENT row, carrying the LEGAL maximum: axis A + exactly one axis-B flag.
+    # (Seeding all three on it would be seeding a state the server now refuses to hold.)
+    c.post("/api/ordered", json={"key": other, "ordered": True})
+    c.post(path, json={"key": other, field: True})
+    c.post(path, json={"key": key, field: False})
+    assert c.get("/api/ordered").get_json()["ordered"][key] is True
+    assert c.get("/api/ordered").get_json()["ordered"][other] is True
+    assert other in c.get(path).get_json()[field]
+    # …and the OTHER two stores of the row being switched off stay as they were: empty,
+    # because nothing ever put a flag there. Turning one off reaches into no store but its own.
+    for p, f in _STATUS:
+        if p != path:
+            assert c.get(p).get_json()[f] == {}, p
+
+
+_ALL_FLAGS = {"ordered", "waiting", "instock", "unavailable"}
+
+
+@pytest.mark.parametrize("path, field", _STATUS)
+def test_the_write_answers_with_the_resulting_flags(monkeypatch, tmp_path, path, field):
+    """The server is the authority on the row's state, so it says what the state now IS —
+    the client only reflects it."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "90000001|TESTKOD-A"
+    c.post("/api/waiting", json={"key": key, "waiting": True})
+    flags = c.post(path, json={"key": key, field: True}).get_json()["flags"]
+    assert flags[field] is True
+    assert set(flags) == _ALL_FLAGS
+    for p, f in _STATUS:
+        assert flags[f] is (f == field), (f, flags)
+
+
+def test_the_objednane_write_answers_with_the_flags_it_did_not_touch(monkeypatch, tmp_path):
+    """„objednané" answers in the SAME shape (one thing for the client to mirror) but it is
+    axis A: the „čaká sa" standing on that row is still there afterwards. Folding this case
+    into the axis-B test above asserted the opposite — that marking a line ordered wipes its
+    status — which is exactly the four-way exclusivity #211 rejected."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "90000001|TESTKOD-A"
+    c.post("/api/waiting", json={"key": key, "waiting": True})
+    flags = c.post("/api/ordered", json={"key": key, "ordered": True}).get_json()["flags"]
+    assert set(flags) == _ALL_FLAGS
+    assert flags["ordered"] is True
+    assert flags["waiting"] is True                      # untouched — the other axis
+    assert flags["instock"] is False and flags["unavailable"] is False
+    assert c.get("/api/waiting").get_json()["waiting"] == {key: True}
+
+
+def test_a_status_flag_only_touches_the_row_it_names(monkeypatch, tmp_path):
+    """The clear is per KEY. A sibling line of the same product (or any other row) that
+    happens to be „čaká sa" must be untouched — the flags are per ORDER LINE."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})
+    c.post("/api/waiting", json={"key": "B|1", "waiting": True})
+    c.post("/api/instock", json={"key": "A|1", "instock": True})
+    assert c.get("/api/waiting").get_json()["waiting"] == {"B|1": True}
+
+
+def test_ordered_bulk_leaves_every_status_flag_alone(monkeypatch, tmp_path):
+    """Marking a whole supplier group „objednané" is axis A — it says nothing about
+    whether those lines are waiting / in stock / unavailable."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})
+    c.post("/api/instock", json={"key": "B|2", "instock": True})
+    c.post("/api/ordered/bulk", json={"keys": ["A|1", "B|2"], "ordered": True})
+    assert c.get("/api/waiting").get_json()["waiting"] == {"A|1": True}
+    assert c.get("/api/instock").get_json()["instock"] == {"B|2": True}
+
+
+def test_clearing_conflicts_never_writes_a_store_it_did_not_change(monkeypatch, tmp_path):
+    """These stores are `protect=True` — the manager's irreplaceable work. A write that
+    changes nothing must not rewrite the file at all (and a store that does not exist yet
+    must not be created just because a conflicting flag was checked for)."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    c.post("/api/instock", json={"key": "A|1", "instock": True})
+    assert not (tmp_path / "w.json").exists(), "an untouched store was written"
+    assert not (tmp_path / "un.json").exists(), "an untouched store was written"
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})
+    before = (tmp_path / "un.json").exists()
+    c.post("/api/waiting", json={"key": "A|1", "waiting": True})   # idempotent re-write
+    assert (tmp_path / "un.json").exists() is before
+
+
+_real_save_waiting = webapp._save_waiting
+
+
+def test_a_failed_clear_never_erases_the_flag_the_manager_just_set(monkeypatch, tmp_path):
+    """`_write_status_flag` touches up to TWO files and `os.replace` is only atomic per
+    file, so the ORDER decides what a mid-way failure leaves behind. Saving the clicked
+    store FIRST means a failing clear leaves a SUPERSET (both flags), which the next axis-B
+    write heals by itself. The other order — clear first — would leave the row with NO
+    status at all: the manager's „skladom" is gone AND the „čaká sa" it replaced is gone,
+    which is exactly the irreplaceable-work loss `protect=True` exists to prevent."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "90000001|TESTKOD-A"
+    c.post("/api/waiting", json={"key": key, "waiting": True})
+
+    def boom(_d):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(webapp, "_save_waiting", boom)      # the CLEAR half fails
+    assert c.post("/api/instock", json={"key": key, "instock": True}).status_code == 500
+
+    monkeypatch.setattr(webapp, "_save_waiting", _real_save_waiting)
+    assert c.get("/api/instock").get_json()["instock"] == {key: True}, \
+        "the flag the manager just clicked was not persisted"
+    assert key in c.get("/api/waiting").get_json()["waiting"], \
+        "the flag it replaced was erased by a write that did not finish"
 
 
 def test_orders_route_merges_instock_and_unavailable(monkeypatch, tmp_path):

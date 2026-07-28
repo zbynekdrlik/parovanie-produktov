@@ -1654,6 +1654,92 @@ def _save_unavailable(d: dict) -> None:
     _atomic_write_json(UNAVAIL, d, protect=True)
 
 
+# #211 — the four to-order markers are TWO AXES, not four independent ticks. Decided from
+# the manager's own live stores: 27 rows carried a combination and EVERY one of them
+# involved „objednané", while „čaká sa"/„skladom"/„nedostupné" never once overlapped each
+# other (0 of 41 keys).
+#   axis A  „objednané"                            — independent, coexists with anything
+#                                                    (objednané + čaká sa na dodávateľa is
+#                                                    what the ⏳ button's own tooltip
+#                                                    describes; objednané + skladom = it
+#                                                    arrived)
+#   axis B  „čaká sa" ⊕ „skladom" ⊕ „nedostupné"   — the line's status, mutually exclusive
+#                                                    (waiting for it / having it / the
+#                                                    supplier not having it contradict)
+# The SERVER is the authority: setting an axis-B flag clears the other two in the SAME
+# `with _lock:` write, so no reader can ever observe a row holding two contradictory
+# statuses. The client only mirrors it. Existing combinations are all legal under this
+# semantics (they all carry „objednané" plus at most one axis-B flag), so nothing is
+# migrated — the manager's markings stay exactly as he made them.
+_STATUS_AXIS = ("waiting", "instock", "unavailable")
+
+
+def _status_stores() -> dict:
+    """Loader/saver per axis-B flag, resolved PER CALL. A module-level tuple of function
+    OBJECTS would freeze them at import exactly like a module-level path constant froze
+    `OUT` (#261) — a later indirection (or a test) rebinding `_save_waiting` would then
+    silently not reach `_write_status_flag`, and the write would look fine while doing
+    something else."""
+    return {"waiting": (_load_waiting, _save_waiting),
+            "instock": (_load_instock, _save_instock),
+            "unavailable": (_load_unavailable, _save_unavailable)}
+
+
+def _write_status_flag(field: str, key: str, on: bool) -> dict:
+    """Write ONE axis-B flag and, when turning it ON, clear the other two for that key.
+    Turning a flag OFF says nothing about the others and touches only its own store.
+    Returns the resulting state of all four flags, so the answer itself tells the client
+    what the row now IS.
+
+    The whole read-modify-write sits in ONE `with _lock:` block (which is inter-process),
+    so no other WRITER can interleave. It is NOT atomic across FILES, though — `os.replace`
+    is atomic per file and this touches up to two. That is why the CLICKED store is saved
+    FIRST and the clears after: if a later save fails (disk full, `StoreWipeRefused`), the
+    row is left holding a SUPERSET — the new status plus the one it was replacing — which
+    the next axis-B write heals by itself. Saving the clear first would instead leave the
+    row with NO status at all: the flag the manager just set never landed AND the one it
+    replaced was erased, i.e. exactly the irreplaceable-work loss `protect=True` exists to
+    prevent. A GET landing in that same window can therefore briefly see both flags; a
+    transient superset is self-healing, a lost marking is not."""
+    stores = _status_stores()
+    with _lock:
+        loaded = {name: load() for name, (load, _save) in stores.items()}
+        dirty = set()
+        for name, d in loaded.items():
+            if name == field:
+                if on and not d.get(key):
+                    d[key] = True
+                    dirty.add(name)
+                elif not on and key in d:
+                    d.pop(key, None)
+                    dirty.add(name)
+            elif on and key in d:      # the conflicting statuses go out with it
+                d.pop(key, None)
+                dirty.add(name)
+        # A write that changed nothing must not rewrite the file: these stores are
+        # `protect=True` (the manager's irreplaceable work), and a store this call never
+        # touched must not even be CREATED just because a conflicting flag was checked.
+        # Clicked store first — see the docstring on why the ORDER is load-bearing.
+        for name in [field] + [n for n in _STATUS_AXIS if n != field]:
+            if name in dirty:
+                stores[name][1](loaded[name])
+        flags = {"ordered": bool(_load_ordered().get(key))}
+        flags.update({name: bool(d.get(key)) for name, d in loaded.items()})
+    if dirty - {field}:
+        log.info("status %s key=%s on=%s cleared=%s",
+                 field, key, on, ",".join(sorted(dirty - {field})))
+    return flags
+
+
+def _flag_snapshot(key: str) -> dict:
+    """All four flags for one line — what every flag write answers with. Call it INSIDE the
+    writer's own `with _lock:` block (`_lock` is reentrant): read outside it and the answer
+    can describe a concurrent LATER write instead of the one being answered."""
+    flags = {"ordered": bool(_load_ordered().get(key))}
+    flags.update({name: bool(load().get(key)) for name, (load, _s) in _status_stores().items()})
+    return flags
+
+
 # Per-ORDER free-text comment for the Na-objednanie tab (key = '<orderCode>'). #101:
 # the manager's note about a WHOLE order — the same thing as the Shoptet admin's
 # "Poznámka e-shopu" (the order export's `shopRemark` column), which the shop already
@@ -2720,8 +2806,13 @@ def api_ordered():
         else:
             d.pop(key, None)
         _save_ordered(d)
+        # axis A: „objednané" clears nothing — it says we placed the order, not what the
+        # line's status is. It still answers with the resulting state of all four flags,
+        # so the client has ONE shape to mirror (#211). Snapshot INSIDE the same lock, or
+        # the answer can describe a concurrent later write instead of this one.
+        flags = _flag_snapshot(key)
     log.info("ordered key=%s ordered=%s", key, ordered)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "flags": flags})
 
 
 @app.route("/api/ordered/bulk", methods=["POST"])
@@ -2763,15 +2854,9 @@ def api_waiting():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     waiting = bool(body.get("waiting"))
-    with _lock:
-        d = _load_waiting()
-        if waiting:
-            d[key] = True
-        else:
-            d.pop(key, None)
-        _save_waiting(d)
+    flags = _write_status_flag("waiting", key, waiting)   # axis B — clears the other two
     log.info("waiting key=%s waiting=%s", key, waiting)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "flags": flags})
 
 
 @app.route("/api/instock", methods=["GET", "POST"])
@@ -2785,15 +2870,9 @@ def api_instock():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     instock = bool(body.get("instock"))
-    with _lock:
-        d = _load_instock()
-        if instock:
-            d[key] = True
-        else:
-            d.pop(key, None)
-        _save_instock(d)
+    flags = _write_status_flag("instock", key, instock)   # axis B — clears the other two
     log.info("instock key=%s instock=%s", key, instock)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "flags": flags})
 
 
 @app.route("/api/unavailable", methods=["GET", "POST"])
@@ -2807,15 +2886,9 @@ def api_unavailable():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     unavailable = bool(body.get("unavailable"))
-    with _lock:
-        d = _load_unavailable()
-        if unavailable:
-            d[key] = True
-        else:
-            d.pop(key, None)
-        _save_unavailable(d)
+    flags = _write_status_flag("unavailable", key, unavailable)   # axis B — clears the rest
     log.info("unavailable key=%s unavailable=%s", key, unavailable)
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "flags": flags})
 
 
 # --------------------------------------------------------------------------- #

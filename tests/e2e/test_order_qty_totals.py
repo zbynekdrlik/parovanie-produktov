@@ -298,14 +298,6 @@ def _copied_qty(page, sup):
     return sum(int(m.group(1)) for m in re.finditer(r"\|\s*(\d+) ks", copied[0])) if copied else 0
 
 
-# alert() is synchronous and blocks the page's JS thread, so the rollback test replaces it
-# with a recorder rather than driving a real dialog.
-_ALERT_SPY = """
-window.__alerts = [];
-window.alert = (m) => { window.__alerts.push(String(m)); };
-"""
-
-
 def _bulk(page, sup):
     return page.locator(".toorder-supplier").filter(has_text=sup).locator(".tosup-bulk")
 
@@ -320,7 +312,6 @@ def test_the_chip_follows_every_mutation_path(page, toorder_server):
     mark, and the rollback of a REFUSED write (the chip may never keep a number the server
     turned down)."""
     console = _console_watch(page)
-    page.add_init_script(_ALERT_SPY)
     page.goto(toorder_server + "/?tab=toorder")
     page.wait_for_selector(".toorder-row")
     assert [t["text"] for t in _totals(page)] == ["Σ spolu 3 ks"] * 2
@@ -346,7 +337,9 @@ def test_the_chip_follows_every_mutation_path(page, toorder_server):
     page.route("**/api/instock", lambda route: route.fulfill(
         status=500, content_type="application/json", body='{"ok": false}'))
     page.locator(".toorder-row[data-code='S1']").first.locator(".to-instock").click()
-    page.wait_for_function("() => window.__alerts.length > 0", timeout=3000)
+    # the refusal is reported in the #234 banner, and the rollback + repaint run BEFORE it —
+    # so the moment a line appears there, the chips this test reads are already final
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
 
     assert [t["text"] for t in _totals(page)] == ["Σ spolu 3 ks"] * 2, \
         "the chip must not keep a number the server refused"

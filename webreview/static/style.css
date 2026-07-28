@@ -158,6 +158,21 @@ body.toorder-wide .filters button.active{background:#DDA43C;border-color:#DDA43C
 .to-toolbar .to-hidehandled:hover{border-color:var(--soft)}
 .to-toolbar .to-hidehandled.on{background:var(--accent-soft);color:var(--accent);
   border-color:var(--accent)}
+/* #234 — zlyhané zápisy: neblokujúci kumulatívny banner namiesto reťaze alert() modálov.
+   Vlastný riadok v top bare (mimo #list — repaint rollbacku by ho inak zmazal). Zoznam sa
+   pri dlhom výpadku roluje V SEBE: žiadny riadok sa nezahadzuje (manažér potrebuje vedieť
+   VŠETKY, ktoré má zopakovať) a banner pritom neodtlačí zoznam mimo obrazovku. */
+.tofails{grid-column:1 / -1;margin-top:6px;padding:9px 12px;border-radius:9px;
+  background:#fdf1ef;border:1px solid #e6b8b0;color:#7d2418;font-size:13px;
+  max-height:170px;overflow-y:auto}
+.tofails .tofail-head{display:flex;align-items:center;gap:10px;font-weight:700;
+  margin-bottom:4px}
+.tofails .tofail-close{margin-left:auto;background:none;border:none;color:inherit;
+  font-size:18px;line-height:1;cursor:pointer;padding:0 4px;opacity:.7}
+.tofails .tofail-close:hover{opacity:1}
+.tofails .tofail{padding:2px 0 2px 14px;text-indent:-14px}
+.tofails .tofail::before{content:"• ";font-weight:700}
+body[data-theme=dark] .tofails{background:#3a1a15;border-color:#7d3a2e;color:#f3c9c1}
 .downloads{display:flex;gap:8px}
 .downloads a{background:var(--accent-hov);color:#fff;text-decoration:none;font-size:13.5px;
   font-weight:600;padding:9px 15px;border-radius:9px}
