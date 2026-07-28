@@ -375,6 +375,34 @@ def test_clearing_conflicts_never_writes_a_store_it_did_not_change(monkeypatch, 
     assert (tmp_path / "un.json").exists() is before
 
 
+_real_save_waiting = webapp._save_waiting
+
+
+def test_a_failed_clear_never_erases_the_flag_the_manager_just_set(monkeypatch, tmp_path):
+    """`_write_status_flag` touches up to TWO files and `os.replace` is only atomic per
+    file, so the ORDER decides what a mid-way failure leaves behind. Saving the clicked
+    store FIRST means a failing clear leaves a SUPERSET (both flags), which the next axis-B
+    write heals by itself. The other order — clear first — would leave the row with NO
+    status at all: the manager's „skladom" is gone AND the „čaká sa" it replaced is gone,
+    which is exactly the irreplaceable-work loss `protect=True` exists to prevent."""
+    _flag_paths(monkeypatch, tmp_path)
+    c = _client()
+    key = "90000001|TESTKOD-A"
+    c.post("/api/waiting", json={"key": key, "waiting": True})
+
+    def boom(_d):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(webapp, "_save_waiting", boom)      # the CLEAR half fails
+    assert c.post("/api/instock", json={"key": key, "instock": True}).status_code == 500
+
+    monkeypatch.setattr(webapp, "_save_waiting", _real_save_waiting)
+    assert c.get("/api/instock").get_json()["instock"] == {key: True}, \
+        "the flag the manager just clicked was not persisted"
+    assert key in c.get("/api/waiting").get_json()["waiting"], \
+        "the flag it replaced was erased by a write that did not finish"
+
+
 def test_orders_route_merges_instock_and_unavailable(monkeypatch, tmp_path):
     orders = ("code;statusName;itemName;itemAmount;itemCode;itemVariantName;itemSupplier\r\n"
               "20261045;Vybavuje sa;Polokošeľa;1;61247/L;Veľkosť: L;BETALOV\r\n")
