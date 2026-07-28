@@ -205,3 +205,24 @@ prenášaš, píš `\u0000` ručne, nikdy neprelepuj hodnotu. Pinnuté testom
 tri (flag, riadok) záznamy, takže assert padol na správnom kóde. Pravidlo „záznamy sa
 NIKDY nemažú" ostáva pinnuté — mení sa len očakávaná množina. Keď meníš, koľko príznakov
 jeden zápis nárokuje, prejdi testy, ktoré `_flagWrites` počítajú.
+
+## 12. Predpoklad na SERVERI naseeduj cez `page.request`, nie klikaním
+
+Keď test potrebuje riadok, ktorý už NEJAKÝ príznak má, a zároveň **čisté klientske
+účtovníctvo** (`_flagWrites` prázdne, `seq` na nule — teda stav manažéra pri čerstvo
+načítanej karte), naklikať sa k nemu NEDÁ: každý klik si sám nárokuje `seq` a predpoklad
+tým znehodnotí. `page.request` chodí mimo stránky, ale zdieľa cookies kontextu (autouse
+fixtúra ich seeduje), takže stačí:
+
+```python
+page.request.post(toorder_server + "/api/ordered", data={"key": _KEY, "ordered": True})
+_open(page, toorder_server)      # až TERAZ sa načíta app.js -> _flagWrites je prázdne
+```
+
+Presne to odlišuje S7 od S5 v `test_order_flag_seq_guard.py`. Ekvivalent cez `page.reload()`
+po kliku funguje tiež (modulové `const _flagWrites` reload vynuluje), ale je o načítanie
+navyše. `/api/*` nie je CSRF-gated (JSON + session cookie stačí — pozri fixtúru `admin_api`).
+
+Drobnosť z tej istej vlny: v **Python** literáli neuzatváraj slovenské `„…“` ASCII
+úvodzovkou — `"… „skladom" …"` reťazec ukončí a zhodí zber testov na `SyntaxError:
+invalid character '„'`. Buď použi pravú `“`, alebo v hláškach assertu píš bez úvodzoviek.
