@@ -124,3 +124,30 @@ reálny kód objednávky naviazaný na meno, e-mail a telefón zákazníka, vo V
 repozitári. „Je to už v tomto súbore" nie je overenie (pred-existujúce výskyty →
 #289). Postup je v `.claude/rules/automation-health.md` — plus over aj 57 MB
 `data/products.csv`, nielen objednávkovú cache.
+
+## 8. Optimistický zápis, ktorý mení VIAC príznakov naraz — dve pasce (revízia PR #290)
+
+Odkedy jeden POST hýbe viacerými príznakmi riadku (#211: zapnutie stavu zhasne ostatné dva):
+
+- **Zoznam menených príznakov stav VŽDY BEZPODMIENEČNE, nikdy nie podľa toho, čo klient
+  práve zobrazuje.** Filter `if (map[key])` vyzerá ako úspora, ale príznak, ktorý klient už
+  optimisticky zhasol pre STARŠÍ letiaci zápis, si tak nenárokuje `seq` — a keď ten starší
+  zápis server ODMIETNE, je jediným vlastníkom toho príznaku a rollbackom ho VZKRIESI, nad
+  novším zápisom, ktorý server prijal. Mazanie neexistujúceho kľúča je no-op, takže nárok
+  na všetky nestojí nič.
+- **Vlastníctvo pre HLÁSENIE urč z KLIKNUTÉHO príznaku, nie z „vlastním hociktorý z nich".**
+  Zápis môže ostať vlastníkom príznaku, ktorý iba ZHASÍNAL (novší zápis sa ho nemusel
+  dotknúť) — brať to ako vlastníctvo znamená DVE hlášky pre jeden riadok.
+
+A ešte: **odpoveď servera so stavom riadku treba naozaj PREČÍTAŤ.** Dva zápisy vydané v
+jednom round-tripe idú po dvoch spojeniach a ich serverové vlákna si vezmú `with _lock:`
+v ľubovoľnom poradí — klientske poradie vydania teda NIE JE poradie commitov. Prijmi
+`flags` cez tú istú bránu `confirmed`/`confirmedSeq` (staršia odpoveď neprebije novšiu) a
+mapu prepíš len keď na ňu nič iné neletí.
+
+## 9. Test, ktorý počíta `_flagWrites` záznamy, po zmene zápisu preráta inak
+
+`test_a_straggler_...` asertoval PRESNE JEDEN záznam. Klik na os B si legitímne nárokuje
+tri (flag, riadok) záznamy, takže assert padol na správnom kóde. Pravidlo „záznamy sa
+NIKDY nemažú" ostáva pinnuté — mení sa len očakávaná množina. Keď meníš, koľko príznakov
+jeden zápis nárokuje, prejdi testy, ktoré `_flagWrites` počítajú.
