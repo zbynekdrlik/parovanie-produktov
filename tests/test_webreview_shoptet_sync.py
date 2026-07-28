@@ -209,9 +209,39 @@ def test_run_via_runner_after_export_failure_records_error(iso, monkeypatch):
 
 # ── never touches the manager's live decision stores ───────────────────────────
 def test_run_never_touches_manager_decision_stores(iso):
+    """Still true after #212 gave the sync a prune, and true for two independent reasons:
+    this fixture's one-order export is far under `ORDERS_PRUNE_MIN_ORDERS`, and the
+    sentinel key is not `<order>|<item>` shaped so no export could ever judge it."""
     webapp.run_shoptet_sync()
     for _name, path in iso["manager_stores"].items():
         assert path.read_text(encoding="utf-8") == '{"sentinel": true}'
+
+
+# ── #212: the hourly refresh is where the orphan prune runs ────────────────────
+def test_run_prunes_orphan_line_flags_from_the_freshly_downloaded_export(iso, monkeypatch):
+    """The prune must be WIRED, not merely written — and wired to the bytes just
+    downloaded, which is the only copy guaranteed to be current.
+
+    The export below closes `99002002` and keeps `99002001` open, plus enough other orders
+    to clear the plausibility floor. Only the closed order's key may go; the one whose
+    order is still open, and the one no export row mentions, must both survive.
+    """
+    rows = ("99002001;2026-07-20 09:00:00;Vybavuje sa;a@x.sk;;X Y;;A1\r\n"
+            "99002002;2026-07-02 09:00:00;Vybavená;a@x.sk;;X Y;;B1\r\n"
+            + "".join(f"99003{i:03d};2026-07-01 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+                      for i in range(60)))
+    monkeypatch.setattr(webapp, "_fetch_orders_csv",
+                        lambda: (ORDERS_CSV.decode("cp1250") + rows).encode("cp1250"))
+    ordered = iso["manager_stores"]["ORDERED"]
+    ordered.write_text(json.dumps({"99002001|A1": True, "99002002|B1": True,
+                                   "99001500|C1": True}), encoding="utf-8")
+
+    result = webapp.run_shoptet_sync()
+
+    assert result["flags_pruned"] == 1, result
+    assert "flags_prune_skipped" not in result, result
+    assert sorted(json.loads(ordered.read_text(encoding="utf-8"))) == \
+        ["99001500|C1", "99002001|A1"]
 
 
 # ── customer export: secret hygiene (same rule as the catalog export) ──────────

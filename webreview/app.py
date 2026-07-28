@@ -1768,6 +1768,114 @@ def _write_status_flag(field: str, key: str, on: bool) -> tuple:
     return flags, commit_seq
 
 
+# #212 — the four per-line flag stores, as (name, loader, saver). Named here so the prune
+# below cannot drift from the set it is supposed to cover; `order_comments.json` is
+# deliberately NOT in it (see its own comment — it is keyed per ORDER and is meant to
+# outlive the order), and neither is any per-PRODUCT store.
+def _line_flag_stores() -> tuple:
+    """Resolved PER CALL, for the same reason as `_status_stores`: a module-level tuple of
+    function objects would freeze at import and quietly stop reaching a later rebinding."""
+    return (("ordered_items.json", _load_ordered, _save_ordered),
+            ("waiting_items.json", _load_waiting, _save_waiting),
+            ("instock_items.json", _load_instock, _save_instock),
+            ("unavailable_items.json", _load_unavailable, _save_unavailable))
+
+
+# An orders export carrying FAR fewer orders than the shop makes is not a quiet quarter,
+# it is a broken feed — a changed export pattern, a filter left on, a truncated download.
+# Same shape and same reasoning as `EXPORT_MIN_CODES` for the catalogue: an absolute floor
+# far below reality, which cannot fire on a running shop and cannot disarm itself.
+#
+# Measured on the live 90-day export (2026-07-28): 521 distinct order codes, 57 of them
+# still „Vybavuje sa". 50 is an order of magnitude under that — a rate no month of this
+# shop has ever come near — while still catching „the export came back with three rows".
+ORDERS_PRUNE_MIN_ORDERS = 50
+ORDERS_PRUNE_LOG_KEYS = 20     # how many removed keys are named in the log line
+
+
+def _orders_by_openness(orders_csv) -> tuple:
+    """`(every order code the export mentions, the ones still „Vybavuje sa")`.
+
+    `statusName` is the whole ORDER's status and is repeated on every one of its lines
+    (`build_to_order_rows` reads it per row for exactly that reason), so an order can never
+    appear here as both seen and not-open unless it really is closed."""
+    text = (orders_csv.decode("cp1250", errors="replace")
+            if isinstance(orders_csv, bytes) else orders_csv or "")
+    seen, still_open = set(), set()
+    for r in csv.DictReader(io.StringIO(text), delimiter=";"):
+        code = (r.get("code") or "").strip()
+        if not code:
+            continue
+        seen.add(code)
+        if (r.get("statusName") or "").strip() == "Vybavuje sa":
+            still_open.add(code)
+    return seen, still_open
+
+
+def _prune_orphan_line_flags(orders_csv) -> dict:
+    """#212 — drop per-line flag keys whose ORDER the export positively shows as closed.
+
+    `orderCode` is transient: the tab only ever shows „Vybavuje sa" orders, so once an
+    order is dispatched its `<orderCode>|<itemCode>` keys can never be seen or cleared
+    again and the stores grow without bound (measured on the manager's live data: 141 of
+    217 keys were already orphans).
+
+    THE RULE IS POSITIVE EVIDENCE, and that is the whole safety argument. A key goes only
+    when its order IS in the export and none of its rows say „Vybavuje sa". An order the
+    export does not mention is not closed, it is UNSEEN — it may simply be older than
+    `ORDERS_EXPORT_WINDOW_DAYS`, or its rows may have been lost from a truncated download.
+    Because a cut export can only make rows DISAPPEAR (it cannot rewrite an order's status
+    onto its remaining lines), a damaged source can only ever make this prune remove FEWER
+    keys, never more. The ticket's own wording — „delete what is not among the open
+    orders" — would instead sweep away every key outside the window, which is live work we
+    merely cannot see.
+
+    On top of that, a fail-closed floor on the source (`ORDERS_PRUNE_MIN_ORDERS`): an
+    export carrying implausibly few orders prunes nothing at all.
+
+    Read-modify-write in ONE `with _lock:` block (inter-process, #264), removing IN PLACE
+    from the loaded map so the write is the legitimate tail of a read-modify-write and the
+    `protect=True` shrink guard (#261/#265) stays fully armed. A store with nothing to
+    remove is not written at all — a no-op write to a protected store burns its read
+    receipt and rewrites a file nothing asked to change (`_write_status_flag` follows the
+    same rule).
+
+    Returns `{"pruned": n, "skipped": reason, "orders_seen": n, "orders_open": n,
+    "per_store": {...}}` — counts the caller can put in front of a human."""
+    seen, still_open = _orders_by_openness(orders_csv)
+    if len(seen) < ORDERS_PRUNE_MIN_ORDERS:
+        log.warning("prune riadkových príznakov PRESKOČENÝ: export nesie len %d objednávok "
+                    "(minimum %d) — vyzerá neúplne, nemaže sa nič",
+                    len(seen), ORDERS_PRUNE_MIN_ORDERS)
+        return {"pruned": 0, "skipped": "implausible-source", "orders_seen": len(seen),
+                "orders_open": len(still_open), "per_store": {}}
+    closed = seen - still_open
+    per_store, total = {}, 0
+    with _lock:
+        for name, load, save in _line_flag_stores():
+            d = load()
+            # a key with no `<order>|<item>` shape cannot be attributed to an order, so it
+            # can never be SHOWN to be orphaned — it is left alone rather than guessed at
+            gone = sorted(k for k in d
+                          if "|" in k and k.split("|", 1)[0] in closed)
+            per_store[name] = len(gone)
+            if not gone:
+                continue
+            for k in gone:
+                d.pop(k, None)
+            save(d)
+            total += len(gone)
+            log.info("prune %s: odstránených %d osirelých kľúčov (objednávka je v exporte "
+                     "a už nie je „Vybavuje sa“): %s%s", name, len(gone),
+                     ", ".join(gone[:ORDERS_PRUNE_LOG_KEYS]),
+                     " …" if len(gone) > ORDERS_PRUNE_LOG_KEYS else "")
+    if not total:
+        log.info("prune riadkových príznakov: nič na odstránenie (%d objednávok v exporte, "
+                 "%d otvorených)", len(seen), len(still_open))
+    return {"pruned": total, "skipped": "", "orders_seen": len(seen),
+            "orders_open": len(still_open), "per_store": per_store}
+
+
 def _flag_snapshot(key: str) -> dict:
     """All four flags for one line — what every flag write answers with. Call it INSIDE the
     writer's own `with _lock:` block (`_lock` is reentrant): read outside it and the answer
@@ -5916,9 +6024,13 @@ def run_shoptet_sync() -> dict:
     then rebuilds the in-memory CODE2PAIR/CATALOG search
     index and resyncs each review card's price/stock snapshot
     (export_helpers.resync_current — the same logic scripts/resync_export.py
-    runs manually). Passive READ-ONLY refresh: never touches the manager
-    decision stores (decisions/ordered_items/waiting_items/order_pairings/
-    supplier_assignments — those are the manager's live work, untouched here).
+    runs manually). Passive READ-ONLY refresh as far as the manager's decision
+    stores go (decisions/order_pairings/supplier_assignments — his live work),
+    with ONE deliberate exception since #212: the per-line flag stores are pruned
+    of keys whose ORDER the freshly downloaded export positively shows as closed.
+    That prune only ever REMOVES keys the tab could never display again, never
+    writes a value, and disarms itself on an implausible export
+    (`_prune_orphan_line_flags`).
 
     Fetch-then-swap (temp file + atomic os.replace) throughout: a failed/partial
     fetch raises BEFORE anything on disk changes, so the runner's existing
@@ -5929,6 +6041,19 @@ def run_shoptet_sync() -> dict:
 
     orders_bytes = _fetch_orders_csv()
     _atomic_write_bytes(ORDERS_CACHE, orders_bytes, mode=0o600)
+
+    # #212 — on the bytes we have JUST downloaded, which is the freshest ground truth
+    # there is. Deliberately NOT on the read path `/api/orders`: a write there would turn
+    # „read the export" into a mutation and would let a STALE on-disk copy keep deciding
+    # what to delete (the same reason `_export_watermark_observe` is not hidden inside a
+    # reader). Housekeeping, so it can never take the hourly refresh down with it — a
+    # refused or failed prune leaves the stores exactly as they were and the sync goes on.
+    try:
+        prune = _prune_orphan_line_flags(orders_bytes)
+    except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
+        log.error("prune riadkových príznakov preskočený (%r) — sync pokračuje", e)
+        prune = {"pruned": 0, "skipped": repr(e), "orders_seen": 0, "orders_open": 0,
+                 "per_store": {}}
 
     # A REFUSED download is NON-FATAL (PR #280 review, MUST FIX 2). The refusal fires
     # only while the copy already on disk is fresh AND plausible — it exists to protect
@@ -6017,7 +6142,13 @@ def run_shoptet_sync() -> dict:
         "review_synced": counts["synced"],
         "review_stale": counts["stale"],
         "customers_bytes": len(customers_bytes),
+        # #212 — how many of the manager's per-line flag keys this run deleted. It is the
+        # one thing in this automation that REMOVES his markings, so it is reported next
+        # to the rest rather than living only in the log.
+        "flags_pruned": prune["pruned"],
     }
+    if prune["skipped"]:
+        result["flags_prune_skipped"] = prune["skipped"]
     if export_error:
         result["export_error"] = export_error
     if customers_error:
