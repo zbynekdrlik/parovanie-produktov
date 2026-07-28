@@ -36,7 +36,15 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "webreview"))
 import app as webapp  # noqa: E402
 
+from tests.conftest import authed_client  # noqa: E402
+
 _HEAD = "code;date;statusName;itemCode;itemName\r\n"
+
+
+def _post_json(url, body):
+    r = authed_client().post(url, json=body)
+    assert r.status_code == 200, (url, r.status_code, r.get_data(as_text=True))
+    return r.get_json()
 
 _KEY = "99002002|B1"          # the key under test, one order, one line
 _OTHER = "99002001|A1"        # an order that stays open — never touched
@@ -300,4 +308,96 @@ def test_a_refused_run_never_touches_the_grace_store(stores):
         _export([_OPEN_ROW, _row("99002002", "Vybavená", 40, "B1")], filler=3))
 
     assert res["skipped"] == "implausible-source", res
+    assert not stores["orders_closed_seen.json"].exists()
+
+
+# ── 6. a record that is WRONG is not a record (PR #295 review) ────────────────
+#     „Losing this store can only DELAY a deletion" is the whole argument for
+#     `protect=False` and for leaving it out of backup_data.sh. It is true of a LOST
+#     store and false of a WRONG one: a backward clock step (NTP correction, a VM
+#     restored from a snapshot, a hand edit) writes today's record with a date in the
+#     past, and the very next healthy run reads an „aged" record and deletes with zero
+#     real grace. The order-age floor cannot catch it — the order genuinely IS old.
+
+def test_a_record_that_PREDATES_ITS_OWN_ORDER_is_treated_as_no_record(stores):
+    """The repro, exactly: a clock stepped back a year while the order was being
+    recorded. No record can honestly say we saw an order closed BEFORE it was placed, so
+    the only safe reading is „no record", i.e. a refusal — and the run then re-records it
+    with today's date, so the grace starts properly instead of being skipped."""
+    order_day = (date.today() - timedelta(days=40)).isoformat()
+    assert _days_ago(400) < order_day                    # the record predates the order
+    _seed_grace(stores, {"99002002": _days_ago(400)})
+
+    res = webapp._prune_orphan_line_flags(
+        _export([_OPEN_ROW, _row("99002002", "Vybavená", 40, "B1")]))
+
+    assert res["pruned"] == 0, res
+    for name, path in stores.items():
+        if name != "orders_closed_seen.json":
+            assert _keys(path) == sorted([_KEY, _OTHER]), name
+    # …and the corrupt value is REPLACED, so the next 30 days are a real grace
+    assert _grace(stores) == {"99002002": date.today().isoformat()}, _grace(stores)
+
+
+def test_a_record_ON_the_order_day_is_still_a_valid_record(stores):
+    """The boundary from the other side — an order placed and closed the same day is
+    ordinary, so „record == order day" must NOT be read as corrupt (that would hand every
+    same-day closure a permanently restarting grace)."""
+    _seed_grace(stores, {"99002002": _days_ago(40)})     # == the order's own day
+
+    res = webapp._prune_orphan_line_flags(
+        _export([_OPEN_ROW, _row("99002002", "Vybavená", 40, "B1")]))
+
+    assert res["pruned"] == 4, res
+
+
+# ── 7. the grace is per ORDER, so a NEW mark must earn its own (PR #295 review) ─
+#     The record is only created when there is none, so a mark made AFTER it exists
+#     inherits whatever is left of that order's clock — which can be nothing at all.
+#     Reachable without any clock games: the order closed 30 days ago, was reopened and
+#     re-closed between two hourly runs (invisible to the reopen-pop), or the manager
+#     still has the tab open on a stale row; he marks a NEW line today; the next run
+#     deletes it the same hour.
+
+@pytest.mark.parametrize("mark", [
+    ("_write_status_flag", lambda k: webapp._write_status_flag("waiting_items.json", k, True)),
+    ("api_ordered", lambda k: _post_json("/api/ordered", {"key": k, "ordered": True})),
+    ("api_ordered_bulk", lambda k: _post_json("/api/ordered/bulk",
+                                              {"keys": [k], "ordered": True})),
+])
+def test_a_mark_made_TODAY_is_never_deleted_by_an_old_record(stores, mark):
+    """Turning a flag ON is new work on that order, so the order's closure record is no
+    longer a description of anything the manager has seen: it must go, and the grace runs
+    again from the next sync that still finds the order closed."""
+    name, do_mark = mark
+    _seed_grace(stores, {"99009001": _days_ago(webapp.ORDERS_PRUNE_REOPEN_GRACE_DAYS)})
+    new_key = "99009001|NEW"
+    do_mark(new_key)
+    assert _grace(stores) == {}, (name, _grace(stores))   # the stale clock is dropped
+
+    res = webapp._prune_orphan_line_flags(
+        _export([_OPEN_ROW, _row("99009001", "Vybavená", 40, "NEW")]))
+
+    assert res["pruned"] == 0, (name, res)
+    assert new_key in _keys(stores["ordered_items.json"] if "ordered" in name
+                            else stores["waiting_items.json"]), name
+    # …and the run has started the grace over, so the mark is not immortal either
+    assert _grace(stores) == {"99009001": date.today().isoformat()}, (name, _grace(stores))
+
+
+def test_turning_a_flag_OFF_leaves_the_record_alone(stores):
+    """Only NEW work resets the clock. Clearing a mark says the manager is done with that
+    line, which is no reason to hand the order another 30 days."""
+    _seed_grace(stores, {"99002002": _days_ago(20)})
+
+    webapp._write_status_flag("waiting_items.json", _KEY, False)
+
+    assert _grace(stores) == {"99002002": _days_ago(20)}, _grace(stores)
+
+
+def test_marking_an_order_with_NO_record_writes_nothing(stores):
+    """store-prune §3 — nothing to remove means no write at all, not an empty file
+    created on every single click."""
+    webapp._write_status_flag("waiting_items.json", "99009001|NEW", True)
+
     assert not stores["orders_closed_seen.json"].exists()
