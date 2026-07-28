@@ -22,6 +22,7 @@ is exercised exactly as in production, not bypassed by writing JSON by hand.
 import json
 import os
 import sys
+from datetime import date, timedelta
 
 import pytest
 
@@ -39,13 +40,16 @@ _UNSEEN = "99001500|C1"      # its order is not in the export at all -> must sta
 def _export(rows, filler=60):
     """A plausible export: `rows` plus enough unrelated orders to clear the floor."""
     body = "".join(rows)
-    body += "".join(f"99003{i:03d};2026-07-01 09:00:00;Vybavená;Z{i};Nieco\r\n"
+    body += "".join(f"99003{i:03d};2026-01-01 09:00:00;Vybavená;Z{i};Nieco\r\n"
                     for i in range(filler))
     return (_HEAD + body).encode("cp1250")
 
 
-_OPEN_ROW = "99002001;2026-07-20 09:00:00;Vybavuje sa;A1;Bunda\r\n"
-_CLOSED_ROW = "99002002;2026-07-02 09:00:00;Vybavená;B1;Ciapka\r\n"
+_OPEN_ROW = "99002001;{};Vybavuje sa;A1;Bunda\r\n".format(
+    (date.today() - timedelta(days=2)).isoformat() + " 09:00:00")
+# Old enough to be past the grace period (`ORDERS_PRUNE_MIN_AGE_DAYS`) on any run day.
+_CLOSED_ROW = "99002002;{};Vybavená;B1;Ciapka\r\n".format(
+    (date.today() - timedelta(days=120)).isoformat() + " 09:00:00")
 
 
 @pytest.fixture
@@ -153,3 +157,103 @@ def test_the_prune_reports_what_it_removed(stores, caplog):
     assert "ordered_items.json" in logged, logged
     assert _OPEN not in logged and _UNSEEN not in logged, (
         "a key that was KEPT was reported as removed", logged)
+
+
+# ── the ways a plausible-LOOKING export can still be lying (PR #292 review) ────
+
+def test_an_export_with_NO_open_orders_at_all_prunes_nothing(stores):
+    """The reviewers' 🔴: „closed" is computed as `seen - still_open`, so anything that
+    empties `still_open` while `seen` stays large makes EVERY in-window order look closed
+    and deletes the manager's marks wholesale — the floor does not fire, and the
+    `protect=True` guard cannot fire either, because the prune is a legitimate
+    read-modify-write.
+
+    Two real triggers, both cheap: Shoptet's status names are shop-configurable TEXT and
+    the literal is hard-coded, and the export template can change. On the live feed 57 of
+    521 orders are open, so „a plausible export in which nothing at all is open" is not a
+    quiet week — it is a signal that we are reading something else than we think."""
+    rows = [r.replace("Vybavuje sa", "Vybavuje sa (nový názov)") for r in
+            (_OPEN_ROW, _CLOSED_ROW)]
+    res = webapp._prune_orphan_line_flags(_export(rows))
+
+    assert res["pruned"] == 0, res
+    assert res["skipped"] == "no-open-orders", res
+    for path in stores.values():
+        assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
+
+
+def test_an_export_without_the_statusName_column_prunes_nothing(stores):
+    """Same 🔴 through the other door: no `statusName` column at all (a changed export
+    template, or the creds URL repointed at an export that also has a `code` column).
+    Every `r.get("statusName")` is then `None` and nothing is open. Caught on the COLUMN,
+    before a single row is judged, so the failure is named rather than inferred."""
+    head = "code;date;itemCode;itemName\r\n"
+    body = "".join(f"99003{i:03d};2026-07-01 09:00:00;Z{i};Nieco\r\n" for i in range(60))
+    body += "99002002;2026-07-02 09:00:00;B1;Ciapka\r\n"
+
+    res = webapp._prune_orphan_line_flags((head + body).encode("cp1250"))
+
+    assert res["pruned"] == 0, res
+    assert res["skipped"] == "no-status-column", res
+    for path in stores.values():
+        assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
+
+
+def test_a_body_cut_mid_row_does_not_judge_that_row(stores):
+    """The truncation argument („a cut export can only make an order DISAPPEAR") is true
+    for every row EXCEPT the one the cut lands in: `csv.DictReader` hands that one back
+    with a truncated or missing `statusName`, so a genuinely OPEN order reads as closed.
+    A body that does not end in a newline is incomplete by definition — its last row is
+    dropped rather than believed."""
+    full = _export([_CLOSED_ROW]).decode("cp1250") + "99002001;2026-07-20 09:00:00;Vybavu"
+
+    res = webapp._prune_orphan_line_flags(full.encode("cp1250"))
+
+    assert _keys(stores["ordered_items.json"]) == sorted([_OPEN, _UNSEEN]), (
+        "the order in the cut-off row was judged from a half-read status", res)
+
+
+def test_an_unparsable_body_prunes_nothing_and_does_not_escape(stores):
+    """`csv.Error` is neither `ValueError` nor `OSError`, so it would sail through the
+    caller's housekeeping `except` and take the whole hourly sync down with it — while the
+    comment there promises it cannot. A body carrying a bare CR in an unquoted field does
+    exactly that, and `errors="replace"` guarantees such a body always reaches the parser."""
+    blob = (_HEAD + "99002002;2026-07-02 09:00:00;Vybav\rená;B1;X\r\n").encode("cp1250")
+
+    res = webapp._prune_orphan_line_flags(blob)     # must NOT raise
+
+    assert res["pruned"] == 0 and res["skipped"] == "implausible-source", res
+    for path in stores.values():
+        assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
+
+
+def test_a_freshly_closed_order_keeps_its_marks_for_a_while(stores):
+    """A closed order can be REOPENED — the repo says so itself where the reminder dedup
+    store explains why it keeps records („a »Vybavená« order can be reopened to »Vybavuje
+    sa« tomorrow"). Deleting its marks the same hour means the line comes back with the
+    manager's „objednané u dodávateľa" silently gone, and he orders it a second time.
+
+    So a closed order also has to be OLD before its keys go. Measured on the live export:
+    the manager's marks sit almost entirely on recent orders, and the export window is 90
+    days — so a 30-day grace still leaves 60 days of hourly runs to do the pruning."""
+    fresh = "99002002;{};Vybavená;B1;Ciapka\r\n".format(
+        (date.today() - timedelta(days=3)).isoformat() + " 09:00:00")
+
+    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW, fresh]))
+
+    assert res["pruned"] == 0, res
+    assert res["skipped"] == "", res            # the source was fine; the order is young
+    for path in stores.values():
+        assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
+
+
+def test_an_order_with_no_usable_date_is_never_pruned(stores):
+    """Age is the grace period, so a row whose `date` cannot be read is a row whose age we
+    do not know — and an unknown age must not be treated as „old enough"."""
+    undated = "99002002;;Vybavená;B1;Ciapka\r\n"
+    junk = "99002002;neplatný dátum;Vybavená;B1;Ciapka\r\n"
+
+    for row in (undated, junk):
+        res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW, row]))
+        assert res["pruned"] == 0, (row, res)
+    assert _keys(stores["ordered_items.json"]) == sorted([_OPEN, _CLOSED, _UNSEEN])

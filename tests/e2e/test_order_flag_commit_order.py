@@ -95,6 +95,13 @@ def test_the_write_that_committed_LAST_is_what_the_row_shows(reordered_page):
 
     page.evaluate("() => window.__release()")                       # …now let A commit
     page.wait_for_function("() => window.__posts.done === 2")
+    # `__posts.done` fires in the RAW fetch's `then`, i.e. before postToOrder awaits the
+    # body, before the bookkeeping and before renderToOrder — so it does NOT mean „the row
+    # has been repainted". Wait for the DOM itself, or the assertions below pass or fail on
+    # an accident of timing (previously: on the round-trip `_server_ordered` happens to add).
+    page.wait_for_function(
+        """() => { const r = document.querySelector(".toorder-row[data-code='C1']");
+                   return r && r.classList.contains('done'); }""", timeout=3000)
 
     assert _server_ordered(page) is True, (
         "precondition: the write issued FIRST must be the one that committed LAST")
@@ -144,3 +151,66 @@ def test_every_flag_write_answers_with_a_commit_number(page, toorder_server):
         "answers by", seqs)
     assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), (
         "commit numbers must be strictly increasing across every flag write", seqs)
+
+
+# The answer that carries NO commit number — the corner the first cut of #291 got wrong.
+# The write really reaches the server; only the number is stripped from the 200 it answers
+# with, which is exactly what a truncated body (this app sits behind a tunnel) or a NEW
+# app.js talking to an OLD server produces.
+_STRIP_COMMIT_SEQ = """
+(() => {
+  const _fetch = window.fetch;
+  window.fetch = function (url, opts) {
+    const p = _fetch.call(window, url, opts);
+    if (!(typeof url === 'string' && url === '/api/instock'
+          && opts && opts.method === 'POST')) return p;
+    return p.then(async (r) => {
+      const j = await r.json();
+      delete j.commitSeq;
+      return new Response(JSON.stringify(j),
+                          {status: r.status, headers: {'Content-Type': 'application/json'}});
+    });
+  };
+})();
+"""
+
+_N1 = ".toorder-row[data-code='N1']"
+
+
+def test_an_accepted_write_without_a_commit_number_still_matches_the_server(
+        page, toorder_server):
+    """An accepted write whose answer carries no number cannot be ORDERED against others —
+    but when it is the only write out for that (flag, row), there is nothing to order it
+    against, and refusing to adopt it freezes `confirmed` on a value the server has moved
+    past. The next REFUSED write then „rolls back" onto that stale value, i.e. does not
+    roll back — the screen shows a flag the server does not hold, right after telling the
+    manager the save failed. That is the #290 failure shape, and the first cut of #291
+    re-opened it while trying to close a different one.
+
+    So: accepted + nothing else in flight for that (flag, row) => adopt, without moving the
+    commit clock. Ambiguity only exists when there IS something to be ambiguous with.
+    """
+    page.add_init_script(_STRIP_COMMIT_SEQ)
+    page.goto(toorder_server + "/?tab=toorder")
+    page.wait_for_selector(".toorder-row")
+
+    with page.expect_response("**/api/instock"):
+        page.locator(_N1 + " .to-instock").click()          # accepted, number stripped
+    page.wait_for_selector(_N1 + ".instock")
+
+    # …now refuse the next write on the same flag: the rollback must land on the value the
+    # server really holds (on), not on a baseline frozen before the accepted write
+    page.route("**/api/instock", lambda r: r.fulfill(
+        status=500, content_type="application/json", body='{"ok": false}')
+        if r.request.method == "POST" else r.continue_())
+    page.locator(_N1 + " .to-instock").click()
+    page.wait_for_selector("#toFails .tofail", timeout=3000)
+
+    server = page.evaluate(
+        """() => fetch('/api/instock').then(r => r.json())
+                   .then(j => Object.keys(j.instock))""")
+    cls = set((page.locator(_N1).get_attribute("class") or "").split())
+    assert server, "precondition: the accepted write must have reached the store"
+    assert "instock" in cls, (
+        "the row shows the flag OFF while the server holds it ON — the accepted write was "
+        "never adopted, so the refused one rolled back onto a stale baseline", server, cls)

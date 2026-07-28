@@ -1087,7 +1087,11 @@ def test_the_client_adopts_the_flags_the_SERVER_answers_with(page, toorder_serve
     # the server answers OK, but with a state the client did not predict
     page.route("**/api/instock", lambda r: r.fulfill(
         status=200, content_type="application/json",
-        body=json.dumps({"ok": True, "commitSeq": 1,
+        # far above any wall-clock-seeded number: with `commitSeq: 1` this stub only
+        # worked while the entry was virgin, so any future edit landing a real write on
+        # the row first would make it drop out as stale and fail for a reason that looks
+        # nothing like the test's name
+        body=json.dumps({"ok": True, "commitSeq": 2 ** 62,
                          "flags": {"ordered": False, "waiting": True,
                                    "instock": False, "unavailable": False}}))
         if r.request.method == "POST" else r.continue_())
