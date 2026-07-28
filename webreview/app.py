@@ -1835,6 +1835,42 @@ def _line_flag_stores() -> tuple:
 ORDERS_PRUNE_MIN_ORDERS = 50
 ORDERS_PRUNE_LOG_KEYS = 20     # how many removed keys are named in the log line
 
+# The statuses that MEAN the order is finished. Closure is membership in THIS set — never
+# „everything that is not the one open literal", which is the same negative evidence this
+# whole prune exists to avoid, just applied to the status instead of to the presence.
+#
+# This is not a two-status shop. The live 90-day export (2026-07-28) carries nine:
+#   Vybavená 387 · Stornovaná 63 · Vybavuje sa 57 · Vybavená výmena 4 · Osob. odber 3
+#   Vybavený Dobropis 3 · Kompletná 2 · Vratený tovar 1 · Výmena tovaru 1
+# `Osob. odber` (waiting to be collected) and `Výmena tovaru` (an exchange being handled)
+# are LIVE states, and `seen - still_open` called all of them closed.
+#
+# Two independent signals in that same data pick out exactly the four below, which is why
+# the list can be trusted rather than guessed:
+#   * the shop's naming convention — the finished form carries a „Vybavená/Vybavený"
+#     prefix: „Vybavená výmena" against „Výmena tovaru", „Vybavený Dobropis" against
+#     „Vratený tovar";
+#   * the tracking number, i.e. the goods physically left: Vybavená 250/387,
+#     Vybavená výmena 4/4, Vybavený Dobropis 3/3 — against Kompletná 0/2, Vratený tovar
+#     0/1, Výmena tovaru 0/1, Osob. odber 0/3.
+# `Stornovaná` is the exception that proves the rule (1/63 — a cancelled order has nothing
+# to dispatch) and is unambiguously over.
+#
+# DELIBERATELY OFF the list, both against the review's suggested minimum:
+#   * `Vratený tovar` — by the convention above it is the in-progress counterpart of
+#     `Vybavený Dobropis` (the goods came back, the credit note is not issued yet). Two of
+#     today's 24 deletions sit on it.
+#   * `Kompletná` — both live ones are 2 and 5 days old with NO tracking number, i.e. fresh
+#     and not dispatched, which reads as „assembled, waiting to go", not as over.
+# The asymmetry decides both: leaving a status off costs a handful of keys that linger until
+# the order reaches a status we do recognise; putting one on wrongly deletes the manager's
+# irreplaceable marks from an order still being handled — and if it returns to „Vybavuje sa"
+# the line is ordered from the supplier a second time, the exact harm the marks prevent.
+# Promoting a status onto this list needs evidence; the reverse cannot be undone.
+ORDERS_TERMINAL_STATUSES = frozenset({
+    "Vybavená", "Vybavená výmena", "Vybavený Dobropis", "Stornovaná",
+})
+
 # …and a closed order's keys are not dropped the same hour it closes. A „Vybavená" order
 # can be REOPENED to „Vybavuje sa" — this repo says so itself where the reminder dedup
 # store explains why IT keeps records (`orders_reminder.py`, DEDUP_RETENTION_DAYS). A line
@@ -1852,20 +1888,27 @@ ORDERS_PRUNE_MIN_AGE_DAYS = 30
 
 
 def _orders_by_openness(orders_csv):
-    """`(seen, still_open, first_date_per_order, reason)` — `reason` is `""` when the
-    export can be believed, and otherwise names WHY it cannot.
+    """`(seen, still_open, finished, first_date_per_order, unknown, reason)` — `reason` is
+    `""` when the export can be believed, and otherwise names WHY it cannot.
+
+    `finished` is the set the caller deletes against, and it is built by POSITIVE
+    membership in `ORDERS_TERMINAL_STATUSES`: an order is finished only when it has rows
+    and not one of them carries a status outside that list. A status this code has never
+    met — a renamed one, a newly added one — therefore keeps its keys instead of losing
+    them, which `seen - still_open` got exactly backwards. `unknown` collects those
+    statuses so an added one is reported rather than silently narrowing the prune.
 
     `statusName` is the whole ORDER's status and is repeated on every one of its lines
-    (`build_to_order_rows` reads it per row for exactly that reason), so an order can never
-    appear here as both seen and not-open unless it really is closed.
+    (`build_to_order_rows` reads it per row for exactly that reason), so a mixed order
+    should not exist; if one ever does, one unfinished row keeps the whole order.
 
-    Three ways this refuses to answer, all of them fail-closed because the CALLER derives
-    „closed" as `seen - still_open` — anything that empties `still_open` while `seen` stays
-    large turns the prune into a wipe:
+    Three ways this refuses to answer, all fail-closed — the floor counts only `seen`, and
+    the `protect=True` shrink guard cannot fire on a prune because a prune IS a legitimate
+    read-modify-write, so a lying export has nothing else standing in its way:
 
-    * **no `statusName` column** — every row would read as not-open. A changed export
-      template does this, and so does a creds URL repointed at another export that happens
-      to have a `code` column too. Caught on the HEADER, before a single row is judged.
+    * **no `statusName` column** — every row would read as an unknown status. A changed
+      export template does this, and so does a creds URL repointed at another export that
+      happens to have a `code` column too. Caught on the HEADER, before a row is judged.
     * **a body that does not end in a newline** — it is incomplete by definition, and the
       row the cut landed in comes back with a truncated or missing status, i.e. a genuinely
       OPEN order reading as closed. The trailing partial row is dropped. (Where the cut
@@ -1886,7 +1929,7 @@ def _orders_by_openness(orders_csv):
     if text and not text.endswith(("\n", "\r")):
         cut = max(text.rfind("\n"), text.rfind("\r"))
         text = text[:cut + 1] if cut >= 0 else ""
-    seen, still_open, dates = set(), set(), {}
+    seen, still_open, unfinished, dates, unknown = set(), set(), set(), {}, set()
     try:
         rd = csv.DictReader(io.StringIO(text), delimiter=";")
         if "statusName" not in (rd.fieldnames or []):
@@ -1894,20 +1937,25 @@ def _orders_by_openness(orders_csv):
             # the operator is told „your export is wrong" with nothing to go and look at
             # (`.claude/rules/automation-health.md` point 3)
             got = {(r.get("code") or "").strip() for r in rd}
-            return {c for c in got if c}, set(), {}, "no-status-column"
+            return {c for c in got if c}, set(), set(), {}, set(), "no-status-column"
         for r in rd:
             code = (r.get("code") or "").strip()
             if not code:
                 continue
             seen.add(code)
-            if (r.get("statusName") or "").strip() == "Vybavuje sa":
+            status = (r.get("statusName") or "").strip()
+            if status == "Vybavuje sa":
                 still_open.add(code)
+            if status not in ORDERS_TERMINAL_STATUSES:
+                unfinished.add(code)
+                if status and status != "Vybavuje sa":
+                    unknown.add(status)
             if code not in dates:
                 dates[code] = (r.get("date") or "").strip()[:10]
     except csv.Error as e:
         log.warning("orders export sa nedá rozparsovať (%r) — prune nemaže nič", e)
-        return set(), set(), {}, "unparsable-source"
-    return seen, still_open, dates, ""
+        return set(), set(), set(), {}, set(), "unparsable-source"
+    return seen, still_open, seen - unfinished, dates, unknown, ""
 
 
 def _order_is_old_enough(day: str) -> bool:
@@ -1929,8 +1977,11 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     again and the stores grow without bound (measured on the manager's live data: 141 of
     217 keys were already orphans).
 
-    THE RULE IS POSITIVE EVIDENCE, and that is the whole safety argument. A key goes only
-    when its order IS in the export and none of its rows say „Vybavuje sa". An order the
+    THE RULE IS POSITIVE EVIDENCE — on BOTH axes, which is the whole safety argument. A key
+    goes only when its order IS in the export (presence) AND every one of its rows carries a
+    status that MEANS finished (`ORDERS_TERMINAL_STATUSES`). „Not the open literal" is not
+    evidence of anything: the shop's status names are configurable text and it uses nine of
+    them, so an unknown or newly added one used to read as closed. An order the
     export does not mention is not closed, it is UNSEEN — it may simply be older than
     `ORDERS_EXPORT_WINDOW_DAYS`, or its rows may have been lost from a truncated download.
     Because a cut export can only make rows DISAPPEAR (it cannot rewrite an order's status
@@ -1950,42 +2001,50 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     same rule).
 
     Returns `{"pruned": n, "skipped": reason, "orders_seen": n, "orders_open": n,
-    "per_store": {...}}` — counts the caller can put in front of a human.
+    "unknown_statuses": [...], "per_store": {...}}` — counts the caller can put in front of
+    a human. `unknown_statuses` is the honest cost of the allow-list: a status nobody added
+    to it quietly stops being pruned, so the run names it instead of hiding it.
 
     It deliberately takes NO commit number (#291), unlike every other writer of these
     stores: those numbers order two answers to the SAME open row for a client that is
     watching it, and a pruned key belongs to an order the tab can no longer display at
     all, so there is no client state for it to order against."""
-    seen, still_open, dates, reason = _orders_by_openness(orders_csv)
+    seen, still_open, finished, dates, unknown, reason = _orders_by_openness(orders_csv)
+    unknown_statuses = sorted(unknown)
     if reason:
         log.error("prune riadkových príznakov PRESKOČENÝ (%s): export nesie %d objednávok "
                   "— nemaže sa nič", reason, len(seen))
         return {"pruned": 0, "skipped": reason, "orders_seen": len(seen),
-                "orders_open": 0, "per_store": {}}
+                "orders_open": 0, "unknown_statuses": unknown_statuses, "per_store": {}}
     if len(seen) < ORDERS_PRUNE_MIN_ORDERS:
         log.warning("prune riadkových príznakov PRESKOČENÝ: export nesie len %d objednávok "
                     "(minimum %d) — vyzerá neúplne, nemaže sa nič",
                     len(seen), ORDERS_PRUNE_MIN_ORDERS)
         return {"pruned": 0, "skipped": "implausible-source", "orders_seen": len(seen),
-                "orders_open": len(still_open), "per_store": {}}
-    # „Closed" is `seen - still_open`, so an EMPTY `still_open` says every order in the
-    # window is closed — and deletes the manager's marks wholesale. On a healthy feed that
-    # is impossible (measured: 57 open of 521), so it is not a quiet week, it is a sign we
-    # are reading something other than what we think: a renamed status (Shoptet's status
-    # names are shop-configurable TEXT and the literal is hard-coded here), a different
-    # export, a filter left on. Neither the floor above (it counts only `seen`) nor the
-    # `protect=True` shrink guard (the prune IS a legitimate read-modify-write) would stop
-    # it, so this is the only thing standing between that and a wipe.
-    # A refusal here is SAFE but SILENT: `no-open-orders` / `no-status-column` are permanent
-    # states, so the stores go on growing with only a log line and a stat to show for it.
-    # Making the manager see it (card banner + ⚠ badge + E2E) is #293.
+                "orders_open": len(still_open),
+                "unknown_statuses": unknown_statuses, "per_store": {}}
+    # An export in which NOTHING is open is a sign we are reading something other than what
+    # we think: a renamed open status (Shoptet's status names are shop-configurable TEXT and
+    # the literal is hard-coded here), a different export, a filter left on. On a healthy
+    # feed it is impossible — measured: 57 open of 521 — so it is not a quiet week.
+    #
+    # Since the allow-list above, this can no longer turn into a wipe on its own (closure
+    # needs positive membership, and a renamed status is simply not on the list), so it is
+    # now belt to that braces. It stays because it is still the cheapest signal that the
+    # source changed under us, and it names the failure instead of leaving the run to look
+    # healthy while pruning nothing.
     if not still_open:
         log.error("prune riadkových príznakov PRESKOČENÝ: v exporte s %d objednávkami nie "
                   "je ani jedna so stavom Vybavuje sa — premenovaný stav alebo iný "
                   "export? Nemaže sa nič", len(seen))
         return {"pruned": 0, "skipped": "no-open-orders", "orders_seen": len(seen),
-                "orders_open": 0, "per_store": {}}
-    closed = {c for c in (seen - still_open) if _order_is_old_enough(dates.get(c))}
+                "orders_open": 0, "unknown_statuses": unknown_statuses, "per_store": {}}
+    # An added status narrows what gets pruned without anything failing — the honest cost of
+    # the allow-list, so it is logged and reported (rendered on the card) rather than hidden.
+    if unknown_statuses:
+        log.info("prune riadkových príznakov: export nesie stavy, ktoré nepoznám a preto "
+                 "ich nepovažujem za ukončené: %s", ", ".join(unknown_statuses))
+    closed = {c for c in finished if _order_is_old_enough(dates.get(c))}
     per_store, total = {}, 0
     with _lock:
         for name, load, save in _line_flag_stores():
@@ -2002,14 +2061,15 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
             save(d)
             total += len(gone)
             log.info("prune %s: odstránených %d osirelých kľúčov (objednávka je v exporte "
-                     "a už nie je „Vybavuje sa“): %s%s", name, len(gone),
+                     "a jej stav znamená vybavené): %s%s", name, len(gone),
                      ", ".join(gone[:ORDERS_PRUNE_LOG_KEYS]),
                      " …" if len(gone) > ORDERS_PRUNE_LOG_KEYS else "")
     if not total:
         log.info("prune riadkových príznakov: nič na odstránenie (%d objednávok v exporte, "
                  "%d otvorených)", len(seen), len(still_open))
     return {"pruned": total, "skipped": "", "orders_seen": len(seen),
-            "orders_open": len(still_open), "per_store": per_store}
+            "orders_open": len(still_open), "unknown_statuses": unknown_statuses,
+            "per_store": per_store}
 
 
 def _flag_snapshot(key: str) -> dict:
@@ -6194,7 +6254,7 @@ def run_shoptet_sync() -> dict:
         # the opposite. `_orders_by_openness` already catches it — this is the backstop.
         log.error("prune riadkových príznakov preskočený (%r) — sync pokračuje", e)
         prune = {"pruned": 0, "skipped": repr(e), "orders_seen": 0, "orders_open": 0,
-                 "per_store": {}}
+                 "unknown_statuses": [], "per_store": {}}
 
     # A REFUSED download is NON-FATAL (PR #280 review, MUST FIX 2). The refusal fires
     # only while the copy already on disk is fresh AND plausible — it exists to protect
