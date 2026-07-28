@@ -137,3 +137,15 @@ def test_an_empty_table_builds_nothing_rather_than_an_empty_import():
 def test_rows_come_out_in_a_stable_order_so_two_runs_are_comparable():
     p = _pending_two_codes()
     assert [r[0] for r in ob.build_import(p)[1]] == ["A", "B"]
+
+
+def test_a_code_with_no_queued_fields_is_never_sent_as_an_empty_row():
+    # An entry can reach the table with an empty `fields` dict (e.g. every
+    # queued value was later overwritten back to blank). Such a code has
+    # nothing to say and must not surface as a bare ["code", "pairCode"] row.
+    pending = dict(_pending_two_codes())
+    pending["C"] = {"pairCode": "PC", "fields": {}}
+    header, rows, blocked = ob.build_import(pending)
+    assert [r[0] for r in rows] == ["A", "B"]
+    assert blocked == {}
+    assert header == "code;pairCode;availabilityInStock;internalNote;stock"
