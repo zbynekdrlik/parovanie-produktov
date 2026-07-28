@@ -6,6 +6,7 @@ Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:879
 """
 from __future__ import annotations
 import collections
+import contextlib
 import csv
 import fcntl
 import hmac
@@ -8825,6 +8826,58 @@ def _start_scheduler() -> bool:
     RUNNER.start()
     SCHEDULER_INTENT = "running"
     return True
+
+
+# #299 — the whole download → let the automations queue changes → one upload →
+# download-again cycle holds ONE claim, so a standalone hourly download cannot land
+# in the middle of it and hand the drain a catalogue that changed under its feet.
+# Same flock shape as SCHEDULER_CLAIM above — but that one is held for the whole
+# process lifetime, while THIS claim must be released the moment the cycle ends
+# (success or exception), so the next hourly run can take it. Hence the context
+# manager, not a boot-time `_claim_*() -> bool` function.
+CYCLE_CLAIM = _store(".shoptet_cycle.lock")
+
+
+def _cycle_busy() -> bool:
+    """True while some process is inside the upload cycle."""
+    p = os.fspath(CYCLE_CLAIM)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _shoptet_cycle_claim():
+    """Take the exclusive cross-process claim for the whole Shoptet upload cycle.
+
+    Yields `True` when the claim was taken (the caller owns the cycle) or `False`
+    when another process already holds it (the caller must skip this run, never
+    proceed anyway). The claim is ALWAYS released when the `with` block exits —
+    including on an exception — so a crashed cycle never wedges the next hourly
+    run open forever."""
+    p = os.fspath(CYCLE_CLAIM)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log.warning("sync do Shoptetu: cyklus už beží inde, preskakujem")
+            yield False
+            return
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()} "
+                     f"started={datetime.now().isoformat(timespec='seconds')}\n".encode())
+        yield True
+    finally:
+        os.close(fd)
+
 
 # Valid /api/ui-label rename keys (#173): every NAV key the frontend actually
 # renders a button for — mirrors app.js's TABS + AUTOMATION_TABS arrays + the
