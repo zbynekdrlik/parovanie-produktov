@@ -228,7 +228,7 @@ def test_run_prunes_orphan_line_flags_from_the_freshly_downloaded_export(iso, mo
     order is still open, and the one no export row mentions, must both survive.
     """
     # dated relative to TODAY: the closed order must be past the reopen grace period
-    # (`ORDERS_PRUNE_MIN_AGE_DAYS`), which a fixed date silently stops being
+    # (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`), which a fixed date silently stops being
     recent = (date.today() - timedelta(days=2)).isoformat()
     old_day = (date.today() - timedelta(days=120)).isoformat()
     rows = (f"99002001;{recent} 09:00:00;Vybavuje sa;a@x.sk;;X Y;;A1\r\n"

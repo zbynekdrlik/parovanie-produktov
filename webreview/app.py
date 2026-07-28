@@ -1871,20 +1871,30 @@ ORDERS_TERMINAL_STATUSES = frozenset({
     "Vybavená", "Vybavená výmena", "Vybavený Dobropis", "Stornovaná",
 })
 
-# …and a closed order's keys are not dropped the same hour it closes. A „Vybavená" order
-# can be REOPENED to „Vybavuje sa" — this repo says so itself where the reminder dedup
-# store explains why IT keeps records (`orders_reminder.py`, DEDUP_RETENTION_DAYS). A line
-# that comes back with the manager's „objednané u dodávateľa" silently gone is a line he
-# orders a second time, which is the exact harm those marks exist to prevent.
+# A floor on the age of the ORDER ITSELF — and the name says that, because it is NOT the
+# reopen grace it was first written as, and cannot be one.
 #
-# The grace period is measured on the order's own DATE, which the export already carries —
-# no new store, and nothing to go stale. 30 days against a 90-day export window
-# (`ORDERS_EXPORT_WINDOW_DAYS`) leaves 60 days of hourly runs in which every eligible key
-# is still reachable, so nothing is ever stranded. Measured on the live data (2026-07-28):
-# the manager's marks sit almost entirely on recent orders, so this trades most of one
-# run's cleanup for the reopen safety and still bounds the stores — they settle at
-# „the last month's work" instead of growing for ever, which is the actual ticket.
-ORDERS_PRUNE_MIN_AGE_DAYS = 30
+# What it was meant for: a „Vybavená" order can be REOPENED to „Vybavuje sa" — this repo
+# says so itself where the reminder dedup store explains why IT keeps records
+# (`orders_reminder.py`, DEDUP_RETENTION_DAYS). A line that comes back with the manager's
+# „objednané u dodávateľa" silently gone is a line he orders a second time, which is the
+# exact harm those marks exist to prevent.
+#
+# What it actually measures: days since the order was PLACED. The export carries 66 columns
+# and its only date is `date` = order creation; there is no status-change or last-modified
+# column anywhere in it, so the moment an order closed simply cannot be read from the source.
+# Be plain about the consequence: an order placed 31 days ago and closed TODAY is pruned on
+# the very next hourly run, with no grace at all — and that is precisely the long
+# supplier-wait order these marks exist for (live open flagged orders run up to 75 days old).
+# Measuring a real grace needs us to record when we first SAW an order closed, i.e. a new
+# store; that is #294, deliberately not smuggled in here.
+#
+# It is still worth keeping as what it is: a bound on how long a key can live. 30 days
+# against a 90-day export window (`ORDERS_EXPORT_WINDOW_DAYS`) leaves 60 days of hourly runs
+# in which every eligible key is still reachable, so nothing is ever stranded, and it does
+# cover the common case where an order closes near the day it was placed. The stores settle
+# at „the last month's work" instead of growing for ever, which is the actual ticket.
+ORDERS_PRUNE_MIN_ORDER_AGE_DAYS = 30
 
 
 def _orders_by_openness(orders_csv):
@@ -1966,7 +1976,7 @@ def _order_is_old_enough(day: str) -> bool:
         placed = date.fromisoformat((day or "").strip())
     except ValueError:
         return False
-    return (date.today() - placed).days >= ORDERS_PRUNE_MIN_AGE_DAYS
+    return (date.today() - placed).days >= ORDERS_PRUNE_MIN_ORDER_AGE_DAYS
 
 
 def _prune_orphan_line_flags(orders_csv) -> dict:

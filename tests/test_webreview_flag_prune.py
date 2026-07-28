@@ -6,14 +6,18 @@ left its keys behind for good. 141 of the 217 keys in his live stores were orpha
 this was measured.
 
 The whole risk of this ticket is in the DELETING, so what is pinned here is mostly what
-the prune must NOT do. Two independent guards, and both get their own test:
+the prune must NOT do. Three independent guards, and each gets its own test:
 
-  1. POSITIVE evidence only — a key goes only when its order is IN the export AND none of
-     its rows say „Vybavuje sa". An order the export does not mention at all is not
-     „closed", it is UNSEEN: the export is a 90-day window (`ORDERS_EXPORT_WINDOW_DAYS`),
-     and a truncated download drops rows rather than changing them. That single rule is
-     what makes a short export able to prune FEWER keys and never more.
-  2. A fail-closed floor on the source, the same shape as the catalogue's
+  1. POSITIVE evidence of PRESENCE — a key goes only when its order is IN the export. An
+     order the export does not mention at all is not „closed", it is UNSEEN: the export is
+     a 90-day window (`ORDERS_EXPORT_WINDOW_DAYS`), and a truncated download drops rows
+     rather than changing them. That rule is what makes a short export able to prune FEWER
+     keys and never more.
+  2. POSITIVE evidence of STATE — every row of that order carries a status that MEANS
+     finished (`ORDERS_TERMINAL_STATUSES`). „Anything that is not the one open literal" was
+     the same negative evidence applied to the status, and this shop uses NINE statuses:
+     an unknown or newly added one used to read as closed and take live work with it.
+  3. A fail-closed floor on the source, the same shape as the catalogue's
      `EXPORT_MIN_CODES`: an export carrying implausibly few orders prunes NOTHING at all.
 
 Stores are seeded through the app's own savers so the `protect=True` machinery (#261/#265)
@@ -48,7 +52,7 @@ def _export(rows, filler=60):
 
 _OPEN_ROW = "99002001;{};Vybavuje sa;A1;Bunda\r\n".format(
     (date.today() - timedelta(days=2)).isoformat() + " 09:00:00")
-# Old enough to be past the grace period (`ORDERS_PRUNE_MIN_AGE_DAYS`) on any run day.
+# Old enough to clear the order-age floor (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`) on any run day.
 _CLOSED_ROW = "99002002;{};Vybavená;B1;Ciapka\r\n".format(
     (date.today() - timedelta(days=120)).isoformat() + " 09:00:00")
 
