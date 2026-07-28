@@ -125,6 +125,20 @@ def schedule_label(schedule: dict) -> str:
     return f"denne o {schedule.get('daily_at', '?')}"
 
 
+def schedule_interval_s(schedule: dict) -> float:
+    """How often this automation is SUPPOSED to run, in seconds — the same schedule
+    shape `schedule_label`/`next_run_at` already read (`interval_minutes` or
+    `daily_at`, never both). #299 opravné kolo 1 review C1 — the ONE new thing a
+    "this producer looks dead" alarm needs that the shared queue table can never
+    give it: what the producer's OWN cadence is, so staleness is judged against
+    the automation, never against how a hourly drain happens to interact with a
+    daily source (that mismatch is exactly why the old queue-based signal fired
+    on every healthy install — see `webreview.app._stale_producer_warnings`)."""
+    if "interval_minutes" in schedule:
+        return int(schedule["interval_minutes"]) * 60
+    return 24 * 3600
+
+
 def next_run_at(schedule: dict, now: datetime | None = None) -> datetime:
     """Next run time in the schedule's timezone (tz-aware). Two schedule shapes:
     daily_at "HH:MM" (next occurrence of that clock time — a run missed while the

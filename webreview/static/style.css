@@ -502,10 +502,19 @@ body[data-theme=dark] .statuscfg-msg.bad{background:#2a0f0f;border-color:#7f1d1d
   border-radius:8px;padding:8px 10px;word-break:break-word}
 body[data-theme=dark] .autoerr{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
 /* #280 review — a run that SUCCEEDED but degraded (one source refused to refresh).
-   Amber, not red: `.autoerr` means „the last run failed", which this is not. */
-.autowarn{font-size:13px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
-  border-radius:8px;padding:8px 10px;word-break:break-word;margin-top:6px}
-body[data-theme=dark] .autowarn{background:#2a1f07;border-color:#78350f;color:#fcd34d}
+   Amber, not red: `.autoerr` means „the last run failed", which this is not.
+   #299 Task 11 / opravné kolo 1 review m2 — `.uploadwarn` (shoptet_upload's own
+   card, styled below) shares this EXACT declaration block rather than repeating
+   it: same look, own class name so a future unscoped `.autowarn` locator can
+   never become ambiguous between the two tabs' cards (`toorder-e2e.md` §14 /
+   #209's "no `.auto*` on a new tab-own element" rule) — not because any
+   locator TODAY is unscoped (none is; both tabs' new banners are found via
+   `data-testid`, and the report's earlier text claiming otherwise was wrong). */
+.autowarn,.uploadwarn{font-size:13px;color:#92400e;background:#fffbeb;
+  border:1px solid #fde68a;border-radius:8px;padding:8px 10px;word-break:break-word;
+  margin-top:6px}
+body[data-theme=dark] .autowarn,body[data-theme=dark] .uploadwarn{
+  background:#2a1f07;border-color:#78350f;color:#fcd34d}
 /* #270 — codes the eshop's catalogue does not carry (kód → čo sme chceli zapísať).
    Looks like .autoerr but has its OWN class: .autoerr means „the last run failed" and
    is always a direct child of the tab section, so a nested second match would break
@@ -543,14 +552,8 @@ body[data-theme=dark] .autoresult.bad{background:#2a0f0f;border-color:#7f1d1d;co
 .pendblocked{font-size:13px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
   border-radius:8px;padding:8px 10px;word-break:break-word;margin-top:6px}
 body[data-theme=dark] .pendblocked{background:#2a1f07;border-color:#78350f;color:#fcd34d}
-/* #299 Task 11 — same amber warning look as `.autowarn`, but its OWN class: the
-   shoptet_sync tab's card already renders `.autowarn` (unscoped) and both tab
-   sections can sit in the DOM at once (hidden, not removed), so a second
-   `.autowarn` here would make an unscoped Playwright locator ambiguous between
-   the two tabs — exactly the #209 collision this file avoids for .autoerr too. */
-.uploadwarn{font-size:13px;color:#92400e;background:#fffbeb;border:1px solid #fde68a;
-  border-radius:8px;padding:8px 10px;word-break:break-word;margin-top:6px}
-body[data-theme=dark] .uploadwarn{background:#2a1f07;border-color:#78350f;color:#fcd34d}
+/* .uploadwarn itself is declared once, together with .autowarn, further up this
+   file (#299 Task 11 / opravné kolo 1 review m2) — no separate ruleset here. */
 .muted{font-size:13px;color:var(--muted)}
 .empty2{margin-top:16px;text-align:center;color:var(--muted);font-size:14px;padding:26px 10px;
   background:var(--panel);border:1px dashed var(--border);border-radius:var(--radius)}

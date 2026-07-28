@@ -43,7 +43,7 @@ from parovanie import (
     posta_uncollected, restock_skladom, riziko_vypadku, shoptet_outbox, stock_skladom,
     supplier_stock, vystavy_imap, writer)
 from parovanie.automation_runner import (
-    Automation, AutomationRunner, AutomationStateCorrupt)
+    Automation, AutomationRunner, AutomationStateCorrupt, schedule_interval_s)
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of, norm_status, resync_current
@@ -5668,11 +5668,29 @@ def _save_pending(d: dict, *, prev: dict | None = None) -> None:
     _atomic_write_json(PENDING_SHOPTET, d, protect=True, prev=prev)
 
 
-def queue_shoptet_fields(source, header, rows, credit_group=None,
-                         credit_value=None) -> int:
-    """Queue rows for the next hourly upload. Returns how many field values landed."""
-    if not rows:
-        return 0
+def queue_shoptet_field_groups(groups) -> list[int]:
+    """Queue several (source, header, rows, credit_group, credit_value) groups
+    against ONE read + ONE atomic write. Returns how many field values each
+    group queued, in the SAME order as `groups`.
+
+    #299 opravné kolo 1 review m4 — `_do_upload_pairings` used to queue its two
+    row groups (reviewed-decision rows, then inline order-pairing rows) via TWO
+    SEPARATE `queue_shoptet_fields` calls — two INDEPENDENT locked
+    read-modify-writes. If the SECOND one raised (a bad row, a lock timeout,
+    anything `shoptet_outbox.queue_fields`/`_atomic_write_json` can throw), the
+    FIRST had already landed on disk: a partial queue, with nothing in the
+    caller's return value (it never returned at all) to say so. Chaining both
+    groups through the SAME in-memory `pending` inside ONE `with _lock:` and
+    writing ONCE at the end means either every group's rows land, or — if any
+    of them raises — NONE do; the exception still propagates (this is
+    deliberately not swallowed), but it can never leave a half-queued table
+    behind it. `queue_shoptet_fields` below is now this function called with a
+    single group, so single-producer callers keep the exact same contract for
+    free — no logic duplicated between the two (`NEkopíruj logiku`)."""
+    non_empty = [(i, g) for i, g in enumerate(groups) if g[2]]
+    counts = [0] * len(groups)
+    if not non_empty:
+        return counts
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     with _lock:
         # A table we could not read is NOT an empty table — queueing on top of the
@@ -5684,14 +5702,25 @@ def queue_shoptet_fields(source, header, rows, credit_group=None,
         # (no quarantine, wrong exception type, and an empty file — a real
         # post-crash shape — would brick queueing for ever).
         pending = _read_json_store(PENDING_SHOPTET, {})
-        pending, n = shoptet_outbox.queue_fields(
-            pending, source, header, rows,
-            credit_group=credit_group, credit_value=credit_value, now=now)
-        if not n:
-            return 0          # nothing queued → never rewrite a protected store
-        _save_pending(pending)
-    log.info("outbox: %s zaradil %d polí (%d kódov)", source, n, len(rows))
-    return n
+        for i, (source, header, rows, credit_group, credit_value) in non_empty:
+            pending, n = shoptet_outbox.queue_fields(
+                pending, source, header, rows,
+                credit_group=credit_group, credit_value=credit_value, now=now)
+            counts[i] = n
+        if any(counts):
+            _save_pending(pending)
+    for i, (source, header, rows, credit_group, credit_value) in non_empty:
+        if counts[i]:
+            log.info("outbox: %s zaradil %d polí (%d kódov)", source, counts[i],
+                     len(rows))
+    return counts
+
+
+def queue_shoptet_fields(source, header, rows, credit_group=None,
+                         credit_value=None) -> int:
+    """Queue rows for the next hourly upload. Returns how many field values landed."""
+    return queue_shoptet_field_groups(
+        [(source, header, rows, credit_group, credit_value)])[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -5939,18 +5968,22 @@ def _do_upload_pairings(dry):
             credit_value[c] = (dec[k].get("url") or "").strip()
     order_credit_group = {c: f"order:{c}" for c in order_written_codes}
     order_credit_value = {c: (order_pairings[c] or "").strip() for c in order_written_codes}
-    # #299 Task 11 finding 3 — TWO separate `queue_shoptet_fields` calls, not one
-    # combined `send_rows` call as before: a reviewed-decision row and an inline
-    # order-pairing row used to go up TOGETHER, so the single `n` this returned
-    # could not be attributed to either bucket. That made BOTH card counters lie —
+    # #299 Task 11 finding 3 — a reviewed-decision row and an inline order-pairing
+    # row are queued as TWO SEPARATE groups, not one combined `send_rows` call as
+    # before: they used to go up TOGETHER, so the single `n` that returned could
+    # not be attributed to either bucket. That made BOTH card counters lie —
     # `queued` ("🔗 Párovania") silently included inline pairs, and `order_count`
     # ("📦 Inline páry: +N nových") stayed 0 forever because it was actually
     # `len(uploaded_order_codes)` — codes confirmed RIGHT AWAY from the export
     # match, never the ones this run just queued (the whole point of "+N
-    # nových"). Splitting the send costs one extra store write on a run that has
-    # BOTH kinds of new rows (each call is its own lock-protected read-modify-
-    # write — safe, just not the single combined write) in exchange for each
-    # counter finally meaning what its label says.
+    # nových").
+    # #299 opravné kolo 1 review m4 — the two groups now go through
+    # `queue_shoptet_field_groups`, which chains them over ONE read and ONE
+    # atomic write (see its own docstring): if queueing the SECOND group ever
+    # raised, the OLD two-separate-calls shape would have already committed the
+    # FIRST group to disk with no trace of the partial state in the return
+    # value. One shared write means either both groups land or neither does,
+    # while each counter still means exactly what its label says.
     pairing_send_rows = [r for r in rows if r[0] not in confirmed]
     order_send_rows = [r for r in order_rows if r[0] not in confirmed]
     # queue_fields() takes a ";"-joined HEADER STRING (it splits on ";" itself,
@@ -5958,12 +5991,12 @@ def _do_upload_pairings(dry):
     # this must be joined, never passed raw (`header.split(";")` on a list raises
     # AttributeError — caught only by actually RUNNING this call, not by reading
     # the task brief's own literal snippet, which passed the list unjoined).
-    queued = queue_shoptet_fields("parovania_eshop", ";".join(import_builder.LINK_HEADER),
-                                  pairing_send_rows, credit_group=credit_group,
-                                  credit_value=credit_value)
-    order_queued = queue_shoptet_fields(
-        "parovania_eshop", ";".join(import_builder.LINK_HEADER), order_send_rows,
-        credit_group=order_credit_group, credit_value=order_credit_value)
+    link_header = ";".join(import_builder.LINK_HEADER)
+    queued, order_queued = queue_shoptet_field_groups([
+        ("parovania_eshop", link_header, pairing_send_rows, credit_group, credit_value),
+        ("parovania_eshop", link_header, order_send_rows,
+         order_credit_group, order_credit_value),
+    ])
 
     result = {"ok": True, "queued": queued, "count": len(uploaded_keys),
               "would_queue": 0, "dry_run": False,
@@ -7236,63 +7269,120 @@ SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
 
 # #299 Task 11 — the fixed list of automation keys that feed `pending_shoptet.json`
 # (Task 10's migration: every one of them only QUEUES now, see `run_shoptet_upload`'s
-# own docstring). Used ONLY by `_note_empty_producers` below to know which `source`
-# tags in the pending table to watch for a silently-dead feed — NOT to decide
-# whether this cycle runs them (it never does; each queues on its own schedule).
+# own docstring). Used by `_stale_producer_warnings`/`_disabled_producer_names`
+# below to know which automations to watch for a silently-dead source — NOT to
+# decide whether this cycle runs them (it never does; each queues on its own
+# schedule).
 PRODUCER_QUEUE_KEYS = ("parovania_eshop", "grube_externalcode", "split_links",
                        "restock_skladom", "stock_skladom")
 
-# How many consecutive hourly cycles a producer may show ZERO fields of its own in
-# the pending table before `_note_empty_producers` reports it. 1 is way too
-# twitchy (a producer with nothing new to send THIS hour is completely normal); 3
-# hours of a registered, queue-feeding producer contributing nothing at all is the
-# "its source looks frozen" signal the brief asks for.
-UPLOAD_EMPTY_STREAK_THRESHOLD = 3
+# #299 opravné kolo 1 review C1 (Critical) — REPLACES the deleted "3 consecutive
+# hourly cycles with 0 fields of its own in the queue" streak signal
+# (`_note_empty_producers`/`UPLOAD_EMPTY_STREAK_STATE`/`UPLOAD_EMPTY_STREAK_THRESHOLD`,
+# all gone — see the report's "Opravné kolo 1" section for the full removal note).
+# That signal measured the WRONG thing: these five producers run DAILY and this
+# drain runs HOURLY, and a confirmed row drops out of the queue the very next
+# time it settles — so a healthy producer's own fields sit in the shared table
+# for well under an hour out of every 24. "0 fields of its own for 3 straight
+# HOURLY cycles" is therefore the NORMAL state of a perfectly healthy producer,
+# not a symptom: the review's own probe measured it firing on the THIRD cycle for
+# 4 of 5 producers and on the FOURTH for all five, on a system with nothing
+# wrong — a permanent, un-clearable "DEGRADOVANÝ" (the exact "trvalý poplach =
+# žiadny poplach" failure this whole task exists to prevent).
+#
+# The real quiet death this alarm exists to catch (#300: an automation nobody
+# ever turned on, or one whose source silently broke) is measured from the
+# producer's OWN `last_run` against its OWN schedule — entirely independent of
+# the shared queue, which was never the right place to look. A producer that is
+# ENABLED but has not run for substantially longer than its own interval is
+# suspicious; a DISABLED producer is its own category (see
+# `_disabled_producer_names` below) — not an error, since #93's safety contract
+# makes "freshly deployed, not yet turned on" a normal, expected state.
+PRODUCER_STALE_RUN_MULTIPLIER = 2
 
-UPLOAD_EMPTY_STREAK_STATE = _store("upload_empty_streak.json")
+
+def _stale_producer_warnings() -> list[str]:
+    """One Slovak sentence per ENABLED producer (of `PRODUCER_QUEUE_KEYS`) that
+    has not run in more than `PRODUCER_STALE_RUN_MULTIPLIER` × its own schedule
+    interval — computed fresh from `RUNNER.status()` every call, never from
+    anything this cycle itself writes (so, like `_queue_stale_while_disabled_
+    warning`, it cannot become a safeguard that guards itself).
+
+    Silent (no warning) for:
+      * a DISABLED producer — its own category, see `_disabled_producer_names`;
+      * a key `PRODUCER_QUEUE_KEYS` names that is no longer a registered
+        automation (#299 opravné kolo 1 review m5 — a renamed/removed key must
+        never crash this cycle; reading names straight off `RUNNER.status()`
+        instead of indexing `RUNNER.automations[k].name` on a hard-coded list
+        also means there is no dict lookup left here that CAN raise `KeyError`).
+
+    Loud (a warning, in the fail-safe direction) for an ENABLED producer that:
+      * has NEVER run at all (`last_run` empty) — immediately suspicious, since
+        being enabled at all means a manager acted on it;
+      * carries an unparsable `last_run` — same "loud, never silently fine"
+        direction the disabled-cycle alarm takes for a bad `queued_at` (I2);
+      * has a parsable `last_run` older than its threshold."""
+    warnings = []
+    by_key = {s["key"]: s for s in RUNNER.status()}
+    now = datetime.now(timezone.utc)
+    for key in PRODUCER_QUEUE_KEYS:
+        s = by_key.get(key)
+        if s is None or not s.get("enabled"):
+            continue
+        automation = RUNNER.automations.get(key)
+        interval_s = schedule_interval_s(automation.schedule) if automation \
+            else 24 * 3600
+        threshold_s = interval_s * PRODUCER_STALE_RUN_MULTIPLIER
+        name = s.get("name") or key
+        last_run = s.get("last_run") or ""
+        if not last_run:
+            warnings.append(f"Automatizácia {name} je zapnutá, ale ešte ani raz "
+                            f"nebežala — over, či beží plánovač.")
+            continue
+        try:
+            dt = datetime.fromisoformat(last_run)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_s = (now - dt).total_seconds()
+        except ValueError:
+            warnings.append(f"Automatizácia {name} má nečitateľný čas posledného "
+                            f"behu — over jej stav.")
+            continue
+        if age_s > threshold_s:
+            hrs = int(age_s // 3600)
+            warnings.append(f"Automatizácia {name} je zapnutá, ale nebežala už "
+                            f"{hrs} h — over, či jej nezlyhal zdroj dát alebo "
+                            f"plánovač.")
+    return warnings
 
 
-def _note_empty_producers(producers, pending: dict) -> list[str]:
-    """#299 Task 11 — a producer whose SOURCE quietly stopped feeding the shared
-    queue (a supplier page recon can no longer parse, a broken n8n hook, a schedule
-    nobody re-enabled after a restart) never raises and never makes THIS cycle's
-    `ok` go False — the pending table simply never grows any entries tagged with
-    that producer's key. Silent, forever, until a human happens to look. This is
-    the streak counter that turns that silence into a warning: for each key in
-    `producers`, 0 fields of its own currently sitting in `pending` counts as one
-    more empty run; ANY field of its own resets the streak. Persisted in its OWN
-    store (`upload_empty_streak.json`, never `AUTOMATIONS_STATE`) so the count
-    survives across the hourly runs that call this — it is a statistic, not the
-    manager's work, so `_atomic_write_json(..., protect=False)` (no shrink-guard,
-    no quarantine-on-corrupt) is the right weight for it; a corrupt/missing streak
-    file just restarts counting from 0, which is the safe direction here (a false
-    "all clear" for at most 3 more hours, never a false alarm from a read failure).
+def _disabled_producer_names() -> list[str]:
+    """#299 opravné kolo 1 review C1 — a DISABLED producer is its own category,
+    "nie chyba, ale nech je to vidieť" (the brief's own words): #93's safety
+    contract means every producer starts disabled straight after a deploy, so
+    "not yet turned on" is a normal, temporary state, not a fault — it must
+    never feed `_stale_producer_warnings`/`degraded` above. Returned as its own
+    field on `run_shoptet_upload`'s result so it stays VISIBLE rather than
+    silently dropped."""
+    return sorted(s["name"] for s in RUNNER.status()
+                 if s["key"] in PRODUCER_QUEUE_KEYS and not s.get("enabled"))
 
-    Deliberately does NOT filter by AUTOMATIONS_STATE's `enabled` flag: unlike
-    `pending_shoptet.json`, that store has no per-test isolation of its own (the
-    whole backend test session shares ONE `WEBREVIEW_OUT`), so gating on it would
-    make this streak's behaviour depend on which OTHER test last flipped a
-    producer's Štart/Stop — exactly the kind of order-dependent flakiness this
-    project's test isolation goes out of its way to avoid elsewhere. A producer
-    nobody has ever turned on legitimately shows a permanent streak; that is a
-    correct (if unexciting) fact about it, not a false alarm — the manager only
-    reads this list when he already turned something on and it stopped feeding."""
-    present = {f.get("source") for e in pending.values()
-              for f in (e.get("fields") or {}).values()}
-    empty = []
-    with _lock:
-        streak = _read_json_store(UPLOAD_EMPTY_STREAK_STATE, {})
-        changed = False
-        for key in producers:
-            n = 0 if key in present else int(streak.get(key, 0)) + 1
-            if streak.get(key, 0) != n:
-                streak[key] = n
-                changed = True
-            if n >= UPLOAD_EMPTY_STREAK_THRESHOLD:
-                empty.append(key)
-        if changed:
-            _atomic_write_json(UPLOAD_EMPTY_STREAK_STATE, streak, protect=False)
-    return empty
+
+def _sync_downloaded_fresh_export() -> bool:
+    """#299 opravné kolo 1 review m3 — `RUNNER.run_sync("shoptet_sync")` returning
+    True only means shoptet_sync's own run STATUS was 'ok'; `run_shoptet_sync`
+    (PR #280) deliberately reports `ok` even when the catalogue download itself
+    was REFUSED (a fresh-enough copy already on disk, `ExportDownloadRefused`,
+    non-fatal by design) — it just keeps serving the old bytes. Counting that as
+    a real download inflated `resynced` with a run that fetched nothing new.
+    Reads straight off the state `_execute` just persisted (synchronously, under
+    its own lock, before `run_sync` returns) — the one place `export_error` is
+    recorded. Missing the automation entirely reads as "not fresh", the same
+    fail-safe direction `_export_age_s`/`presync_fresh` already take."""
+    for a in RUNNER.status():
+        if a["key"] == "shoptet_sync":
+            return not (a.get("last_result") or {}).get("export_error")
+    return False
 
 
 def run_shoptet_upload() -> dict:
@@ -7373,7 +7463,8 @@ def run_shoptet_upload() -> dict:
                     "confirmed": 0, "blocked": 0, "stale_blocked": [],
                     "resynced": 0,
                     "skipped_second_sync": True, "unconfirmed": 0,
-                    "degraded": False, "warnings": []}
+                    "degraded": False, "warnings": [],
+                    "producers_disabled": _disabled_producer_names()}
 
         presync_age = _export_age_s()
         presync_fresh = (presync_age is not None
@@ -7384,7 +7475,8 @@ def run_shoptet_upload() -> dict:
                       "min) — preskakujem predimportné stiahnutie",
                       presync_age / 60, SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S / 60)
         else:
-            resynced = int(bool(RUNNER.run_sync("shoptet_sync")))
+            resynced = int(bool(RUNNER.run_sync("shoptet_sync"))
+                          and _sync_downloaded_fresh_export())
             log.info("sync do Shoptetu: predimportné stiahnutie spúšťam (vek "
                       "exportu %s)", "neznámy" if presync_age is None
                       else f"{presync_age / 60:.1f} min")
@@ -7459,7 +7551,8 @@ def run_shoptet_upload() -> dict:
         unconfirmed = sent - confirmed
         skipped = SECOND_SYNC_SKIP_WHEN_NOTHING_SENT and confirmed == 0
         if not skipped:
-            resynced += int(bool(RUNNER.run_sync("shoptet_sync")))
+            resynced += int(bool(RUNNER.run_sync("shoptet_sync"))
+                            and _sync_downloaded_fresh_export())
 
         stale = shoptet_outbox.stale_blocked(settled)
         ok = (not import_busy) and (res is None or (res["ok"] and not res["partial"])) \
@@ -7485,9 +7578,9 @@ def run_shoptet_upload() -> dict:
         # WHOLE point of this task: `ok` alone already went False for the
         # unconfirmed/stale/busy cases (Task 7's decision), but a manager reading
         # only the pill still had no SENTENCE saying what actually happened, and
-        # the empty-producer streak below can degrade a run that itself reports
+        # `_stale_producer_warnings` below can degrade a run that itself reports
         # `ok: True` (nothing this cycle attempted failed — the problem is
-        # upstream, in a producer that stopped feeding it).
+        # upstream, in a producer that stopped running).
         warnings = []
         if unconfirmed:
             warnings.append(f"Shoptet nepotvrdil {unconfirmed} z {sent} riadkov — "
@@ -7495,12 +7588,7 @@ def run_shoptet_upload() -> dict:
         if stale:
             warnings.append(f"{len(stale)} kódov čaká zablokovaných 3 a viac behov — "
                             f"eshop ich v katalógu nemá.")
-        empty = _note_empty_producers(PRODUCER_QUEUE_KEYS, pending)
-        if empty:
-            names = [RUNNER.automations[k].name for k in empty]
-            warnings.append("Automatizácie, ktoré majú zásobovať frontu, nezaradili "
-                            "3 hodinové behy po sebe nič: " + ", ".join(names) +
-                            " — over, či sú zapnuté a či im nezlyhal zdroj dát.")
+        warnings.extend(_stale_producer_warnings())
         if skipped and sent:
             warnings.append("Druhé stiahnutie sa preskočilo, hoci sa niečo posielalo.")
         degraded = bool(warnings)
@@ -7509,7 +7597,8 @@ def run_shoptet_upload() -> dict:
                 "stale_blocked": stale,
                 "resynced": resynced, "skipped_second_sync": skipped,
                 "unconfirmed": unconfirmed, "error": error,
-                "degraded": degraded, "warnings": warnings}
+                "degraded": degraded, "warnings": warnings,
+                "producers_disabled": _disabled_producer_names()}
 
 
 def _credit_producer(store: str, entries: dict) -> None:
@@ -9493,26 +9582,67 @@ def _queue_stale_while_disabled_warning(enabled: bool) -> str:
     rules out ("poistka nesmie sama vyžadovať, aby bežal vypnutý cyklus"). This is
     also why it lives on the TOP-LEVEL automation status dict (`api_automations`
     below), not inside `last_result`: the badge and the card must show it even
-    when `shoptet_upload` has NEVER run at all."""
+    when `shoptet_upload` has NEVER run at all.
+
+    #299 opravné kolo 1 review I1/I2/m1 — three ways the ORIGINAL version of
+    this alarm could read "nothing to worry about" for the one input shape it
+    actually cannot judge, which is the opposite of every other branch here:
+      * I1 — an UNREADABLE `pending_shoptet.json` used to degrade to `{}`
+        (`_load_pending`, same as a legitimately empty table) and read as
+        "queue is empty" — the one branch in this whole module that is
+        dangerously QUIET about the case it cannot see. Distinguished here from
+        a genuinely MISSING file (a fresh install — still legitimately silent,
+        `store-prune.md` §1's "absence is never evidence") by asking
+        `_read_json_store_state` for provenance AND checking the file really
+        exists on disk: present-but-unparsable fires LOUD.
+      * I2 — a field with NO `queued_at` at all used to be silently filtered
+        out of the "oldest" computation (`if f.get("queued_at")`); if every
+        field in a non-empty queue lacked one, the whole alarm still read
+        "nothing queued". Now treated exactly like an unparsable timestamp —
+        loud, never silently dropped.
+      * m1 — `min()` over the ISO STRINGS themselves is LEXICOGRAPHIC, not
+        chronological: two timestamps that differ only in UTC OFFSET (a DST
+        transition either side of the queue) can sort backwards from their
+        real chronological order, misjudging staleness by up to an hour.
+        Every timestamp is now parsed to a real `datetime` and compared by
+        actual elapsed seconds, never by string order."""
     if enabled:
         return ""
-    pending = _load_pending()
-    queued_ats = [f.get("queued_at", "") for e in pending.values()
-                  for f in (e.get("fields") or {}).values() if f.get("queued_at")]
-    if not queued_ats:
+    pending, from_disk = _read_json_store_state(PENDING_SHOPTET, {})
+    if not from_disk and os.path.exists(PENDING_SHOPTET):
+        log.error("sync do Shoptetu: %s sa nedá prečítať — neviem posúdiť "
+                  "starnutie fronty pri vypnutom cykle", PENDING_SHOPTET)
+        return ("Tabuľka čakajúcich zmien (pending_shoptet.json) sa nedá "
+                "prečítať — neviem posúdiť, či v nej niečo starne, kým je "
+                "hodinový cyklus „Sync do Shoptetu“ vypnutý. Over súbor.")
+    fields = [f for e in pending.values() for f in (e.get("fields") or {}).values()]
+    if not fields:
         return ""
-    oldest = min(queued_ats)
-    try:
-        dt = datetime.fromisoformat(oldest)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        age_s = (datetime.now(timezone.utc) - dt).total_seconds()
-    except ValueError:
-        # an unparsable timestamp in a live queue is itself worth shouting about —
-        # the fail-safe direction here is LOUD, never a silent "must be fine". A
-        # large FINITE sentinel (never `float("inf")`): `inf // N` is NaN in
-        # Python, which `int()` below cannot convert at all.
-        age_s = QUEUE_STALE_WHILE_DISABLED_AFTER_S * 1000
+    now = datetime.now(timezone.utc)
+    ages_s = []
+    unreadable = 0
+    for f in fields:
+        raw = f.get("queued_at")
+        if not raw:
+            unreadable += 1
+            continue
+        try:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ages_s.append((now - dt).total_seconds())
+        except ValueError:
+            unreadable += 1
+    if unreadable:
+        log.error("sync do Shoptetu: %d polí vo fronte nemá čitateľný čas "
+                  "zaradenia — neviem posúdiť starnutie pri vypnutom cykle",
+                  unreadable)
+        return (f"{unreadable} polí vo fronte nemá čitateľný čas zaradenia a "
+                f"hodinový cyklus „Sync do Shoptetu“ je vypnutý — neviem "
+                f"povedať, ako dlho tam čakajú. Over pending_shoptet.json.")
+    if not ages_s:
+        return ""
+    age_s = max(ages_s)          # m1 — oldest = the LARGEST real elapsed time
     if age_s < QUEUE_STALE_WHILE_DISABLED_AFTER_S:
         return ""
     hrs = int(age_s // 3600)

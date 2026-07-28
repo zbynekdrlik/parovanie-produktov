@@ -31,6 +31,18 @@ def queue_fields(pending, source, header, rows, credit_group=None,
     snapshot is safe even if something later mutates a field dict in place;
     values nested deeper inside a field (e.g. its `credit` dict) may still
     be shared.
+
+    #299 opravné kolo 1 review C2 (Critical) — `queued_at` is the time this
+    field's CURRENT value was FIRST queued, not the time of the most recent
+    call that happened to queue it again. A producer re-queueing the SAME
+    value it already queued (parovania_eshop runs daily and, while the
+    disabled upload cycle never confirms anything, re-sends its whole backlog
+    every run) must NOT push `queued_at` forward — that silently reset the
+    disabled-cycle staleness alarm (`_queue_stale_while_disabled_warning`) to
+    "just queued" on every producer tick, so a queue that had genuinely been
+    waiting for days never crossed the alarm's threshold. Same discipline
+    `settle()` already applies to a blocked row's `since` (`prev.get("since")
+    or now`): only a genuinely NEW or CHANGED value gets a fresh timestamp.
     """
     cols = [c.strip() for c in header.split(";")]
     out = {}
@@ -59,7 +71,15 @@ def queue_fields(pending, source, header, rows, credit_group=None,
             val = "" if val is None else str(val).strip()
             if not val:
                 continue
-            field = {"value": val, "source": source, "queued_at": now}
+            prev_field = fields.get(col)
+            # C2 — the field's value is UNCHANGED from what is already sitting in
+            # the table → this is a re-queue of the same fact, so it keeps its
+            # ORIGINAL `queued_at` (falling back to `now` only if that field
+            # somehow has none — never letting a re-queue erase a real timestamp).
+            # A genuinely new or DIFFERENT value always gets `now`, same as before.
+            same_value = prev_field is not None and prev_field.get("value") == val
+            queued_at = (prev_field.get("queued_at") or now) if same_value else now
+            field = {"value": val, "source": source, "queued_at": queued_at}
             group = (credit_group or {}).get(code)
             if group is not None:
                 field["credit"] = {"store": source, "group": group,

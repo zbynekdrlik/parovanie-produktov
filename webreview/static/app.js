@@ -603,9 +603,9 @@ function navError(key) {
   // #299 Task 11 — two MORE ways `shoptet_upload` specifically can be degraded
   // without `last_status`/`last_result.ok` ever saying so:
   //   * `last_result.degraded` — a run that itself reports `ok: true` (nothing
-  //     THIS cycle attempted failed) but found something wrong upstream (a
-  //     producer's empty streak, a skipped second download while something was
-  //     on the wire). Named DIFFERENTLY from `source_degraded` above on purpose
+  //     THIS cycle attempted failed) but found something wrong upstream (an
+  //     enabled producer that stopped running, a skipped second download while
+  //     something was on the wire). Named DIFFERENTLY from `source_degraded` above on purpose
   //     — that one is Pošta/shoptet_sync's own established flag; conflating the
   //     two would make an unrelated automation's degrade light THIS tab's badge.
   //   * `queue_stale_warning` — lives on `a` itself, NOT inside `last_result`,
@@ -4420,12 +4420,16 @@ function renderShoptetUpload() {
   // computed server-side straight off the pending table + `enabled` — it is
   // truthy even when this automation has NEVER run (last_run empty), which is
   // exactly the "forgot to start it" case this exists for. Own class
-  // (`.uploadwarn`, styled identically to `.autowarn`) rather than a SECOND
-  // `.auto*` element on this tab — `.autowarn` already appears (unscoped) on the
-  // shoptet_sync tab's own card, and both cards can be in the DOM (hidden, not
-  // removed) at once; a shared class would make an unscoped `.autowarn` locator
-  // ambiguous between the two tabs (the exact #209 collision this file's own
-  // header comment warns about).
+  // (`.uploadwarn`, sharing `.autowarn`'s look — see style.css) rather than
+  // reusing `.auto*` directly on this tab: per this project's own convention
+  // (toorder-e2e.md §14 / #209), a NEW element on an automation card never
+  // carries an existing `.auto*` class — it is the same defence-in-depth as
+  // `.automiss`/`.pendblocked` below, protecting a FUTURE unscoped locator
+  // even though, as of opravné kolo 1's review m2, no test today locates
+  // `.autowarn` unscoped — every banner this file adds is found via
+  // `data-testid`, and the earlier claim here (that an unscoped `.autowarn`
+  // locator was already ambiguous between the two tabs) was not literally
+  // true.
   if (a.queue_stale_warning) {
     const w = el('div', 'uploadwarn', '');
     w.dataset.testid = 'shoptet-upload-stale-disabled';
@@ -4433,14 +4437,26 @@ function renderShoptetUpload() {
     st.appendChild(w);
   }
   // …and the run's OWN warnings (Task 11's `warnings: []` — unconfirmed rows,
-  // stale-blocked codes, a producer's empty streak, a skipped second download).
-  // Same `.uploadwarn` class, one block per sentence — `warnings` is already a
-  // list of complete, ready-to-read Slovak sentences.
+  // stale-blocked codes, an enabled producer that stopped running (opravné
+  // kolo 1 review C1 — replaces the old empty-queue-streak signal), a skipped
+  // second download). Same `.uploadwarn` class, one block per sentence —
+  // `warnings` is already a list of complete, ready-to-read Slovak sentences.
   for (const w of (lr.warnings || [])) {
     const wd = el('div', 'uploadwarn', '');
     wd.dataset.testid = 'shoptet-upload-warning';
     wd.textContent = '⚠️ ' + w;
     st.appendChild(wd);
+  }
+
+  // #299 opravné kolo 1 review C1 — `producers_disabled` is its own category,
+  // "nie chyba, ale nech je to vidieť": #93's safety contract means a producer
+  // deploys disabled by default, so this is normal, NOT a warning — plain
+  // `.muted` text (not `.uploadwarn`/amber), never counted into `degraded`.
+  if ((lr.producers_disabled || []).length) {
+    const d = el('div', 'muted', '');
+    d.dataset.testid = 'shoptet-upload-producers-disabled';
+    d.textContent = 'Vypnuté: ' + lr.producers_disabled.join(', ');
+    st.appendChild(d);
   }
 
   // #299 review decision 4 — the two Task 8 producers (grube_externalcode,
