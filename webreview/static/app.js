@@ -831,23 +831,25 @@ async function loadOrders() {
 // `if (!r.ok) return;` left the manager guessing whether his click landed (and, for the
 // optimistic flag toggles, showing a flag the server never stored). One message shape
 // for all of them, in the manager's language.
-const TO_ERR_DEDUP_MS = 5000;
-// Object.create(null): `where` carries the manager's free text (a supplier name), and a
-// group named '__proto__' must not swallow the entry.
-const _toOrderErrSeen = Object.create(null);
-// `where` = which row/order/product the write belonged to. It is part of the message AND
-// of the dedup key on purpose: working DOWN a supplier group is what this tab is for, so
-// 3-5 rows failing within a couple of seconds is the normal shape of a partial outage,
-// not a repeat of one event. Keying the dedup on the prose alone (which carries no row
-// identity) told the manager once and let the other flags quietly flip back, leaving him
-// unable to tell which of his writes landed — the silent failure #214 exists to remove.
-// `value` never reaches the manager — it is dedup-only. Without it a CORRECTION is
-// swallowed: he fixes a rejected pair URL and re-saves within the window (same what /
-// where / 'chyba 500') and gets no feedback at all, which is the silence being fixed.
-// #234 — every failure the manager has not dealt with yet, oldest first. The list is what
-// the banner renders; it is emptied by the things that mean „there is nothing left to
-// redo": a write that SUCCEEDS, a reload, or his own „×".
+// #234 — every failure the manager has not dealt with yet, oldest first. THE LIST ITSELF
+// is the dedup: an identical failure already standing in the banner is not added twice.
+//
+// It used to be a 5 s TIME window, which was right while the report was a modal (he had
+// just seen the alert). With a persistent banner the timer is wrong in BOTH directions:
+// a retry after the window appended a SECOND line for one row (and the headline counts
+// rows to redo, so it lied), and a retry inside the window after the banner had been
+// cleared was swallowed with nothing on screen at all — the silent lost write #214 exists
+// to remove. Deduping against what is VISIBLE is right in both.
+//
+// `where` (which row/order/product) is part of the identity on purpose: working DOWN a
+// supplier group is what this tab is for, so 3-5 rows failing within a couple of seconds
+// is the normal shape of a partial outage, not a repeat of one event. `value` is in the
+// identity but never shown — without it a CORRECTION is swallowed: he fixes a rejected
+// pair URL and re-saves (same what / where / 'chyba 500') and gets no feedback.
 let _toOrderFails = [];
+
+const _failIdent = (f) => [f.what, f.where || '', f.detail || '',
+                           String(f.value == null ? '' : f.value)].join(' ');
 
 // The banner lives in the TOP BAR (`#toFails` in index.html), never inside `#list`. Every
 // rollback repaints the list BEFORE it reports, so a banner in there would be wiped by the
@@ -859,10 +861,14 @@ function renderToOrderFails() {
   box.innerHTML = '';
   if (!_toOrderFails.length) { box.hidden = true; return; }
   const head = el('div', 'tofail-head');
-  // the count first: during an outage he wants to know HOW MANY rows he has to redo
-  // without counting lines, and „položiek" is declined like every other tally on this tab
+  // The count first: during an outage he wants to know HOW MANY rows he has to redo
+  // without counting lines. ACCUSATIVE after „uložiť" (`itemsWord(n, true)`) — n=1 is the
+  // banner's most common state and „uložiť 1 položka" is simply wrong Slovak.
+  // No blanket „skús znova": some of these are DETERMINISTIC refusals (a URL without a
+  // scheme, a product missing from the review) where an unchanged retry can never work —
+  // the reason on each line says what to do.
   head.textContent = '⚠️ Nepodarilo sa uložiť ' + _toOrderFails.length + ' '
-    + itemsWord(_toOrderFails.length) + ' — skús to prosím znova.';
+    + itemsWord(_toOrderFails.length, true) + ':';
   const x = el('button', 'tofail-close', '×');
   x.title = 'Zavrieť';
   x.onclick = () => { _toOrderFails = []; renderToOrderFails(); };
@@ -876,32 +882,36 @@ function renderToOrderFails() {
       + (f.detail ? ' (' + f.detail + ')' : '');
     box.appendChild(line);
   }
-  box.hidden = false;
+  // The top bar is SHARED with the review tab, so an answer that settles AFTER he has left
+  // must not raise this over „Kontrola párovania" (where „Nepodarilo sa uložiť…" reads as
+  // failed review saves). The list survives; `render()` shows it when he comes back.
+  box.hidden = ACTIVE_TAB !== 'toorder';
 }
 
-// Nothing is left to redo — drop the report rather than leave a stale warning over a tab
-// that is saving fine again (a warning he learns to ignore is one he stops reading).
+// Nothing is left to redo at all — a reload (the server's own state replaced everything)
+// or his „×". A stale warning over a tab that is saving fine again is one he learns to
+// ignore, and then the next real one goes unread.
 function clearToOrderFails() {
   if (!_toOrderFails.length) return;
   _toOrderFails = [];
   renderToOrderFails();
 }
 
+// ONE write landed — drop only ITS line. Wiping the whole banner on the first write that
+// happens to succeed takes away the names of the rows he has NOT redone yet, at exactly
+// the moment he starts working through them, which defeats accumulating them at all.
+function clearToOrderFail(what, where) {
+  const before = _toOrderFails.length;
+  _toOrderFails = _toOrderFails.filter(f => !(f.what === what && f.where === (where || '')));
+  if (_toOrderFails.length !== before) renderToOrderFails();
+}
+
 function toOrderSaveFailed(what, detail, where, value) {
-  // The same refused write re-clicked inside the window is one event, not two — dedup per
-  // WRITE, as it was when this was a modal.
-  const now = Date.now();
-  for (const k of Object.keys(_toOrderErrSeen)) {
-    if (now - _toOrderErrSeen[k] >= TO_ERR_DEDUP_MS) delete _toOrderErrSeen[k];
-  }
-  // NUL-joined, written as a source ESCAPE (a raw NUL byte in the file would have git
-  // and half the editors treat app.js as binary): the parts are free-form human text,
-  // so a printable separator could let two writes collide and swallow a message
-  const dedupKey = [what, where || '', detail || '', String(value == null ? '' : value)]
-    .join('\u0000');
-  if (_toOrderErrSeen[dedupKey] !== undefined) return;
-  _toOrderErrSeen[dedupKey] = now;
-  _toOrderFails.push({ what, where: where || '', detail: detail || '', at: now });
+  const entry = { what, where: where || '', detail: detail || '', value, at: Date.now() };
+  // Already standing in the banner → he can see it, and a second identical line would
+  // only inflate the „how many rows to redo" count.
+  if (_toOrderFails.some(f => _failIdent(f) === _failIdent(entry))) return;
+  _toOrderFails.push(entry);
   renderToOrderFails();
 }
 
@@ -916,16 +926,21 @@ function toOrderRowLabel(key) {
 
 // Run one to-order write. Returns '' on success, else a short human reason. Reporting is
 // left to the caller ON PURPOSE: a caller that changed the UI optimistically must roll
-// back FIRST, so the tab is already telling the truth when the message pops up.
-async function postToOrder(path, payload) {
+// back FIRST, so the tab is already telling the truth when the message pops up. Clearing
+// the report is the caller's job too, and per WRITE (`clearToOrderFail`) — a blanket clear
+// here would drop the rows he has not redone yet on the first success.
+// `out` (optional) receives the parsed success body as `out.json` — the flag writes mirror
+// the server's authoritative `flags` from it.
+async function postToOrder(path, payload, out) {
   try {
     const r = await fetch(path, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    // A write that LANDS means the outage is over and the banner is about work that no
-    // longer needs redoing — this is the one place every to-order write passes through.
-    if (r.ok) { clearToOrderFails(); return ''; }
+    if (r.ok) {
+      if (out) out.json = await r.json().catch(() => null);
+      return '';
+    }
     // surface the endpoint's own reason — 'comment too long' / 'invalid supplier' /
     // 'unauthorized' are all deterministic, so a bare status code would have the manager
     // retrying a write that can never succeed
@@ -963,20 +978,28 @@ function _flagEntry(field, key, map) {
     || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedSeq: 0, inflight: 0 });
 }
 
-// When the LAST response outstanding for a (flag, row) has settled, the map must agree
-// with what the server confirmed. A superseded write that returned BLIND lost an ACCEPTED
-// write whose success landed after a newer one had already rolled back — and refused-fast
-// + accepted-slow is exactly what a partial outage produces (a 500/401 answers instantly
-// while a real write queues behind the app's `with _lock:` + atomic replace). The manager
-// was told „nepodarilo sa uložiť", the row showed the flag OFF, and the server held it ON.
-// `confirmed` is maintained by the highest-seq SUCCESSFUL write and still carries the
-// original baseline when every write failed, so reconciling to it is right in both
-// directions. Only the settling of the last in-flight write may do it: reconciling while
-// another write is still out would fight that write's own optimistic value.
-function _reconcileFlag(st, map, key) {
-  if (!!map[key] === st.confirmed) return;
-  if (st.confirmed) map[key] = true; else delete map[key];
-  renderToOrder();
+// Every flag write answers `{ok, flags:{ordered, waiting, instock, unavailable}}` — the
+// server's own account of the row AT THE MOMENT that write committed. Adopt it through the
+// SAME gate the client's bookkeeping uses, so an answer that committed EARLIER can never
+// overwrite one that committed later (`confirmedSeq`), and so a map another write is still
+// holding optimistically is left alone (`inflight`). Returns true if anything moved.
+function _mirrorServerFlags(body, key, seq) {
+  const flags = body && body.flags;
+  if (!flags) return false;
+  const maps = { ordered: ORDERED, waiting: WAITING, instock: INSTOCK, unavailable: UNAVAIL };
+  let moved = false;
+  for (const field of Object.keys(maps)) {
+    if (typeof flags[field] !== 'boolean') continue;
+    const map = maps[field];
+    const st = _flagEntry(field, key, map);
+    if (_flagWrites[st.wk] !== st || seq < st.confirmedSeq) continue;
+    st.confirmed = flags[field];
+    st.confirmedSeq = seq;
+    if (st.inflight !== 0 || !!map[key] === flags[field]) continue;
+    if (flags[field]) map[key] = true; else delete map[key];
+    moved = true;
+  }
+  return moved;
 }
 
 // One POST can move MORE than one flag on a row: turning an axis-B status on makes the
@@ -989,6 +1012,7 @@ function _reconcileFlag(st, map, key) {
 // bookkeeping exists to prevent, and a clear-side flag would be just as exposed to it.
 // `writes` = [{field, map, value}], the first entry being the flag the manager clicked.
 async function saveOrderWrite(path, payload, writes, key, what) {
+  const ans = {};
   const sts = writes.map(w => _flagEntry(w.field, key, w.map));
   const seqs = sts.map(st => ++st.seq);
   sts.forEach(st => { st.inflight += 1; });
@@ -998,13 +1022,18 @@ async function saveOrderWrite(path, payload, writes, key, what) {
   // entries — they are never deleted, so they would never reach 0 again for this page
   try {
     writes.forEach(w => { if (w.value) w.map[key] = true; else delete w.map[key]; });
-    err = await postToOrder(path, payload);
+    err = await postToOrder(path, payload, ans);
   } finally { sts.forEach(st => { st.inflight -= 1; }); }
   // `loadOrders()` drops the maps when it re-reads the server, so an entry that is no
   // longer the live one for its key must not roll anything back over fresh data. The
   // wipe clears every entry at once, so this verdict is the same for the whole write.
   const live = _flagWrites[sts[0].wk] === sts[0];
-  let owner = false, repaint = false;
+  // Ownership for REPORTING is decided by the CLICKED flag alone. A write can still own a
+  // flag it merely CLEARED (the newer write on the row need not have touched that one), and
+  // treating that as ownership made a superseded write report a second time for one row —
+  // the newer write already owns the row and speaks for it.
+  const owner = live && seqs[0] === sts[0].seq;
+  let repaint = false;
   writes.forEach((w, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;
@@ -1017,13 +1046,21 @@ async function saveOrderWrite(path, payload, writes, key, what) {
       }
       return;
     }
-    owner = true;
     if (err && !!w.map[key] !== st.confirmed) {
       if (st.confirmed) w.map[key] = true; else delete w.map[key];
+      repaint = true;
     }
   });
+  // The SERVER is the authority and every answer says what the row now IS. The client's
+  // own issue-order bookkeeping is not enough by itself: two axis-B writes issued inside
+  // one round-trip travel on separate connections and their server threads can take
+  // `with _lock:` in the REVERSE order, so both succeed and the server's final state is
+  // the one that committed LAST — not the one the client issued last. Mirror the answered
+  // flags through the SAME confirmed/confirmedSeq gate, so a stale answer can never
+  // overwrite a newer one, and only touch a map with nothing else in flight for it.
+  const mirrored = live && !err && _mirrorServerFlags(ans.json, key, seqs[0]);
   if (!live || !owner) {          // superseded by a newer write, or disowned by a reload
-    if (repaint) renderToOrder();
+    if (repaint || mirrored) renderToOrder();
     // A write the reload DISOWNED has no map left to roll back — but it still failed, and
     // returning `false` in silence is the very silent-lost-write #214 exists to kill. A
     // write superseded by a NEWER one on the same row stays quiet on purpose: that newer
@@ -1031,7 +1068,11 @@ async function saveOrderWrite(path, payload, writes, key, what) {
     if (!live && err) toOrderSaveFailed(what, err, toOrderRowLabel(key), writes[0].value);
     return !err;
   }
-  if (!err) return true;
+  if (!err) {
+    clearToOrderFail(what, toOrderRowLabel(key));   // this row's report is settled
+    if (mirrored) renderToOrder();
+    return true;
+  }
   // Always repaint on the owner's failure, even when the map happens to already agree
   // with the server: the CLICK HANDLER painted the row (and its buttons) by hand before
   // this write was issued, so only a repaint puts the screen back in step with the maps.
@@ -1086,8 +1127,17 @@ function toggleStatusFlag(key, row, field) {
   const on = !me.map[key];
   const writes = [{ field: me.field, map: me.map, value: on }];
   if (on) {
+    // EVERY other axis-B flag joins the write — NOT only the ones the client currently
+    // shows. Filtering on `s.map[key]` was a real defect: a flag this client had already
+    // cleared OPTIMISTICALLY for an earlier, still-in-flight write claimed no sequence
+    // number here, so when that earlier write was REFUSED it was the sole owner of the
+    // flag and rolled it back to life — over a newer write the server had accepted, whose
+    // server-side clear had removed it. The row then showed two contradictory statuses
+    // (the exact thing #211 removes) with a poisoned `confirmed` baseline for every later
+    // write on it. Deleting an absent map key is a no-op and the server's conditional
+    // write never touches a store it did not change, so claiming all three costs nothing.
     for (const s of specs) {
-      if (s.field !== field && s.map[key]) writes.push({ field: s.field, map: s.map, value: false });
+      if (s.field !== field) writes.push({ field: s.field, map: s.map, value: false });
     }
   }
   saveOrderWrite(me.path, { key, [field]: on }, writes, key, me.what);
@@ -1105,8 +1155,8 @@ function toggleStatusFlag(key, row, field) {
 // ISSUED, exactly like a per-row write. Claiming them at RESPONSE time was the bug: the
 // bulk then outranked per-row writes the manager issued AFTER clicking it (newer intent,
 // and committed LATER on the server behind the bulk's own `with _lock:`), so his last
-// click was silently inverted — the tab painted the row the bulk's way, `_reconcileFlag`
-// forced the map to match on settle, and nothing was reported. Issue-time sequencing puts
+// click was silently inverted — the tab painted the row the bulk's way, the settle
+// reconcile forced the map to match, and nothing was reported. Issue-time sequencing puts
 // the bulk where it belongs in the order and keeps the mirror case right too: a bulk that
 // was ACCEPTED is the newest server truth for its rows, so a later refused write rolls
 // back onto it, not onto the pre-bulk baseline.
@@ -1154,6 +1204,8 @@ async function markGroupOrdered(items, ordered) {
                       items.length ? 'skupina ' + effSup(items[0]) : '', ordered);
     return false;
   }
+  clearToOrderFail('Hromadné označenie skupiny',
+                   items.length ? 'skupina ' + effSup(items[0]) : '');
   renderToOrder();
   return true;
 }
@@ -1455,6 +1507,7 @@ async function savePairUrl(o, url) {
     for (const x of ORDERS) {
       if (x.reviewKey === o.reviewKey) { x.supplierUrl = url; x.reviewStatus = 'manual'; }
     }
+    clearToOrderFail('Párovacia URL', toOrderPartLabel('kód', o.itemCode));
     renderToOrder();
     return true;
   }
@@ -1464,6 +1517,7 @@ async function savePairUrl(o, url) {
   // it on EVERY order line of that code, so mirror that client-side: without it the
   // sibling lines keep showing an empty paste box for a product that IS paired (#204).
   for (const x of ORDERS) if (x.itemCode === o.itemCode) x.pairUrl = url;
+  clearToOrderFail('Párovacia URL', toOrderPartLabel('kód', o.itemCode));
   renderToOrder();                       // re-render so the new link shows immediately
   return true;
 }
@@ -1621,6 +1675,7 @@ async function saveSupplier(o, raw) {
   // assignment is keyed by itemCode (a product property) → apply to EVERY order line
   // of that code, so all sibling lines regroup together (not just the clicked one)
   for (const x of ORDERS) if (x.itemCode === o.itemCode) x.assignedSupplier = supplier;
+  clearToOrderFail('Priradenie dodávateľa', toOrderPartLabel('kód', o.itemCode));
   renderToOrder();                 // re-render: the row(s) move into the supplier group
   return true;
 }
@@ -1652,6 +1707,7 @@ async function saveOrderComment(o, comment) {
   const err = await postToOrder('/api/order-comment', { orderCode: o.orderCode, comment });
   if (err) { toOrderSaveFailed('Komentár k objednávke', err, toOrderPartLabel('obj.', o.orderCode), comment); return false; }
   if (comment) ORDER_COMMENTS[o.orderCode] = comment; else delete ORDER_COMMENTS[o.orderCode];
+  clearToOrderFail('Komentár k objednávke', toOrderPartLabel('obj.', o.orderCode));
   renderToOrder();
   return true;
 }
@@ -4993,8 +5049,7 @@ function render() {
   // #234 — the top bar is SHARED with the review tab (the `setEmptyText` lesson), so a
   // warning about order lines must not follow him there. It is only ever shown on this
   // tab, and only while something on it still needs redoing.
-  const fbox = document.getElementById('toFails');
-  if (fbox) fbox.hidden = !toorder || !_toOrderFails.length;
+  renderToOrderFails();   // #234 — its own rule: this tab only, and only while non-empty
   const secNd = document.getElementById('tab-nedostupne'); if (secNd) secNd.hidden = !nedostupne;
   const secVy = document.getElementById('tab-vystavy'); if (secVy) secVy.hidden = !vystavy;
   const sec = document.getElementById('tab-search'); if (sec) sec.hidden = !search;

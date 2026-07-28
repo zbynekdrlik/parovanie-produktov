@@ -1671,20 +1671,39 @@ def _save_unavailable(d: dict) -> None:
 # statuses. The client only mirrors it. Existing combinations are all legal under this
 # semantics (they all carry „objednané" plus at most one axis-B flag), so nothing is
 # migrated — the manager's markings stay exactly as he made them.
-_STATUS_AXIS = (
-    ("waiting", _load_waiting, _save_waiting),
-    ("instock", _load_instock, _save_instock),
-    ("unavailable", _load_unavailable, _save_unavailable),
-)
+_STATUS_AXIS = ("waiting", "instock", "unavailable")
+
+
+def _status_stores() -> dict:
+    """Loader/saver per axis-B flag, resolved PER CALL. A module-level tuple of function
+    OBJECTS would freeze them at import exactly like a module-level path constant froze
+    `OUT` (#261) — a later indirection (or a test) rebinding `_save_waiting` would then
+    silently not reach `_write_status_flag`, and the write would look fine while doing
+    something else."""
+    return {"waiting": (_load_waiting, _save_waiting),
+            "instock": (_load_instock, _save_instock),
+            "unavailable": (_load_unavailable, _save_unavailable)}
 
 
 def _write_status_flag(field: str, key: str, on: bool) -> dict:
-    """Write ONE axis-B flag and, when turning it ON, clear the other two for that key —
-    one atomic write, no window in which the row holds two statuses. Turning a flag OFF
-    says nothing about the others and touches only its own store. Returns the resulting
-    state of all four flags, so the answer itself tells the client what the row now IS."""
+    """Write ONE axis-B flag and, when turning it ON, clear the other two for that key.
+    Turning a flag OFF says nothing about the others and touches only its own store.
+    Returns the resulting state of all four flags, so the answer itself tells the client
+    what the row now IS.
+
+    The whole read-modify-write sits in ONE `with _lock:` block (which is inter-process),
+    so no other WRITER can interleave. It is NOT atomic across FILES, though — `os.replace`
+    is atomic per file and this touches up to two. That is why the CLICKED store is saved
+    FIRST and the clears after: if a later save fails (disk full, `StoreWipeRefused`), the
+    row is left holding a SUPERSET — the new status plus the one it was replacing — which
+    the next axis-B write heals by itself. Saving the clear first would instead leave the
+    row with NO status at all: the flag the manager just set never landed AND the one it
+    replaced was erased, i.e. exactly the irreplaceable-work loss `protect=True` exists to
+    prevent. A GET landing in that same window can therefore briefly see both flags; a
+    transient superset is self-healing, a lost marking is not."""
+    stores = _status_stores()
     with _lock:
-        loaded = {name: load() for name, load, _save in _STATUS_AXIS}
+        loaded = {name: load() for name, (load, _save) in stores.items()}
         dirty = set()
         for name, d in loaded.items():
             if name == field:
@@ -1700,11 +1719,12 @@ def _write_status_flag(field: str, key: str, on: bool) -> dict:
         # A write that changed nothing must not rewrite the file: these stores are
         # `protect=True` (the manager's irreplaceable work), and a store this call never
         # touched must not even be CREATED just because a conflicting flag was checked.
-        for name, _load, save in _STATUS_AXIS:
+        # Clicked store first — see the docstring on why the ORDER is load-bearing.
+        for name in [field] + [n for n in _STATUS_AXIS if n != field]:
             if name in dirty:
-                save(loaded[name])
+                stores[name][1](loaded[name])
         flags = {"ordered": bool(_load_ordered().get(key))}
-    flags.update({name: bool(d.get(key)) for name, d in loaded.items()})
+        flags.update({name: bool(d.get(key)) for name, d in loaded.items()})
     if dirty - {field}:
         log.info("status %s key=%s on=%s cleared=%s",
                  field, key, on, ",".join(sorted(dirty - {field})))
@@ -1712,10 +1732,11 @@ def _write_status_flag(field: str, key: str, on: bool) -> dict:
 
 
 def _flag_snapshot(key: str) -> dict:
-    """All four flags for one line — what every flag write answers with."""
-    with _lock:
-        flags = {"ordered": bool(_load_ordered().get(key))}
-        flags.update({name: bool(load().get(key)) for name, load, _save in _STATUS_AXIS})
+    """All four flags for one line — what every flag write answers with. Call it INSIDE the
+    writer's own `with _lock:` block (`_lock` is reentrant): read outside it and the answer
+    can describe a concurrent LATER write instead of the one being answered."""
+    flags = {"ordered": bool(_load_ordered().get(key))}
+    flags.update({name: bool(load().get(key)) for name, (load, _s) in _status_stores().items()})
     return flags
 
 
@@ -2785,11 +2806,13 @@ def api_ordered():
         else:
             d.pop(key, None)
         _save_ordered(d)
+        # axis A: „objednané" clears nothing — it says we placed the order, not what the
+        # line's status is. It still answers with the resulting state of all four flags,
+        # so the client has ONE shape to mirror (#211). Snapshot INSIDE the same lock, or
+        # the answer can describe a concurrent later write instead of this one.
+        flags = _flag_snapshot(key)
     log.info("ordered key=%s ordered=%s", key, ordered)
-    # axis A: „objednané" clears nothing — it says we placed the order, not what the
-    # line's status is. It still answers with the resulting state of all four flags, so
-    # the client has ONE shape to mirror (#211).
-    return jsonify({"ok": True, "flags": _flag_snapshot(key)})
+    return jsonify({"ok": True, "flags": flags})
 
 
 @app.route("/api/ordered/bulk", methods=["POST"])
