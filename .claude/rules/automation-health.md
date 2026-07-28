@@ -275,6 +275,13 @@ nevyhodil), len o úroveň nižšie: tu je celý VÝSLEDOK zlyhaný, nielen jede
 - **Rozšírenie `navError()` o `(a.last_result || {}).ok === false` je bezpečné len vtedy, keď
   ŽIADNA iná automatizácia nepoužíva kľúč `"ok"` vo svojom výsledku s iným významom** — over si
   to `grep`-om cez všetky `run_*()` funkcie predtým, než zdieľanú funkciu takto rozšíriš.
+  **Kolízia REÁLNE existuje — `run_image_health` má vo svojich `stats` tiež kľúč `ok`, ale
+  je to POČET obrázkov, čo prešli kontrolou (`ok_n`, číslo), nie príznak (opravné kolo 1 k
+  Tasku 7, #299 — pôvodná verzia tohto komentára tvrdila opak a bolo to nepravdivé). Kód je
+  dnes bezpečný LEN vďaka striktnému `=== false` — číslo sa mu nikdy nerovná. Keby to niekto
+  prepísal na pravdivostné porovnanie (`!a.last_result.ok`), `image_health` s `ok: 0`
+  (žiadny obrázok neprešiel) by odznak zapol falošne. Pri KAŽDOM ďalšom `run_*()`, čo prejde
+  cez tento wrapper, over si nielen prítomnosť kľúča `ok`, ale aj jeho VÝZNAM.
 - **Test na to musí mutovať PRÁVE `last_status`, nie `last_result`** — fixtúra/`page.evaluate`
   nastaví `last_status: 'ok'` A ZÁROVEŇ `last_result.ok: false`, inak sa nedá odlíšiť „karta
   číta last_result" od „karta číta last_status a náhodou to vyšlo".

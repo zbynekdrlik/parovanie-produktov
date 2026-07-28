@@ -586,8 +586,19 @@ function navError(key) {
   // ("cyklus už beží" / "iný import práve beží" / unconfirmed-or-blocked rows)
   // through `last_result.ok === false`, by a NORMAL return, so `last_status`
   // stays 'ok' for them (same fail-silently-ok shape as `source_degraded`
-  // above). No OTHER automation's `run_*()` sets an `ok` key in its result today
-  // (grepped), so this is safe to check unconditionally.
+  // above).
+  // WARNING (Task 7 opravné kolo 1) — the `ok` key is NOT unique to
+  // `shoptet_upload`. `run_image_health`'s `stats` ALSO carries a top-level
+  // `ok` key (`webreview/app.py` `run_image_health`, ~line 8705) — but there
+  // it is a COUNT of images that passed the check (`ok_n`, an int), not a
+  // pass/fail flag. The check below is safe TODAY only because it is the
+  // STRICT `=== false`: a number is never `=== false` in JS, so
+  // `image_health`'s count can never light this badge, however that count
+  // reads. If you ever rewrite this to a truthy/falsy check (`!a.last_result.ok`
+  // or similar), `image_health` reporting `ok: 0` (zero images passed) would
+  // wrongly flip this badge on — a REAL collision, not a hypothetical one.
+  // Before touching this comparison, re-grep every `run_*()` for an `ok` key
+  // (`grep -n '"ok"' webreview/app.py`) and check what each one MEANS.
   return !!(a && (a.last_status === 'error' || (a.last_result || {}).source_degraded
     || (a.last_result || {}).ok === false));
 }
