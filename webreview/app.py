@@ -1654,6 +1654,39 @@ def _save_unavailable(d: dict) -> None:
     _atomic_write_json(UNAVAIL, d, protect=True)
 
 
+# #291 — WHEN a flag write committed, as a number the client can order answers by.
+#
+# The tab writes optimistically and keeps a per-(flag, row) counter so a stale answer can
+# never overwrite a newer one. That counter is taken when a write is ISSUED, but what
+# decides the bytes on disk is the order the server threads took `with _lock:` — the order
+# they COMMITTED. Two writes issued inside one round-trip go out on two connections, so
+# the two orders can diverge, and the client then stands on the answer that committed
+# EARLIER while the store holds the other one. No client-side bookkeeping can close that;
+# only the server knows its own commit order, so it says so.
+#
+# Seeded from the WALL CLOCK in milliseconds rather than from 0: an open tab survives a
+# restart of this service (and a deploy is exactly when one is most likely mid-round-trip).
+# Starting over at 1 would hand a client holding number 4 812 a stream of "older" answers
+# it would then refuse for the life of the page — its `confirmed` baseline frozen on stale
+# data, which is the #290 failure shape reached through a different door.
+#
+# Read and bumped ONLY inside a `with _lock:` block that is actually committing a write
+# (`_lock` is inter-process, so the increment is serialised with the store writes it
+# orders). Never persisted: it only has to be monotonic within a client's page lifetime,
+# and the wall-clock seed already covers the restart case.
+_flag_commit_seq = int(time.time() * 1000)
+
+
+def _next_commit_seq() -> int:
+    """The commit number for the write being made. MUST be called inside the writer's own
+    `with _lock:` block — called outside it, two writes could take the same number, or
+    take them in the opposite order to the one they committed in, which is precisely the
+    thing this number exists to make impossible."""
+    global _flag_commit_seq
+    _flag_commit_seq += 1
+    return _flag_commit_seq
+
+
 # #211 — the four to-order markers are TWO AXES, not four independent ticks. Decided from
 # the manager's own live stores: 27 rows carried a combination and EVERY one of them
 # involved „objednané", while „čaká sa"/„skladom"/„nedostupné" never once overlapped each
@@ -1685,11 +1718,12 @@ def _status_stores() -> dict:
             "unavailable": (_load_unavailable, _save_unavailable)}
 
 
-def _write_status_flag(field: str, key: str, on: bool) -> dict:
+def _write_status_flag(field: str, key: str, on: bool) -> tuple:
     """Write ONE axis-B flag and, when turning it ON, clear the other two for that key.
     Turning a flag OFF says nothing about the others and touches only its own store.
-    Returns the resulting state of all four flags, so the answer itself tells the client
-    what the row now IS.
+    Returns `(flags, commit_seq)`: the resulting state of all four flags — so the answer
+    itself tells the client what the row now IS — and WHEN that state committed (#291),
+    which is the only thing that can order two answers correctly.
 
     The whole read-modify-write sits in ONE `with _lock:` block (which is inter-process),
     so no other WRITER can interleave. It is NOT atomic across FILES, though — `os.replace`
@@ -1725,10 +1759,13 @@ def _write_status_flag(field: str, key: str, on: bool) -> dict:
                 stores[name][1](loaded[name])
         flags = {"ordered": bool(_load_ordered().get(key))}
         flags.update({name: bool(d.get(key)) for name, d in loaded.items()})
+        # …inside the SAME lock as the saves above, so the number really does order this
+        # write against every other one (#291).
+        commit_seq = _next_commit_seq()
     if dirty - {field}:
         log.info("status %s key=%s on=%s cleared=%s",
                  field, key, on, ",".join(sorted(dirty - {field})))
-    return flags
+    return flags, commit_seq
 
 
 def _flag_snapshot(key: str) -> dict:
@@ -2811,8 +2848,9 @@ def api_ordered():
         # so the client has ONE shape to mirror (#211). Snapshot INSIDE the same lock, or
         # the answer can describe a concurrent later write instead of this one.
         flags = _flag_snapshot(key)
+        commit_seq = _next_commit_seq()          # #291 — inside the same lock as the save
     log.info("ordered key=%s ordered=%s", key, ordered)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 @app.route("/api/ordered/bulk", methods=["POST"])
@@ -2838,8 +2876,9 @@ def api_ordered_bulk():
             else:
                 d.pop(key, None)
         _save_ordered(d)
+        commit_seq = _next_commit_seq()          # #291 — inside the same lock as the save
     log.info("ordered bulk n=%d ordered=%s", len(keys), ordered)
-    return jsonify({"ok": True, "count": len(keys)})
+    return jsonify({"ok": True, "count": len(keys), "commitSeq": commit_seq})
 
 
 @app.route("/api/waiting", methods=["GET", "POST"])
@@ -2854,9 +2893,9 @@ def api_waiting():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     waiting = bool(body.get("waiting"))
-    flags = _write_status_flag("waiting", key, waiting)   # axis B — clears the other two
+    flags, commit_seq = _write_status_flag("waiting", key, waiting)   # axis B — clears the other two
     log.info("waiting key=%s waiting=%s", key, waiting)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 @app.route("/api/instock", methods=["GET", "POST"])
@@ -2870,9 +2909,9 @@ def api_instock():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     instock = bool(body.get("instock"))
-    flags = _write_status_flag("instock", key, instock)   # axis B — clears the other two
+    flags, commit_seq = _write_status_flag("instock", key, instock)   # axis B — clears the other two
     log.info("instock key=%s instock=%s", key, instock)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 @app.route("/api/unavailable", methods=["GET", "POST"])
@@ -2886,9 +2925,9 @@ def api_unavailable():
     if not key:
         return jsonify({"ok": False, "error": "key required"}), 400
     unavailable = bool(body.get("unavailable"))
-    flags = _write_status_flag("unavailable", key, unavailable)   # axis B — clears the rest
+    flags, commit_seq = _write_status_flag("unavailable", key, unavailable)   # axis B — clears the rest
     log.info("unavailable key=%s unavailable=%s", key, unavailable)
-    return jsonify({"ok": True, "flags": flags})
+    return jsonify({"ok": True, "flags": flags, "commitSeq": commit_seq})
 
 
 # --------------------------------------------------------------------------- #

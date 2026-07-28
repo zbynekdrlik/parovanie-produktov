@@ -962,44 +962,82 @@ async function postToOrder(path, payload, out) {
 // server explicitly refused (the manager is told the save failed and then looks at a row
 // claiming it succeeded). Keyed per FLAG too — 'čaká sa' and 'skladom' are independent
 // writes on the same row and must not supersede each other.
-// (Responses arriving out of REQUEST order stay inherently unresolvable client-side;
-// this fixes the client's own bookkeeping, which is what invented the phantom flag.)
+// (#291: which answer is NEWEST is decided by the server's own commit number, not by the
+// order this client issued the writes in — see `confirmedCommit` below.)
 const _flagWrites = Object.create(null);
 
 // The entry is NEVER deleted (bounded by rows x 4 flags): `confirmed` is this row+flag's
 // last known SERVER value and is the baseline for every future write. Deleting it on
 // settle opened a generation hole — a straggler from an older burst would land on the
 // entry a LATER click had freshly created and poison its baseline, putting the phantom
-// flag right back. `confirmedSeq` is what closes it: a write's acceptance only counts if
-// no LATER-issued write has already been accepted.
+// flag right back. `confirmedCommit` is what closes it: a write's acceptance only counts
+// if no write that committed LATER has already been accepted.
+//
+// #291 — that number is the SERVER's (`commitSeq`, taken inside the same `with _lock:`
+// block that writes the store), never this client's `seq`. `seq` is taken when a write is
+// ISSUED, and two writes issued inside one round-trip go out on two connections whose
+// server threads take the lock in either order — so issue order is simply not commit
+// order, and a guard built on it stands on whichever answer was issued last instead of on
+// the one that IS the store. `seq` keeps its OTHER job untouched: it decides which write
+// still owns the (flag, row) for rollback and for REPORTING (`seqs[0] === sts[0].seq`),
+// and that one really is about the manager's latest INTENT, not about the server's history.
+//
+// The two numbers are deliberately NOT interchangeable: `seq` is an independent counter
+// per (flag, row), `confirmedCommit` is ONE global clock. That is what finally makes
+// answers comparable across flags — but the stamping rule from the PR #290 review stands
+// unchanged (a write may only stamp the guard of a flag it CLAIMED), because a write must
+// not materialise bookkeeping for a flag it never wrote.
 function _flagEntry(field, key, map) {
   const wk = field + '\u0000' + key;
   return _flagWrites[wk]
-    || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedSeq: 0, inflight: 0 });
+    || (_flagWrites[wk] = { wk, seq: 0, confirmed: !!map[key], confirmedCommit: 0, inflight: 0 });
 }
 
-// Every flag write answers `{ok, flags:{ordered, waiting, instock, unavailable}}` — the
-// server's own account of the row AT THE MOMENT that write committed. Adopt it through the
-// SAME gate the client's bookkeeping uses, so an answer that committed EARLIER can never
-// overwrite one that committed later (`confirmedSeq`), and so a map another write is still
-// holding optimistically is left alone (`inflight`). Returns true if anything moved.
+// The server's commit number out of one answer, or `null` when the answer does not carry
+// one (a success whose body `postToOrder` could not parse — for these endpoints that means
+// a truncated response).
 //
-// `claimed` = {field: the sequence number THAT FIELD took for this write}. The answer
-// describes all four flags, but only the ones the write actually claimed may be stamped
-// with it: `seq` is an INDEPENDENT counter per (flag, row) — that independence is the
-// whole point of `_flagWrites` — so the numbers are NOT comparable across flags. Stamping
-// every answered flag with the CLICKED flag's number wrote a foreign, higher value into
-// the guard of a flag whose own counter was behind; that guard then rejected that flag's
-// own accepted writes, `confirmed` froze on stale data, and the next REFUSED write "rolled
-// back" to the stale value, i.e. did not roll back — leaving the row shown un-ordered
-// while the server held it (and the mirror image). The invariant, in one line: a flag's
-// `confirmedSeq` may only ever be set from a sequence number THAT flag claimed.
+// `null` means ADOPT NOTHING, and that is deliberate rather than a fallback to the old
+// issue-order rule. The two numbers live in different spaces — one global commit clock
+// against an independent per-(flag, row) counter — so a guard that accepted either would
+// be comparing values that have no order between them: once a commit number is stamped no
+// issue number could ever clear it again, and before one is, issue order would silently
+// decide. Leaving `confirmed` where it is costs a slightly stale rollback baseline in that
+// one corner; mixing the two spaces costs the guard itself.
+function _commitOf(body) {
+  const n = body && body.commitSeq;
+  return (typeof n === 'number' && isFinite(n)) ? n : null;
+}
+
+// Every flag write answers `{ok, flags:{ordered, waiting, instock, unavailable}, commitSeq}`
+// — the server's own account of the row AT THE MOMENT that write committed, plus WHEN it
+// committed. Adopt it through the SAME gate the client's bookkeeping uses, so an answer
+// that committed EARLIER can never overwrite one that committed later (`confirmedCommit`),
+// and so a map another write is still holding optimistically is left alone (`inflight`).
+// Returns true if anything moved.
 //
-// Nothing is lost by the restriction, because no endpoint writes across the axes: a write
-// can only ever change the flags it claimed. `/api/ordered` touches `ordered` alone (axis A
-// clears nothing) and `_write_status_flag` only the three axis-B stores — and turning an
-// axis-B status ON already claims all three of them (`toggleStatusFlag`), which is exactly
-// the reverse-commit-order case this mirror was added for.
+// #291 — the comparison is on the SERVER's commit number, not on this client's issue
+// counter. Issue order approximates commit order and is wrong exactly when it matters:
+// two writes issued inside one round-trip travel on separate connections, so a write
+// issued FIRST can take `with _lock:` LAST. Its answer is then the newest truth there is
+// — it IS the store — and the old gate threw it away as stale for carrying the lower
+// issue number, leaving the row showing the value that committed earlier.
+//
+// `claimed` = {field: the ISSUE number that field took}, which is now used only as the
+// SET of flags this write may stamp — never as the number stamped. The answer describes
+// all four flags, but a write may still only touch the guards of the ones it claimed:
+// `_flagEntry` creates entries on demand, so stamping an unclaimed flag would materialise
+// bookkeeping for a flag this write never wrote. (Under the old ISSUE numbering the
+// restriction was load-bearing for CORRECTNESS too — the counters were independent per
+// (flag, row), so a foreign number could outrank a flag's own accepted writes, freeze its
+// `confirmed` on stale data and turn the next refused write's rollback into a no-op. A
+// single global commit clock removes that hazard; the restriction stays for the reason
+// above.)
+//
+// Nothing is lost by it, because no endpoint writes across the axes: a write can only ever
+// change the flags it claimed. `/api/ordered` touches `ordered` alone (axis A clears
+// nothing) and `_write_status_flag` only the three axis-B stores — and turning an axis-B
+// status ON already claims all three of them (`toggleStatusFlag`).
 function _mirrorServerFlags(body, key, claimed) {
   const flags = body && body.flags;
   if (!flags) return false;
@@ -1007,15 +1045,16 @@ function _mirrorServerFlags(body, key, claimed) {
   let moved = false;
   for (const field of Object.keys(maps)) {
     if (typeof flags[field] !== 'boolean') continue;
-    const seq = claimed[field];
     // an unclaimed flag is not even LOOKED UP: `_flagEntry` creates the entry on demand,
     // so touching one here would materialise bookkeeping for a flag this write never wrote
-    if (seq === undefined) continue;
+    if (claimed[field] === undefined) continue;
     const map = maps[field];
+    const commit = _commitOf(body);
+    if (commit === null) continue;             // no commit number → nothing to order it by
     const st = _flagEntry(field, key, map);
-    if (_flagWrites[st.wk] !== st || seq < st.confirmedSeq) continue;
+    if (_flagWrites[st.wk] !== st || commit < st.confirmedCommit) continue;
     st.confirmed = flags[field];
-    st.confirmedSeq = seq;
+    st.confirmedCommit = commit;
     if (st.inflight !== 0 || !!map[key] === flags[field]) continue;
     if (flags[field]) map[key] = true; else delete map[key];
     moved = true;
@@ -1062,7 +1101,14 @@ async function saveOrderWrite(path, payload, writes, key, what) {
   writes.forEach((w, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;
-    if (!err && seq >= st.confirmedSeq) { st.confirmed = w.value; st.confirmedSeq = seq; }
+    // #291 — WHEN this write committed, from the server, never `seq` (when it was issued).
+    // `_mirrorServerFlags` below re-reads the same number and overwrites `confirmed` with
+    // the server's own account of the flag; this line is what carries a write whose answer
+    // has no `flags` to mirror. `null` (an unreadable body) adopts nothing — see _commitOf.
+    const commit = _commitOf(ans.json);
+    if (!err && commit !== null && commit >= st.confirmedCommit) {
+      st.confirmed = w.value; st.confirmedCommit = commit;
+    }
     if (seq !== st.seq) {                     // a later write owns this (flag, row) now
       // …and once nothing else is out for it, the map owes the server's own last word
       if (st.inflight === 0 && !!w.map[key] !== st.confirmed) {
@@ -1076,14 +1122,14 @@ async function saveOrderWrite(path, payload, writes, key, what) {
       repaint = true;
     }
   });
-  // The SERVER is the authority and every answer says what the row now IS. The client's
-  // own issue-order bookkeeping is not enough by itself: two axis-B writes issued inside
-  // one round-trip travel on separate connections and their server threads can take
-  // `with _lock:` in the REVERSE order, so both succeed and the server's final state is
-  // the one that committed LAST — not the one the client issued last. Mirror the answered
-  // flags through the SAME confirmed/confirmedSeq gate, so a stale answer can never
-  // overwrite a newer one, and only touch a map with nothing else in flight for it —
-  // each flag under the sequence number IT claimed, never the clicked flag's.
+  // The SERVER is the authority and every answer says what the row now IS — and, since
+  // #291, WHEN it said so. Two writes issued inside one round-trip travel on separate
+  // connections and their server threads can take `with _lock:` in the REVERSE order, so
+  // both succeed and the server's final state is the one that COMMITTED last, not the one
+  // the client ISSUED last. Mirror the answered flags through the SAME
+  // confirmed/confirmedCommit gate, so an answer that committed earlier can never overwrite
+  // one that committed later, and only touch a map with nothing else in flight for it —
+  // restricted to the flags this write claimed.
   const mirrored = live && !err && _mirrorServerFlags(ans.json, key, claimed);
   if (!live || !owner) {          // superseded by a newer write, or disowned by a reload
     if (repaint || mirrored) renderToOrder();
@@ -1177,31 +1223,39 @@ function toggleStatusFlag(key, row, field) {
 // ORDERED sa mení až PO úspechu, takže pri zlyhaní netreba nič vracať — len to povedať.
 //
 // A write that does not go through saveOrderFlag still changes the same rows, so it joins
-// the same `_flagWrites` bookkeeping — and it takes its sequence numbers when it is
+// the same `_flagWrites` bookkeeping — and it takes its OWNERSHIP numbers when it is
 // ISSUED, exactly like a per-row write. Claiming them at RESPONSE time was the bug: the
 // bulk then outranked per-row writes the manager issued AFTER clicking it (newer intent,
 // and committed LATER on the server behind the bulk's own `with _lock:`), so his last
 // click was silently inverted — the tab painted the row the bulk's way, the settle
 // reconcile forced the map to match, and nothing was reported. Issue-time sequencing puts
-// the bulk where it belongs in the order and keeps the mirror case right too: a bulk that
-// was ACCEPTED is the newest server truth for its rows, so a later refused write rolls
-// back onto it, not onto the pre-bulk baseline.
+// the bulk where it belongs in the manager's INTENT order.
+//
+// #291 — which answer is newest is a separate question, and the bulk answers it the same
+// way every other write does: with the server's `commitSeq`, taken inside the bulk's own
+// `with _lock:`. The endpoint returns no per-row `flags` (it moves one flag on many rows),
+// so unlike `saveOrderWrite` there is nothing to mirror — the value it confirms is its own
+// `ordered`, stamped with the moment the server actually wrote it.
 async function markGroupOrdered(items, ordered) {
   const keys = items.map(o => o.key);
   const sts = keys.map(k => _flagEntry('ordered', k, ORDERED));
   const seqs = sts.map(st => ++st.seq);
   sts.forEach(st => { st.inflight += 1; });
   let err;
+  const ans = {};
   // unskippable, for the same reason as in saveOrderFlag: a leaked counter would disable
   // reconciliation for those rows for the lifetime of the page
   try {
-    err = await postToOrder('/api/ordered/bulk', { keys, ordered });
+    err = await postToOrder('/api/ordered/bulk', { keys, ordered }, ans);
   } finally { sts.forEach(st => { st.inflight -= 1; }); }
   let repaint = false;
   keys.forEach((key, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;      // loadOrders() disowned this write
-    if (!err && seq >= st.confirmedSeq) { st.confirmed = ordered; st.confirmedSeq = seq; }
+    const commit = _commitOf(ans.json);
+    if (!err && commit !== null && commit >= st.confirmedCommit) {
+      st.confirmed = ordered; st.confirmedCommit = commit;
+    }
     if (seq !== st.seq) {                       // a later write owns this row now
       // …and once nothing else is out for it, the map owes the server's own last word
       if (st.inflight === 0 && !!ORDERED[key] !== st.confirmed) {
