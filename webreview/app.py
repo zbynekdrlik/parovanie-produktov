@@ -1824,6 +1824,16 @@ def _line_flag_stores() -> tuple:
             ("unavailable_items.json", _load_unavailable, _save_unavailable))
 
 
+def _orders_with_flags(loaded) -> set:
+    """Which ORDERS still own at least one per-line mark, across the loaded flag stores.
+
+    `loaded` is `[(name, save, dict), …]` — the dicts are mutated in place by the prune, so
+    calling this before and after the deletions answers „who is being timed" and „who is
+    left" from the same objects."""
+    return {k.split("|", 1)[0] for _n, _s, d in loaded
+            for k in d if "|" in k and k.split("|", 1)[0]}
+
+
 # An orders export carrying FAR fewer orders than the shop makes is not a quiet quarter,
 # it is a broken feed — a changed export pattern, a filter left on, a truncated download.
 # Same shape and same reasoning as `EXPORT_MIN_CODES` for the catalogue: an absolute floor
@@ -1981,21 +1991,55 @@ ORDERS_BLANK_STATUS_LABEL = "(prázdny stav)"
 # „objednané u dodávateľa" silently gone is a line he orders a second time, which is the
 # exact harm those marks exist to prevent.
 #
-# What it actually measures: days since the order was PLACED. The export carries 66 columns
+# What it actually measures: days since the order was PLACED. The export carries 67 columns
 # and its only date is `date` = order creation; there is no status-change or last-modified
-# column anywhere in it, so the moment an order closed simply cannot be read from the source.
-# Be plain about the consequence: an order placed 31 days ago and closed TODAY is pruned on
-# the very next hourly run, with no grace at all — and that is precisely the long
-# supplier-wait order these marks exist for (live open flagged orders run up to 75 days old).
-# Measuring a real grace needs us to record when we first SAW an order closed, i.e. a new
-# store; that is #294, deliberately not smuggled in here.
+# column anywhere in it (re-verified on the live export for #294), so the moment an order
+# closed cannot be read from the source at all.
 #
-# It is still worth keeping as what it is: a bound on how long a key can live. 30 days
-# against a 90-day export window (`ORDERS_EXPORT_WINDOW_DAYS`) leaves 60 days of hourly runs
-# in which every eligible key is still reachable, so nothing is ever stranded, and it does
-# cover the common case where an order closes near the day it was placed. The stores settle
-# at „the last month's work" instead of growing for ever, which is the actual ticket.
+# Since #294 it is no longer the whole rule — it is the FLOOR UNDER the real grace, which is
+# measured from when this app first SAW the order closed (`ORDERS_CLOSED_SEEN` below). It
+# stays because it is the one bound that needs no store of ours: an unreadable date is an
+# unknown age, and an unknown age is never „old enough".
 ORDERS_PRUNE_MIN_ORDER_AGE_DAYS = 30
+
+# #294 — the REAL grace, and where it is measured from.
+#
+# The export cannot tell us when an order closed, so the app remembers it: `{order code:
+# the ISO day we first saw that order in a terminal status}`. An order placed 40 days ago
+# and closed TODAY used to be pruned on the very next hourly run — no grace whatsoever, and
+# precisely at the long supplier-wait order these marks exist for (live open flagged orders
+# run up to 75 days old).
+#
+# ORDER OF OPERATIONS IS THE WHOLE DESIGN: the run RECORDS first and DECIDES after. A newly
+# closed order therefore gets the full grace on the very first run that sees it. Deciding
+# first would make every newly closed order „unrecorded", i.e. fall back to the order-age
+# rule, i.e. no grace at all — for ever, not just once. The same order also makes a lost or
+# corrupt store fail-CLOSED by construction: it degrades to „we do not know when anything
+# closed", everything is re-recorded as closed today, and that run deletes nothing.
+#
+# It holds NO work of the manager's — it is our own observation log, and losing it can only
+# DELAY a deletion, never cause one. Hence `protect=False` (a legitimate „the last records
+# went with the last keys" write would otherwise raise `StoreWipeRefused` every hour and
+# take the prune's own bookkeeping down with it) and no place in `backup_data.sh`, which is
+# for stores whose loss costs work nobody can redo.
+ORDERS_CLOSED_SEEN = _store("orders_closed_seen.json")
+
+# How long a key survives after we first see its order closed. Same 30 days as the order-age
+# floor, and for the same reason it was reached for: a „Vybavená" order can come back to
+# „Vybavuje sa", and a line that returns without „objednané u dodávateľa" is ordered twice.
+ORDERS_PRUNE_REOPEN_GRACE_DAYS = 30
+
+# …and the bound that keeps the grace from turning into „never" (store-prune §1c: check that
+# the grace and the source window do not leave a key stuck).
+#
+# The export is a 90-day window measured from the ORDER date, and an order the export does
+# not mention is UNSEEN, never closed — so a key whose order leaves the window before its
+# grace elapses could never be deleted again, and the stores would grow for ever exactly as
+# they did before #212. An order that closes very late therefore gets a SHORTER grace rather
+# than an infinite one; say it plainly rather than let it look like a full 30 days. 80 leaves
+# 10 days — ~240 hourly runs — of margin for a sync that has been down, and every order that
+# closes within its first 50 days still gets the whole grace.
+ORDERS_PRUNE_LAST_CHANCE_AGE_DAYS = 80
 
 
 def _orders_by_openness(orders_csv):
@@ -2076,20 +2120,52 @@ def _orders_by_openness(orders_csv):
     return seen, still_open, seen - unfinished, dates, unknown, ""
 
 
-def _order_is_old_enough(day: str) -> bool:
-    """Is this order past the order-age floor (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`)? Note the
-    name: it is the age of the ORDER, not time since it closed, and it is therefore NOT the
-    reopen grace it was first written as — the export carries no status-change date, so that
-    needs a store of its own (#294).
+def _order_age_days(day):
+    """Whole days since the order was PLACED, or `None` when its date cannot be read.
 
-    An unreadable or missing date means we do NOT know its age — and an unknown age is never
-    „old enough" (the same stance `_parse_date`'s callers take for a date going to a
-    customer)."""
+    `None` is not zero and not „old": an unreadable or missing date means we do NOT know
+    the age, and an unknown age is never „old enough" (the same stance `_parse_date`'s
+    callers take for a date that would go to a customer)."""
     try:
         placed = date.fromisoformat((day or "").strip())
-    except ValueError:
+    except (TypeError, ValueError):
+        return None
+    return (date.today() - placed).days
+
+
+def _order_is_old_enough(day: str) -> bool:
+    """Is this order past the order-age FLOOR (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`)?
+
+    The floor only, not the grace — since #294 the grace runs from when we first saw the
+    order CLOSED (`_prune_due`), and this is the bound underneath it that needs no store of
+    ours."""
+    age = _order_age_days(day)
+    return age is not None and age >= ORDERS_PRUNE_MIN_ORDER_AGE_DAYS
+
+
+def _prune_due(day, first_closed) -> bool:
+    """May this order's per-line marks go? (#294)
+
+    Three conditions, and the order they are written in is the argument for each:
+
+    1. the order-age floor still holds — an unreadable date is an unknown age, so it can
+       never pass (and neither of the branches below could be trusted for it either);
+    2. the order is about to leave the export window → LAST CHANCE. After that it is
+       UNSEEN, never „closed", so the key could never be deleted again (store-prune §1c).
+       A very late closure buys a shorter grace, never an infinite one;
+    3. otherwise: the real grace, measured from the day we FIRST saw this order closed.
+       No usable record = not due. That is not a hole — the caller writes the record for
+       every finished order BEFORE asking, so „no record" means the store could not be
+       read at all, and refusing to delete is the safe answer to that. A record dated in
+       the future (a clock stepped back, a hand edit) yields a negative age and is
+       likewise not due."""
+    age = _order_age_days(day)
+    if age is None or age < ORDERS_PRUNE_MIN_ORDER_AGE_DAYS:
         return False
-    return (date.today() - placed).days >= ORDERS_PRUNE_MIN_ORDER_AGE_DAYS
+    if age >= ORDERS_PRUNE_LAST_CHANCE_AGE_DAYS:
+        return True
+    closed_age = _order_age_days(first_closed if isinstance(first_closed, str) else None)
+    return closed_age is not None and closed_age >= ORDERS_PRUNE_REOPEN_GRACE_DAYS
 
 
 def _prune_orphan_line_flags(orders_csv) -> dict:
@@ -2115,6 +2191,12 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
 
     On top of that, a fail-closed floor on the source (`ORDERS_PRUNE_MIN_ORDERS`): an
     export carrying implausibly few orders prunes nothing at all.
+
+    And a GRACE, because closure is not the end — a „Vybavená" order can come back to
+    „Vybavuje sa" (#294). It runs from the day this app FIRST SAW the order closed, which
+    the run records here (`ORDERS_CLOSED_SEEN`) because the export carries no such date;
+    see `_prune_due` for the three conditions and `ORDERS_CLOSED_SEEN` for why the record is
+    written BEFORE the decision.
 
     Read-modify-write in ONE `with _lock:` block (inter-process, #264), removing IN PLACE
     from the loaded map so the write is the legitimate tail of a read-modify-write and the
@@ -2171,11 +2253,34 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     if unknown_statuses:
         log.info("prune riadkových príznakov: export nesie stavy, ktoré nepoznám a preto "
                  "ich nepovažujem za ukončené: %s", ", ".join(unknown_statuses))
-    closed = {c for c in finished if _order_is_old_enough(dates.get(c))}
     per_store, total = {}, 0
     with _lock:
-        for name, load, save in _line_flag_stores():
-            d = load()
+        # Everything below is ONE read-modify-write over five stores, so they are all loaded
+        # first: the grace bookkeeping needs to know which orders still own a key AFTER the
+        # deletions, and the deletions need the grace to decide.
+        loaded = [(name, save, load()) for name, load, save in _line_flag_stores()]
+        flagged = _orders_with_flags(loaded)
+        closed_seen = _read_json_store(ORDERS_CLOSED_SEEN, {})
+        today = date.today().isoformat()
+        seen_changed = False
+        # #294 — RECORD FIRST, DECIDE AFTER. An order we are seeing closed for the first
+        # time starts its grace NOW; deciding before recording would give every newly closed
+        # order the order-age rule instead, i.e. no grace at all, which is the ticket's bug.
+        # It is also what makes a lost store fail-CLOSED: nothing read → everything recorded
+        # today → nothing deleted this run.
+        for code in sorted(flagged & finished):
+            if not isinstance(closed_seen.get(code), str):
+                closed_seen[code] = today
+                seen_changed = True
+        # A REOPEN drops the record, so the grace runs again from the SECOND closure — on
+        # POSITIVE evidence only (the order is in the export and is not finished). An order
+        # the export does not mention is UNSEEN, not reopened, and keeps its record; a
+        # truncated download must not restart everybody's grace.
+        for code in [c for c in closed_seen if c in seen and c not in finished]:
+            closed_seen.pop(code, None)
+            seen_changed = True
+        closed = {c for c in finished if _prune_due(dates.get(c), closed_seen.get(c))}
+        for name, save, d in loaded:
             # a key with no `<order>|<item>` shape cannot be attributed to an order, so it
             # can never be SHOWN to be orphaned — it is left alone rather than guessed at
             gone = sorted(k for k in d
@@ -2187,10 +2292,21 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
                 d.pop(k, None)
             save(d)
             total += len(gone)
-            log.info("prune %s: odstránených %d osirelých kľúčov (objednávka je v exporte "
-                     "a jej stav znamená vybavené): %s%s", name, len(gone),
+            log.info("prune %s: odstránených %d osirelých kľúčov (objednávka je v exporte, "
+                     "jej stav znamená vybavené a od prvého videného zatvorenia ubehol "
+                     "odklad): %s%s", name, len(gone),
                      ", ".join(gone[:ORDERS_PRUNE_LOG_KEYS]),
                      " …" if len(gone) > ORDERS_PRUNE_LOG_KEYS else "")
+        # Bounded growth: a record exists to TIME the deletion of that order's keys, so once
+        # the last of them is gone it has nothing left to time. The store therefore stays as
+        # big as „the orders the manager currently has marked", not as the export window.
+        left = _orders_with_flags(loaded)
+        for code in [c for c in closed_seen if c not in left]:
+            closed_seen.pop(code, None)
+            seen_changed = True
+        # …and when nothing changed, the file is not touched at all (store-prune §3).
+        if seen_changed:
+            _atomic_write_json(ORDERS_CLOSED_SEEN, closed_seen)
     if not total:
         log.info("prune riadkových príznakov: nič na odstránenie (%d objednávok v exporte, "
                  "%d otvorených)", len(seen), len(still_open))

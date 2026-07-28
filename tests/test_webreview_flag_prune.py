@@ -252,10 +252,10 @@ def test_a_freshly_PLACED_order_keeps_its_marks_for_a_while(stores):
     hour means the line comes back with the manager's „objednané u dodávateľa" silently gone,
     so he orders it a second time.
 
-    What it actually covers: only the common case where an order closes near the day it was
-    placed. The export has no status-change column, so an order PLACED 120 days ago and
-    closed today is pruned at once, with no grace — #294 is where that gets a real fix. This
-    pins the floor that does exist, not the grace that does not."""
+    What it covers is the FLOOR only. The real reopen grace — measured from the day this app
+    first saw the order closed, since the export has no status-change column — arrived with
+    #294 and is pinned in `test_webreview_prune_grace.py`; the floor stays underneath it
+    because an unreadable date is an unknown age, and that must never read as „old enough"."""
     fresh = "99002002;{};Vybavená;B1;Ciapka\r\n".format(
         (date.today() - timedelta(days=3)).isoformat() + " 09:00:00")
 
