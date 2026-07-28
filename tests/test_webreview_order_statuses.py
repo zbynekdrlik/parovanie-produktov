@@ -739,6 +739,23 @@ def test_the_blind_spot_ERROR_names_the_CONFIGURED_statuses_not_a_constant(iso, 
     assert "DISPATCHED_STATUS" not in msg
 
 
+def test_the_blind_spot_ERROR_stops_claiming_ANI_JEDNA_when_a_few_survive(iso):
+    """PR #298 review, A1: the signal now also fires with 1-4 recognised orders (a renamed main
+    status whose rare siblings survive), so the line may not keep asserting that not a single
+    order carries one of the names — it would be false about the only number the manager can
+    act on, which is how the previous version of this message ended up saying „v okne je 0
+    objednávok"."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Expedovaná", "Zrušená"],
+                 "known_open": [], "cancelled": ["Zrušená"]})
+    msg = webapp._dispatched_status_blind_message(102, webapp._posta_statuses()[1],
+                                                  dispatched=2)
+    assert "102" in msg and "2" in msg and "Expedovaná" in msg
+    assert "ANI JEDNA" not in msg
+    # …and with a genuinely empty count it still says exactly that
+    assert "ANI JEDNA" in webapp._dispatched_status_blind_message(
+        102, webapp._posta_statuses()[1], dispatched=0)
+
+
 # ── #297: widening `to_order` silently widens the customer mailing list ────────
 # `to_order` drives three things at once — the „Na objednanie" tab, „Nedostupné" AND the
 # reminder mails (deliberately: one notion of „open", not four). The sharp edge is that adding

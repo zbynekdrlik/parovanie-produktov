@@ -761,10 +761,75 @@ def test_an_EMPTY_dispatched_set_lights_the_blind_spot_instead_of_falling_back()
     are non-empty, so nothing upstream refuses it. It must fire the alarm's own blind-spot
     signal, never quietly fall back to the built-in „Vybavená" (a name the shop may have
     renamed years ago), which would report a healthy green over a set nobody is watching."""
-    rows = [(d % 20, "Zrušená", "", "Kuriér") for d in range(8)]
+    # The fixture MUST hold an order in the module's built-in default status. Without one the
+    # test proved nothing it claims: with the fallback restored (`return out or default`) the
+    # dispatched set becomes „Vybavená", the fixture holds no such row either way, and every
+    # count below is identical — the whole 126-test suite passes against the bug (PR #298
+    # review, B-F1). With this row the fallback is what makes `dispatched_orders` 1, not 0.
+    rows = ([(d % 20, "Zrušená", "", "Kuriér") for d in range(8)]
+            + [(3, "Vybavená", "EF000000099SK", "Kuriér")])
     c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
                            cancelled_statuses=set(), dispatched_statuses=set())
-    assert c["eligible_orders"] == 8
+    assert c["eligible_orders"] == 9
     assert c["dispatched_orders"] == 0
     assert c["dispatched_status_unknown"] is True
     assert c["degraded"] is False        # a pure counter: it never invents a shipment
+
+
+# ── PR #298 review, A1: the blind-spot signal assumed a ONE-NAME dispatched set ────────────
+# `dispatched` used to be the single literal „Vybavená", so „the shop renamed the status" and
+# „the set matches nothing" were THE SAME EVENT and `not dispatched` detected both. Deriving it
+# as `terminal − cancelled` (three live names) split them apart: one surviving rare name keeps
+# the set non-empty for ever, and 1-4 dispatched orders are ALSO below MIN_DISPATCHED_FOR_ALARM,
+# so `degraded` is not computed either. That interval was silent in BOTH directions — and the
+# rename lands exactly in it.
+_DISPATCHED_3 = frozenset({"Vybavená", "Vybavená výmena", "Vybavený Dobropis"})
+
+
+def test_a_renamed_MAIN_status_still_lights_the_blind_spot_when_rare_ones_survive():
+    """The reviewer's measured repro: the shop renames „Vybavená" → „Expedovaná" and forgets
+    the card; 100 dispatched orders vanish from the alarm's denominator while one dobropis and
+    one výmena keep the configured set non-empty. Before this fix the run reported
+    `dispatched_orders=2, dispatched_status_unknown=False, degraded=False` over a source that is
+    genuinely dead — on `main` the same shop got the alarm. Silencing the very guard the ticket
+    exists for is the regression."""
+    rows = ([(d % 25, "Expedovaná", "", "Kuriér") for d in range(100)]
+            + [(4, "Vybavený Dobropis", "", "Kuriér"), (6, "Vybavená výmena", "", "Kuriér")])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           cancelled_statuses={"Stornovaná"},
+                           dispatched_statuses=_DISPATCHED_3)
+    assert c["eligible_orders"] == 102
+    assert c["dispatched_orders"] == 2                  # the two rare survivors
+    assert c["dispatched_status_unknown"] is True       # …which is not enough to judge anything
+    assert c["degraded"] is False                       # below the evidence floor, by design
+
+
+def test_the_two_verdicts_together_cover_every_window_they_are_asked_about():
+    """The hole this closes stated as an invariant rather than a case: a window worth judging
+    is either JUDGED (`degraded` computed over >= MIN_DISPATCHED_FOR_ALARM dispatched orders)
+    or DECLARED BLIND. Nothing in between may be silently green — that gap is what a renamed
+    status fell into."""
+    for n in range(0, 9):
+        rows = ([(d % 25, "Expedovaná", "", "Kuriér") for d in range(40)]
+                + [(3, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(n)])
+        c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                               cancelled_statuses={"Stornovaná"},
+                               dispatched_statuses=_DISPATCHED_3)
+        judged = c["dispatched_orders"] >= pu.MIN_DISPATCHED_FOR_ALARM
+        assert judged or c["dispatched_status_unknown"] is True, (n, c)
+
+
+def test_a_SMALL_healthy_window_is_not_called_blind():
+    """The calibration control — it must pass BEFORE and AFTER, or „always report blind" would
+    be indistinguishable from the fix. Measured read-only over 120 rolling windows of the live
+    export: `dispatched/eligible` never fell below 0.63 (worst window 86 of 136) and not one
+    window had `eligible >= 5` with fewer than 5 dispatched. A quiet shop whose handful of
+    orders ARE recognised is short of evidence, not blind, so it stays quiet."""
+    rows = ([(d, "Vybavuje sa", "", "Kuriér") for d in range(5)]
+            + [(3, "Vybavená", f"EF00000{i:04d}SK", "Kuriér") for i in range(3)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           cancelled_statuses={"Stornovaná"},
+                           dispatched_statuses=_DISPATCHED_3)
+    assert c["eligible_orders"] == 8 and c["dispatched_orders"] == 3
+    assert c["dispatched_status_unknown"] is False
+    assert c["degraded"] is False
