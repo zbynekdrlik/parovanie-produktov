@@ -4387,8 +4387,20 @@ function renderOrderStatusConfig() {
         return;
       }
       ORDER_STATUSES.statuses = j.statuses;
-      msg.className = 'statuscfg-msg';
-      msg.textContent = '✅ Uložené. Platí to hneď pre celú appku.';
+      // PR #295 review — this endpoint only ever answers 200 once its own
+      // `_resolve_status_sets` found nothing wrong with what was just written (the
+      // response carries no separate `reason` field to read instead — checked in
+      // app.py), so success itself IS the „the stale reason no longer holds" signal.
+      // Without clearing it, `renderOrderStatusConfig()` keeps drawing the ⛔ banner
+      // for a configuration that no longer exists on disk, right above this very
+      // message saying it is fixed — he would only find out on the next reload.
+      ORDER_STATUSES.reason = '';
+      render();   // rebuilds this whole panel — the OLD `msg` node above is now detached
+      const freshMsg = document.querySelector('[data-testid="order-statuses-msg"]');
+      if (freshMsg) {
+        freshMsg.className = 'statuscfg-msg';
+        freshMsg.textContent = '✅ Uložené. Platí to hneď pre celú appku.';
+      }
     } catch (e) {
       msg.className = 'statuscfg-msg bad';
       msg.textContent = '⛔ Server neodpovedal: ' + String(e);
