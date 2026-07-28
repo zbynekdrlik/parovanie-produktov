@@ -199,6 +199,48 @@ def test_an_UNUSABLE_set_falls_back_to_the_measured_defaults(iso, cfg):
     assert "Vybavená" in st["terminal"], st
 
 
+def test_a_config_file_that_EXISTS_but_cannot_be_used_DISARMS_the_prune(iso, tmp_path,
+                                                                        monkeypatch):
+    """The asymmetry that matters, and the one a plain „fall back to the defaults" gets
+    backwards. A manager who NARROWS the finished list is told by the card itself to do it
+    only when he is sure, because deleted marks cannot be brought back. If that file then
+    becomes unreadable, silently restoring the four built-ins RE-ARMS the prune on exactly
+    the statuses he excluded — a fail-OPEN on the one operation this whole area exists to
+    make safe (store-prune §1: a missed status costs a few keys, a wrongly included one
+    costs irreplaceable work).
+
+    So: no file at all = a fresh install = the defaults. A file that IS there and cannot be
+    used = we do not know what he decided → the prune refuses under its own named reason,
+    which the card renders as a red banner instead of quietly deleting."""
+    for attr, fname in (("ORDERED", "ordered_items.json"), ("WAITING", "waiting_items.json"),
+                        ("INSTOCK", "instock_items.json"),
+                        ("UNAVAIL", "unavailable_items.json"),
+                        ("ORDERS_CLOSED_SEEN", "orders_closed_seen.json")):
+        monkeypatch.setattr(webapp, attr, str(tmp_path / fname))
+    webapp._save_ordered({"99002002|B1": True})
+    (iso / "order_statuses.json").write_text("{ toto nie je json", encoding="utf-8")
+    body = (_order_row("Vybavuje sa")
+            + "".join(_order_row("Vybavená", code=f"99003{i:03d}", days_old=120,
+                                 item=f"Z{i}") for i in range(60))
+            + _order_row("Vybavená", code="99002002", days_old=120, item="B1"))
+
+    res = webapp._prune_orphan_line_flags((_HEAD + body).encode("cp1250"))
+
+    assert res["skipped"] == "bad-status-config", res
+    assert res["pruned"] == 0, res
+    assert sorted(webapp._load_ordered()) == ["99002002|B1"]
+
+
+def test_no_config_file_at_all_is_a_fresh_install_not_a_broken_one(iso):
+    """The other half: an app that was never configured must work, so „missing" and
+    „present but broken" cannot share an answer."""
+    assert not (iso / "order_statuses.json").exists()
+    st = webapp._order_statuses()
+
+    assert st["to_order"] == frozenset({"Vybavuje sa"}), st
+    assert webapp._order_statuses_state()[1] == "", webapp._order_statuses_state()
+
+
 def test_a_status_claimed_by_BOTH_open_and_finished_falls_back_entirely(iso):
     """The one invariant the prune cannot survive: a status that means both „still being
     handled" and „over" would delete the marks of live orders. A hand-edited file that
@@ -263,7 +305,12 @@ def test_POST_saves_all_three_sets_and_they_take_effect_at_once(iso):
 @pytest.mark.parametrize("payload,why", [
     ({"to_order": [], "terminal": ["Vybavená"]}, "prázdny"),
     ({"to_order": ["Vybavuje sa"], "terminal": []}, "prázdny"),
-    ({"to_order": ["Kompletná"], "terminal": ["Vybavená", "Kompletná"]}, "aj"),
+    ({"to_order": ["Kompletná"], "terminal": ["Vybavená", "Kompletná"]}, "naraz"),
+    # the likeliest mis-edit of three copy-pasteable boxes: moved to „known open" but left
+    # in „finished". Its consequence is deletion, while the box's own help text promises
+    # the marks stay — so it is refused exactly like the to_order/terminal clash.
+    ({"terminal": ["Vybavená", "Kompletná"], "known_open": ["Kompletná"]}, "naraz"),
+    ({"to_order": ["Vybavuje sa", "X"], "known_open": ["X"]}, "naraz"),
 ])
 def test_POST_REFUSES_a_configuration_that_would_break_the_prune(iso, payload, why):
     """Refused at the door with a sentence a human can act on — not silently corrected,
@@ -275,6 +322,59 @@ def test_POST_REFUSES_a_configuration_that_would_break_the_prune(iso, payload, w
     assert why in (r.get_json().get("error") or "").lower(), r.get_json()
     assert json.dumps(webapp._read_json_store(webapp.ORDER_STATUSES, {}),
                       sort_keys=True) == before
+
+
+@pytest.mark.parametrize("body", ["\"hello\"", "17", "null", "[1,2]"])
+def test_a_non_dict_BODY_is_refused_not_a_500(iso, body):
+    """`get_json(silent=True) or {}` neutralises null and [], but a JSON string or number
+    sails through and blows up on `.get`. A malformed request must never be a 500."""
+    r = _client_as(ADMIN).post("/api/order-statuses", data=body,
+                               content_type="application/json")
+
+    assert r.status_code in (200, 400), (body, r.status_code)
+
+
+def test_an_OVER_CAP_list_is_refused_rather_than_silently_truncated(iso):
+    """Saving 60 statuses and answering „✅ Uložené" while keeping 50 is a lie the manager
+    cannot see — and a status that was silently dropped simply never matches the export
+    again. The endpoint refuses the other two bad shapes; this is the third."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json={
+        "known_open": [f"S{i}" for i in range(webapp.ORDER_STATUS_MAX + 10)]})
+
+    assert r.status_code == 400, r.get_json()
+    assert str(webapp.ORDER_STATUS_MAX) in (r.get_json().get("error") or "")
+
+
+def test_an_OVER_LONG_status_is_refused_rather_than_silently_cut(iso):
+    r = _client_as(ADMIN).post("/api/order-statuses", json={
+        "known_open": ["x" * (webapp.ORDERS_UNKNOWN_STATUS_MAXLEN + 1)]})
+
+    assert r.status_code == 400, r.get_json()
+
+
+def test_a_PARTIAL_payload_keeps_the_sets_it_does_not_mention(iso):
+    """The endpoint's central promise — the card can send one box without wiping the other
+    two, and a future screen that edits only one set stays safe."""
+    _write(iso, {"to_order": ["Spracúva sa"], "terminal": ["Hotová"],
+                 "known_open": ["Čaká na dodávateľa"]})
+
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"known_open": ["Iné"]})
+
+    assert r.status_code == 200, r.get_json()
+    st = webapp._order_statuses()
+    assert st["to_order"] == frozenset({"Spracúva sa"}), st
+    assert st["terminal"] == frozenset({"Hotová"}), st
+    assert st["known_open"] == frozenset({"Iné"}), st
+
+
+def test_build_to_order_rows_honours_an_EXPLICIT_status_set(iso):
+    """The seam the web app uses is also the seam a script or a test uses — pin it, or the
+    parameter silently rots into „whatever the store says"."""
+    export = (_HEAD + _order_row("Čokoľvek")).encode("cp1250")
+
+    rows = webapp.build_to_order_rows(export, [], {}, {}, {}, statuses={"Čokoľvek"})
+
+    assert [r["key"] for r in rows] == ["99002001|A1"], rows
 
 
 def test_the_prune_result_NAMES_the_configured_open_statuses(iso, tmp_path, monkeypatch):

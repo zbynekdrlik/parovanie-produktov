@@ -59,8 +59,18 @@ _CLOSED_ROW = "99002002;{};Vybavená;B1;Ciapka\r\n".format(
 
 @pytest.fixture
 def stores(tmp_path, monkeypatch):
-    """All four flag stores in tmp, each seeded with the same three keys."""
-    paths = {}
+    """All four flag stores in tmp, each seeded with the same three keys.
+
+    Plus the #294 grace store, seeded so `_CLOSED`'s order has ALREADY served its reopen
+    grace. Every test in this file is about WHICH keys may go and on what evidence — the
+    presence axis, the status axis, the source floor. Since #294 there is a third,
+    independent axis (how long we have known the order was closed), and without this seed
+    every one of these tests would be measuring THAT instead of the thing it names. The
+    timing itself is pinned separately, in `test_webreview_prune_grace.py`.
+
+    `_UNSEEN`'s order deliberately gets NO record: an order we have never seen closed must
+    stay untouched whether or not it is in the export."""
+    paths = {}          # ONLY the flag stores — every test here iterates paths.values()
     for attr, fname in (("ORDERED", "ordered_items.json"),
                         ("WAITING", "waiting_items.json"),
                         ("INSTOCK", "instock_items.json"),
@@ -71,6 +81,11 @@ def stores(tmp_path, monkeypatch):
     for save in (webapp._save_ordered, webapp._save_waiting,
                  webapp._save_instock, webapp._save_unavailable):
         save({_OPEN: True, _CLOSED: True, _UNSEEN: True})
+    grace = tmp_path / "orders_closed_seen.json"
+    monkeypatch.setattr(webapp, "ORDERS_CLOSED_SEEN", str(grace))
+    long_ago = (date.today()
+                - timedelta(days=webapp.ORDERS_PRUNE_REOPEN_GRACE_DAYS + 5)).isoformat()
+    grace.write_text(json.dumps({_CLOSED.split("|", 1)[0]: long_ago}), encoding="utf-8")
     return paths
 
 
