@@ -617,3 +617,111 @@ def test_a_hand_edited_control_character_is_DROPPED_by_the_loader(iso):
 
     assert webapp._order_statuses()["known_open"] == frozenset({"Dobrý stav"}), \
         webapp._order_statuses()["known_open"]
+
+
+# ── #296: the Pošta automation's two remaining literals ────────────────────────
+# `posta_uncollected.DISPATCHED_STATUS` („vybavená") and its `== "stornovaná"` filter stayed
+# outside #209's configuration. They live on the TERMINAL side, which the `terminal` set owns
+# — so a fourth set names the CANCELLED half of it and „dispatched" is what is left over.
+# Deriving it is the load-bearing decision: a fourth EDITABLE box would make one rename need
+# TWO edits, and the second one is not on the card where the manager is told about the new
+# status — which is the silent death #209 removed.
+
+def test_cancelled_defaults_to_the_measured_live_status(iso):
+    """A fresh install keeps behaving exactly as v0.103.0 did: „Stornovaná" is the cancelled
+    status, and it is one of the four the default `terminal` set already carries."""
+    st = webapp._order_statuses()
+    assert st["cancelled"] == frozenset({"Stornovaná"})
+    assert st["cancelled"] <= st["terminal"]
+
+
+def test_dispatched_is_DERIVED_as_terminal_minus_cancelled(iso):
+    """No fourth editable box. Renaming a dispatched status is ONE edit — of `terminal`, the
+    box the prune already forces the manager to keep correct."""
+    cancelled, dispatched = webapp._posta_statuses()
+    assert cancelled == frozenset({"Stornovaná"})
+    assert dispatched == frozenset({"Vybavená", "Vybavená výmena", "Vybavený Dobropis"})
+    c = _client_as(ADMIN).post("/api/order-statuses", json={
+        "terminal": ["Expedovaná", "Zrušená"], "cancelled": ["Zrušená"]})
+    assert c.status_code == 200, c.get_json()
+    assert webapp._posta_statuses() == (frozenset({"Zrušená"}), frozenset({"Expedovaná"}))
+
+
+def test_a_cancelled_status_OUTSIDE_terminal_is_REFUSED_by_the_endpoint(iso):
+    """The invariant that stops the two boxes drifting apart. „Zrušená is cancelled but is not
+    a finished status" is not a configuration anybody means — and left unchecked it is exactly
+    the silent drift #296 is about, one box further along."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json={
+        "terminal": ["Vybavená", "Stornovaná"], "cancelled": ["Zrušená"]})
+    assert r.status_code == 400
+    assert "Zrušená" in r.get_json()["error"]
+
+
+def test_an_EMPTIED_cancelled_is_refused_like_the_other_load_bearing_sets(iso):
+    """With nothing cancelled, `dispatched` becomes the whole `terminal` set — so cancelled
+    orders land in the alarm's denominator (they never carry a package number) and, if one
+    ever did, its customer gets chased with escalation mails."""
+    r = _client_as(ADMIN).post("/api/order-statuses", json={"cancelled": []})
+    assert r.status_code == 400
+    assert "zrušen" in r.get_json()["error"].lower()
+
+
+def test_a_hand_edited_cancelled_outside_terminal_DISARMS_the_prune(iso):
+    """Same rule on the loader — the endpoint is the door, the loader is the lock. A file the
+    app cannot use must report `bad-status-config` (red banner + ⚠ + no deleting), never
+    silently substitute a default and re-arm the prune on statuses the manager removed."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená"],
+                 "known_open": [], "cancelled": ["Zrušená"]})
+    sets, reason = webapp._order_statuses_state()
+    assert reason == "bad-status-config"
+    assert sets == {k: frozenset(v) for k, v in webapp.ORDER_STATUS_DEFAULTS.items()}
+
+
+def test_an_ABSENT_cancelled_key_is_a_fresh_install_not_a_broken_config(iso):
+    """Every config file written before this change has no `cancelled` key at all. That must
+    read as „not configured" → the default, with no reason and no banner."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Vybavená", "Stornovaná"],
+                 "known_open": []})
+    sets, reason = webapp._order_statuses_state()
+    assert reason == ""
+    assert sets["cancelled"] == frozenset({"Stornovaná"})
+
+
+def test_the_posta_run_passes_the_CONFIGURED_sets_to_the_automation(iso, tmp_path,
+                                                                   monkeypatch):
+    """The wiring itself: without it every test above pins a helper nobody calls."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Expedovaná", "Zrušená"],
+                 "known_open": [], "cancelled": ["Zrušená"]})
+    monkeypatch.setattr(webapp, "POSTA_STATE", str(tmp_path / "posta.json"))
+    monkeypatch.setattr(webapp, "_orders_csv_cached", lambda: b"")
+    seen = {}
+
+    def _ship(csv_bytes, today=None, cancelled_statuses=None):
+        seen["cancelled"] = cancelled_statuses
+        return []
+
+    def _cov(csv_bytes, today=None, cancelled_statuses=None, dispatched_statuses=None):
+        seen["cov_cancelled"] = cancelled_statuses
+        seen["dispatched"] = dispatched_statuses
+        return {"eligible_orders": 0, "dispatched_orders": 0, "dispatched_with_package": 0,
+                "dispatched_without_package": 0, "missing_package": 0,
+                "days_since_last_package": None, "dispatched_status_unknown": False,
+                "degraded": False}
+
+    monkeypatch.setattr(webapp.posta_uncollected, "shipments_from_orders_csv", _ship)
+    monkeypatch.setattr(webapp.posta_uncollected, "source_coverage", _cov)
+    webapp.run_posta_uncollected()
+    assert seen["cancelled"] == frozenset({"Zrušená"})
+    assert seen["cov_cancelled"] == frozenset({"Zrušená"})
+    assert seen["dispatched"] == frozenset({"Expedovaná"})
+
+
+def test_the_blind_spot_ERROR_names_the_CONFIGURED_statuses_not_a_constant(iso, caplog):
+    """store-prune §7 / automation-health §3: a refusal that names a literal the shop no
+    longer uses sends the manager looking for something that does not exist. The old line
+    told him to edit `DISPATCHED_STATUS` — a name only the source code has."""
+    _write(iso, {"to_order": ["Vybavuje sa"], "terminal": ["Expedovaná", "Zrušená"],
+                 "known_open": [], "cancelled": ["Zrušená"]})
+    msg = webapp._dispatched_status_blind_message(12, webapp._posta_statuses()[1])
+    assert "12" in msg and "Expedovaná" in msg
+    assert "DISPATCHED_STATUS" not in msg

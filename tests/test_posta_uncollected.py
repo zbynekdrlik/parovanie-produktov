@@ -14,6 +14,7 @@ unnoticed, so the fixture now mirrors the real response (result-level
 """
 import json
 import os
+import unicodedata
 from datetime import date, timedelta
 
 from parovanie import posta_uncollected as pu
@@ -632,3 +633,70 @@ def test_build_email_renders_a_slovak_date_not_iso():
     # no zero padding — „03. 08. 2026" is not how it is written either
     _, body = pu.build_email(1, "Ján Vzor", "EF1SK", "Skalica 1", "", "2026-08-03", today=TODAY)
     assert "03. 08. 2026" not in body
+
+
+# ── #296: the two status literals are CONFIGURATION, not code ──────────────────
+# `DISPATCHED_STATUS = "vybavená"` and the `== "stornovaná"` filter stayed outside the
+# configurable sets #209 introduced, so a rename in the Shoptet admin still reaches this
+# module. Measured read-only on the live export (28.7.2026, 1961 rows, 144 eligible orders).
+def test_a_renamed_dispatched_status_must_not_blind_the_coverage_alarm():
+    """Renaming „Vybavená" took `dispatched_orders` from 89 to 0 on the live export — and,
+    far worse, flipped `degraded` from True to FALSE. The alarm built against silent death
+    went quietly GREEN over a source that was genuinely dead (4 of 89 dispatched orders
+    carried a number that night). The configured `terminal` set already knows the new name."""
+    rows = ([(26, "Expedovaná", f"EF00000{i:04d}SK", "Kuriér") for i in range(4)]
+            + [(d % 30, "Expedovaná", "", "Kuriér") for d in range(87)])
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           dispatched_statuses={"Expedovaná"})
+    assert c["dispatched_orders"] == 91
+    assert c["dispatched_with_package"] == 4
+    assert c["degraded"] is True
+    assert c["dispatched_status_unknown"] is False
+
+
+def test_a_renamed_cancelled_status_must_still_keep_cancelled_orders_OUT():
+    """The second literal, and the one that can actually mail somebody: renaming „Stornovaná"
+    put 16 cancelled orders back into the set this automation chases (live export: 144 → 160).
+    An escalation mail to a customer who cancelled is the one thing #93 never sends."""
+    csv_txt = _orders([(2, "Zrušená", "EF000000009SK", "Kuriér"),
+                       (2, "Vybavená", "EF000000010SK", "Kuriér")])
+    s = pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27),
+                                     cancelled_statuses={"Zrušená"})
+    assert [x["packageNumber"] for x in s] == ["EF000000010SK"]
+
+
+def test_the_configured_cancelled_set_no_longer_hard_codes_Stornovana():
+    """…and the flip side of the same call: once the shop has renamed it, the OLD literal is
+    just another status. Pinning this stops a „defensive" union of old-and-new creeping back
+    in, which would silently keep chasing whatever the manager deliberately reclassified."""
+    csv_txt = _orders([(2, "Stornovaná", "EF000000012SK", "Kuriér")])
+    s = pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27),
+                                     cancelled_statuses={"Zrušená"})
+    assert [x["packageNumber"] for x in s] == ["EF000000012SK"]
+
+
+def test_the_status_comparison_is_NFC_normalised_on_BOTH_sides():
+    """The trap #296 names explicitly: this module compared LOWERCASED names while the
+    configuration carries the exact ones the manager typed. A decomposed (NFD) name is
+    byte-different, renders identically and matches nothing — and for the dispatched side
+    that means the alarm silently reads zero dispatched orders."""
+    nfd = unicodedata.normalize("NFD", "Vybavená")
+    assert nfd != "Vybavená"                      # the two really are different bytes
+    c = pu.source_coverage(_orders([(1, nfd, "EF000000011SK", "Kuriér")]),
+                           today=date(2026, 7, 27), dispatched_statuses={"Vybavená"})
+    assert c["dispatched_orders"] == 1
+    s = pu.shipments_from_orders_csv(_orders([(1, nfd, "EF000000013SK", "Kuriér")]),
+                                     today=date(2026, 7, 27),
+                                     cancelled_statuses={unicodedata.normalize("NFD", "Vybavená")})
+    assert s == []                                # …and the same on the cancelled side
+
+
+def test_passing_NO_sets_keeps_the_module_standalone_on_its_own_literals():
+    """The app passes the configured sets; the module keeps working without them, so it stays
+    unit-testable on its own and a caller that never heard of #209 behaves exactly as before."""
+    csv_txt = _orders([(2, "Stornovaná", "EF000000014SK", "Kuriér"),
+                       (2, "Vybavená", "EF000000015SK", "Kuriér")])
+    assert [x["packageNumber"] for x in
+            pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))] \
+        == ["EF000000015SK"]
+    assert pu.source_coverage(csv_txt, today=date(2026, 7, 27))["dispatched_orders"] == 1
