@@ -346,3 +346,26 @@ nemajú nič spoločné — pri #209 to boli 4 naraz a vyzeralo to ako regresia 
   ako to už robia `test_ui_labels.py` (403), `test_auth.py` (401/403),
   `test_orders_reminder.py` (502) a `test_image_resilience.py` (404). Nevypínaj kvôli tomu
   kontrolu konzoly celú.
+
+## 15. Nový `confirm()` pred zápisom TICHO prepne cudzí test na vetvu „zrušiť" (#297)
+
+Playwright bez `page.on("dialog", …)` každý dialóg sám ZAMIETNE. Keď teda pridáš potvrdenie
+pred uloženie, test, ktorý to uloženie pripína, nespadne na dialógu — spadne o tri riadky
+nižšie na tom, že sa nič neuložilo, a vyzerá to ako regresia zápisu. Horšie: keby jeho assert
+bol mäkší, ostal by zelený a odvtedy by testoval CANCEL vetvu.
+
+- Cudzí test uprav vo VLASTNOM commite (bod 6) — `page.on("dialog", lambda d: d.accept())` je
+  spätne kompatibilné (bez featury sa handler nikdy nezavolá), takže si to over stashnutím
+  zdrojáku: celý súbor musí byť zelený aj proti NEOPRAVENÉMU kódu. To je dôkaz, že si cudzí
+  test neoslabil, len prestal pripínať tok, ktorý už neexistuje.
+- **Pozor, čo urobí zmena FIXTÚRY.** Riadok pridaný do `orders_cache.csv` fixture servera vie
+  spraviť z dovtedy neškodnej úpravy v cudzom teste úpravu s reálnym dosahom — a tým mu
+  vyvolať dialóg. Keď do fixture exportu pridávaš objednávky, prejdi VŠETKÝCH jej
+  konzumentov (`grep -rn "<meno_fixtúry>" tests/e2e`).
+- **Dátumy v takom riadku píš RELATÍVNE k `datetime.now()`.** Napevno zapísaný dátum
+  prekĺzne cez `MIN_DAYS` bránu a náhľad odvtedy ticho vracia 0 — test prestane testovať
+  čokoľvek a nikto sa to nedozvie.
+- Spy na dialóg si nechaj vrátiť aj TEXT (`seen.append(d.message)`) — inak overíš, že sa
+  niečo spýtalo, ale nie že to povedalo správne číslo.
+- Skloňovanie počtu v tej hláške ide cez `pluralWord` (bod 3): assertuj `„2 objednávky"`,
+  nie len prítomnosť čísla.

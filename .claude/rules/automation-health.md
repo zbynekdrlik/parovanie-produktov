@@ -203,3 +203,29 @@ Pravidlá, ktoré z toho platia pre každé pole idúce do zákazníckeho textu:
 ho preto aproximoval (`missing_package + dispatched_orders`) a v jedinej vetve, ktorá vôbec
 nastane, to spadlo na nulu: „v okne je 0 objednávok, ale ANI JEDNA nemá stav Vybavená". Keď
 pridávaš príznak, pridaj vedľa neho aj surové číslo, ktorým sa dá napísať pravdivá veta.
+
+## 5. Tichá smrť má zrkadlo: tiché ROZŠÍRENIE (#297)
+
+Bod 3 stráži automatizáciu, ktorá prestane robiť čokoľvek. Rovnako drahý je opačný smer:
+jedno nastavenie, ktoré ticho ROZŠÍRI množinu ľudí, ktorým niečo odíde. `to_order` vedie
+záložku, „Nedostupné" AJ pripomienkové maily (zámerne — jedna predstava o „otvorenej"
+objednávke, nie štyri), takže pridanie stavu spraví zo VŠETKÝCH objednávok v ňom starších
+než 4 dni okamžite mailovateľné. Dedup store zastaví až DRUHÝ mail, prvú vlnu nikdy.
+Namerané nad živým exportom: pridanie `Vybavená` = 387 objednávok / **370 zákazníkov** naraz,
+pod kartou, ktorá odpovie „✅ Uložené".
+
+Keď nastavenie rozhoduje o tom, komu sa niečo POŠLE, ukáž dôsledok PRED uložením:
+
+- **Číslo si vypýtaj pre KANDIDÁTA, nie pre uložený stav** — samostatný read-only endpoint,
+  ktorý dostane navrhovanú množinu a nič nezapisuje.
+- **Rozlíš „koľko toho pribudne" od „koľkým to reálne môže odísť".** Horná hranica vlny je
+  užšia množina (má poznámku, má adresu, nie je už vybavená v evidencii) a nikdy nebude
+  presná — o odoslaní rozhoduje až AI klasifikátor. Náhľad, ktorý nadhodnocuje, je náhľad,
+  ktorý sa prestane čítať; rátaj RÔZNYCH zákazníkov, nie objednávky.
+- **Keď sa to nedá spočítať, pýtaj sa TAKISTO.** Nula na nulovom dôkaze zmenu potichu
+  prepustí — to je presne to, proti čomu náhľad vznikol.
+- **Keď zmena nikoho nového nezasiahne, MLČ.** Dialóg pri každom uložení sa preklikáva bez
+  čítania a zoberie so sebou aj ten, ktorý niečo znamená (rovnaká logika ako „trvalý banner"
+  v store-prune §7). Nechaj v testoch KONTROLU na túto vetvu — musí prejsť pred aj po oprave,
+  inak sa záplata „nikdy nezobrazuj dialóg" nedá odlíšiť od opravy.
+- Nič nezakazuj. Cieľ je, aby sa to nedalo spraviť omylom — nie aby sa to nedalo spraviť.

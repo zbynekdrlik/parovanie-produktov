@@ -161,6 +161,34 @@ NEUKONČENÉ a značky prežijú. Zoznam nehádaj — over ho na živých dátac
   - **Meno stavu je text, ktorý ide do LOGU** — zakáž riadiace znaky (endpoint 400,
     loader ich zahodí s ERROR riadkom), inak sa cez API alebo ručnú úpravu dá do logu
     podvrhnúť celý riadok.
+  - **NOVÁ množina sa pridáva do súboru, ktorý UŽ na disku je — a jej PREDVOLBA sa vie biť
+    s tým, čo tam manažér napísal (#296).** `cancelled` pribudlo ako štvrtá množina s
+    predvolbou `{Stornovaná}` a s podmienkou „musí byť podmnožinou `terminal`". Prvý cut ju
+    vynucoval v LOADERI — a tým by z uloženého nastavenia, ktoré `terminal` legitímne zúžilo
+    (karta mu to sama dovoľuje), spravil pri upgrade `bad-status-config`: červený banner a
+    odzbrojený prune za stav, ktorý nikto nespôsobil, len tá verzia vtedy ešte neexistovala.
+    Spadli na tom tri cudzie testy a mali PRAVDU.
+    - **Cross-set podmienku vynucuj tam, kde ju manažér vie hneď opraviť** (endpoint, a len
+      keď tú množinu request naozaj nesie), nie v loaderi, ktorý beží aj nad súborom
+      napísaným staršou verziou. Panel posiela všetky škatuľky, takže preklep „presunul som
+      stav, ale zo starého poľa som ho nezmazal" je krytý naplno; čiastočné API volanie a
+      upgrade prejdú.
+    - **Než z niečoho spravíš `why`, spýtaj sa, čo sa reálne pokazí.** Tu nič: „odoslaná" je
+      `terminal − cancelled`, takže názov navyše iba neodpočíta nič. Podmienka bola konzistenčná,
+      nie bezpečnostná — a `why` zahadzuje konfiguráciu CELÚ.
+  - **Odvodenú množinu NEROB druhou škatuľkou (#296).** „Odoslaná" sa dá vyrobiť ako
+    `terminal − cancelled`. Vlastné editovateľné pole by spravilo z JEDNÉHO premenovania DVE
+    úpravy — a tá druhá nie je na karte, kde sa manažér o novom stave dozvie, čiže presne tá
+    tichá smrť, ktorú #209 odstraňovalo. Keď sa nová množina dá odvodiť z existujúcej,
+    odvoď ju; pýtaj si od manažéra len to, čo sa odvodiť NEDÁ.
+  - **Nová množina do `_status_overlap` nepatrí automaticky.** Tá kontrola je o
+    PARTÍCII (`ORDER_STATUS_EXCLUSIVE`); `cancelled` `terminal` zámerne REFINUJE, takže
+    prekryv je pri nej zmysel, nie protirečenie. Keď pridávaš množinu, rozhodni sa, či
+    partícionuje alebo spresňuje — a zapíš to do konštanty, nie do hlavy.
+  - **Slovenské `„…“` v PYTHON reťazci nikdy nezatváraj ASCII úvodzovkou** — reťazec sa tým
+    ukončí a `import app` padne na `SyntaxError: invalid character '—'` niekde o riadok nižšie.
+    Stálo to cyklus aj tu; detail je v `.claude/rules/toorder-e2e.md` bode 12.
+
   - **`_read_json_store` na nečitateľnom (nie pokazenom) súbore ZÁMERNE prepúšťa `OSError`.**
     Pri väčšine úložísk to zhodí jednu záložku; tento súbor ale čítajú `/api/orders`,
     `/api/nedostupne`, `/api/nedostupne/<code>` aj prune — teda štyri cesty naraz. Chyť ho a

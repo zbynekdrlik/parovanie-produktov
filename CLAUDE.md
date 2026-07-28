@@ -4,15 +4,15 @@ Nástroj: páruje forestshop (Shoptet) produkty na produktové stránky dodávat
 
 ## Playbook router
 Load the matching skill BEFORE working on that area (don't re-derive):
-- automatizácie: tichá smrť behu (alarm/stats/banner), kalibrácia prahov, dôvera fixtúram cudzieho API → `.claude/rules/automation-health.md` (auto-loads on its `paths:`)
-- e2e „Na objednanie": zdieľané `#list`/`ACTIVE_TAB`, výroba ✂️ split riadku, skloňovanie počtov, spy na hlásenie + route podľa metódy, zmena sémantiky vs. cudzie testy, optimistický zápis cez viac príznakov (`seq`/`confirmedSeq` nárokuje len vlastný príznak), surový NUL oslepí `grep`, seed predpokladu cez `page.request`, nový prvok na karte automatizácie nesmie nosiť triedy `.auto*` → `.claude/rules/toorder-e2e.md` (auto-loads on its `paths:`)
+- automatizácie: tichá smrť behu (alarm/stats/banner), kalibrácia prahov, dôvera fixtúram cudzieho API, tiché ROZŠÍRENIE mailovanej množiny → `.claude/rules/automation-health.md` (auto-loads on its `paths:`)
+- e2e „Na objednanie": zdieľané `#list`/`ACTIVE_TAB`, výroba ✂️ split riadku, skloňovanie počtov, spy na hlásenie + route podľa metódy, zmena sémantiky vs. cudzie testy, optimistický zápis cez viac príznakov (`seq`/`confirmedSeq` nárokuje len vlastný príznak), surový NUL oslepí `grep`, seed predpokladu cez `page.request`, nový prvok na karte automatizácie nesmie nosiť triedy `.auto*`, nový `confirm()` prepne cudzí test na vetvu „zrušiť" → `.claude/rules/toorder-e2e.md` (auto-loads on its `paths:`)
 - shoptet eshop / export / import / polia produktov / textProperty / vypredané/vypnuté → load `.claude/skills/shoptet`
 - dodávatelia / recon webu / pridanie dodávateľa / parsovanie výsledkov → load `.claude/skills/suppliers`
 - deploy / verejná linka / cloudflare tunel / systemd služby → load `.claude/skills/deploy`
 - webreview web (review tab / Na objednanie / per-riadkové stavy / api endpointy / úložiská párov / záložka „Vývoj" = GitHub issues + žiarovka nápad→issue) → load `.claude/skills/webreview`
 - import párov z Discord vlákna cez n8n (forwardnuté notifikácie → páry) → load `.claude/skills/discord-import`
 - GRUBE per-veľkosť kódy / grube.de itemId extrakcia / externalCode zápis → load `.claude/skills/grube`
-- mazanie/prune z manažérových úložísk (`data/out/*.json`) → `.claude/rules/store-prune.md` (auto-loads on its `paths:`)
+- mazanie/prune z manažérových úložísk (`data/out/*.json`), pridanie novej množiny do `order_statuses.json` → `.claude/rules/store-prune.md` (auto-loads on its `paths:`)
 
 ## Always
 - Kódovanie I/O = **cp1250** na ČÍTANIE exportu; **import CSV = UTF-8 s BOM** (`utf-8-sig`), `;`, CRLF (cp1250 import → mojibake `č`→`è`).
