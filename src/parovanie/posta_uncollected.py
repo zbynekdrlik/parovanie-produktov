@@ -44,9 +44,25 @@ from parovanie.export_helpers import norm_status
 # (case-insensitive substring match). DPD is the one confirmed live (#126);
 # the rest are common SK couriers kept out defensively per the issue's "DPD +
 # other couriers" wording.
+#
+# PERSONAL PICKUP (#287) is on this list too, even though it is not a courier: there is no
+# parcel at all, so there is nothing for this automation to track. Live export (28.7.2026)
+# carries exactly four SHIPPING names — "Kuriér" (444 orders, = Pošta SK home delivery),
+# "DPD doručenie na adresu" (53), "Osobný odber - len na predajni v POPRADE!" (24) and "DPD
+# kuriér" (1) — so 8 pickups sat inside the 30-day eligible set and 3 of them counted towards
+# the coverage alarm's denominator, where a package number can never appear. Today that costs
+# only accuracy (a pickup has no number, so it never reaches a tracking call); the moment one
+# is typed into Shoptet by mistake the automation starts chasing a parcel that does not exist.
+#
+# The keyword is the two-word PHRASE, and both spellings of it, on purpose. A bare "odber"
+# would also match a real delivery service ("odberné miesto") — and a wrongly excluded
+# shipment is a customer who is never told their parcel is waiting, which is the exact failure
+# this automation exists to prevent. Matching is `.lower()` only, with no diacritic folding,
+# so the unaccented spelling is listed rather than assumed.
 NON_POSTA_CARRIER_KEYWORDS = (
     "dpd", "gls", "packeta", "zásielkov", "zasielkov",
     "in time", "intime", "wedo", "spservis",
+    "osobný odber", "osobny odber",
 )
 
 TRACKING_API = "https://api.posta.sk/tracking?q={q}&l=sk&p=1"
