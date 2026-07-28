@@ -1,3 +1,5 @@
+import copy
+
 from parovanie import shoptet_outbox as ob
 
 
@@ -70,3 +72,28 @@ def test_a_row_shorter_than_the_header_is_refused_loudly():
     with pytest.raises(ValueError):
         ob.queue_fields({}, source="s", header="code;pairCode;internalNote",
                         rows=[["A", "P"]], now="T")
+
+
+def test_queue_fields_leaves_the_caller_s_table_untouched():
+    before = ob.queue_fields({}, source="s", header="code;pairCode;internalNote",
+                             rows=[["A", "P", "u"]], now="T1")[0]
+    snapshot = copy.deepcopy(before)
+    after, _ = ob.queue_fields(before, source="s2",
+                               header="code;pairCode;supplier",
+                               rows=[["A", "P", "FOREST"]], now="T2")
+    assert before == snapshot, "the caller's table must survive the call unchanged"
+    assert after is not before
+
+
+def test_queue_fields_returned_table_does_not_share_nested_dicts_with_the_input():
+    # A code untouched by the second call must still get its own copy of
+    # `fields` and of every individual field dict — not just the top-level
+    # entry — so a later in-place mutation of one snapshot (e.g. by settle())
+    # can never leak into a table someone else is still holding.
+    before, _ = ob.queue_fields({}, source="s", header="code;pairCode;internalNote",
+                                 rows=[["A", "P", "u"]], now="T1")
+    after, _ = ob.queue_fields(before, source="s2",
+                                header="code;pairCode;supplier",
+                                rows=[["B", "P", "FOREST"]], now="T2")
+    assert after["A"]["fields"] is not before["A"]["fields"]
+    assert after["A"]["fields"]["internalNote"] is not before["A"]["fields"]["internalNote"]

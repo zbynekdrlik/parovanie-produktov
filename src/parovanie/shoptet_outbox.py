@@ -24,9 +24,20 @@ def queue_fields(pending, source, header, rows, credit_group=None,
     bookkeeping: the drain records `{group: value}` into the producer's
     uploaded-store only once EVERY queued code of that group is confirmed (the
     #49 rule — a group straddling a failed chunk must stay un-credited).
+
+    Copy guarantee: the returned table never shares a mutable object with
+    `pending` down to two levels — each entry, its `fields` dict, and every
+    individual field dict are fresh copies — so a caller holding an older
+    snapshot is safe even if something later mutates a field dict in place;
+    values nested deeper inside a field (e.g. its `credit` dict) may still
+    be shared.
     """
     cols = [c.strip() for c in header.split(";")]
-    out = {k: dict(v) for k, v in pending.items()}
+    out = {}
+    for k, v in pending.items():
+        entry = dict(v)
+        entry["fields"] = {fk: dict(fv) for fk, fv in (v.get("fields") or {}).items()}
+        out[k] = entry
     queued = 0
     for r in rows:
         if len(r) < len(cols):
