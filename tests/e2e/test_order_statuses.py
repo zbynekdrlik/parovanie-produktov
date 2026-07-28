@@ -92,6 +92,13 @@ def test_saving_a_renamed_status_persists_and_takes_effect(page, sync_prune_bloc
 
     # two names the shop does not use yet — a status that is already classified in another
     # box would (correctly) be refused as being in two lists at once
+    #
+    # #297 — „Čaká na dodávateľa" is now carried by two orders in this fixture's export, so
+    # this edit really does widen who can be mailed and the card asks before saving. The
+    # confirmation is the NEW behaviour, not a regression, so the test answers it instead of
+    # letting Playwright auto-dismiss (which would silently turn this into a test of the
+    # cancel path). What it pins — the rename persists and survives a reload — is unchanged.
+    page.on("dialog", lambda d: d.accept())
     page.locator('[data-testid="order-statuses-to_order"]').fill(
         "Spracúva sa\nČaká na dodávateľa")
     with page.expect_response("**/api/order-statuses"):
