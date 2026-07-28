@@ -8858,7 +8858,14 @@ def api_order_statuses():
 @app.route("/api/order-statuses/impact", methods=["POST"])
 def api_order_statuses_impact():
     """#297 — how many customers a CANDIDATE `to_order` set would newly reach with a
-    reminder mail. Read-only; nothing is saved and nothing is sent.
+    reminder mail.
+
+    It runs on a candidate the manager has NOT saved, so it writes no configuration, touches
+    none of his stores and sends nothing. It is NOT literally side-effect-free, and saying so
+    would be the kind of comment that outlives its truth: `_orders_csv_cached` refreshes the
+    shared orders cache when that copy has aged out, exactly as `/api/orders` does on any page
+    load. That is our own copy of Shoptet's data on the ordinary read path, not a write to
+    anything the manager made.
 
     `to_order` drives three things at once — the „Na objednanie" tab, „Nedostupné" AND
     `run_orders_reminder`. That is deliberate (#209: one notion of „open", not four, so a
