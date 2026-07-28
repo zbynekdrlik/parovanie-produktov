@@ -199,6 +199,43 @@ def test_an_unusable_config_says_the_app_is_running_on_DEFAULTS(page,
     assert console == [], f"console not clean: {console}"
 
 
+def test_saving_a_repaired_config_clears_the_stale_banner_without_a_reload(
+        page, sync_prune_blocked_server):
+    """This is exactly the card the mail-refusal banner sends him to (#295 review B1). Saving
+    a config the server accepts writes `ORDER_STATUSES.statuses` on the client — but until
+    `ORDER_STATUSES.reason` is ALSO cleared, `renderOrderStatusConfig()` keeps drawing the ⛔
+    banner for a configuration that no longer exists on disk, right above the ✅ that says it
+    is fixed. He would only find out on the next reload.
+
+    `bad_status_config_server`'s corrupt-on-disk config cannot be used here — a corrupt file
+    makes `_atomic_write_json`'s `protect=True` guard REFUSE the write outright (503,
+    `store-prune.md` §1: „unreadable, so we cannot know how much work it holds"), which tests
+    that guard, not this bug. So the reason is set the same way the sibling test two above
+    does (`page.evaluate` + `renderShoptetSync()`) on a server whose store genuinely accepts
+    a save — proving the CLIENT state, not the corrupt-store refusal path."""
+    console = _console(page)
+    _open_tab(page, sync_prune_blocked_server)
+
+    page.evaluate("""() => {
+      ORDER_STATUSES.reason = 'bad-status-config';
+      renderShoptetSync();
+    }""")
+    panel = page.locator('[data-testid="order-statuses"]')
+    # sanity: the stale-config banner is really there before the fix
+    expect(panel.locator(".statuscfgerr")).to_have_count(1, timeout=15000)
+
+    # the boxes still hold a legitimate config (untouched) — saving it as-is is exactly
+    # „he repaired it" from the client's point of view: the server accepts it
+    with page.expect_response("**/api/order-statuses"):
+        page.locator('[data-testid="order-statuses-save"]').click()
+
+    msg = page.locator('[data-testid="order-statuses-msg"]')
+    expect(msg).to_contain_text("Uložené", timeout=15000)
+    expect(panel.locator(".statuscfgerr")).to_have_count(0, timeout=15000)
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_an_unusable_config_stops_the_reminders_LOUDLY(page, bad_status_config_server):
     """The card of the automation that would have mailed says so in red, and the side ⚠
     badge lights — a run that cannot read its own configuration has failed even though it
