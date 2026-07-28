@@ -37,6 +37,7 @@ from html import escape
 # came from a Google Sheet). The one GET deep-link the Shoptet admin supports is the global search
 # — verified live 2026-07-22 (see posta_uncollected.ADMIN_ORDER_LINK). Reused verbatim so both
 # order automations link to the admin the same, verified way.
+from parovanie.export_helpers import norm_status
 from parovanie.posta_uncollected import ADMIN_ORDER_LINK
 
 ORDER_STATUS = "Vybavuje sa"          # n8n „Filter": statusName == 'Vybavuje sa'
@@ -65,7 +66,7 @@ def _parse_dt(s) -> datetime | None:
 
 
 def select_orders(orders_csv, now: datetime | None = None,
-                  min_days: int = MIN_DAYS) -> list[dict]:
+                  min_days: int = MIN_DAYS, statuses=None) -> list[dict]:
     """Shoptet orders.csv (cp1250 bytes or str) → one entry per ORDER worth acting on.
 
     Port of the n8n „Filter" (statusName == 'Vybavuje sa') + „Remove Duplicates" (by code, first
@@ -75,6 +76,14 @@ def select_orders(orders_csv, now: datetime | None = None,
     text = (orders_csv.decode("cp1250", errors="replace")
             if isinstance(orders_csv, bytes) else orders_csv)
     now = now or datetime.now()
+    # #209 — the CONFIGURED „being processed" set when the web app passes one, otherwise the
+    # module's own literal. A rename in the Shoptet admin must not leave this automation
+    # mailing nobody in silence (automation-health.md §3); it is the SAME set the to-order
+    # tab and „Nedostupné" use, so there is one notion of „open", not three.
+    # NFC + strip on BOTH sides (PR #295 review) — see `export_helpers.norm_status`; a
+    # decomposed name here means the reminder silently reaches nobody.
+    wanted = (frozenset({ORDER_STATUS}) if statuses is None
+              else frozenset(norm_status(s) for s in statuses) - {""})
     cutoff = timedelta(days=min_days)
     out, seen = [], set()
     for r in csv.DictReader(io.StringIO(text), delimiter=";"):
@@ -82,7 +91,7 @@ def select_orders(orders_csv, now: datetime | None = None,
         if not code or code in seen:
             continue
         seen.add(code)
-        if (r.get("statusName") or "").strip() != ORDER_STATUS:
+        if norm_status(r.get("statusName")) not in wanted:
             continue
         od = _parse_dt(r.get("date"))
         if od is None or (now - od) <= cutoff:

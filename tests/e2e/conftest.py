@@ -69,7 +69,7 @@ _SERVER_FIXTURES = ("live_server", "matched_server",
                     "sync_prune_blocked_server", "imgfail_server",
                     "imgflood_server", "dev_server",
                     "nedostupne_server", "vystavy_server", "toorder_server",
-                    "toorder_wide_server")
+                    "toorder_wide_server", "bad_status_config_server")
 
 
 @pytest.fixture(autouse=True)
@@ -666,6 +666,75 @@ def sync_prune_blocked_server(tmp_path_factory):
                             "flags_prune_skipped": "no-open-orders",
                             "flags_orders_seen": 521, "flags_orders_open": 0,
                             "flags_unknown_statuses": [], "source_degraded": True},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+    (out / "orders_cache.csv").write_text(
+        "code;date;statusName;email;phone;billFullName;packageNumber;itemCode\r\n"
+        "99002000;2026-07-20 10:00:00;Vybavuje sa;x@example.com;;Bez Balíka;;9/M\r\n",
+        encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),
+        "MAIL_HOST": "",
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture()
+def bad_status_config_server(tmp_path_factory):
+    """Isolated webreview instance whose `order_statuses.json` is there and UNUSABLE.
+
+    PR #295 review B1: the loader answers an unusable configuration with the built-in
+    DEFAULTS, which is right for rendering a tab and fail-OPEN for anything that acts —
+    the customer reminders would go out on the default „Vybavuje sa", i.e. to exactly the
+    people the manager may have excluded by narrowing that set. The run now refuses, and
+    the whole value of a refusal is what he SEES (`automation-health.md` §3 asks for the
+    stat, the ERROR line, the red banner AND the ⚠ badge — the badge is the one that keeps
+    being forgotten, so it is checked here).
+
+    Seeded through `automations.json` → `last_result` (what the card renders from) plus a
+    genuinely broken config file (what the panel and the API read). Nothing is ever run:
+    creds point at a nonexistent file and MAIL_HOST is empty."""
+    out = tmp_path_factory.mktemp("wr_badcfg_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "order_statuses.json").write_text("{ this is not json", encoding="utf-8")
+    (out / "orders_reminder.json").write_text(json.dumps({
+        "last_check": "2026-07-28T08:00:05+02:00",
+        "orders": {}, "red": [], "orange": [],
+        "skipped": [{"code": "99001001", "billFullName": "Eva Nová", "email": "e@x.sk",
+                     "itemName": "Nohavice", "shopRemark": "volať zákazníka", "days": 10,
+                     "admin_link": "https://www.forestshop.sk/admin/",
+                     "pending": "nastavenie stavov objednávok sa nedá prečítať"}],
+        "no_email": [],
+        "stats": {"orders_4d": 1, "no_note": 0, "with_note": 1, "emailed_now": 0,
+                  "emailed_total": 0, "skipped_now": 0, "ai_unavailable": 0,
+                  "no_email": 0, "errors": 0, "bcc_missing": False,
+                  "bad_status_config": True, "source_degraded": True},
+    }, ensure_ascii=False), encoding="utf-8")
+    (out / "automations.json").write_text(json.dumps({
+        "orders_reminder": {
+            "last_run": "2026-07-28T08:00:05+02:00",
+            "last_status": "ok",
+            "last_result": {"orders_4d": 1, "no_note": 0, "with_note": 1,
+                            "emailed_now": 0, "emailed_total": 0, "skipped_now": 0,
+                            "ai_unavailable": 0, "no_email": 0, "errors": 0,
+                            "bcc_missing": False, "bad_status_config": True,
+                            "source_degraded": True},
         },
     }, ensure_ascii=False), encoding="utf-8")
     (out / "orders_cache.csv").write_text(
