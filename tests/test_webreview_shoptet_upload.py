@@ -10,6 +10,11 @@ def pend(tmp_path, monkeypatch):
     return p
 
 
+@pytest.fixture
+def claim(tmp_path, monkeypatch):
+    monkeypatch.setattr(webapp, "CYCLE_CLAIM", str(tmp_path / ".cycle.lock"))
+
+
 def test_queue_shoptet_fields_persists_and_counts(pend):
     n = webapp.queue_shoptet_fields(
         "parovania_eshop", "code;pairCode;internalNote",
@@ -84,3 +89,19 @@ def test_the_whole_read_modify_write_runs_under_the_store_lock(pend, monkeypatch
     assert n == 1
     assert depths == [1], (
         "_save_pending ran while the store lock was NOT held", depths)
+
+
+def test_the_claim_is_exclusive_and_reports_busy_while_held(claim):
+    with webapp._shoptet_cycle_claim() as got:
+        assert got is True
+        assert webapp._cycle_busy() is True
+        with webapp._shoptet_cycle_claim() as second:
+            assert second is False
+    assert webapp._cycle_busy() is False
+
+
+def test_the_claim_is_released_even_when_the_body_raises(claim):
+    with pytest.raises(ValueError):
+        with webapp._shoptet_cycle_claim():
+            raise ValueError("boom")
+    assert webapp._cycle_busy() is False
