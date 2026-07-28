@@ -481,7 +481,20 @@ body[data-theme=dark] .pill.on{background:#064e3b;color:#6ee7b7}
    a footnote; sits between the Štart/Stop head and the Plán/Posledný beh line. */
 .autodesc{font-size:13.5px;color:var(--text);line-height:1.45}
 .autometa{font-size:13px;color:var(--muted);display:flex;gap:6px;flex-wrap:wrap}
-/* #209 — one Shoptet order status per line, on the „Sync zo Shoptetu" card. */
+/* #209 — „which Shoptet status means what", on the „Sync zo Shoptetu" card. Own class
+   names, not the .auto* ones: those are the automation card's, and a second element wearing
+   them breaks every E2E locator that expects exactly one of each on the tab. */
+.statuscfg{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);
+  padding:14px 16px;box-shadow:var(--shadow);display:flex;flex-direction:column;gap:8px;
+  margin-top:14px}
+.statuscfg-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.statuscfg-desc{font-size:13.5px;color:var(--text);line-height:1.45}
+.statuscfg-label{font-size:13px;color:var(--text);margin-top:6px}
+.statuscfg-help{font-size:12.5px;color:var(--muted);line-height:1.45}
+.statuscfg-msg{font-size:13px;color:var(--muted)}
+.statuscfg-msg.bad{color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;
+  border-radius:8px;padding:8px 10px;word-break:break-word}
+body[data-theme=dark] .statuscfg-msg.bad{background:#2a0f0f;border-color:#7f1d1d;color:#fca5a5}
 .statusset{width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;
   background:var(--panel);color:var(--text);font-size:13.5px;line-height:1.5;resize:vertical}
 .statusset:focus{outline:2px solid var(--accent);border-color:var(--accent)}

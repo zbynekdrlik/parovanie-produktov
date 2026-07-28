@@ -4275,22 +4275,25 @@ const ORDER_STATUS_BOXES = [
 ];
 
 function renderOrderStatusConfig() {
-  const box = el('div', 'autostatus');
+  // Its OWN css namespace on purpose: the automation-card classes (.autostatus/.autometa/
+  // .autoerr) are what a dozen E2E tests locate strictly on these very tabs, and a second
+  // element wearing them turns every one of those into a strict-mode violation.
+  const box = el('div', 'statuscfg');
   box.dataset.testid = 'order-statuses';
-  box.appendChild(el('div', 'autohead', '<b>Stavy objednávok v Shoptete</b>'));
-  box.appendChild(el('div', 'autodesc',
+  box.appendChild(el('div', 'statuscfg-head', '<b>Stavy objednávok v Shoptete</b>'));
+  box.appendChild(el('div', 'statuscfg-desc',
     'Názvy stavov si v Shoptete nastavuje obchod, takže ich appka nemôže mať napevno. '
     + 'Tu je povedané, čo ktorý stav znamená — jeden stav na riadok.'));
   if (!ORDER_STATUSES) {
-    box.appendChild(el('div', 'muted', 'Nastavenie sa nepodarilo načítať.'));
+    box.appendChild(el('div', 'statuscfg-help', 'Nastavenie sa nepodarilo načítať.'));
     return box;
   }
   const admin = isAdmin();
   const fields = {};
   for (const [key, title, help] of ORDER_STATUS_BOXES) {
     const values = (ORDER_STATUSES.statuses || {})[key] || [];
-    box.appendChild(el('div', 'autometa', `<span><b>${escapeHtml(title)}</b></span>`));
-    box.appendChild(el('div', 'muted', escapeHtml(help)));
+    box.appendChild(el('div', 'statuscfg-label', `<b>${escapeHtml(title)}</b>`));
+    box.appendChild(el('div', 'statuscfg-help', escapeHtml(help)));
     if (admin) {
       const ta = document.createElement('textarea');
       ta.className = 'statusset';
@@ -4302,14 +4305,14 @@ function renderOrderStatusConfig() {
     } else {
       // a non-admin still needs to SEE what the app is going by — the counts on this card
       // only make sense next to it
-      box.appendChild(el('div', 'muted',
+      box.appendChild(el('div', 'statuscfg-help',
         values.length ? escapeHtml(values.join(' · ')) : '(prázdne)'));
     }
   }
   if (!admin) return box;
   const save = el('button', 'btn sm good', '💾 Uložiť stavy');
   save.dataset.testid = 'order-statuses-save';
-  const msg = el('div', 'muted', '');
+  const msg = el('div', 'statuscfg-msg', '');
   msg.dataset.testid = 'order-statuses-msg';
   save.onclick = async () => {
     const payload = {};
@@ -4326,21 +4329,21 @@ function renderOrderStatusConfig() {
       if (!r.ok) {
         // the server REFUSES a configuration that would break the prune; show its sentence
         // verbatim instead of a generic „nepodarilo sa", which would tell him nothing
-        msg.className = 'autoerr';
+        msg.className = 'statuscfg-msg bad';
         msg.textContent = '⛔ ' + (j.error || 'Nepodarilo sa uložiť.');
         return;
       }
       ORDER_STATUSES.statuses = j.statuses;
-      msg.className = 'muted';
+      msg.className = 'statuscfg-msg';
       msg.textContent = '✅ Uložené. Platí to hneď pre celú appku.';
     } catch (e) {
-      msg.className = 'autoerr';
+      msg.className = 'statuscfg-msg bad';
       msg.textContent = '⛔ Server neodpovedal: ' + String(e);
     } finally {
       save.disabled = false;
     }
   };
-  const foot = el('div', 'autohead');
+  const foot = el('div', 'statuscfg-head');
   foot.appendChild(save);
   box.appendChild(foot);
   box.appendChild(msg);
