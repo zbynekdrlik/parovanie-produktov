@@ -35,6 +35,7 @@ _HEAD = "code;date;statusName;itemCode;itemName\r\n"
 _OPEN = "99002001|A1"        # its order is still „Vybavuje sa" -> must stay
 _CLOSED = "99002002|B1"      # its order is in the export and Vybavená -> must go
 _UNSEEN = "99001500|C1"      # its order is not in the export at all -> must stay
+_CUT = "99002003|D1"         # its order appears ONLY in a row the download cut -> must stay
 
 
 def _export(rows, filler=60):
@@ -102,9 +103,13 @@ def test_an_implausibly_small_export_prunes_NOTHING(stores):
 def test_an_empty_or_unparsable_export_prunes_NOTHING(stores):
     """Degenerate sources take the same door as a small one — never „nothing is open, so
     everything can go", which is the shape that turns one bad fetch into a wipe."""
-    for blob in (b"", _HEAD.encode("cp1250"), b"not a csv at all"):
+    # each names its OWN reason — „there is no statusName column" and „the body would not
+    # parse" send an operator to different places, so they are not collapsed into one label
+    for blob, why in ((b"", "no-status-column"),
+                      (_HEAD.encode("cp1250"), "implausible-source"),
+                      (b"not a csv at all", "no-status-column")):
         res = webapp._prune_orphan_line_flags(blob)
-        assert res["pruned"] == 0 and res["skipped"] == "implausible-source", (blob, res)
+        assert res["pruned"] == 0 and res["skipped"] == why, (blob, res)
     for path in stores.values():
         assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
 
@@ -205,11 +210,18 @@ def test_a_body_cut_mid_row_does_not_judge_that_row(stores):
     with a truncated or missing `statusName`, so a genuinely OPEN order reads as closed.
     A body that does not end in a newline is incomplete by definition — its last row is
     dropped rather than believed."""
-    full = _export([_CLOSED_ROW]).decode("cp1250") + "99002001;2026-07-20 09:00:00;Vybavu"
+    # `_OPEN_ROW` intact (so the run is not refused for having no open orders at all) plus
+    # `_CLOSED_ROW` (which must still be pruned — the cut is not an excuse to stop working)
+    # and, cut in half, a SECOND open order whose key must survive.
+    webapp._save_ordered({_OPEN: True, _CLOSED: True, _UNSEEN: True, _CUT: True})
+    full = _export([_OPEN_ROW, _CLOSED_ROW]).decode("cp1250") + \
+        "99002003;{} 09:00:00;Vybavu".format(
+            (date.today() - timedelta(days=90)).isoformat())
 
     res = webapp._prune_orphan_line_flags(full.encode("cp1250"))
 
-    assert _keys(stores["ordered_items.json"]) == sorted([_OPEN, _UNSEEN]), (
+    assert res["skipped"] == "", res
+    assert _keys(stores["ordered_items.json"]) == sorted([_OPEN, _UNSEEN, _CUT]), (
         "the order in the cut-off row was judged from a half-read status", res)
 
 
@@ -222,7 +234,7 @@ def test_an_unparsable_body_prunes_nothing_and_does_not_escape(stores):
 
     res = webapp._prune_orphan_line_flags(blob)     # must NOT raise
 
-    assert res["pruned"] == 0 and res["skipped"] == "implausible-source", res
+    assert res["pruned"] == 0 and res["skipped"] == "unparsable-source", res
     for path in stores.values():
         assert _keys(path) == sorted([_OPEN, _CLOSED, _UNSEEN]), path.name
 

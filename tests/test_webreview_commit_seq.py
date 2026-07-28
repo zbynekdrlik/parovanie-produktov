@@ -95,8 +95,13 @@ def test_the_clock_never_goes_backwards_across_a_restart(flag_stores, monkeypatc
 
     ahead = first + 10 ** 9
     webapp._reserve_commit_seq(ahead)          # what an earlier process had reached
-    monkeypatch.setattr(webapp.time, "time", lambda: 1.0)   # …and the clock is now useless
+    # …and the clock is now useless. Patched ONLY across the seed: a session cookie and
+    # half the app read the same clock, so leaving it at epoch 1 would break the request
+    # below for a reason that has nothing to do with what is being pinned.
+    real_time = webapp.time.time
+    monkeypatch.setattr(webapp.time, "time", lambda: 1.0)
     webapp._seed_commit_seq()                  # „restart"
+    monkeypatch.setattr(webapp.time, "time", real_time)
 
     after = c.post("/api/ordered", json={"key": _KEY, "ordered": False}).get_json()["commitSeq"]
     assert after > ahead, (

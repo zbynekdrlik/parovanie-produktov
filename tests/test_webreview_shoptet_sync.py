@@ -12,6 +12,7 @@ SYNTHETIC — never real PII.
 import json
 import os
 import sys
+from datetime import date, timedelta
 
 import pytest
 import requests
@@ -226,9 +227,13 @@ def test_run_prunes_orphan_line_flags_from_the_freshly_downloaded_export(iso, mo
     to clear the plausibility floor. Only the closed order's key may go; the one whose
     order is still open, and the one no export row mentions, must both survive.
     """
-    rows = ("99002001;2026-07-20 09:00:00;Vybavuje sa;a@x.sk;;X Y;;A1\r\n"
-            "99002002;2026-07-02 09:00:00;Vybavená;a@x.sk;;X Y;;B1\r\n"
-            + "".join(f"99003{i:03d};2026-07-01 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
+    # dated relative to TODAY: the closed order must be past the reopen grace period
+    # (`ORDERS_PRUNE_MIN_AGE_DAYS`), which a fixed date silently stops being
+    recent = (date.today() - timedelta(days=2)).isoformat()
+    old_day = (date.today() - timedelta(days=120)).isoformat()
+    rows = (f"99002001;{recent} 09:00:00;Vybavuje sa;a@x.sk;;X Y;;A1\r\n"
+            f"99002002;{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;B1\r\n"
+            + "".join(f"99003{i:03d};{old_day} 09:00:00;Vybavená;a@x.sk;;X Y;;Z{i}\r\n"
                       for i in range(60)))
     monkeypatch.setattr(webapp, "_fetch_orders_csv",
                         lambda: (ORDERS_CSV.decode("cp1250") + rows).encode("cp1250"))

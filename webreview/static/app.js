@@ -994,19 +994,36 @@ function _flagEntry(field, key, map) {
 }
 
 // The server's commit number out of one answer, or `null` when the answer does not carry
-// one (a success whose body `postToOrder` could not parse — for these endpoints that means
-// a truncated response).
-//
-// `null` means ADOPT NOTHING, and that is deliberate rather than a fallback to the old
-// issue-order rule. The two numbers live in different spaces — one global commit clock
-// against an independent per-(flag, row) counter — so a guard that accepted either would
-// be comparing values that have no order between them: once a commit number is stamped no
-// issue number could ever clear it again, and before one is, issue order would silently
-// decide. Leaving `confirmed` where it is costs a slightly stale rollback baseline in that
-// one corner; mixing the two spaces costs the guard itself.
+// one — a success whose body `postToOrder` turned into `null` (a truncated response; this
+// app is served through a tunnel), or a tab still running this file against a server that
+// predates #291.
 function _commitOf(body) {
   const n = body && body.commitSeq;
   return (typeof n === 'number' && isFinite(n)) ? n : null;
+}
+
+// May this ACCEPTED answer be adopted as the flag's new server-known value?
+//
+// With a number, the rule is the whole point of #291: only if nothing that committed LATER
+// has been adopted already.
+//
+// Without one, there is nothing to order this answer BY — but „cannot be ordered" is not
+// the same as „must be ignored". Ordering only matters when there is something to be
+// ordered AGAINST: if this write is still the latest one issued for its (flag, row) and
+// nothing else is in flight for it, then it is the only writer, its acceptance IS the
+// server's state, and refusing it just freezes `confirmed` on a value the server has moved
+// past — after which the next REFUSED write „rolls back" onto that stale value, i.e. does
+// not roll back, and the row shows a flag the server does not hold. That is the #290
+// failure shape, and the first cut of this fix reintroduced it (measured against `main`,
+// which did not have it). So: adopt, and leave the clock where it is — advancing it on a
+// number we never received is what would let issue order silently creep back in.
+//
+// The two numbers are never mixed. `seq` is an independent counter per (flag, row),
+// `confirmedCommit` is one global clock; a guard that accepted either would be comparing
+// values with no order between them.
+function _mayAdopt(commit, st, seq) {
+  return commit !== null ? commit >= st.confirmedCommit
+                         : (seq === st.seq && st.inflight === 0);
 }
 
 // Every flag write answers `{ok, flags:{ordered, waiting, instock, unavailable}, commitSeq}`
@@ -1040,7 +1057,12 @@ function _commitOf(body) {
 // status ON already claims all three of them (`toggleStatusFlag`).
 function _mirrorServerFlags(body, key, claimed) {
   const flags = body && body.flags;
-  if (!flags) return false;
+  const commit = _commitOf(body);
+  // An answer with no commit number cannot be ordered against the others describing this
+  // row, and here — unlike the write's OWN flag in `saveOrderWrite` — there is no „nothing
+  // else is in flight for it" to fall back on, because these are the write's other flags.
+  // Its own value is adopted there; the rest of the answer is simply not used.
+  if (!flags || commit === null) return false;
   const maps = { ordered: ORDERED, waiting: WAITING, instock: INSTOCK, unavailable: UNAVAIL };
   let moved = false;
   for (const field of Object.keys(maps)) {
@@ -1049,8 +1071,6 @@ function _mirrorServerFlags(body, key, claimed) {
     // so touching one here would materialise bookkeeping for a flag this write never wrote
     if (claimed[field] === undefined) continue;
     const map = maps[field];
-    const commit = _commitOf(body);
-    if (commit === null) continue;             // no commit number → nothing to order it by
     const st = _flagEntry(field, key, map);
     if (_flagWrites[st.wk] !== st || commit < st.confirmedCommit) continue;
     st.confirmed = flags[field];
@@ -1098,16 +1118,18 @@ async function saveOrderWrite(path, payload, writes, key, what) {
   // the newer write already owns the row and speaks for it.
   const owner = live && seqs[0] === sts[0].seq;
   let repaint = false;
+  // #291 — WHEN this write committed, from the server, never `seq` (when it was ISSUED).
+  // One number per response, so it is read once rather than once per flag.
+  const commit = _commitOf(ans.json);
   writes.forEach((w, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;
-    // #291 — WHEN this write committed, from the server, never `seq` (when it was issued).
     // `_mirrorServerFlags` below re-reads the same number and overwrites `confirmed` with
-    // the server's own account of the flag; this line is what carries a write whose answer
-    // has no `flags` to mirror. `null` (an unreadable body) adopts nothing — see _commitOf.
-    const commit = _commitOf(ans.json);
-    if (!err && commit !== null && commit >= st.confirmedCommit) {
-      st.confirmed = w.value; st.confirmedCommit = commit;
+    // the server's own account of the flag; this line is what carries an answer that has
+    // no `flags` to mirror, and the unnumbered one (`_mayAdopt`).
+    if (!err && _mayAdopt(commit, st, seq)) {
+      st.confirmed = w.value;
+      if (commit !== null) st.confirmedCommit = commit;
     }
     if (seq !== st.seq) {                     // a later write owns this (flag, row) now
       // …and once nothing else is out for it, the map owes the server's own last word
@@ -1249,12 +1271,13 @@ async function markGroupOrdered(items, ordered) {
     err = await postToOrder('/api/ordered/bulk', { keys, ordered }, ans);
   } finally { sts.forEach(st => { st.inflight -= 1; }); }
   let repaint = false;
+  const commit = _commitOf(ans.json);           // one number for the whole bulk
   keys.forEach((key, i) => {
     const st = sts[i], seq = seqs[i];
     if (_flagWrites[st.wk] !== st) return;      // loadOrders() disowned this write
-    const commit = _commitOf(ans.json);
-    if (!err && commit !== null && commit >= st.confirmedCommit) {
-      st.confirmed = ordered; st.confirmedCommit = commit;
+    if (!err && _mayAdopt(commit, st, seq)) {
+      st.confirmed = ordered;
+      if (commit !== null) st.confirmedCommit = commit;
     }
     if (seq !== st.seq) {                       // a later write owns this row now
       // …and once nothing else is out for it, the map owes the server's own last word
