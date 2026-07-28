@@ -753,3 +753,18 @@ def test_the_pickup_keyword_is_the_PHRASE_not_the_bare_word_odber():
     assert [x["packageNumber"] for x in
             pu.shipments_from_orders_csv(csv_txt, today=date(2026, 7, 27))] \
         == ["EF000000023SK"]
+
+
+def test_an_EMPTY_dispatched_set_lights_the_blind_spot_instead_of_falling_back():
+    """The edge the derivation creates: „dispatched" is `terminal − cancelled`, so a
+    configuration that calls EVERY finished status cancelled leaves it empty — and both sets
+    are non-empty, so nothing upstream refuses it. It must fire the alarm's own blind-spot
+    signal, never quietly fall back to the built-in „Vybavená" (a name the shop may have
+    renamed years ago), which would report a healthy green over a set nobody is watching."""
+    rows = [(d % 20, "Zrušená", "", "Kuriér") for d in range(8)]
+    c = pu.source_coverage(_orders(rows), today=date(2026, 7, 27),
+                           cancelled_statuses=set(), dispatched_statuses=set())
+    assert c["eligible_orders"] == 8
+    assert c["dispatched_orders"] == 0
+    assert c["dispatched_status_unknown"] is True
+    assert c["degraded"] is False        # a pure counter: it never invents a shipment

@@ -2051,15 +2051,17 @@ def _cancelled_outside_terminal(sets) -> list:
     was called off" rather than „this order went out". Letting the two drift apart is the very
     failure #296 is about, one box further along: the manager renames „Stornovaná" in
     `terminal` (which he must, or the prune stops recognising it), the stale name lingers here,
-    and cancelled orders silently rejoin the set the Pošta automation chases. Refused at the
-    endpoint AND at the loader, so neither the panel nor a hand edit can create it."""
+    and cancelled orders silently rejoin the set the Pošta automation chases.
+
+    Used by the SAVE endpoint only, and deliberately not by the loader — see the note in
+    `_resolve_status_sets` for why a loader-level check would break an upgrade."""
     return sorted(sets["cancelled"] - sets["terminal"])
 
 
 def _order_statuses_state() -> tuple:
-    """`({"to_order": frozenset, "terminal": frozenset, "known_open": frozenset}, reason)`
-    — the EFFECTIVE sets, plus `""` or the reason the STORED configuration could not be
-    used. Resolved PER CALL (a module-level dict would freeze at import and stop seeing an
+    """`({"to_order": …, "terminal": …, "known_open": …, "cancelled": …}, reason)` — the
+    EFFECTIVE sets (each a frozenset), plus `""` or the reason the STORED configuration could
+    not be used. Resolved PER CALL (a module-level dict would freeze at import and stop seeing an
     edit until the service restarts, the same trap `_line_flag_stores` avoids).
 
     „Nothing configured" and „configured, but unreadable" get DIFFERENT answers, and that
@@ -6734,9 +6736,10 @@ def run_posta_uncollected() -> dict:
         dispatched_statuses=dispatched_statuses)
     if coverage["dispatched_status_unknown"]:
         # The alarm's own blind spot, logged rather than assumed away: every count above hangs off
-        # one hard-coded status string. Orders in the window of which NOT ONE is recognised as
-        # dispatched means that vocabulary moved — and this alarm would then sit green forever,
-        # exactly like the automation it was built to watch.
+        # the dispatched status NAMES — configuration since #296, but a name can still be edited
+        # WRONG. Orders in the window of which NOT ONE is recognised as dispatched means that
+        # vocabulary moved — and this alarm would then sit green forever, exactly like the
+        # automation it was built to watch.
         # `eligible_orders` and not `missing_package + dispatched_orders`: this branch fires only
         # when dispatched_orders is 0, so that sum degenerates to „orders WITHOUT a number", and a
         # window whose orders all carry one reported „v okne je 0 objednávok, ale ANI JEDNA…" —

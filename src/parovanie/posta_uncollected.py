@@ -165,9 +165,14 @@ def _is_non_posta_carrier(name: str) -> bool:
 
 def _status_set(statuses, default: frozenset) -> frozenset:
     """A caller-supplied set of status names → the ONE form both sides compare in, or the
-    module default when the caller passed nothing. `None` and the default are deliberately
-    different from an EMPTY set: the app never sends an empty one (its endpoint and loader
-    both refuse it), so an empty set here means „the caller really means nothing matches"."""
+    module default when the caller passed nothing.
+
+    `None` and an EMPTY set are deliberately different answers. Nothing may quietly promote
+    „the caller says nothing matches" into „use the built-in names": the app DERIVES its
+    dispatched set (`terminal − cancelled`), so a configuration calling every finished status
+    cancelled really does leave it empty — and the honest consequence is that
+    `dispatched_status_unknown` fires and names the blind spot, not that this module silently
+    falls back to a literal the shop may have renamed years ago."""
     if statuses is None:
         return default
     return frozenset(norm_status(s) for s in statuses) - {""}
