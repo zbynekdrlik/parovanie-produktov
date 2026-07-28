@@ -96,3 +96,46 @@ def build_import(pending, absent_codes=frozenset()):
         rows.append([code, entry.get("pairCode") or ""]
                     + [(fields.get(col) or {}).get("value", "") for col in cols])
     return header, rows, blocked
+
+
+def settle(pending, success_codes, blocked, now=""):
+    """Drop what Shoptet confirmed, keep the rest, and hand back the credits.
+
+    A producer's uploaded-store is written HERE — after the import log confirmed
+    the rows — never by the producer before the fact. That is the #257 lesson in
+    one place: the app used to mark work as uploaded on its own say-so.
+    """
+    out, credits = {}, {}
+    groups = {}
+    for code, entry in pending.items():
+        for field in (entry.get("fields") or {}).values():
+            c = field.get("credit")
+            if not c:
+                continue
+            g = groups.setdefault((c["store"], c["group"]),
+                                  {"value": c["value"], "codes": set()})
+            g["codes"].add(code)
+    for (store, group), g in groups.items():
+        if g["codes"] <= set(success_codes):
+            credits.setdefault(store, {})[group] = g["value"]
+    for code, entry in pending.items():
+        if code in success_codes:
+            continue
+        e = dict(entry)
+        if code in blocked:
+            prev = e.get("blocked") or {}
+            e["blocked"] = {"reason": blocked[code],
+                            "since": prev.get("since") or now}
+        else:
+            e["blocked"] = None
+        e["attempts"] = int(e.get("attempts") or 0) + 1
+        out[code] = e
+    return out, credits
+
+
+def stale_blocked(pending, min_attempts=3):
+    """Codes stuck blocked for at least `min_attempts` runs — the silent-death
+    guard for the table itself: a held-back row must never wait forever unseen.
+    """
+    return sorted(c for c, e in pending.items()
+                  if (e.get("blocked") and int(e.get("attempts") or 0) >= min_attempts))
