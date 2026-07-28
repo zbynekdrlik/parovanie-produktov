@@ -538,8 +538,9 @@ def test_do_upload_suppliers_blocks_when_export_empty(iso, monkeypatch):
     assert result["count"] == 0           # nothing written to the live eshop
     assert result["blocked"] == 2         # both assignments held back
     assert calls == []                    # the careful import never ran
-    # nothing recorded as uploaded → the idempotency store is never even written
-    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+    # nothing recorded as uploaded → the idempotency store is left exactly as it was
+    # (the fixture seeds an on-disk empty record — see `iso`)
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {}
 
 
 # ── BUG 1 (case c): a code that IS in supplier_assignments but has no "own supplier"
@@ -1417,7 +1418,7 @@ def test_a_stale_export_blocks_the_whole_supplier_write_back(iso, monkeypatch):
     assert result["count"] == 0
     assert result["blocked"] == 2            # both HELD — held is not dropped
     # the assignments survive untouched, so the next good export sends them
-    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {}
     assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGNMENT", "9/Z": "FOREST"}
 
 
@@ -1553,7 +1554,7 @@ def test_an_implausibly_small_export_blocks_the_supplier_write_back(iso, monkeyp
     assert result["count"] == 0
     assert result["blocked"] == 1            # held, not dropped
     assert result["products"] == [{"code": "9/Z", "supplier": "STALE_ASSIGNMENT"}]
-    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {}
 
     # …and the very same assignment IS written once the export is plausible again —
     # the gate blocks a broken feed, it does not freeze the write-back.
@@ -1594,7 +1595,7 @@ def test_the_supplier_write_gate_uses_the_same_ratio_floor_as_the_verdicts(iso, 
     assert status == 200
     assert calls == []                       # NOTHING reached the live eshop
     assert result["count"] == 0 and result["blocked"] == 1      # held, not dropped
-    assert not (iso["tmp"] / "uploaded_suppliers.json").exists()
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {}
 
 
 def test_the_blocked_run_reports_WHY_the_gate_blocked(iso, monkeypatch):

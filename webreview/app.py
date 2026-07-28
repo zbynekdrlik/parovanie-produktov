@@ -373,21 +373,39 @@ def _read_json_store(path, default):
     NOTE: the two FAIL-CLOSED dedup stores (orders_reminder, posta_uncollected — #225)
     deliberately do NOT use this reader; losing THEIR contents means mailing a customer
     twice, so they raise instead of degrading."""
+    return _read_json_store_state(path, default)[0]
+
+
+def _read_json_store_state(path, default) -> tuple:
+    """`(value, from_disk)` — `_read_json_store` plus the one thing its callers cannot
+    otherwise recover: whether the value it hands back is the STORED content or the
+    default standing in for a read that did not work out (PR #295 review).
+
+    An empty `{}` means two opposite things and the difference decides deletions: „the
+    manager really has nothing recorded here" (evidence) versus „missing / corrupt /
+    wrong type" (no evidence at all). Anything that DELETES on the absence of a record
+    must ask for `from_disk` and refuse without it — `_do_upload_suppliers`'s #215 rule
+    condemns every assignment when `uploaded_suppliers.json` degrades to `{}`, and that
+    file does not exist on the live box at all. store-prune §1: absence is never
+    evidence.
+
+    The default is `from_disk=False` on EVERY degraded path, so a caller cannot get the
+    answer half-right by accident."""
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
     except FileNotFoundError:
-        return default
+        return default, False
     except ValueError:
         # Degrading keeps the tab alive, but it must not be SILENT: a protected write
         # over this file is about to be refused, and this line is what explains why.
         log.error("úložisko %s sa nedá prečítať (poškodený/neúplný zápis) — zobrazujem "
                   "prázdno, ale zápis doň bude zamietnutý, kým sa neopraví", path)
-        return default
+        return default, False
     if not isinstance(d, type(default)):
-        return default
+        return default, False
     _note_store_read(path, d)
-    return d
+    return d, True
 
 
 def _thread_ring(p: str) -> collections.deque:
@@ -5640,7 +5658,19 @@ def _load_uploaded_suppliers():
     """{code: supplier} already written back to the eshop — so the nightly job only
     sends new or changed assignments. Missing/corrupt → empty (everything is new).
     Always a dict (a stray array could repeat a code and break the summary invariant)."""
-    return _read_json_store(SUPPLIERS_STATE, {})
+    return _load_uploaded_suppliers_state()[0]
+
+
+def _load_uploaded_suppliers_state() -> tuple:
+    """`({code: supplier}, from_disk)` — the same map, plus whether it really came off
+    disk (PR #295 review).
+
+    Degrading to `{}` is right for SENDING (an unknown record means „send it again",
+    which is idempotent) and catastrophic for DELETING: #215 condemns an assignment on
+    `c not in uploaded`, so a missing or corrupt record condemns the whole store at once.
+    The removal therefore asks for this flag; everything else keeps using the plain
+    loader."""
+    return _read_json_store_state(SUPPLIERS_STATE, {})
 
 
 def _save_uploaded_suppliers(d):
@@ -5700,14 +5730,19 @@ def _do_upload_suppliers(dry):
     supplier in the current export are excluded, so a stale assignment never clobbers
     a real eshop supplier (BUG 1)."""
     assigns = _load_supplier_assign()
-    uploaded = _load_uploaded_suppliers()
+    # …and WHETHER that record really came off disk. The #215 removal below stands on
+    # `c not in uploaded`, so a degraded read („{}") would condemn every assignment at
+    # once (PR #295 review). Sending is unaffected — re-sending a value is idempotent.
+    uploaded, uploaded_on_disk = _load_uploaded_suppliers_state()
     new_codes = import_builder.new_supplier_keys(assigns, uploaded)
     products = [{"code": c, "supplier": assigns[c]} for c in new_codes]
     if not new_codes:
         log.info("n8n suppliers: 0 new assignments")
-        # `obsolete_removed` is part of the shape on EVERY path, so a caller never has to
-        # tell „nothing was removed" from „this build does not report it"
+        # `obsolete_removed` / `obsolete_held` are part of the shape on EVERY path, so a
+        # caller never has to tell „nothing was removed" from „this build does not report
+        # it" — nor „nothing was obsolete" from „we refused to judge"
         return {"ok": True, "count": 0, "products": [], "obsolete_removed": [],
+                "obsolete_held": [],
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
 
@@ -5762,7 +5797,7 @@ def _do_upload_suppliers(dry):
         return {"ok": True, "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
-                "obsolete_removed": [],
+                "obsolete_removed": [], "obsolete_held": [],
                 "gate_blocked": {"reason": reason, "codes": len(export_codes),
                                  "min_codes": min_codes,
                                  "age_h": (round(export_age / 3600, 1)
@@ -5798,6 +5833,14 @@ def _do_upload_suppliers(dry):
     #     tell the two apart. #215 is about an assignment that was NEVER written back
     #     (blocked from the first run and every run after); removing an edited one would
     #     delete the manager's correction overnight and leave the old name live in the shop;
+    #   * …and therefore ONLY on a record we REALLY READ (`uploaded_on_disk`, PR #295
+    #     review). `_read_json_store` answers `{}` for a missing, corrupt or wrong-type
+    #     file exactly as it does for an empty one, and `{}` makes „never written back"
+    #     true of EVERY code — the whole store condemned in one run, on no evidence at
+    #     all. `uploaded_suppliers.json` does not exist on the live box today, so this is
+    #     one export appearance away, not a thought experiment. Absence is not evidence
+    #     (store-prune §1), so without the record nothing is judged: the candidates are
+    #     reported as `obsolete_held` and reconsidered on the next run that can read it;
     #   * NEVER `missing_codes` (#275): „the catalogue does not carry this code" is a
     #     different hold with a different fate — it is self-healing and the code may appear
     #     tomorrow, so that assignment must still be there when it does;
@@ -5805,7 +5848,17 @@ def _do_upload_suppliers(dry):
     #     there is nothing to remove, and the concrete codes AND the values dropped go into
     #     the log — a count alone defends nothing three weeks later.
     obsolete = sorted(set(new_codes) & own_supplier & export_codes - set(uploaded))
-    obsolete_removed = []
+    obsolete_removed, obsolete_held = [], []
+    if obsolete and not uploaded_on_disk:
+        # Fail-CLOSED and LOUD (automation-health §3): a permanent hold that nobody can
+        # see is the silent death this rule exists to prevent, and the fix is a one-line
+        # one — the file has to be there before we may delete on its silence.
+        obsolete_held, obsolete = obsolete, []
+        log.error("n8n suppliers: %d priradení vyzerá neaktuálne, ale evidenciu "
+                  "nahratých dodávateľov (%s) sa nepodarilo prečítať — NEMAŽE SA NIČ, "
+                  "lebo bez nej sa „nikdy sme to nenahrali\" nedá odlíšiť od „manažér "
+                  "práve zmenil meno dodávateľa\": %s",
+                  len(obsolete_held), SUPPLIERS_STATE, ", ".join(obsolete_held[:10]))
     if obsolete and not dry:
         try:
             with _lock:
@@ -5883,7 +5936,7 @@ def _do_upload_suppliers(dry):
                     len(new_codes), len(own_supplier & set(new_codes)), len(missing_codes))
         return {"ok": True, "count": 0, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
-                "obsolete_removed": obsolete_removed,
+                "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
                 **_missing_report(missing_codes, assigns),
                 **_supplier_summary(uploaded, assigns)}, 200
 
@@ -5898,7 +5951,8 @@ def _do_upload_suppliers(dry):
         # this return sits AFTER the cleanup above, so it is the one path where a removal
         # may already have happened — it has to say so like every other
         return {"ok": False, "error": "import already running",
-                "obsolete_removed": obsolete_removed}, 409
+                "obsolete_removed": obsolete_removed,
+                "obsolete_held": obsolete_held}, 409
     log.info("n8n suppliers: %d codes, %d rows (chunks of %d), dry_run=%s",
              len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
     try:
@@ -5926,7 +5980,7 @@ def _do_upload_suppliers(dry):
               "error_detail": res["error_detail"], "error": err_msg,
               "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
               "products": products, "stdout_tail": res["stdout_tail"],
-              "obsolete_removed": obsolete_removed,
+              "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
               **_missing_report(missing_codes, assigns),
               **_supplier_summary(uploaded, assigns)}
     log.info("n8n suppliers: rc=%s chunks=%d/%d processed=%s codes=%d",
