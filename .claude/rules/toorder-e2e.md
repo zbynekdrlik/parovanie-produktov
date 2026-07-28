@@ -324,3 +324,25 @@ OUT. To je proti invariantu, na ktorom stojí celé #261: suchý beh, ktorý eš
 `WEBREVIEW_OUT` na kópiu, by trafil živý adresár skôr, než stihne zabrať jeho vlastný
 `assert` — a import by si bral medziprocesový flock (až 30 s za bežiacou službou).
 Seeduj pri PRVOM zápise, pod zámkom, ktorý si volajúci aj tak drží.
+
+## 14. Nový prvok na karte automatizácie NESMIE nosiť triedy `.auto*` (#209)
+
+Platí pre KAŽDÝ tab s kartou automatizácie, nielen pre „Na objednanie". Karta má
+`.autostatus` / `.autohead` / `.autometa` / `.autodesc` / `.autoerr` a **desiatka e2e testov
+na ne lokátoruje STRIKTNE** (`page.locator(".autometa").inner_text()` v `test_automations`,
+`test_image_health`, `test_parovania_eshop`, `test_grube_externalcode`, `test_restock_skladom`,
+`test_supplier_stock`, `test_riziko_vypadku`, `test_shoptet_sync`…). Druhý prvok v tej istej
+triede = `strict mode violation: resolved to 4 elements` a spadnú testy, ktoré s tvojou zmenou
+nemajú nič spoločné — pri #209 to boli 4 naraz a vyzeralo to ako regresia karty.
+
+- Novému panelu daj **vlastný menný priestor** (`.statuscfg`, `.statuscfg-head`, …) a
+  naštýluj ho zvlášť. Nekopíruj `.auto*` len preto, že „vyzerá to rovnako".
+- Rovnako pri hlásení: vlastné `.statuscfg-msg.bad`, nie `.autoerr` — inak sa rozdvojí
+  lokátor na banner odmietnutého prunu.
+- Vlastné testy vieš odviazať od tried úplne: `data-testid` na paneli aj na každom poli.
+- **Zámerne vyprovokovaný non-2xx je konzolová chyba.** Chrome loguje každý neúspešný
+  request; test na odmietnutý zápis preto filtruje presne ten riadok
+  (`_PROVOKED = re.compile(r"Failed to load resource: .*\b400\b")` + `_unexpected()`),
+  ako to už robia `test_ui_labels.py` (403), `test_auth.py` (401/403),
+  `test_orders_reminder.py` (502) a `test_image_resilience.py` (404). Nevypínaj kvôli tomu
+  kontrolu konzoly celú.

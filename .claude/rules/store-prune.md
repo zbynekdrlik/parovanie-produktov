@@ -2,6 +2,8 @@
 paths:
   - "webreview/app.py"
   - "tests/test_webreview_flag_prune.py"
+  - "tests/test_webreview_prune_grace.py"
+  - "tests/test_webreview_parovania_eshop.py"
   - "tests/test_webreview_shoptet_sync.py"
   - "tests/test_store_safety.py"
   - "tests/test_store_concurrency.py"
@@ -80,6 +82,25 @@ NEUKONČENÉ a značky prežijú. Zoznam nehádaj — over ho na živých dátac
   text z riadku, ktorý potom loguješ, ukladáš do `automations.json` a vykresľuješ na karte.
   Strop na počet aj na dĺžku, nech pokazený zdroj nevie natrvalo vysypať svoj obsah (možno aj
   zákaznícke dáta) do manažérovho úložiska.
+- **Od #209 ten zoznam NIE JE v kóde — je to nastavenie.** Názvy stavov si obchod v Shoptete
+  edituje, takže `order_statuses.json` nesie tri množiny (`to_order` / `terminal` /
+  `known_open`) a konštanty v `app.py` sú už len ich PREDVOLBY. Čo z toho platí, keď na tom
+  robíš:
+  - Čítaj cez `_order_statuses()` a **rozhoduj sa PER VOLANIE** — modulový dict by zamrzol
+    pri importe a zmenu by uvidel až po reštarte (tá istá pasca ako `_line_flag_stores`).
+  - **Nepoužiteľná množina padá na predvolbu, nikdy na prázdnu.** Prázdne `to_order`
+    vyprázdni záložku, „Nedostupné" aj pripomienky zákazníkom; prázdne `terminal` potichu
+    odzbrojí prune. Súbor, ktorý sa nedá prečítať, nie je povolenie vymyslieť si správanie.
+  - **Prienik `to_order ∩ terminal` zahoď CELÝ konfig**, nie jednu stranu: stav, ktorý
+    znamená „rieši sa" aj „skončené", zmaže značky živých objednávok, a záplata jednej
+    strany nechá manažéra bežať na nastavení, ktoré nikdy nenapísal. Endpoint to odmieta na
+    vstupe, loader je poistka pre ručne upravený súbor.
+  - **Jedna množina, nie štyri kópie.** „Objednávka sa rieši" pohýna záložku, „Nedostupné"
+    AJ pripomienkové maily — každá vlastná kópia literálu je ďalšia automatizácia, ktorá po
+    premenovaní stavu potichu prestane robiť čokoľvek.
+  - **Hláška odmietnutia menuje NASTAVENÉ stavy, nie literál.** Beh vracia `open_statuses`;
+    banner „ani jedna otvorená" bez toho posiela manažéra hľadať názov, ktorý obchod už
+    nepoužíva.
 
 ### A test na ÚPLNÉ premenovanie NEPOKRÝVA čiastočné
 
@@ -114,28 +135,56 @@ prune, keď je množina otvorených PRÁZDNA**. Na zdravom feede je to nemožné
 pomenuj ZVLÁŠŤ (`no-status-column` vs `no-open-orders` vs `unparsable-source`): operátora
 posielajú na iné miesto.
 
-## 1c. Zánik ≠ koniec — nechaj odklad, lebo veci sa VRACAJÚ
+## 1c. Zánik ≠ koniec — odklad, a MERAJ HO OD ZATVORENIA (#294)
 
 Objednávka „Vybavená" sa môže vrátiť do „Vybavuje sa" — tento repozitár si to sám píše
 tam, kde dedup store pripomienok vysvetľuje, prečo záznamy DRŽÍ. Keď prune zmaže značky
 v tú istú hodinu, riadok sa vráti bez manažérovho „objednané u dodávateľa" a objedná sa
-druhý raz. Zmazanie preto vyžaduje aj VEK: `ORDERS_PRUNE_MIN_ORDER_AGE_DAYS` (30 dní) z dátumu
-objednávky, ktorý export aj tak nesie — žiadny nový store, nič, čo zastará.
+druhý raz.
 
-Skontroluj, že odklad a okno zdroja spolu **nenechajú kľúč trčať**: 30 dní odkladu proti
-90-dňovému oknu exportu = 60 dní hodinových behov, počas ktorých je každý kľúč ešte
-dosiahnuteľný. A **neznámy vek nie je „dosť starý"** — neprečítateľný dátum sa nemaže.
+**Pomenuj konštantu podľa toho, čo MERIA, nie podľa toho, čo si ňou chcel dosiahnuť.** Prvá
+verzia sa volala „odklad", ale merala vek OBJEDNÁVKY — jediný dátum, ktorý export nesie
+(67 stĺpcov, `date` = vytvorenie, žiadna zmena stavu ani posledná úprava; overené znova pri
+#294). Objednávka vytvorená pred 40 dňami a zatvorená DNES sa tak zmazala hneď pri
+najbližšom behu, s NULOVÝM odkladom — a to práve pri dlhom čakaní na dodávateľa, čiže presne
+tam, kde tie značky najviac chýbajú. Namerané na živých dátach v deň opravy: staré pravidlo
+by v tej hodine zmazalo **22 kľúčov**, nové ani jeden.
 
-**Pomenuj konštantu podľa toho, čo MERIA, nie podľa toho, čo si ňou chcel dosiahnuť.**
-Odklad má bežať od ZATVORENIA, lenže dátum v exporte je dátum VYTVORENIA objednávky (66
-stĺpcov a ani jeden so zmenou stavu či poslednou úpravou). Objednávka vytvorená pred 31
-dňami a zatvorená dnes sa teda zmaže hneď pri najbližšom behu, s NULOVÝM odkladom — a to
-práve pri dlhom čakaní na dodávateľa, čiže presne tam, kde tie značky najviac chýbajú. Kým
-to tak je, nevydávaj vek objednávky za odklad po zatvorení: konštanta sa volá podľa merania
-(`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`), komentár povie, čo dať NEVIE, a skutočné riešenie
-(store s dátumom prvého videného zatvorenia) má vlastný ticket (#294). Konštanta pomenovaná
-podľa zámeru klame o bezpečnosti, ktorú kód nemá — a klame práve toho, kto sa na ňu spoľahne
-pri ďalšej zmene.
+**Keď zdroj údaj nemá, ZMERAJ SI HO SÁM — a napíš si ho skôr, než sa rozhoduješ.**
+`orders_closed_seen.json` = `{kód objednávky: deň, keď sme ju PRVÝ RAZ videli v koncovom
+stave}`. Štyri veci, na ktorých to celé stojí:
+
+- **Poradie je celý návrh: najprv ZAPÍŠ, potom rozhoduj.** Čerstvo zatvorená objednávka tak
+  dostane plný odklad hneď pri prvom behu, ktorý ju vidí. Opačné poradie znamená, že KAŽDÁ
+  čerstvo zatvorená objednávka je „neznáma" a padne na staré pravidlo — čiže nulový odklad
+  navždy, nie raz. Ten istý poriadok robí zo straty storu fail-CLOSED zadarmo: nič sa
+  neprečítalo → všetko sa zapíše dneškom → ten beh nezmaže nič.
+- **Reopen maže záznam** (objednávka JE v exporte a NIE JE koncová — pozitívny dôkaz).
+  Objednávka mimo exportu je NEVIDENÁ, nie znovuotvorená, a záznam si drží; useknutý
+  download nesmie reštartovať odklad všetkým.
+- **Over, či odklad a OKNO ZDROJA nenechajú kľúč trčať.** Okno je 90 dní od DÁTUMU
+  objednávky, takže objednávka zatvorená v 70. dni z okna vypadne skôr, než 30-dňový odklad
+  uplynie — a potom sa jej kľúč nedá zmazať už NIKDY (nevidené ≠ zatvorené, bod 1). Preto
+  `ORDERS_PRUNE_LAST_CHANCE_AGE_DAYS = 80`: neskoro zatvorená objednávka dostane KRATŠÍ
+  odklad, nie nekonečný, a v kóde to je napísané tak, nie ako plný odklad. 10 dní rezervy
+  (~240 hodinových behov) je na výpadok synchronizácie.
+- **Rast ohranič cez to, čo store OBSLUHUJE:** záznam vzniká len pre objednávku, ktorá má
+  aspoň jeden kľúč v značkových úložiskách, a zaniká s jej posledným kľúčom. Store je tak
+  veľký ako „čo má manažér označené" (namerané: 66 objednávok pri 176 kľúčoch), nie ako okno
+  exportu.
+
+**`protect=` daj podľa toho, ČIA práca v store je.** Tento nesie NAŠE pozorovanie, nie prácu
+manažéra, a jeho strata vie mazanie iba ODLOŽIŤ, nikdy spôsobiť → `protect=False` a nepatrí
+ani do `backup_data.sh` (ten je pre „stratiť = neopakovateľná práca"). `protect=True` by z
+legitímneho „posledné záznamy odišli s poslednými kľúčmi" spravil hodinový
+`StoreWipeRefused`, ktorý zhodí vlastné účtovníctvo prunu. Naopak manažérom EDITOVANÝ store
+(`order_statuses.json`) `protect=True` mať má — a potom ho musíš dopísať aj do
+`backup_data.sh`, lebo pokrytie sa odvodzuje z výskytov `protect=` v `app.py`
+(`test_the_backup_script_covers_every_irreplaceable_store` spadne, ak zabudneš).
+
+**A neznámy vek stále nie je „dosť starý"** — neprečítateľný dátum sa nemaže, aj keď máš
+záznam o zatvorení: vekovú podlahu (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`) aj vetvu „posledná
+šanca" počítaš z toho istého dátumu.
 
 ## 2. Fail-closed prah na ZDROJ, aj keď pravidlo z bodu 1 už drží
 
@@ -171,6 +220,32 @@ presne to, čo ten `except` sľubuje, že sa stať nemôže. Chytaj ho na oboch 
 - Volaj to ako **housekeeping v try/except** (`StoreLockTimeout, StoreWipeRefused, OSError,
   ValueError`, **a `csv.Error`** — viď vyššie): zlyhaný prune nesmie zhodiť beh, ktorý ho
   hostí. Než ten `except` napíšeš, over si, že typy, ktoré parser naozaj hádže, sú v ňom.
+
+## 3a. Mazanie z manažérovho storu MIMO prunu — tie isté pravidlá (#215)
+
+Nie každé mazanie sa volá „prune". `_do_upload_suppliers` maže priradenia, ktoré eshop
+medzitým PREDBEHOL (produkt už má vlastného dodávateľa), a je to rovnako nezvratné mazanie
+manažérovho vstupu — takže platia body 1, 2 aj 3 bez zľavy:
+
+- **Pozitívny dôkaz na OBOCH osiach:** kód JE v exporte (prítomnosť) A export pri ňom nesie
+  vlastného dodávateľa (stav). „Nevidím pri ňom nášho dodávateľa" nedokazuje nič.
+- **Fail-closed brána musí byť NAD tým.** Tu ju netreba písať druhý raz — dosiahnutie toho
+  riadku už dokazuje, že export je prítomný, dosť veľký a ČERSTVÝ, lebo brána vyššie inak
+  skončí `return`-om. Overené mutáciou: presun mazania NAD bránu zhodí testy `small`/`stale`
+  (variant `empty` prežije — tam ho nezávisle kryje pozitívny dôkaz, čo je v poriadku, ale
+  vedieť to treba).
+- **Nemaž iný typ zadržania.** „Katalóg taký kód nemá" (#275) je INÉ zdržanie s iným osudom:
+  je samoliečivé a kód sa môže objaviť zajtra, takže to priradenie musí prežiť. Nad živými
+  dátami je to celý rozdiel — jediné dnešné priradenie je zadržané práve takto, čiže suchý
+  beh nad kópiou zmazal **0**.
+- **Suchý beh nesmie mazať** (`dry` vetva), in-place `pop` pod jedným `with _lock:`, žiadny
+  zápis keď niet čo mazať, a do logu konkrétne kódy AJ hodnoty.
+- **PASCA: zmazaný záznam musí odísť aj z POHĽADU TOHO BEHU.** Po zmazaní sa `assigns`
+  načíta znova, ale `new_codes` a `products` sú staré zoznamy — a `{c: assigns[c] for c in
+  new_codes}` o dva riadky nižšie potom spadne na `KeyError`. Prefiltruj oboje, inak beh
+  spadne presne v tej chvíli, keď prvý raz naozaj niečo zmaže.
+- **Nové pole vracaj na KAŽDEJ vetve** (`obsolete_removed: []` aj v skorých `return`-och) —
+  volajúci nemá ako odlíšiť „nič sa nezmazalo" od „táto verzia to nehlási".
 
 ## 4. Prune patrí k ČERSTVÉMU fetchu, nie na čítaciu cestu
 
