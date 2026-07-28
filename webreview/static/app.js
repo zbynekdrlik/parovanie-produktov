@@ -4118,7 +4118,8 @@ function flagPruneBlockedWarning(lr) {
       // „Vybavuje sa": after a rename that sends him looking for exactly the wrong thing.
       // An older recorded refusal has no such field → fall back to the built-in default.
       why: `v exporte${count} nie je ani jedna objednávka v stave `
-           + escapeHtml((lr.flags_open_statuses || ['Vybavuje sa'])
+           + escapeHtml((lr.flags_open_statuses?.length
+             ? lr.flags_open_statuses : ['Vybavuje sa'])
              .map(s => `„${s}"`).join(' / ')),
       look: 'skontroluj v Shoptete názvy stavov objednávok (asi sa niektorý premenoval) '
             + 'a nižšie na tejto karte ich zaraď do správnej skupiny',
@@ -4132,6 +4133,14 @@ function flagPruneBlockedWarning(lr) {
       why: 'stiahnutý export sa nedá prečítať — namiesto tabuľky prišlo niečo iné',
       look: 'skús export objednávok stiahnuť ručne zo Shoptetu a pozri sa, čo príde '
             + '(chybová stránka, prihlásenie, prázdny súbor)',
+    },
+    'bad-status-config': {
+      // #209 — the manager's own classification is unreadable, so the run refuses to
+      // delete rather than fall back to the built-in list and delete on statuses he may
+      // have removed on purpose. The fix is the panel right below.
+      why: 'nastavenie stavov objednávok sa nedá použiť (prázdny alebo protirečivý zoznam)',
+      look: 'skontroluj nižšie na tejto karte zoznamy stavov — jeden stav nesmie byť '
+            + 'vo viacerých zoznamoch a prvé dva nesmú byť prázdne',
     },
     'implausible-source': {
       why: `export${count} nesie príliš málo objednávok na to, aby bol úplný`,
@@ -4173,6 +4182,9 @@ function renderShoptetSync() {
   const a = autoByKey('shoptet_sync');
   if (!a) {
     wrap.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    // the status configuration is a SETTING, not part of the automation card — a failed
+    // /api/automations must not take away the one screen that fixes a renamed status
+    wrap.appendChild(renderOrderStatusConfig());
     return;
   }
   const st = el('div', 'autostatus');
@@ -5490,6 +5502,7 @@ async function init() {
   // loadUiLabels() (#173) is prefetched too — renderTabs()'s first paint must
   // already show admin-set custom names, not the default flashing first.
   await Promise.all([loadOrders(), loadNotes(), loadAutomations(), loadUiLabels()]);
+  if (ACTIVE_TAB === 'shoptet_sync') await loadShoptetSync();   // #209 — the panel needs it
   if (ACTIVE_TAB === 'users') await loadUsers();
   if (ACTIVE_TAB === 'posta') await loadPosta();
   if (ACTIVE_TAB === 'dev') await loadDevIssues();

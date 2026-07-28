@@ -91,6 +91,18 @@ NEUKONČENÉ a značky prežijú. Zoznam nehádaj — over ho na živých dátac
   - **Nepoužiteľná množina padá na predvolbu, nikdy na prázdnu.** Prázdne `to_order`
     vyprázdni záložku, „Nedostupné" aj pripomienky zákazníkom; prázdne `terminal` potichu
     odzbrojí prune. Súbor, ktorý sa nedá prečítať, nie je povolenie vymyslieť si správanie.
+  - **ALE: „nič nie je nastavené" a „nastavené je, len sa to nedá prečítať" musia dostať INÉ
+    odpovede** (revízia PR #295). `_read_json_store` vráti na oboje `{}`, takže ich rozlíši
+    len existencia súboru. Prvé je čerstvá inštalácia → predvolby. Druhé znamená, že
+    nevieme, čo manažér rozhodol — a vrátiť tam zabudovaný `terminal` zoznam znovu OZBROJÍ
+    prune presne na stavoch, ktoré možno zámerne vyhodil (karta mu pritom píše, nech ten
+    zoznam zužuje, len keď si je istý). To je fail-OPEN na mazaní. Preto: sety sa vrátia
+    (záložka musí niečo vykresliť), ale beh dostane dôvod `bad-status-config`, prune
+    odmietne a karta ukáže červený banner.
+  - **Kontroluj prienik VŠETKÝCH troch zoznamov, nielen `to_order ∩ terminal`.** Pri troch
+    textových poliach je najpravdepodobnejší preklep „presunul som stav, ale zo starého
+    poľa som ho nezmazal" — a `terminal ∩ known_open` skončí mazaním, hoci nápoveda toho
+    poľa sľubuje, že značky ostanú.
   - **Prienik `to_order ∩ terminal` zahoď CELÝ konfig**, nie jednu stranu: stav, ktorý
     znamená „rieši sa" aj „skončené", zmaže značky živých objednávok, a záplata jednej
     strany nechá manažéra bežať na nastavení, ktoré nikdy nenapísal. Endpoint to odmieta na
@@ -162,12 +174,23 @@ stave}`. Štyri veci, na ktorých to celé stojí:
 - **Reopen maže záznam** (objednávka JE v exporte a NIE JE koncová — pozitívny dôkaz).
   Objednávka mimo exportu je NEVIDENÁ, nie znovuotvorená, a záznam si drží; useknutý
   download nesmie reštartovať odklad všetkým.
-- **Over, či odklad a OKNO ZDROJA nenechajú kľúč trčať.** Okno je 90 dní od DÁTUMU
-  objednávky, takže objednávka zatvorená v 70. dni z okna vypadne skôr, než 30-dňový odklad
-  uplynie — a potom sa jej kľúč nedá zmazať už NIKDY (nevidené ≠ zatvorené, bod 1). Preto
-  `ORDERS_PRUNE_LAST_CHANCE_AGE_DAYS = 80`: neskoro zatvorená objednávka dostane KRATŠÍ
-  odklad, nie nekonečný, a v kóde to je napísané tak, nie ako plný odklad. 10 dní rezervy
-  (~240 hodinových behov) je na výpadok synchronizácie.
+- **Over, či odklad a OKNO ZDROJA nenechajú kľúč trčať — a keď áno, priznaj to.** Okno je
+  90 dní od DÁTUMU objednávky, takže objednávka zatvorená po ~60. dni z neho vypadne skôr,
+  než 30-dňový odklad uplynie, a jej kľúč tam ostane navždy. Obe cesty von sa v revízii PR
+  #295 vyskúšali a OBE sú horšie ako ten zvyšok:
+  - **„Zmaž tesne pred tým, než zmizne"** (prvý cut mal `LAST_CHANCE = 80 dní`) dá NULOVÝ
+    odklad práve tým objednávkam, kvôli ktorým odklad existuje — a keďže rozhodoval podľa
+    veku objednávky, mazal aj so STRATENÝM grace storom, čím potichu zneplatnil celý
+    argument „stratiť tento store nemôže stáť značku".
+  - **„Rozhoduj ďalej podľa záznamu, aj keď objednávka z exportu vypadla"** znie dobre, kým
+    si nevšimneš, že „nie je v exporte" vyzerá rovnako ako USEKNUTÝ download. Beh by tak
+    mazal kľúče objednávok, ktoré v pokazenom súbore len chýbajú, a padla by vlastnosť, na
+    ktorej #212 stojí: poškodený zdroj vie prune len ZÚŽIŤ
+    (`test_losing_rows_from_the_export_can_only_prune_FEWER_keys` to pripína a spadne).
+  Zvyšok teda nechaj ležať a napíš prečo. Asymetria z bodu 1 to rozhoduje: pár kľúčov, čo
+  ostanú, nestojí nikoho nič; zmazaná značka pošle manažéra objednať ten istý riadok druhý
+  raz. A zvyšok je malý — sú to len objednávky, ktoré NAVYŠE nesú značky a zatvoria sa v
+  posledných týždňoch svojho okna.
 - **Rast ohranič cez to, čo store OBSLUHUJE:** záznam vzniká len pre objednávku, ktorá má
   aspoň jeden kľúč v značkových úložiskách, a zaniká s jej posledným kľúčom. Store je tak
   veľký ako „čo má manažér označené" (namerané: 66 objednávok pri 176 kľúčoch), nie ako okno
@@ -238,8 +261,25 @@ manažérovho vstupu — takže platia body 1, 2 aj 3 bez zľavy:
   je samoliečivé a kód sa môže objaviť zajtra, takže to priradenie musí prežiť. Nad živými
   dátami je to celý rozdiel — jediné dnešné priradenie je zadržané práve takto, čiže suchý
   beh nad kópiou zmazal **0**.
+- **A NAJVÄČŠIA pasca (revízia PR #295): „eshop tam má vlastného dodávateľa" NEZNAMENÁ „naše
+  priradenie je neaktuálne".** `new_supplier_keys` vracia aj kód, ktorému manažér meno
+  dodávateľa práve ZMENIL — a pri ňom export legitímne nesie „vlastného dodávateľa": tú
+  STARÚ hodnotu, ktorú sme tam zapísali MY. Index z exportu si drží len kód, nie hodnotu,
+  takže tieto dva prípady rozlíšiť nevie a mazanie by manažérovu opravu cez noc zahodilo a
+  v obchode nechalo starý názov. Rozlišuje ich záznam o nahratí: #215 je o priradení, ktoré
+  sa NIKDY nezapísalo (`c not in uploaded`). Overené spustením — bez tej podmienky store
+  skončí prázdny a beh k tomu vypíše upokojujúce „0 new codes".
 - **Suchý beh nesmie mazať** (`dry` vetva), in-place `pop` pod jedným `with _lock:`, žiadny
   zápis keď niet čo mazať, a do logu konkrétne kódy AJ hodnoty.
+- **Zabaľ to ako housekeeping** (§3 posledná odrážka platí aj tu): `StoreWipeRefused` z
+  paralelného kliku by inak zhodil CELÝ nočný zápis dodávateľov skôr, než sa postaví prvý
+  importný riadok — čiže priradenia manažéra by prestali chodiť do eshopu úplne.
+- **Hlás, čo naozaj odišlo, nie čo si chcel zmazať** (`sorted(dropped)`, nie zamýšľaná
+  množina) — a nové pole daj do KAŽDEJ návratovej vetvy vrátane tej, ktorá je AŽ ZA
+  mazaním (409 „iný import beží"), inak sa beh, ktorý práve mazal, o tom nezmieni.
+- **Rozlišuj „nič sa nezmenilo" podľa OBSAHU, nie podľa príznaku.** Booleovské „niečo sa
+  stalo" sa dá nastaviť dvakrát (pridám záznam, o pár riadkov ho zase zmažem) a potom
+  vyrobí súbor len preto, aby doň zapísal to isté, čo v ňom bolo — porovnaj snapshot.
 - **PASCA: zmazaný záznam musí odísť aj z POHĽADU TOHO BEHU.** Po zmazaní sa `assigns`
   načíta znova, ale `new_codes` a `products` sú staré zoznamy — a `{c: assigns[c] for c in
   new_codes}` o dva riadky nižšie potom spadne na `KeyError`. Prefiltruj oboje, inak beh

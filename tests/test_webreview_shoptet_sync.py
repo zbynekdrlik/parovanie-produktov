@@ -81,8 +81,18 @@ def iso(tmp_path, monkeypatch):
         p.write_text('{"sentinel": true}', encoding="utf-8")
         monkeypatch.setattr(webapp, name, str(p))
         sentinel_paths[name] = p
+    # #294 — the prune now also waits out a reopen grace measured from the day it FIRST saw
+    # an order closed. This file's prune test is about the WIRING (is the prune run, and on
+    # the freshly downloaded bytes), so its closed order is pre-recorded as long since
+    # closed; the grace itself is pinned in `test_webreview_prune_grace.py`.
+    grace = tmp_path / "orders_closed_seen.json"
+    grace.write_text(json.dumps({"99002002": (
+        date.today() - timedelta(days=webapp.ORDERS_PRUNE_REOPEN_GRACE_DAYS + 5)
+    ).isoformat()}), encoding="utf-8")
+    monkeypatch.setattr(webapp, "ORDERS_CLOSED_SEEN", str(grace))
     return {"tmp": tmp_path, "src": src, "data": data, "orders_cache": orders_cache,
-            "customers_cache": customers_cache, "manager_stores": sentinel_paths}
+            "customers_cache": customers_cache, "manager_stores": sentinel_paths,
+            "grace": grace}
 
 
 # ── secret hygiene: a network failure must never leak the partner-hash URL ────

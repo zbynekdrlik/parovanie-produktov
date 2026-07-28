@@ -88,7 +88,10 @@ def test_saving_a_renamed_status_persists_and_takes_effect(page, sync_prune_bloc
     console = _console(page)
     _open_tab(page, sync_prune_blocked_server)
 
-    page.locator('[data-testid="order-statuses-to_order"]').fill("Spracúva sa\nOsob. odber")
+    # two names the shop does not use yet — a status that is already classified in another
+    # box would (correctly) be refused as being in two lists at once
+    page.locator('[data-testid="order-statuses-to_order"]').fill(
+        "Spracúva sa\nČaká na dodávateľa")
     with page.expect_response("**/api/order-statuses"):
         page.locator('[data-testid="order-statuses-save"]').click()
     page.wait_for_function(
@@ -101,7 +104,7 @@ def test_saving_a_renamed_status_persists_and_takes_effect(page, sync_prune_bloc
     page.get_by_role("button", name="Sync zo Shoptetu").click()
     page.wait_for_selector('[data-testid="order-statuses"]')
     assert page.locator('[data-testid="order-statuses-to_order"]').input_value() \
-        == "Osob. odber\nSpracúva sa"
+        == "Spracúva sa\nČaká na dodávateľa"
 
     assert console == [], f"console not clean: {console}"
 
@@ -129,3 +132,41 @@ def test_a_configuration_that_would_break_the_prune_is_REFUSED_with_a_readable_r
         "statuses"]["to_order"] == ["Vybavuje sa"]
 
     assert _unexpected(console) == [], f"console not clean: {console}"
+
+
+def test_landing_DIRECTLY_on_the_tab_loads_the_configuration(page, sync_prune_blocked_server):
+    """A reload, a bookmark or a remembered tab must not show „Nastavenie sa nepodarilo
+    načítať." — the fetch simply never ran. `init()` special-cases the other tabs that need
+    their own data; this one was missing, and both other E2E tests hid it by always
+    clicking the nav button."""
+    console = _console(page)
+    page.goto(sync_prune_blocked_server + "/?tab=shoptet_sync")
+    page.wait_for_selector('[data-testid="order-statuses"]')
+
+    panel = page.locator('[data-testid="order-statuses"]')
+    assert "nepodarilo" not in panel.inner_text(), panel.inner_text()
+    assert page.locator('[data-testid="order-statuses-to_order"]').input_value() \
+        == "Vybavuje sa"
+
+    assert console == [], f"console not clean: {console}"
+
+
+def test_a_NON_ADMIN_sees_the_sets_but_cannot_edit_them(page, sync_prune_blocked_server,
+                                                        admin_api, context):
+    """Reading is not admin-only: the card's own counts and its „stavy, ktoré nepoznám" line
+    only make sense next to the classification the app is going by. Writing is."""
+    admin_api(sync_prune_blocked_server, "/api/users",
+              {"email": "clen@e2e.sk", "password": "clen-heslo-12345", "is_admin": False})
+    context.clear_cookies()
+    page.goto(sync_prune_blocked_server + "/login")
+    page.fill('input[name="email"]', "clen@e2e.sk")
+    page.fill('input[name="password"]', "clen-heslo-12345")
+    page.click('button[type="submit"]')
+    page.wait_for_selector('[data-testid="version"]')
+    page.get_by_role("button", name="Sync zo Shoptetu").click()
+    page.wait_for_selector('[data-testid="order-statuses"]')
+
+    panel = page.locator('[data-testid="order-statuses"]')
+    assert "Vybavuje sa" in panel.inner_text()
+    assert page.locator('[data-testid="order-statuses-to_order"]').count() == 0
+    assert page.locator('[data-testid="order-statuses-save"]').count() == 0

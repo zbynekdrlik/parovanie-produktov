@@ -404,12 +404,14 @@ def test_obsolete_removed_is_on_the_result_of_EVERY_path(iso, monkeypatch):
     report it" — including the two paths that return before the upload: nothing new to do,
     and another import already running (which is reached AFTER the removal)."""
     webapp._save_supplier_assign({"9/Z": "BETALOV"})
-    webapp._save_uploaded_suppliers({"9/Z": "BETALOV"})           # nothing new
-    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
+    webapp._save_uploaded_suppliers({"9/Z": "BETALOV"})           # nothing new to send
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "7/Y": "P1"})
     r1, _s = webapp._do_upload_suppliers(dry=False)
     assert r1["obsolete_removed"] == [], r1
 
-    webapp._save_uploaded_suppliers({})                           # now it IS new
+    # now there IS something new (a code the fixture export really lists, so the run gets
+    # as far as the import), and another import is already running
+    webapp._save_supplier_assign({"9/Z": "BETALOV", "7/Y": "BETALOV"})
     assert webapp._import_lock.acquire(blocking=False)
     try:
         r2, s2 = webapp._do_upload_suppliers(dry=False)

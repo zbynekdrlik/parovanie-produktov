@@ -18,10 +18,10 @@ order in a terminal status". What is pinned here:
   2. the record is written BEFORE the run decides, so a newly closed order gets the FULL
      grace on the very first run that sees it — deciding first would make every newly closed
      order „unknown", i.e. no grace at all, for ever (the bug itself);
-  3. nothing is ever STRANDED, and nothing is deleted early to achieve that: the export
-     window is 90 days from the ORDER date, so an order that closes late leaves it before a
-     30-day grace elapses. The RECORD outlives the export, and it — not the order's absence
-     — is what makes the key deletable afterwards (store-prune §1c);
+  3. nothing is EVER deleted without its full grace — not even an order about to leave the
+     90-day export window, and not on a surviving record once it has left. Both escapes
+     from the resulting residue were tried and rejected in review; the residue is the
+     deliberate, cheaper mistake (store-prune §1c and the comment beside the constants);
   4. a reopen restarts the grace, and the store cannot grow without bound;
   5. a lost / corrupt store prunes NOTHING that run — it re-records everything as closed
      today, which is fail-CLOSED by construction.
@@ -159,44 +159,39 @@ def test_an_order_with_no_usable_DATE_is_still_never_pruned(stores):
     assert res["pruned"] == 0, res
 
 
-# ── 2/3. never STRANDED — the RECORD is what carries the key past the window ───
+# ── 2/3. what happens at the EDGE of the export window ────────────────────────
 
-def test_an_order_that_has_LEFT_the_export_is_pruned_once_its_grace_elapses(stores):
-    """store-prune §1c: check that the grace and the source window do not leave a key
-    stuck. The export is a 90-day window measured from the ORDER date, so an order that
-    closes late leaves it before a 30-day grace can elapse — and if „still in the export"
-    were required, that key could never be deleted again.
+def test_an_order_that_has_LEFT_the_export_is_never_pruned_even_with_an_old_record(stores):
+    """The deliberate trade, and the reason the grace has no „last chance" escape.
 
-    It is deleted on OUR OWN RECORD, which is a different thing from the „I cannot see it,
-    so it must be gone" that store-prune §1 forbids: we watched this order carry a terminal
-    status and wrote the day down. Absence is not the evidence here; the record is."""
-    _seed_grace(stores, {"99002002": _days_ago(webapp.ORDERS_PRUNE_REOPEN_GRACE_DAYS)})
+    „Not in the export" is what an order ageing out of the 90-day window looks like — and
+    ALSO what a truncated download looks like. Acting on a surviving record here would
+    therefore delete keys of orders that are merely missing from a cut file, and would
+    break the property #212 leans on: a damaged source can only ever prune FEWER keys, never
+    more (`test_losing_rows_from_the_export_can_only_prune_FEWER_keys`). A reopen inside the
+    missing rows would be invisible, and the marks would go — the exact harm.
+
+    The cost is that keys of an order that closes very late linger for good. That is the
+    cheaper mistake by a wide margin (store-prune §1's asymmetry), and it is bounded: only
+    orders that carry marks AND close in the last weeks of their window."""
+    _seed_grace(stores, {"99002002": _days_ago(365)})
 
     res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW]))   # 99002002 is NOT in it
 
-    assert res["pruned"] == 4, res
-    assert _grace(stores) == {}, _grace(stores)          # …and the record goes with it
+    assert res["pruned"] == 0, res
+    assert _keys(stores["ordered_items.json"]) == sorted([_KEY, _OTHER])
+    assert _grace(stores) == {"99002002": _days_ago(365)}, _grace(stores)
 
 
-def test_an_order_that_has_left_the_export_still_serves_its_FULL_grace(stores):
-    """The half that makes the branch above safe: leaving the window is not a shortcut.
-    An order we saw closed yesterday keeps its marks even once the export forgets it."""
-    _seed_grace(stores, {"99002002": _days_ago(1)})
-
-    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW]))
+def test_an_order_at_the_edge_of_the_window_still_serves_its_FULL_grace(stores):
+    """The other half of the same decision: being about to disappear buys no discount. An
+    85-day-old order first seen closed today keeps its marks — a first cut deleted them on
+    the spot, which is zero grace for precisely the long supplier-wait order #294 is for."""
+    res = webapp._prune_orphan_line_flags(
+        _export([_OPEN_ROW, _row("99002002", "Vybavená", 85, "B1")]))
 
     assert res["pruned"] == 0, res
-    assert _grace(stores) == {"99002002": _days_ago(1)}, _grace(stores)
-
-
-def test_an_order_we_never_saw_closed_is_NEVER_pruned_once_it_leaves(stores):
-    """The rule that keeps the branch above from becoming „not in the export = gone": with
-    no record there is no evidence, so the key stays for ever. That is the correct answer —
-    the manager can still be waiting on it."""
-    res = webapp._prune_orphan_line_flags(_export([_OPEN_ROW]))
-
-    assert res["pruned"] == 0, res
-    assert _grace(stores) == {}, _grace(stores)
+    assert _grace(stores) == {"99002002": date.today().isoformat()}, _grace(stores)
 
 
 # ── 4. reopen restarts the grace; the store stays bounded ─────────────────────

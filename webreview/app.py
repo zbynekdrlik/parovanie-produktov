@@ -1932,6 +1932,11 @@ ORDER_STATUS_LABELS = {
     "terminal": "objednávka je ukončená",
     "known_open": "ostatné známe stavy (nie sú ukončené)",
 }
+# The two sets that must never be empty: without `to_order` the tab, „Nedostupné" and the
+# customer reminders show nothing, and without `terminal` nothing is ever finished, so the
+# prune silently stops. `known_open` may legitimately be empty — it only decides which
+# statuses are reported as unclassified.
+ORDER_STATUS_REQUIRED = ("to_order", "terminal")
 
 
 def _clean_status_list(value):
@@ -1944,40 +1949,96 @@ def _clean_status_list(value):
     the prune. A file this app cannot read is not permission to invent behaviour."""
     if not isinstance(value, list):
         return None
-    out = []
+    out, seen = [], set()
     for v in value:
         if not isinstance(v, str):
             continue
         s = v.strip()[:ORDERS_UNKNOWN_STATUS_MAXLEN]
-        if s and s not in out:
+        # dedup through a SET and stop at the cap: this runs on the stored file on every
+        # request path (to-order tab, „Nedostupné", the prune, the reminders), and the
+        # docstring above invites a hand-edited file, so a pasted list must not turn into
+        # a quadratic scan over an unbounded list.
+        if s and s not in seen:
+            seen.add(s)
             out.append(s)
-    return out[:ORDER_STATUS_MAX] or None
+            if len(out) >= ORDER_STATUS_MAX:
+                break
+    return out or None
+
+
+def _status_overlap(sets) -> list:
+    """Statuses claimed by MORE THAN ONE of the three sets — always a contradiction, and
+    every combination of two ends in deleted work or work that is never cleaned:
+
+    * `to_order` ∩ `terminal` — „still being handled" AND „over": the prune deletes the
+      marks of live orders, the exact harm #212/#292 exist to prevent;
+    * `terminal` ∩ `known_open` — the likeliest mis-edit of three copy-pasteable boxes
+      („moved it, forgot to delete it"), and its outcome is deletion while the card's own
+      help text for that box promises the marks stay;
+    * `to_order` ∩ `known_open` — harmless in effect, but it means the manager thinks one
+      of the two boxes does something it does not."""
+    seen, dupes = set(), set()
+    for key in ORDER_STATUS_DEFAULTS:
+        for v in sets[key]:
+            (dupes if v in seen else seen).add(v)
+    return sorted(dupes)
+
+
+def _order_statuses_state() -> tuple:
+    """`({"to_order": frozenset, "terminal": frozenset, "known_open": frozenset}, reason)`
+    — the EFFECTIVE sets, plus `""` or the reason the STORED configuration could not be
+    used. Resolved PER CALL (a module-level dict would freeze at import and stop seeing an
+    edit until the service restarts, the same trap `_line_flag_stores` avoids).
+
+    „Nothing configured" and „configured, but unreadable" get DIFFERENT answers, and that
+    asymmetry is the whole point:
+
+    * no file at all = a fresh install → the measured defaults, so the app works out of
+      the box exactly as it did before #209;
+    * a file that IS there and cannot be used → we do not know what the manager decided.
+      Falling back to the built-in `terminal` list would RE-ARM the prune on precisely the
+      statuses he removed — and the card tells him to narrow that list only when he is
+      sure, because deleted marks cannot be brought back. So the sets are still returned
+      (the tab has to render something), but the reason is too, and the prune refuses on
+      it under its own name instead of quietly deleting. `store-prune.md` §1's asymmetry
+      argument in one sentence: a missed status costs a few keys, a wrongly included one
+      costs irreplaceable work.
+
+    An individual set that is unusable falls back to its own default; a configuration whose
+    sets OVERLAP is discarded WHOLE, because patching one side of it would leave the
+    manager running a configuration he never wrote. Both are reported as a reason."""
+    raw = _read_json_store(ORDER_STATUSES, {})
+    out, why = {}, ""
+    for key, default in ORDER_STATUS_DEFAULTS.items():
+        vals = _clean_status_list(raw.get(key))
+        # An empty `known_open` is a legitimate answer („I have classified nothing else"),
+        # so only the two LOAD-BEARING sets count as broken when they come back unusable:
+        # an empty `to_order` blanks the tab and the customer mails, an empty `terminal`
+        # silently disarms the prune.
+        if vals is None and key in raw and key in ORDER_STATUS_REQUIRED:
+            why = why or "zoznam „%s“ sa nedá použiť" % ORDER_STATUS_LABELS[key]
+        out[key] = frozenset(vals) if vals else frozenset(default)
+    # `_read_json_store` answers `{}` for BOTH „no file" and „file there but corrupt", so
+    # the file itself is what tells the two apart. A file present with nothing usable in it
+    # is not a fresh install.
+    if not raw and os.path.exists(os.fspath(ORDER_STATUSES)):
+        why = "súbor s nastavením sa nedá prečítať"
+    clash = _status_overlap(out)
+    if clash:
+        why = "stav %s je naraz vo viacerých zoznamoch" % ", ".join(clash)
+        out = {k: frozenset(v) for k, v in ORDER_STATUS_DEFAULTS.items()}
+    if why:
+        # ONE reason code for the refusal (they all send the manager to the same panel),
+        # the specific cause in the log — the operator needs the detail, the card needs a
+        # single case to render (store-prune §7).
+        log.error("nastavenie stavov objednávok sa nedá použiť (%s) — mazanie starých "
+                  "značiek sa zastavuje, kým sa to neopraví", why)
+    return out, ("bad-status-config" if why else "")
 
 
 def _order_statuses() -> dict:
-    """`{"to_order": frozenset, "terminal": frozenset, "known_open": frozenset}` — the
-    EFFECTIVE sets, resolved PER CALL (a module-level dict would freeze at import and stop
-    seeing an edit until the service restarts, the same trap `_line_flag_stores` avoids).
-
-    Fail-SAFE in both directions, because both directions are damaging: an unusable set
-    falls back to its measured default, and a configuration whose `to_order` and `terminal`
-    OVERLAP is discarded WHOLE. That overlap is the one state the prune cannot survive — a
-    status meaning both „still being handled" and „over" deletes the marks of live orders —
-    and patching only one side of it would leave the manager running a configuration he
-    never wrote. The write endpoint refuses it at the door; this is the backstop for a
-    hand-edited file and for a store written by an older version."""
-    raw = _read_json_store(ORDER_STATUSES, {})
-    out = {}
-    for key, default in ORDER_STATUS_DEFAULTS.items():
-        vals = _clean_status_list(raw.get(key))
-        out[key] = frozenset(vals) if vals else frozenset(default)
-    clash = out["to_order"] & out["terminal"]
-    if clash:
-        log.error("nastavenie stavov objednávok je nekonzistentné (%s je naraz "
-                  "rozpracovaný aj ukončený) — používam pôvodné nastavenie",
-                  ", ".join(sorted(clash)))
-        return {k: frozenset(v) for k, v in ORDER_STATUS_DEFAULTS.items()}
-    return out
+    """The effective status sets, for every caller that does not decide about DELETING."""
+    return _order_statuses_state()[0]
 # a blank status is not falsy-therefore-ignorable: it is an unreadable one, and dropping it
 # would narrow the prune with no trace anywhere. It gets a name instead.
 ORDERS_BLANK_STATUS_LABEL = "(prázdny stav)"
@@ -2029,20 +2090,36 @@ ORDERS_CLOSED_SEEN = _store("orders_closed_seen.json")
 # „Vybavuje sa", and a line that returns without „objednané u dodávateľa" is ordered twice.
 ORDERS_PRUNE_REOPEN_GRACE_DAYS = 30
 
-# …and the bound that keeps the grace from turning into „never" (store-prune §1c: check that
-# the grace and the source window do not leave a key stuck).
+# store-prune §1c also asks: do the grace and the source window together leave a key STUCK?
+# Here the honest answer is YES, for one narrow band — and that is the DELIBERATE trade,
+# because both ways of avoiding it are worse. The export is a 90-day window measured from
+# the ORDER date, so an order that closes after day ~60 leaves it before 30 days of grace
+# can elapse, and its keys then stay for good.
 #
-# The export is a 90-day window measured from the ORDER date, and an order the export does
-# not mention is UNSEEN, never closed — so a key whose order leaves the window before its
-# grace elapses could never be deleted again, and the stores would grow for ever exactly as
-# they did before #212. An order that closes very late therefore gets a SHORTER grace rather
-# than an infinite one; say it plainly rather than let it look like a full 30 days. 80 leaves
-# 10 days — ~240 hourly runs — of margin for a sync that has been down, and every order that
-# closes within its first 50 days still gets the whole grace.
-ORDERS_PRUNE_LAST_CHANCE_AGE_DAYS = 80
+# The two escapes, and why neither is taken:
+#
+#   * DELETE EARLY, just before the order disappears (a first cut did this at 80 days).
+#     It hands ZERO grace to exactly the orders the grace exists for — the long
+#     supplier-wait ones — and, because it decided on the ORDER's age alone, it deleted
+#     even when the grace store was lost, which quietly made „losing this store cannot cost
+#     a mark" false.
+#   * KEEP EVALUATING after the order leaves the export, on the surviving record. It reads
+#     well until you notice that „not in the export" is also what a TRUNCATED download
+#     looks like: the run would then delete keys of orders that are merely missing from a
+#     cut file, and „a damaged source can only ever prune FEWER keys" — the property §1
+#     buys and `test_losing_rows_from_the_export_can_only_prune_FEWER_keys` pins — is gone.
+#     A reopen inside a truncated window would be invisible, and the marks would go.
+#
+# So: no key is ever deleted without its full grace, and the residue is left to linger.
+# `store-prune.md` §1's asymmetry decides it — a few keys that stay cost nothing anyone can
+# see, while a mark deleted from a live order sends the manager to order the same line from
+# the supplier a second time. The residue is also small: it is only orders that both carry
+# marks AND close in the last ~30 days of their window (most close far earlier — the live
+# stores held 176 keys across 66 orders when this was measured), so the stores still settle
+# instead of growing the way they did before #212.
 
 
-def _orders_by_openness(orders_csv):
+def _orders_by_openness(orders_csv, state=None):
     """`(seen, still_open, finished, first_date_per_order, unknown, reason)` — `reason` is
     `""` when the export can be believed, and otherwise names WHY it cannot.
 
@@ -2084,8 +2161,24 @@ def _orders_by_openness(orders_csv):
     if text and not text.endswith(("\n", "\r")):
         cut = max(text.rfind("\n"), text.rfind("\r"))
         text = text[:cut + 1] if cut >= 0 else ""
-    st = _order_statuses()
+    # ONE resolution per run: the caller passes the state it already read, so the answer and
+    # the statuses the answer NAMES cannot come from two different reads with an admin's
+    # save in between.
+    st, bad_config = _order_statuses_state() if state is None else state
     open_set, terminal = st["to_order"], st["terminal"]
+    if bad_config:
+        # The manager's own classification is what decides which keys may be deleted. When
+        # the stored one cannot be used we do not know it, and guessing it from the
+        # built-in defaults would delete on statuses he may have deliberately removed.
+        # Refuse, name it, and let the card show the red banner — the same shape as the
+        # other three refusals (store-prune §7). Count the orders anyway, so the refusal
+        # can still say what it fired on (automation-health §3).
+        try:
+            got = {(r.get("code") or "").strip()
+                   for r in csv.DictReader(io.StringIO(text), delimiter=";")}
+        except csv.Error:
+            got = set()
+        return {c for c in got if c}, set(), set(), {}, set(), bad_config
     # „known" is the union of ALL THREE sets: a status is only reported as unknown when the
     # manager has classified it NOWHERE (store-prune §1a — the signal must mean genuinely
     # UNJUDGED, or it fires permanently on expected values and hides the one new one).
@@ -2133,39 +2226,36 @@ def _order_age_days(day):
     return (date.today() - placed).days
 
 
-def _order_is_old_enough(day: str) -> bool:
-    """Is this order past the order-age FLOOR (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`)?
+def _grace_elapsed(first_closed) -> bool:
+    """Has the reopen grace run out for a record of „first seen closed on this day"? (#294)
 
-    The floor only, not the grace — since #294 the grace runs from when we first saw the
-    order CLOSED (`_prune_due`), and this is the bound underneath it that needs no store of
-    ours."""
-    age = _order_age_days(day)
-    return age is not None and age >= ORDERS_PRUNE_MIN_ORDER_AGE_DAYS
+    No usable record = NO. A record dated in the future (a clock stepped back, a hand edit)
+    gives a negative age and is likewise not due. This is the ONE condition that decides a
+    deletion, so everything it cannot read is a refusal."""
+    return (_order_age_days(first_closed if isinstance(first_closed, str) else None) or -1) \
+        >= ORDERS_PRUNE_REOPEN_GRACE_DAYS
 
 
 def _prune_due(day, first_closed) -> bool:
-    """May this order's per-line marks go? (#294)
+    """May this order's per-line marks go, for an order the export still CARRIES? (#294)
 
-    Three conditions, and the order they are written in is the argument for each:
+    The grace decides, and the order date only ever REFUSES:
 
-    1. the order-age floor still holds — an unreadable date is an unknown age, so it can
-       never pass (and neither of the branches below could be trusted for it either);
-    2. the order is about to leave the export window → LAST CHANCE. After that it is
-       UNSEEN, never „closed", so the key could never be deleted again (store-prune §1c).
-       A very late closure buys a shorter grace, never an infinite one;
-    3. otherwise: the real grace, measured from the day we FIRST saw this order closed.
-       No usable record = not due. That is not a hole — the caller writes the record for
-       every finished order BEFORE asking, so „no record" means the store could not be
-       read at all, and refusing to delete is the safe answer to that. A record dated in
-       the future (a clock stepped back, a hand edit) yields a negative age and is
-       likewise not due."""
+    * an unreadable or missing order date is an unknown age, and an unknown age is never
+      „old enough" — the row itself is suspect, so nothing about it is acted on;
+    * the order-age floor (`ORDERS_PRUNE_MIN_ORDER_AGE_DAYS`) is a backstop against a
+      back-dated or hand-edited record, which could otherwise delete the marks of an order
+      placed three days ago. In normal operation it can never be the deciding condition: a
+      record day is never earlier than the order day, so 30 days of grace already implies
+      30 days of order age.
+
+    „No record" is therefore also a refusal, and it is not a hole: the caller writes the
+    record for every FLAGGED finished order before it asks, so an order with marks always
+    has one by the time this runs."""
     age = _order_age_days(day)
     if age is None or age < ORDERS_PRUNE_MIN_ORDER_AGE_DAYS:
         return False
-    if age >= ORDERS_PRUNE_LAST_CHANCE_AGE_DAYS:
-        return True
-    closed_age = _order_age_days(first_closed if isinstance(first_closed, str) else None)
-    return closed_age is not None and closed_age >= ORDERS_PRUNE_REOPEN_GRACE_DAYS
+    return _grace_elapsed(first_closed)
 
 
 def _prune_orphan_line_flags(orders_csv) -> dict:
@@ -2214,12 +2304,14 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
     stores: those numbers order two answers to the SAME open row for a client that is
     watching it, and a pruned key belongs to an order the tab can no longer display at
     all, so there is no client state for it to order against."""
-    seen, still_open, finished, dates, unknown, reason = _orders_by_openness(orders_csv)
+    state = _order_statuses_state()
+    seen, still_open, finished, dates, unknown, reason = _orders_by_openness(
+        orders_csv, state)
     unknown_statuses = sorted(unknown)[:ORDERS_UNKNOWN_STATUS_MAX]
     # #209 — every answer carries the statuses this run was actually looking for. The
     # „nothing is open" banner used to name the hard-coded „Vybavuje sa", which after a
     # rename sends the manager looking for exactly the wrong thing.
-    open_statuses = sorted(_order_statuses()["to_order"])
+    open_statuses = sorted(state[0]["to_order"])
     base = {"orders_seen": len(seen), "orders_open": len(still_open),
             "unknown_statuses": unknown_statuses, "open_statuses": open_statuses,
             "per_store": {}}
@@ -2261,8 +2353,8 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
         loaded = [(name, save, load()) for name, load, save in _line_flag_stores()]
         flagged = _orders_with_flags(loaded)
         closed_seen = _read_json_store(ORDERS_CLOSED_SEEN, {})
+        before = dict(closed_seen)     # what „nothing changed" is measured against
         today = date.today().isoformat()
-        seen_changed = False
         # #294 — RECORD FIRST, DECIDE AFTER. An order we are seeing closed for the first
         # time starts its grace NOW; deciding before recording would give every newly closed
         # order the order-age rule instead, i.e. no grace at all, which is the ticket's bug.
@@ -2271,14 +2363,12 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
         for code in sorted(flagged & finished):
             if not isinstance(closed_seen.get(code), str):
                 closed_seen[code] = today
-                seen_changed = True
         # A REOPEN drops the record, so the grace runs again from the SECOND closure — on
         # POSITIVE evidence only (the order is in the export and is not finished). An order
         # the export does not mention is UNSEEN, not reopened, and keeps its record; a
         # truncated download must not restart everybody's grace.
         for code in [c for c in closed_seen if c in seen and c not in finished]:
             closed_seen.pop(code, None)
-            seen_changed = True
         closed = {c for c in finished if _prune_due(dates.get(c), closed_seen.get(c))}
         for name, save, d in loaded:
             # a key with no `<order>|<item>` shape cannot be attributed to an order, so it
@@ -2303,9 +2393,11 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
         left = _orders_with_flags(loaded)
         for code in [c for c in closed_seen if c not in left]:
             closed_seen.pop(code, None)
-            seen_changed = True
-        # …and when nothing changed, the file is not touched at all (store-prune §3).
-        if seen_changed:
+        # …and when nothing changed, the file is not touched at all (store-prune §3). It is
+        # the record SET that is compared, not a „something happened" flag: a record added
+        # and dropped again in the same run leaves the set as it was, and a flag would then
+        # create the file to write a value nobody asked for.
+        if closed_seen != before:
             _atomic_write_json(ORDERS_CLOSED_SEEN, closed_seen)
     if not total:
         log.info("prune riadkových príznakov: nič na odstránenie (%d objednávok v exporte, "
@@ -5698,31 +5790,51 @@ def _do_upload_suppliers(dry):
     #   * FAIL-CLOSED on the source — reaching this line already proves the export is
     #     present, plausible (>= `_export_min_codes()`) and FRESH, because the gate above
     #     returns otherwise. There is deliberately no second, weaker check here;
-    #   * only for codes still waiting to go up (`new_codes`) — one already uploaded is
-    #     done, not blocked, and its record is what keeps the upload incremental;
+    #   * only for codes WE NEVER WROTE BACK (`c not in uploaded`). This one is not
+    #     belt-and-braces, it is the whole correctness of the rule: `new_supplier_keys`
+    #     also returns a code whose name the manager has just EDITED, and for that code the
+    #     export legitimately shows „its own supplier" — the OLD value WE put there. The
+    #     export index keeps only the code, not the value, so „it has a supplier" cannot
+    #     tell the two apart. #215 is about an assignment that was NEVER written back
+    #     (blocked from the first run and every run after); removing an edited one would
+    #     delete the manager's correction overnight and leave the old name live in the shop;
     #   * NEVER `missing_codes` (#275): „the catalogue does not carry this code" is a
     #     different hold with a different fate — it is self-healing and the code may appear
     #     tomorrow, so that assignment must still be there when it does;
     #   * never on a DRY run, in-place `pop` under one `with _lock:`, no write at all when
     #     there is nothing to remove, and the concrete codes AND the values dropped go into
     #     the log — a count alone defends nothing three weeks later.
-    obsolete = sorted(set(new_codes) & own_supplier & export_codes)
+    obsolete = sorted(set(new_codes) & own_supplier & export_codes - set(uploaded))
+    obsolete_removed = []
     if obsolete and not dry:
-        with _lock:
-            live = _load_supplier_assign()
-            dropped = {c: live[c] for c in obsolete if c in live}
+        try:
+            with _lock:
+                live = _load_supplier_assign()
+                dropped = {c: live[c] for c in obsolete if c in live}
+                if dropped:
+                    for c in dropped:
+                        live.pop(c, None)
+                    _save_supplier_assign(live)
+            # report what was ACTUALLY dropped, not what we set out to drop: a code that
+            # vanished meanwhile must not be named as removed by us
+            obsolete_removed = sorted(dropped)
             if dropped:
-                for c in dropped:
-                    live.pop(c, None)
-                _save_supplier_assign(live)
                 log.info("n8n suppliers: %d priradení zmazaných ako neaktuálne — eshop už "
                          "pri tých kódoch má vlastného dodávateľa: %s", len(dropped),
                          ", ".join(f"{c}={v}" for c, v in sorted(dropped.items())))
+        except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
+            # HOUSEKEEPING, so it is wrapped like housekeeping (store-prune §3): a
+            # concurrent click invalidates the read receipt and `_save_supplier_assign`
+            # raises — unwrapped, that would abort the whole nightly write-back before a
+            # single import row is built, and the manager's assignments would stop going up
+            # entirely. Nothing was removed; the next run tries again.
+            log.error("n8n suppliers: upratanie neaktuálnych priradení zlyhalo (%r) — "
+                      "nemaže sa nič, beh pokračuje", e)
+            obsolete_removed = []
     elif obsolete:
         log.info("n8n suppliers: %d priradení je neaktuálnych (eshop má vlastného "
                  "dodávateľa), suchý beh ich nemaže: %s", len(obsolete),
                  ", ".join(obsolete))
-    obsolete_removed = obsolete if not dry else []
     if obsolete_removed:
         # A removed assignment is no longer one: it must leave THIS run's view of the work
         # too, or the summary would go on counting it as waiting to go up and the row
@@ -5783,7 +5895,10 @@ def _do_upload_suppliers(dry):
 
     if not _import_lock.acquire(blocking=False):
         log.warning("n8n suppliers: another import already running")
-        return {"ok": False, "error": "import already running"}, 409
+        # this return sits AFTER the cleanup above, so it is the one path where a removal
+        # may already have happened — it has to say so like every other
+        return {"ok": False, "error": "import already running",
+                "obsolete_removed": obsolete_removed}, 409
     log.info("n8n suppliers: %d codes, %d rows (chunks of %d), dry_run=%s",
              len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
     try:
@@ -8419,24 +8534,49 @@ def api_order_statuses_save():
     me = _admin_or_none()
     if not me:
         return _forbidden()
-    body = request.get_json(silent=True) or {}
+    # `get_json(silent=True) or {}` neutralises null / {} / [], but a JSON string or number
+    # sails straight through and blows up on `.get` — a malformed request is a 400, never
+    # a 500.
+    body = request.get_json(silent=True)
+    body = body if isinstance(body, dict) else {}
     stored = _read_json_store(ORDER_STATUSES, {})
     out = {}
     for key in ORDER_STATUS_DEFAULTS:
+        # REFUSE what we cannot store faithfully rather than silently trimming it: a status
+        # quietly cut to 80 characters never matches the export again, and a list quietly
+        # cut to 50 loses entries while the card answers „✅ Uložené".
+        if key in body:
+            raw = body[key]
+            if not isinstance(raw, list):
+                return jsonify({"ok": False, "error": (
+                    "zoznam „%s“ musí byť zoznam stavov" % ORDER_STATUS_LABELS[key])}), 400
+            if len(raw) > ORDER_STATUS_MAX:
+                return jsonify({"ok": False, "error": (
+                    "zoznam „%s“ má %d položiek, povolených je najviac %d"
+                    % (ORDER_STATUS_LABELS[key], len(raw), ORDER_STATUS_MAX))}), 400
+            too_long = [v for v in raw if isinstance(v, str)
+                        and len(v.strip()) > ORDERS_UNKNOWN_STATUS_MAXLEN]
+            if too_long:
+                return jsonify({"ok": False, "error": (
+                    "názov stavu môže mať najviac %d znakov (v zozname „%s“ je dlhší)"
+                    % (ORDERS_UNKNOWN_STATUS_MAXLEN, ORDER_STATUS_LABELS[key]))}), 400
         raw = body.get(key, stored.get(key))
         vals = _clean_status_list(raw)
-        if vals is None and key in body:
+        if vals is None and key in body and key in ORDER_STATUS_REQUIRED:
             return jsonify({"ok": False, "error": (
                 "zoznam „%s“ nesmie byť prázdny — bez neho by appka nevedela, ktoré "
                 "objednávky sú rozpracované a ktoré ukončené"
                 % ORDER_STATUS_LABELS[key])}), 400
-        out[key] = vals if vals is not None else list(ORDER_STATUS_DEFAULTS[key])
-    clash = sorted(set(out["to_order"]) & set(out["terminal"]))
+        if vals is None and key in body:
+            out[key] = []          # explicitly emptied (only reachable for known_open)
+        else:
+            out[key] = vals if vals is not None else list(ORDER_STATUS_DEFAULTS[key])
+    clash = _status_overlap({k: set(v) for k, v in out.items()})
     if clash:
         return jsonify({"ok": False, "error": (
-            "stav %s je uvedený aj medzi rozpracovanými, aj medzi ukončenými — "
-            "to sa navzájom vylučuje a pri mazaní starých značiek by to zmazalo prácu "
-            "pri živých objednávkach" % ", ".join(clash))}), 400
+            "stav %s je uvedený naraz vo viacerých zoznamoch — to sa navzájom vylučuje "
+            "a pri mazaní starých značiek by to zmazalo prácu pri živých objednávkach"
+            % ", ".join(clash))}), 400
     with _lock:
         d = _read_json_store(ORDER_STATUSES, {})
         d.update(out)
