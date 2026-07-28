@@ -347,12 +347,14 @@ def test_only_an_ENABLED_and_QUEUE_MIGRATED_producer_runs_and_producers_reflects
 
 def test_a_producer_not_yet_migrated_to_the_queue_never_runs_even_when_enabled(
         cycle, monkeypatch):
-    """#299 review I2 — every one of CYCLE_PRODUCERS still writes straight to the
-    live eshop today (QUEUE_MIGRATED stays empty until Tasks 8-10 migrate them one
-    by one, in the SAME commit that switches each one over). The cycle must NEVER
-    start one just because a manager enabled it in the meantime — that would turn
-    a 1x/day automation into 24x/day writes to forestshop.sk. Kills the mutation
-    that deletes the `QUEUE_MIGRATED` membership check."""
+    """#299 review I2 — a producer not yet in QUEUE_MIGRATED still writes straight to
+    the live eshop on its own daily schedule (Tasks 8-10 migrate the five producers
+    one by one, in the SAME commit that switches each one over — Task 8 moved
+    grube_externalcode/split_links; parovania_eshop is still pending). The cycle
+    must NEVER start an unmigrated producer just because a manager enabled it in
+    the meantime — that would turn a 1x/day automation into 24x/day writes to
+    forestshop.sk. Kills the mutation that deletes the `QUEUE_MIGRATED` membership
+    check."""
     monkeypatch.setattr(webapp.RUNNER, "status",
                         lambda: [{"key": "parovania_eshop", "enabled": True}])
     res = webapp.run_shoptet_upload()
@@ -396,3 +398,129 @@ def test_a_credit_for_an_unknown_store_is_dropped_with_a_log_not_a_crash(
     assert res["ok"] is True
     assert res["confirmed"] == 1
     assert any("neznámy kredit store" in r.message for r in caplog.records)
+
+
+# ── #299 Task 8 — the first two producers switch to the queue: GRUBE ─────────── #
+# ── externalCode write-back and per-size split links. Both automations start ── #
+# ── DISABLED (#93 contract), so this is zero live-write risk. ───────────────── #
+
+def test_grube_producer_queues_instead_of_importing(pend, monkeypatch):
+    """The brief's own fixture used `{"pairCode": ..., "externalCode": ...}` for the
+    grube_codes.json entry shape — but `new_externalcode_keys`/`externalcode_rows`
+    read `info["itemId"]` (confirmed against the real grube_codes.json producer,
+    `.claude/skills/grube` + `test_webreview_grube_externalcode.py`'s own
+    `_seed_grube` helper: `{itemId, size, deUrl, productId}`). The brief's literal
+    fixture has no `itemId` key at all, so `new_externalcode_keys` would filter code
+    "A" out entirely (empty itemId) and the assertion `queued == 1` would never even
+    exercise the guard it exists to pin — corrected here to the real shape."""
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda *a, **k: pytest.fail("producer must not import"))
+    monkeypatch.setattr(webapp, "_load_grube_codes",
+                        lambda: {"A": {"itemId": "12345"}})
+    monkeypatch.setattr(webapp, "_load_uploaded_externalcodes", lambda: {})
+    res, status = webapp._do_upload_externalcodes(False)
+    assert status == 200
+    assert res["queued"] == 1
+    d = webapp._load_pending()
+    assert d["A"]["fields"]["externalCode"]["value"] == "12345"
+    assert d["A"]["fields"]["externalCode"]["source"] == "grube_externalcode"
+
+
+def test_grube_producer_never_credits_itself(pend, monkeypatch):
+    """#299 Task 8 decision #2 (carried over from earlier tasks, not in this task's
+    brief): the producer must not write its own uploaded_externalcodes.json anymore
+    — that credit belongs to the drain's `_credit_producer`, called only AFTER
+    Shoptet's import actually confirms the row (the #257 class of bug: an
+    "uploaded" mark written on our own say-so). Kills a regression that re-adds
+    `_record_uploaded`/`_save_uploaded_externalcodes` to the producer itself."""
+    monkeypatch.setattr(webapp, "_load_grube_codes",
+                        lambda: {"A": {"itemId": "12345"}})
+    monkeypatch.setattr(webapp, "_load_uploaded_externalcodes", lambda: {})
+    monkeypatch.setattr(webapp, "_save_uploaded_externalcodes",
+                        lambda d: pytest.fail("producer must not credit itself"))
+    res, status = webapp._do_upload_externalcodes(False)
+    assert status == 200
+    assert res["queued"] == 1
+
+
+def test_split_links_producer_queues_instead_of_importing(pend, monkeypatch):
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda *a, **k: pytest.fail("producer must not import"))
+    monkeypatch.setattr(webapp, "PRODUCTS",
+                        [{"key": "TRIGONA|395", "variant_codes": ["60645/S"]}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"60645/S": "395"})
+    monkeypatch.setattr(webapp, "_load_variant_links",
+                        lambda: {"60645/S": "https://trigona.sk/s"})
+    monkeypatch.setattr(webapp, "_load_uploaded_variant_links", lambda: {})
+    monkeypatch.setattr(webapp, "_load_decisions",
+                        lambda: {"TRIGONA|395": {"status": "split", "url": ""}})
+    res, status = webapp._do_upload_variant_links(False)
+    assert status == 200
+    assert res["queued"] == 1
+    d = webapp._load_pending()
+    assert d["60645/S"]["fields"]["internalNote"]["value"] == "https://trigona.sk/s"
+    assert d["60645/S"]["fields"]["internalNote"]["source"] == "split_links"
+
+
+def test_split_links_producer_never_credits_itself(pend, monkeypatch):
+    """Mirrors `test_grube_producer_never_credits_itself` for the second Task 8
+    producer — same #257-class reasoning."""
+    monkeypatch.setattr(webapp, "PRODUCTS",
+                        [{"key": "TRIGONA|395", "variant_codes": ["60645/S"]}])
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"60645/S": "395"})
+    monkeypatch.setattr(webapp, "_load_variant_links",
+                        lambda: {"60645/S": "https://trigona.sk/s"})
+    monkeypatch.setattr(webapp, "_load_uploaded_variant_links", lambda: {})
+    monkeypatch.setattr(webapp, "_load_decisions",
+                        lambda: {"TRIGONA|395": {"status": "split", "url": ""}})
+    monkeypatch.setattr(webapp, "_save_uploaded_variant_links",
+                        lambda d: pytest.fail("producer must not credit itself"))
+    res, status = webapp._do_upload_variant_links(False)
+    assert status == 200
+    assert res["queued"] == 1
+
+
+def test_both_task8_producers_are_open_in_the_queue_migration_gate():
+    """Without both keys in QUEUE_MIGRATED, `run_shoptet_upload`'s hourly cycle
+    would never invoke either producer even after a manager enables them — the
+    migration would ship dead (the tichá smrť class, `automation-health.md` §3).
+    Kills a regression that reverts either addition to QUEUE_MIGRATED."""
+    assert "grube_externalcode" in webapp.QUEUE_MIGRATED
+    assert "split_links" in webapp.QUEUE_MIGRATED
+
+
+def test_a_confirmed_credit_for_grube_externalcode_actually_writes_EXTERNALCODES_STATE(
+        cycle, tmp_path, monkeypatch):
+    """Mirrors `test_a_confirmed_credit_for_parovania_eshop_actually_writes_
+    PAIRINGS_STATE` for the `_credit_producer` mapping this task adds. Kills the
+    mutation that drops "grube_externalcode" from that mapping."""
+    state = tmp_path / "uploaded_externalcodes.json"
+    monkeypatch.setattr(webapp, "EXTERNALCODES_STATE", str(state))
+    webapp.queue_shoptet_fields(
+        "grube_externalcode", "code;pairCode;externalCode",
+        [["A", "P", "12345"]], credit_group={"A": "A"}, credit_value={"A": "12345"})
+
+    res = webapp.run_shoptet_upload()
+
+    assert res["confirmed"] == 1
+    d = json.loads(state.read_text(encoding="utf-8"))
+    assert d["A"] == "12345"
+
+
+def test_a_confirmed_credit_for_split_links_actually_writes_VARIANT_LINKS_STATE(
+        cycle, tmp_path, monkeypatch):
+    """Kills the mutation that drops "split_links" from the `_credit_producer`
+    mapping this task adds."""
+    state = tmp_path / "uploaded_variant_links.json"
+    monkeypatch.setattr(webapp, "VARIANT_LINKS_STATE", str(state))
+    webapp.queue_shoptet_fields(
+        "split_links", "code;pairCode;internalNote",
+        [["60645/S", "395", "https://trigona.sk/s"]],
+        credit_group={"60645/S": "60645/S"},
+        credit_value={"60645/S": "https://trigona.sk/s"})
+
+    res = webapp.run_shoptet_upload()
+
+    assert res["confirmed"] == 1
+    d = json.loads(state.read_text(encoding="utf-8"))
+    assert d["60645/S"] == "https://trigona.sk/s"

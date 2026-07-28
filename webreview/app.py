@@ -6339,16 +6339,27 @@ def _externalcode_summary(uploaded, grube_codes):
 def _do_upload_externalcodes(dry):
     """Core of the nightly GRUBE externalCode write-back — the SINGLE place the logic
     lives (NEkopíruj logiku). Reads the durable grube_codes.json store, builds
-    code;pairCode;externalCode for only the codes not yet uploaded (or whose itemId
-    changed), runs the careful chunked import, records what went up, and returns
-    (result, status). Shared by the n8n HTTP endpoint (below) and the in-app „GRUBE
-    kódy → eshop" automation (#62) — no auth / Flask request access here. Touches ONLY
-    the `externalCode` column (own file → a present-but-empty cell can't wipe
-    internalNote/state/prices). The externalCode is the grube per-size `itemId`, which
-    MUST be purely numeric — the numeric guard lives in both new_externalcode_keys and
-    externalcode_rows (a non-numeric cell is junk / a possible formula-injection lead,
-    dropped, never an empty cell that would WIPE the existing externalCode). GRUBE-only
-    is guaranteed by the source store (grube_codes.json is built only for GRUBE)."""
+    code;pairCode;externalCode rows for the codes not yet uploaded (or whose itemId
+    changed), and QUEUES them into the shared pending_shoptet table for the next
+    hourly „Sync do Shoptetu" drain (#299 Task 8) — it never imports directly
+    (`_import_rows_chunked` is never called here) and never writes
+    uploaded_externalcodes.json itself; that credit is written only by
+    `_credit_producer` once the hourly cycle's OWN import actually confirms the row
+    (the #257 class of bug: an „uploaded" mark written on our own say-so, before
+    Shoptet confirmed anything — decision carried over from Task 6/7, not in this
+    task's original brief). Shared by the n8n HTTP endpoint (below) and the in-app
+    „GRUBE kódy → eshop" automation (#62) — no auth / Flask request access here.
+    Touches ONLY the `externalCode` column (own file → a present-but-empty cell can't
+    wipe internalNote/state/prices). The externalCode is the grube per-size `itemId`,
+    which MUST be purely numeric — the numeric guard lives in both new_externalcode_keys
+    and externalcode_rows (a non-numeric cell is junk / a possible formula-injection
+    lead, dropped, never an empty cell that would WIPE the existing externalCode).
+    GRUBE-only is guaranteed by the source store (grube_codes.json is built only for
+    GRUBE). `dry=True` builds the same candidate rows but queues nothing — same
+    "changes nothing" contract the old dry-run import had. `credit_group`/
+    `credit_value` are keyed by the code itself (1:1, no cross-code grouping needed
+    here) so the drain can only ever credit a code once every one of its own fields
+    is confirmed."""
     grube = _load_grube_codes()
     uploaded = _load_uploaded_externalcodes()
     new_codes = import_builder.new_externalcode_keys(grube, uploaded)
@@ -6356,59 +6367,30 @@ def _do_upload_externalcodes(dry):
                 for c in new_codes]
     if not new_codes:
         log.info("n8n externalcode: 0 new codes")
-        return {"ok": True, "count": 0, "products": [],
+        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": [],
                 **_externalcode_summary(uploaded, grube)}, 200
 
     rows = import_builder.externalcode_rows({c: grube[c] for c in new_codes}, CODE2PAIR)
     if not rows:
         log.warning("n8n externalcode: %d new codes but 0 import rows", len(new_codes))
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
                 **_externalcode_summary(uploaded, grube)}, 200
 
-    # externalcode_rows is 1:1 with codes (no product→variant indirection) and applies
-    # the same numeric guard, so every new code that survived new_externalcode_keys has
-    # exactly one row — written_codes == set(new_codes).
-    written_codes = {r[0] for r in rows}
+    if dry:
+        log.info("n8n externalcode: dry run — %d rows would be queued, nothing written",
+                 len(rows))
+        return {"ok": True, "queued": 0, "count": 0, "dry_run": True, "products": products,
+                **_externalcode_summary(uploaded, grube)}, 200
 
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n externalcode: another import already running")
-        return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n externalcode: %d codes, %d rows (chunks of %d), dry_run=%s",
-             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: chunked import (formula-injection guard applied per cell — belt-and-
-        # braces alongside the numeric itemId guard). FIRST failing chunk stops the
-        # batch; success_codes are the codes imported by a successful chunk (partial
-        # progress → resumable).
-        res = _import_rows_chunked(rows, import_builder.EXTERNALCODE_HEADER, dry,
-                                   prefix="import_externalcode_", csv_safe=True, timeout=900)
-        ok = res["ok"]
-        success = res["success_codes"]
-        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry:                          # record only codes that imported OK
-            uploaded = _record_uploaded(
-                _load_uploaded_externalcodes, _save_uploaded_externalcodes,
-                {c: str(grube[c].get("itemId", "")).strip() for c in uploaded_codes})
-    finally:
-        _import_lock.release()
-
-    err_msg = ""
-    if not ok:
-        err_msg = _chunk_error_msg(res, len(rows))
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
-              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
-              **_externalcode_summary(uploaded, grube)}
-    log.info("n8n externalcode: rc=%s chunks=%d/%d processed=%s codes=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
-    if not ok:
-        log.error("n8n externalcode FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    queued = queue_shoptet_fields(
+        "grube_externalcode", ";".join(import_builder.EXTERNALCODE_HEADER), rows,
+        credit_group={r[0]: r[0] for r in rows},
+        credit_value={r[0]: r[2] for r in rows})
+    result = {"ok": True, "queued": queued, "count": queued, "dry_run": dry,
+              "products": products, **_externalcode_summary(uploaded, grube)}
+    log.info("n8n externalcode: queued %d field(s) for %d code(s)", queued, len(rows))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-externalcode", methods=["POST"])
@@ -6467,18 +6449,26 @@ def _variant_link_summary(uploaded, vlinks, split_codes):
 def _do_upload_variant_links(dry):
     """Core of the nightly per-size split-link write-back (#192) — the SINGLE place
     the logic lives (NEkopíruj logiku). Reads the durable variant_links.json store +
-    the live split decisions, builds code;pairCode;internalNote rows for only the split
+    the live split decisions, builds code;pairCode;internalNote rows for the split
     variants not yet uploaded (or whose URL changed) via import_builder.link_rows (the
     SAME row builder the manual zip uses — GRUBE .de normalization + per-variant
-    skip-empty included), runs the careful chunked import, records what went up, and
-    returns (result, status). Shared by the n8n HTTP endpoint (below) and the in-app
-    „Veľkostné linky → eshop" automation (#192) — no auth / Flask request access here.
-    Touches ONLY the `internalNote` column (LINK_HEADER → a present-but-empty cell
-    can't wipe state/prices; and a variant with no stored link is skipped by link_rows,
-    never an empty cell that would WIPE the existing link). A non-http(s) URL is dropped
-    in new_variant_link_keys (fail-safe — never reaches the live eshop). Only `split`
-    decisions are passed to link_rows, so good/manual links (already pushed by
-    „Párovania → eshop") are never re-written here."""
+    skip-empty included), and QUEUES them into the shared pending_shoptet table for the
+    next hourly „Sync do Shoptetu" drain (#299 Task 8) — it never imports directly
+    (`_import_rows_chunked` is never called here) and never writes
+    uploaded_variant_links.json itself; that credit is written only by
+    `_credit_producer` once the hourly cycle's OWN import actually confirms the row
+    (same #257-class reasoning as `_do_upload_externalcodes` above; carried over from
+    Task 6/7, not in this task's original brief). Shared by the n8n HTTP endpoint
+    (below) and the in-app „Veľkostné linky → eshop" automation (#192) — no auth /
+    Flask request access here. Touches ONLY the `internalNote` column (LINK_HEADER →
+    a present-but-empty cell can't wipe state/prices; and a variant with no stored
+    link is skipped by link_rows, never an empty cell that would WIPE the existing
+    link). A non-http(s) URL is dropped in new_variant_link_keys (fail-safe — never
+    reaches the live eshop). Only `split` decisions are passed to link_rows, so
+    good/manual links (already pushed by „Párovania → eshop") are never re-written
+    here. `dry=True` builds the same candidate rows but queues nothing. `credit_group`/
+    `credit_value` are keyed by the variant code itself (1:1, no cross-code grouping
+    needed here, unlike the pairing-decision credit groups Task 10 will add)."""
     vlinks = _load_variant_links()
     uploaded = _load_uploaded_variant_links()
     dec = _load_decisions()
@@ -6490,7 +6480,7 @@ def _do_upload_variant_links(dry):
     products = [{"code": c, "url": (vlinks.get(c) or "").strip()} for c in new_codes]
     if not new_codes:
         log.info("n8n variant-links: 0 new split links")
-        return {"ok": True, "count": 0, "products": [],
+        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": [],
                 **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
     # Build rows via link_rows (the manual-zip builder). Passing ONLY split_dec keeps
@@ -6501,7 +6491,7 @@ def _do_upload_variant_links(dry):
                                     {c: vlinks[c] for c in new_codes})
     if not rows:
         log.warning("n8n variant-links: %d new codes but 0 import rows", len(new_codes))
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
                 **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
@@ -6515,45 +6505,22 @@ def _do_upload_variant_links(dry):
         log.warning("n8n variant-links: %d of %d codes generated no row (deduped): %s",
                     len(blocked), len(new_codes), blocked[:10])
 
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n variant-links: another import already running")
-        return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n variant-links: %d codes, %d rows (chunks of %d), dry_run=%s",
-             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: chunked import. csv_safe per cell (belt-and-braces — the URL is already
-        # http(s)-guarded so the '-prefix never actually fires, but the nightly sink
-        # must not be weaker than the manual zip). FIRST failing chunk stops the batch;
-        # success_codes are the codes imported by a successful chunk (partial → resumable).
-        res = _import_rows_chunked(rows, import_builder.LINK_HEADER, dry,
-                                   prefix="import_variant_links_", csv_safe=True, timeout=900)
-        ok = res["ok"]
-        success = res["success_codes"]
-        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry:                          # record only codes that imported OK
-            uploaded = _record_uploaded(
-                _load_uploaded_variant_links, _save_uploaded_variant_links,
-                {c: (vlinks[c] or "").strip() for c in uploaded_codes})
-    finally:
-        _import_lock.release()
+    if dry:
+        log.info("n8n variant-links: dry run — %d rows would be queued, nothing written",
+                 len(rows))
+        return {"ok": True, "queued": 0, "count": 0, "dry_run": True, "products": products,
+                "blocked": len(blocked),
+                **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
-    err_msg = ""
-    if not ok:
-        err_msg = _chunk_error_msg(res, len(rows))
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
-              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
-              "blocked": len(blocked),
+    queued = queue_shoptet_fields(
+        "split_links", ";".join(import_builder.LINK_HEADER), rows,
+        credit_group={r[0]: r[0] for r in rows},
+        credit_value={r[0]: r[2] for r in rows})
+    result = {"ok": True, "queued": queued, "count": queued, "dry_run": dry,
+              "products": products, "blocked": len(blocked),
               **_variant_link_summary(uploaded, vlinks, split_codes)}
-    log.info("n8n variant-links: rc=%s chunks=%d/%d processed=%s codes=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
-    if not ok:
-        log.error("n8n variant-links FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    log.info("n8n variant-links: queued %d field(s) for %d code(s)", queued, len(rows))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-variant-links", methods=["POST"])
@@ -7199,12 +7166,15 @@ def run_shoptet_sync() -> dict:
 CYCLE_PRODUCERS = ("parovania_eshop", "grube_externalcode", "split_links",
                    "restock_skladom", "stock_skladom")
 # #299 review I2 — producers already switched from their OLD direct-to-eshop
-# import onto `queue_shoptet_fields` (Tasks 8-10 add one each here, in the SAME
-# commit that switches it). Until a producer is in here the cycle must NEVER
-# run it: today ALL of CYCLE_PRODUCERS still write straight to the live eshop,
-# so running them hourly would turn a 1x/day automation into 24x/day writes to
-# forestshop.sk the moment a manager clicks ▶ Štart on "Sync do Shoptetu".
-QUEUE_MIGRATED: tuple[str, ...] = ()
+# import onto `queue_shoptet_fields` (Tasks 8-10 add one here per producer, in the
+# SAME commit that switches it). Until a producer is in here the cycle must NEVER
+# run it: a producer NOT yet in this tuple still writes straight to the live eshop
+# on its OWN daily schedule, so running it hourly TOO would turn a 1x/day
+# automation into 24x/day writes to forestshop.sk the moment a manager clicks
+# ▶ Štart on "Sync do Shoptetu". Task 8 (#299) moved grube_externalcode and
+# split_links onto the queue — both start DISABLED (#93 contract), so this is
+# zero live-write risk until a manager opts either one in.
+QUEUE_MIGRATED: tuple[str, ...] = ("grube_externalcode", "split_links")
 SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 # #299 review N3 — shoptet_sync and shoptet_upload share the SAME 60-minute
 # schedule, so their scheduler ticks synchronize: without this, the cycle's own
@@ -7406,7 +7376,9 @@ def run_shoptet_upload() -> dict:
 
 def _credit_producer(store: str, entries: dict) -> None:
     """Write a producer's uploaded-state for groups the import confirmed."""
-    path = {"parovania_eshop": PAIRINGS_STATE}.get(store)
+    path = {"parovania_eshop": PAIRINGS_STATE,
+            "grube_externalcode": EXTERNALCODES_STATE,
+            "split_links": VARIANT_LINKS_STATE}.get(store)
     if path is None:
         log.warning("outbox: neznámy kredit store %s (%d skupín)", store, len(entries))
         return

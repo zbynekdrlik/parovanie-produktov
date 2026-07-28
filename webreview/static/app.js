@@ -4394,10 +4394,11 @@ function renderShoptetUpload() {
     st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(lr.error)));
   }
 
-  // #299 review decision 4 — QUEUE_MIGRATED is empty today (no producer queues
-  // yet), so this table is legitimately empty on a healthy install; the text
-  // below states only what IS true today, never that something is already
-  // collecting.
+  // #299 review decision 4 — the two Task 8 producers (grube_externalcode,
+  // split_links) both start DISABLED (#93 contract), so this table is still
+  // legitimately empty on a healthy install until a manager opts one in; the
+  // text below states only what IS true today, never that something is
+  // already collecting.
   const P = PENDING_SHOPTET || { pending: [], blocked: [] };
   const cnt = el('div', 'pendcount', '');
   cnt.dataset.testid = 'pending-count';
