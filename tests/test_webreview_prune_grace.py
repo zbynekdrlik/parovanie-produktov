@@ -46,6 +46,7 @@ def _post_json(url, body):
     assert r.status_code == 200, (url, r.status_code, r.get_data(as_text=True))
     return r.get_json()
 
+
 _KEY = "99002002|B1"          # the key under test, one order, one line
 _OTHER = "99002001|A1"        # an order that stays open — never touched
 
@@ -360,7 +361,7 @@ def test_a_record_ON_the_order_day_is_still_a_valid_record(stores):
 #     deletes it the same hour.
 
 @pytest.mark.parametrize("mark", [
-    ("_write_status_flag", lambda k: webapp._write_status_flag("waiting_items.json", k, True)),
+    ("_write_status_flag", lambda k: webapp._write_status_flag("waiting", k, True)),
     ("api_ordered", lambda k: _post_json("/api/ordered", {"key": k, "ordered": True})),
     ("api_ordered_bulk", lambda k: _post_json("/api/ordered/bulk",
                                               {"keys": [k], "ordered": True})),
@@ -390,7 +391,7 @@ def test_turning_a_flag_OFF_leaves_the_record_alone(stores):
     line, which is no reason to hand the order another 30 days."""
     _seed_grace(stores, {"99002002": _days_ago(20)})
 
-    webapp._write_status_flag("waiting_items.json", _KEY, False)
+    webapp._write_status_flag("waiting", _KEY, False)
 
     assert _grace(stores) == {"99002002": _days_ago(20)}, _grace(stores)
 
@@ -398,6 +399,6 @@ def test_turning_a_flag_OFF_leaves_the_record_alone(stores):
 def test_marking_an_order_with_NO_record_writes_nothing(stores):
     """store-prune §3 — nothing to remove means no write at all, not an empty file
     created on every single click."""
-    webapp._write_status_flag("waiting_items.json", "99009001|NEW", True)
+    webapp._write_status_flag("waiting", "99009001|NEW", True)
 
     assert not stores["orders_closed_seen.json"].exists()

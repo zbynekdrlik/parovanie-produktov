@@ -1818,6 +1818,11 @@ def _write_status_flag(field: str, key: str, on: bool) -> tuple:
         for name in [field] + [n for n in _STATUS_AXIS if n != field]:
             if name in dirty:
                 stores[name][1](loaded[name])
+        # A mark turned ON is NEW work on that order, so its closure record no longer
+        # describes anything the manager has seen — it goes, and the order earns a full
+        # grace from the next sync that still finds it closed (PR #295 review, A2).
+        if on:
+            _clear_closed_seen([key])
         flags = {"ordered": bool(_load_ordered().get(key))}
         flags.update({name: bool(d.get(key)) for name, d in loaded.items()})
         # …inside the SAME lock as the saves above, so the number really does order this
@@ -2096,11 +2101,17 @@ ORDERS_PRUNE_MIN_ORDER_AGE_DAYS = 30
 # corrupt store fail-CLOSED by construction: it degrades to „we do not know when anything
 # closed", everything is re-recorded as closed today, and that run deletes nothing.
 #
-# It holds NO work of the manager's — it is our own observation log, and losing it can only
+# It holds NO work of the manager's — it is our own observation log, and LOSING it can only
 # DELAY a deletion, never cause one. Hence `protect=False` (a legitimate „the last records
 # went with the last keys" write would otherwise raise `StoreWipeRefused` every hour and
 # take the prune's own bookkeeping down with it) and no place in `backup_data.sh`, which is
 # for stores whose loss costs work nobody can redo.
+#
+# That argument covers LOSS only, and the PR #295 review was right to say so: a record that
+# is WRONG — a day in the past, from a clock stepped back or a hand edit — would cause a
+# deletion, because it reads as a grace already served. Losing this store is therefore
+# still free, but TRUSTING it is not: `_prune_due` refuses a record that predates its own
+# order, which is the one thing a real observation can never do.
 ORDERS_CLOSED_SEEN = _store("orders_closed_seen.json")
 
 # How long a key survives after we first see its order closed. Same 30 days as the order-age
@@ -2254,6 +2265,79 @@ def _grace_elapsed(first_closed) -> bool:
         >= ORDERS_PRUNE_REOPEN_GRACE_DAYS
 
 
+def _closed_seen_day(first_closed, day):
+    """The USABLE „first seen closed on this day" record for an order placed on `day`, or
+    `None` when there is none we may act on (PR #295 review, A1).
+
+    A record can never predate the order itself — we cannot have seen an order closed
+    before it was placed. Such a record is corrupt: a clock stepped back (an NTP
+    correction, a VM restored from a snapshot), or a hand edit. And a corrupt record is
+    „no record", i.e. a refusal, because the alternative is the whole grace evaporating on
+    the very next HEALTHY run — the record reads as long aged, and the order-age floor
+    cannot help, since the order genuinely IS old.
+
+    This is also what keeps `ORDERS_CLOSED_SEEN`'s own justification honest. „Losing this
+    store can only DELAY a deletion" is true of a LOST store and false of a WRONG one; the
+    two callers together restore it — the prune refuses on a contradictory record, and the
+    run REPLACES it with today, so the grace starts over instead of the order becoming
+    unprunable for ever.
+
+    An order date we cannot read leaves the record alone: it is not evidence against it,
+    and `_prune_due` already refuses on an unknown age."""
+    if not isinstance(first_closed, str):
+        return None
+    try:
+        seen = date.fromisoformat(first_closed.strip())
+    except (TypeError, ValueError):
+        return None
+    try:
+        placed = date.fromisoformat((day or "").strip()[:10])
+    except (TypeError, ValueError):
+        return first_closed
+    return None if seen < placed else first_closed
+
+
+def _clear_closed_seen(keys) -> None:
+    """Drop the closure record of every ORDER a per-line mark was just turned ON for, so
+    the mark earns a FULL grace of its own (PR #295 review, A2).
+
+    The grace is kept per ORDER, and the record is written only when there is none — so a
+    mark made AFTER the record exists inherits whatever is left of that order's clock,
+    which can be nothing at all. It needs no clock games to reach: the order closed 30 days
+    ago, was reopened and re-closed between two hourly runs (invisible to the reopen-pop),
+    or the manager simply still had the tab open on a stale row. He marks a NEW line today
+    and the next sync deletes it the same hour — the exact „he orders the line a second
+    time" harm the grace exists to prevent.
+
+    Dropping the record instead of re-keying the store per ITEM is the cheaper trade: the
+    order then earns a full grace from the next sync that still sees it closed, and the
+    store keeps its one-row-per-order shape and its bounded growth.
+
+    MUST be called inside the caller's `with _lock:` — it does not take the lock itself, so
+    it is the legitimate tail of the same read-modify-write that saved the flag. Turning a
+    flag OFF is not new work and must NOT reset anybody's clock. Nothing to remove means no
+    write at all (store-prune §3), and a failure here is HOUSEKEEPING: the manager's click
+    has already landed and must not 500 because our own bookkeeping could not be updated."""
+    codes = {k.split("|", 1)[0].strip() for k in keys
+             if isinstance(k, str) and "|" in k}
+    codes.discard("")
+    if not codes:
+        return
+    try:
+        d = _read_json_store(ORDERS_CLOSED_SEEN, {})
+        gone = sorted(c for c in codes if c in d)
+        if not gone:
+            return
+        for c in gone:
+            d.pop(c, None)
+        _atomic_write_json(ORDERS_CLOSED_SEEN, d, protect=False)
+        log.info("odklad pred mazaním: nová značka na objednávkach %s — ich záznam o "
+                 "zatvorení sa ruší, odklad začne odznova", ", ".join(gone))
+    except (StoreLockTimeout, StoreWipeRefused, OSError, ValueError) as e:  # noqa: BLE001
+        log.error("odklad pred mazaním: záznam o zatvorení sa nepodarilo zrušiť (%r) — "
+                  "značka je uložená, ale môže sa zmazať skôr, než by mala", e)
+
+
 def _prune_due(day, first_closed) -> bool:
     """May this order's per-line marks go, for an order the export still CARRIES? (#294)
 
@@ -2269,11 +2353,14 @@ def _prune_due(day, first_closed) -> bool:
 
     „No record" is therefore also a refusal, and it is not a hole: the caller writes the
     record for every FLAGGED finished order before it asks, so an order with marks always
-    has one by the time this runs."""
+    has one by the time this runs.
+
+    …and a record that CONTRADICTS the order is no record either — see
+    `_closed_seen_day`."""
     age = _order_age_days(day)
     if age is None or age < ORDERS_PRUNE_MIN_ORDER_AGE_DAYS:
         return False
-    return _grace_elapsed(first_closed)
+    return _grace_elapsed(_closed_seen_day(first_closed, day))
 
 
 def _prune_orphan_line_flags(orders_csv) -> dict:
@@ -2379,7 +2466,10 @@ def _prune_orphan_line_flags(orders_csv) -> dict:
         # It is also what makes a lost store fail-CLOSED: nothing read → everything recorded
         # today → nothing deleted this run.
         for code in sorted(flagged & finished):
-            if not isinstance(closed_seen.get(code), str):
+            # „no usable record" also covers one that CONTRADICTS its order (PR #295
+            # review): replacing it here is what stops a clock-skewed value from either
+            # deleting with no grace or, once the prune refuses it, sitting there for ever.
+            if _closed_seen_day(closed_seen.get(code), dates.get(code)) is None:
                 closed_seen[code] = today
         # A REOPEN drops the record, so the grace runs again from the SECOND closure — on
         # POSITIVE evidence only (the order is in the export and is not finished). An order
@@ -3503,6 +3593,8 @@ def api_ordered():
         else:
             d.pop(key, None)
         _save_ordered(d)
+        if ordered:                   # PR #295 review A2 — a new mark earns its own grace
+            _clear_closed_seen([key])
         # axis A: „objednané" clears nothing — it says we placed the order, not what the
         # line's status is. It still answers with the resulting state of all four flags,
         # so the client has ONE shape to mirror (#211). Snapshot INSIDE the same lock, or
@@ -3536,6 +3628,8 @@ def api_ordered_bulk():
             else:
                 d.pop(key, None)
         _save_ordered(d)
+        if ordered:                   # PR #295 review A2 — a new mark earns its own grace
+            _clear_closed_seen(keys)
         commit_seq = _next_commit_seq()          # #291 — inside the same lock as the save
     log.info("ordered bulk n=%d ordered=%s", len(keys), ordered)
     return jsonify({"ok": True, "count": len(keys), "commitSeq": commit_seq})
