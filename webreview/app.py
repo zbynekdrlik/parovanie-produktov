@@ -6367,28 +6367,35 @@ def _do_upload_externalcodes(dry):
                 for c in new_codes]
     if not new_codes:
         log.info("n8n externalcode: 0 new codes")
-        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": [],
-                **_externalcode_summary(uploaded, grube)}, 200
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": [], **_externalcode_summary(uploaded, grube)}, 200
 
     rows = import_builder.externalcode_rows({c: grube[c] for c in new_codes}, CODE2PAIR)
     if not rows:
         log.warning("n8n externalcode: %d new codes but 0 import rows", len(new_codes))
-        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": products,
-                "message": "no import rows", "blocked": len(new_codes),
-                **_externalcode_summary(uploaded, grube)}, 200
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": products, "message": "no import rows",
+                "blocked": len(new_codes), **_externalcode_summary(uploaded, grube)}, 200
 
     if dry:
+        # #299 review m3 — dry_run used to reach a real Shoptet dry-run import that
+        # genuinely validated the payload; post-migration there is no import left
+        # to dry-run (the producer only queues). `would_queue` restores the
+        # security-check's actual purpose — "what would this run send" — as a
+        # true preview of `len(rows)` candidate field values, while queueing
+        # nothing (no queue_shoptet_fields call on this branch at all).
         log.info("n8n externalcode: dry run — %d rows would be queued, nothing written",
                  len(rows))
-        return {"ok": True, "queued": 0, "count": 0, "dry_run": True, "products": products,
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(rows),
+                "dry_run": True, "products": products,
                 **_externalcode_summary(uploaded, grube)}, 200
 
     queued = queue_shoptet_fields(
         "grube_externalcode", ";".join(import_builder.EXTERNALCODE_HEADER), rows,
         credit_group={r[0]: r[0] for r in rows},
         credit_value={r[0]: r[2] for r in rows})
-    result = {"ok": True, "queued": queued, "count": queued, "dry_run": dry,
-              "products": products, **_externalcode_summary(uploaded, grube)}
+    result = {"ok": True, "queued": queued, "count": queued, "would_queue": queued,
+              "dry_run": dry, "products": products, **_externalcode_summary(uploaded, grube)}
     log.info("n8n externalcode: queued %d field(s) for %d code(s)", queued, len(rows))
     return result, 200
 
@@ -6480,8 +6487,8 @@ def _do_upload_variant_links(dry):
     products = [{"code": c, "url": (vlinks.get(c) or "").strip()} for c in new_codes]
     if not new_codes:
         log.info("n8n variant-links: 0 new split links")
-        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": [],
-                **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": [], **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
     # Build rows via link_rows (the manual-zip builder). Passing ONLY split_dec keeps
     # good/manual links out (they go via _do_upload_pairings); passing ONLY the new
@@ -6491,8 +6498,9 @@ def _do_upload_variant_links(dry):
                                     {c: vlinks[c] for c in new_codes})
     if not rows:
         log.warning("n8n variant-links: %d new codes but 0 import rows", len(new_codes))
-        return {"ok": True, "queued": 0, "count": 0, "dry_run": dry, "products": products,
-                "message": "no import rows", "blocked": len(new_codes),
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": products, "message": "no import rows",
+                "blocked": len(new_codes),
                 **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
     # A new code can miss a row: link_rows dedups per variant code (first-wins across
@@ -6506,18 +6514,29 @@ def _do_upload_variant_links(dry):
                     len(blocked), len(new_codes), blocked[:10])
 
     if dry:
+        # #299 review m3 — same reasoning as _do_upload_externalcodes' dry branch:
+        # no import is left to dry-run post-migration, so `would_queue` (a true
+        # preview of `len(rows)` candidate field values) restores the security
+        # check's actual purpose without queueing anything on this branch.
         log.info("n8n variant-links: dry run — %d rows would be queued, nothing written",
                  len(rows))
-        return {"ok": True, "queued": 0, "count": 0, "dry_run": True, "products": products,
-                "blocked": len(blocked),
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(rows),
+                "dry_run": True, "products": products, "blocked": len(blocked),
                 **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
     queued = queue_shoptet_fields(
         "split_links", ";".join(import_builder.LINK_HEADER), rows,
         credit_group={r[0]: r[0] for r in rows},
-        credit_value={r[0]: r[2] for r in rows})
-    result = {"ok": True, "queued": queued, "count": queued, "dry_run": dry,
-              "products": products, "blocked": len(blocked),
+        # #299 review C1 — the credit MUST be the RAW variant_links.json value
+        # new_variant_link_keys compares against (never `r[2]`, the row's eshop
+        # cell value): for GRUBE that cell is the NORMALIZED .de URL
+        # (import_builder.to_grube_de via link_rows), a DIFFERENT string than the
+        # raw stored link. Crediting the normalized value meant the incremental
+        # check could never match, so the same GRUBE split link requeued to the
+        # live eshop every hour, forever, with total_uploaded stuck at 0.
+        credit_value={r[0]: (vlinks.get(r[0]) or "").strip() for r in rows})
+    result = {"ok": True, "queued": queued, "count": queued, "would_queue": queued,
+              "dry_run": dry, "products": products, "blocked": len(blocked),
               **_variant_link_summary(uploaded, vlinks, split_codes)}
     log.info("n8n variant-links: queued %d field(s) for %d code(s)", queued, len(rows))
     return result, 200
@@ -7483,30 +7502,37 @@ def run_parovania_eshop() -> dict:
 def run_grube_externalcode() -> dict:
     """Nightly push (daily 03:30) of the GRUBE per-size externalCodes (grube itemId
     → the eshop `externalCode` field) — the in-app cron follow-up (#62) to the MVP
-    manual zip. Reuses the SAME careful chunked import path as the n8n endpoint
-    (_do_upload_externalcodes — no Shoptet logic reimplemented). The write stays
-    IDEMPOTENT: an already-uploaded itemId is skipped via uploaded_externalcodes.json,
-    so a re-run never re-pushes an unchanged itemId; only a NEW code or a CHANGED
-    itemId goes up. A step that completes with ok:false (import failed) or blocked is
-    surfaced in the returned `status` without crashing the run; a genuine exception
-    propagates to the runner (records last_status='error', keeps the app alive).
+    manual zip. Since #299 Task 8 this does NOT import directly: it calls
+    `_do_upload_externalcodes` — the SAME core the n8n endpoint uses — which only
+    QUEUES the candidate rows into the shared pending_shoptet table; the actual
+    upload to Shoptet, and the "nahraté" write to uploaded_externalcodes.json, are
+    the hourly „Sync do Shoptetu" drain's job (`run_shoptet_upload`), not this
+    function's. The write stays IDEMPOTENT: an itemId the drain has already
+    CONFIRMED is skipped (`new_externalcode_keys` reads uploaded_externalcodes.json,
+    which only `_credit_producer` writes, only after Shoptet confirms), so a re-run
+    never re-queues an unchanged itemId; only a NEW code or a CHANGED itemId goes
+    up.
+
+    `_do_upload_externalcodes` cannot itself return a failed queueing outcome (#299
+    review I1 — it always queues successfully or reports 0 candidates); the only
+    way THIS step can fail is `queue_shoptet_fields` refusing to write on top of an
+    unreadable pending table (`StoreWipeRefused`) or another genuine exception —
+    that propagates straight to the runner, which records last_status='error' and
+    keeps the app alive. `blocked` (a numeric-itemId code that produced no import
+    row) is the only other-than-`ok` status this step itself can report.
 
     Reads ONLY the durable grube_codes.json store (built by scripts/build_grube_codes.py)
-    — never modifies it; its own progress lives in uploaded_externalcodes.json.
+    — never modifies it; the WRITE-BACK progress this automation contributes to
+    lives in pending_shoptet.json → uploaded_externalcodes.json, both owned by the
+    hourly drain, not by this function.
 
     SEPARATE from „Párovania → eshop": that automation is ALREADY enabled on prod, and
     externalCode is a distinct write field — folding it in would auto-activate on the
     live eshop, breaking the #93 default-disabled-for-new-live-write contract. This one
     starts DISABLED on its own."""
     ext, _es = _do_upload_externalcodes(dry=False)
-    e_ok = bool(ext.get("ok"))
     blocked = int(ext.get("blocked") or 0)
-    if not e_ok:
-        status = "failed"          # an import (or lock/timeout) failed → red row
-    elif blocked:
-        status = "blocked"         # numeric-itemId codes that produced no row → orange
-    else:
-        status = "ok"
+    status = "blocked" if blocked else "ok"   # numeric-itemId codes with no row → orange
     result = {
         "status": status,
         "externalcodes": {
@@ -7515,8 +7541,6 @@ def run_grube_externalcode() -> dict:
             "total_codes": ext.get("total_codes", 0),
             "remaining": ext.get("remaining", 0),
             "blocked": blocked,
-            "ok": e_ok,
-            "error": ext.get("error", ""),
         },
         "review_url": PUBLIC_URL,
     }
@@ -7528,17 +7552,29 @@ def run_grube_externalcode() -> dict:
 def run_split_links() -> dict:
     """Nightly push (daily 03:45) of the per-size SPLIT links (#174 „✂ Rozdeliť na
     veľkosti") to the eshop `internalNote` field, per variant — the in-app cron
-    follow-up (#192) to the MVP manual zip. Reuses the SAME careful chunked import path
-    + row builder as the n8n endpoint (_do_upload_variant_links → link_rows — no Shoptet
-    logic reimplemented). The write stays IDEMPOTENT: an already-uploaded URL is skipped
-    via uploaded_variant_links.json, so a re-run never re-pushes an unchanged link; only
-    a NEW split variant or a CHANGED URL goes up. A step that completes with ok:false
-    (import failed) or blocked is surfaced in the returned `status` without crashing the
-    run; a genuine exception propagates to the runner (records last_status='error',
-    keeps the app alive).
+    follow-up (#192) to the MVP manual zip. Since #299 Task 8 this does NOT import
+    directly: it calls `_do_upload_variant_links` — the SAME core the n8n endpoint
+    uses (→ link_rows for the rows — no Shoptet logic reimplemented) — which only
+    QUEUES the candidate rows into the shared pending_shoptet table; the actual
+    upload to Shoptet, and the "nahraté" write to uploaded_variant_links.json, are
+    the hourly „Sync do Shoptetu" drain's job (`run_shoptet_upload`), not this
+    function's. The write stays IDEMPOTENT: a link the drain has already CONFIRMED
+    is skipped (`new_variant_link_keys` reads uploaded_variant_links.json, which
+    only `_credit_producer` writes, only after Shoptet confirms), so a re-run never
+    re-queues an unchanged link; only a NEW split variant or a CHANGED URL goes up.
 
-    Reads ONLY the durable variant_links.json store + the live split decisions — never
-    modifies them; its own progress lives in uploaded_variant_links.json.
+    `_do_upload_variant_links` cannot itself return a failed queueing outcome (#299
+    review I1 — it always queues successfully or reports 0 candidates); the only
+    way THIS step can fail is `queue_shoptet_fields` refusing to write on top of an
+    unreadable pending table (`StoreWipeRefused`) or another genuine exception —
+    that propagates straight to the runner, which records last_status='error' and
+    keeps the app alive. `blocked` (a split variant whose row got deduped away by
+    link_rows) is the only other-than-`ok` status this step itself can report.
+
+    Reads ONLY the durable variant_links.json store + the live split decisions —
+    never modifies them; the WRITE-BACK progress this automation contributes to
+    lives in pending_shoptet.json → uploaded_variant_links.json, both owned by the
+    hourly drain, not by this function.
 
     SEPARATE from „Párovania → eshop" (which is already enabled on prod): a split link
     is a distinct write (internalNote per variant via link_rows, keyed per variant
@@ -7546,14 +7582,8 @@ def run_split_links() -> dict:
     the live eshop, breaking the #93 default-disabled-for-new-live-write contract. This
     one starts DISABLED on its own."""
     vl, _vs = _do_upload_variant_links(dry=False)
-    v_ok = bool(vl.get("ok"))
     blocked = int(vl.get("blocked") or 0)
-    if not v_ok:
-        status = "failed"          # an import (or lock/timeout) failed → red row
-    elif blocked:
-        status = "blocked"         # split codes that produced no row → orange
-    else:
-        status = "ok"
+    status = "blocked" if blocked else "ok"   # split codes with no row (deduped) → orange
     result = {
         "status": status,
         "variantlinks": {
@@ -7562,8 +7592,6 @@ def run_split_links() -> dict:
             "total_codes": vl.get("total_codes", 0),
             "remaining": vl.get("remaining", 0),
             "blocked": blocked,
-            "ok": v_ok,
-            "error": vl.get("error", ""),
         },
         "review_url": PUBLIC_URL,
     }
@@ -8789,26 +8817,39 @@ AUTOMATION_DESCRIPTIONS = {
         "review kartách. Zmaže pritom značky pri riadkoch tých objednávok, ktoré sú už "
         "vybavené a na tabe sa nedajú zobraziť — nič iné z tvojej práce nemení.",
     "shoptet_upload":
-        # #299 review I2: zapisovanie automatizácií do tabuľky čakajúcich zmien
-        # ešte len pribúda (Tasky 8-10, jedna za druhou) — dnes tabuľka zostáva
-        # prázdna a tento popis nesmie tvrdiť, že ju niekto napĺňa, kým to tak
-        # naozaj nie je.
+        # #299 review I1 — Task 8 migrated the first two producers (grube_
+        # externalcode, split_links) onto this table; Task 9/10 will move the
+        # rest. This description must say WHICH automations already write here
+        # today, not "nikto zatiaľ" — keep it in sync as each Task migrates one.
         "Každú hodinu stiahne čerstvý stav zo Shoptetu, jedným importom nahrá do "
         "eshopu všetko, čo je zapísané v tabuľke čakajúcich zmien, a potom stav "
         "stiahne znova. Nahraté označí až vtedy, keď to Shoptet potvrdí; čo eshop "
-        "v katalógu nemá, ostane čakať a je to tu vidieť. Automatizácie do tejto "
-        "tabuľky zatiaľ nezapisujú — prechádzajú na ňu postupne, jedna po druhej.",
+        "v katalógu nemá, ostane čakať a je to tu vidieť. Zatiaľ do nej zapisujú "
+        "„GRUBE kódy → eshop“ a „Veľkostné linky → eshop“ — ostatné automatizácie "
+        "zatiaľ nahrávajú do eshopu priamo samy a prechádzajú na túto tabuľku "
+        "postupne, jedna po druhej.",
     "parovania_eshop":
         "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
         "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
     "grube_externalcode":
-        "Denne o 3:30 nahrá do Shoptet eshopu kódy dodávateľa GRUBE pre jednotlivé "
-        "veľkosti (do poľa externalCode). Nahrá len nové alebo zmenené kódy — čo už "
-        "raz nahrala, znova neposiela.",
+        # #299 review I1 — since Task 8 this only ZARADÍ (queues) into the shared
+        # table; the hourly „Sync do Shoptetu“ automation does the actual upload
+        # up to an hour later. The description must say that, not imply an
+        # immediate 3:30 upload — a manager reading this needs BOTH automations
+        # enabled to see codes actually land in the eshop.
+        "Denne o 3:30 zaradí kódy dodávateľa GRUBE pre jednotlivé veľkosti (pole "
+        "externalCode) do spoločnej tabuľky čakajúcich zmien — do eshopu ich potom "
+        "nahrá hodinová automatizácia „Sync do Shoptetu“ (musí byť tiež zapnutá). "
+        "Zaradí len nové alebo zmenené kódy — čo je už v eshope potvrdené, znova "
+        "neposiela.",
     "split_links":
-        "Denne o 3:45 nahrá do Shoptet eshopu odkazy na jednotlivé veľkosti pri "
-        "produktoch rozdelených na veľkosti (do internej poznámky produktu). Nahrá "
-        "len nové alebo zmenené odkazy — čo už raz nahrala, znova neposiela.",
+        # #299 review I1 — same correction as grube_externalcode above: this
+        # queues, it does not upload.
+        "Denne o 3:45 zaradí odkazy na jednotlivé veľkosti pri produktoch "
+        "rozdelených na veľkosti (interná poznámka produktu) do spoločnej tabuľky "
+        "čakajúcich zmien — do eshopu ich potom nahrá hodinová automatizácia „Sync "
+        "do Shoptetu“ (musí byť tiež zapnutá). Zaradí len nové alebo zmenené "
+        "odkazy — čo je už v eshope potvrdené, znova neposiela.",
     "dodavatelsky_sklad":
         "Denne o 5:00 prejde weby dodávateľov (pri nejasnej dostupnosti pomôže AI) "
         "a zistí, čo majú skladom a za akú cenu.",

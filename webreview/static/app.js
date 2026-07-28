@@ -4901,13 +4901,15 @@ function renderGrubeExternalcode() {
     const box = el('div', 'autoresult ' + cls);
     box.appendChild(el('div', 'autoresult-head', label));
     box.appendChild(el('div', '',
-      `🏷️ GRUBE kódy: +${e.count ?? 0} nových`
+      // #299 review m1 — since Task 8 this producer only QUEUES field values into
+      // the shared table (the hourly „Sync do Shoptetu" drain does the actual
+      // upload + credit), so "nových" here means "candidates just queued this
+      // run", never "freshly uploaded" — that would-be-misleading claim belongs
+      // to `total_uploaded`/`total_codes` below, which stay genuinely credited.
+      `🏷️ GRUBE kódy: ${e.count ?? 0} zaradených do frontu`
       + (e.blocked ? ` · ${e.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${e.total_uploaded ?? 0} / ${e.total_codes ?? 0} nahraných`
       + ` · chýba ${e.remaining ?? 0}`));
-    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
-    // successful chunks ARE saved → the next run only retries the rest)
-    if (e.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(e.error)));
     st.appendChild(box);
   } else if (!a.last_run) {
     st.appendChild(el('div', 'muted',
@@ -4967,13 +4969,15 @@ function renderSplitLinks() {
     const box = el('div', 'autoresult ' + cls);
     box.appendChild(el('div', 'autoresult-head', label));
     box.appendChild(el('div', '',
-      `🔗 Veľkostné linky: +${e.count ?? 0} nových`
+      // #299 review m1 — since Task 8 this producer only QUEUES field values into
+      // the shared table (the hourly „Sync do Shoptetu" drain does the actual
+      // upload + credit), so "nových" here means "candidates just queued this
+      // run", never "freshly uploaded" — that would-be-misleading claim belongs
+      // to `total_uploaded`/`total_codes` below, which stay genuinely credited.
+      `🔗 Veľkostné linky: ${e.count ?? 0} zaradených do frontu`
       + (e.blocked ? ` · ${e.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${e.total_uploaded ?? 0} / ${e.total_codes ?? 0} nahraných`
       + ` · chýba ${e.remaining ?? 0}`));
-    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
-    // successful chunks ARE saved → the next run only retries the rest)
-    if (e.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(e.error)));
     st.appendChild(box);
   } else if (!a.last_run) {
     st.appendChild(el('div', 'muted',
