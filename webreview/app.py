@@ -7320,6 +7320,23 @@ SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
 # already makes for `not-in-catalog`): a human has to look at it.
 STALE_UNCONFIRMED_MIN_ATTEMPTS = 24
 
+# #299 záverečná recenzia I5 — a queued field only ever had an age gate at
+# QUEUEING time (each producer's own export-freshness check); nothing
+# re-checked it at SEND time. `restock_skladom`/`stock_skladom` have no dedup
+# and re-queue their whole candidate list DAILY, so a "switch to Skladom"
+# decision sitting in the table while this hourly cycle is disabled looks
+# freshly-queued every single day it re-runs (`queue_fields`'s own C2
+# discipline keeps `queued_at` at the FIRST time a value was queued, never
+# bumped by a re-queue of the SAME value) — right up until the cycle comes
+# back on and ships a week-old restock decision to the LIVE eshop, long after
+# the product may have sold out again. 24h matches `STALE_UNCONFIRMED_MIN_
+# ATTEMPTS`'s own reasoning: one full day is longer than any legitimate gap
+# between this hourly drain's own runs, so a healthy queue never trips it,
+# while a field this old was queued against a stock/price snapshot that is no
+# longer trustworthy. A field this catches is NEVER dropped — see
+# `shoptet_outbox.stale_fields`'s own docstring.
+QUEUED_FIELD_MAX_AGE_S = 24 * 3600
+
 # #299 Task 11 — the fixed list of automation keys that feed `pending_shoptet.json`
 # (Task 10's migration: every one of them only QUEUES now, see `run_shoptet_upload`'s
 # own docstring). Used by `_stale_producer_warnings`/`_disabled_producer_names`
@@ -7545,7 +7562,7 @@ def run_shoptet_upload() -> dict:
         if not got:
             return {"ok": False, "error": "cyklus už beží", "queued": 0, "sent": 0,
                     "confirmed": 0, "blocked": 0, "stale_blocked": [],
-                    "stuck_unconfirmed": [],
+                    "stuck_unconfirmed": [], "stale_fields_held": [],
                     "resynced": 0,
                     "skipped_second_sync": True, "unconfirmed": 0,
                     "degraded": False, "warnings": [],
@@ -7581,10 +7598,33 @@ def run_shoptet_upload() -> dict:
         # `shoptet_outbox.stale_unconfirmed`'s docstring for why.
         stuck = set(shoptet_outbox.stale_unconfirmed(
             pending, min_attempts=STALE_UNCONFIRMED_MIN_ATTEMPTS))
-        rows = [r for r in rows_all if r[0] not in absent and r[0] not in stuck]
+        # #299 záverečná recenzia I5 — a code carrying a field queued more than
+        # QUEUED_FIELD_MAX_AGE_S ago is held back from THIS send exactly like an
+        # absent/stuck one — WHOLE code, never just the one stale column. A
+        # PARTIAL exclusion (send the code's other, fresh fields; withhold only
+        # the stale column) was tried and rejected: `settle()` marks a
+        # CONFIRMED code `dirty` the moment ANY of its current fields is not in
+        # `sent_fields` — which a withheld-but-still-queued stale field always
+        # is — and a dirty code withholds credit for EVERY group it belongs to,
+        # including one whose confirmed field has nothing to do with the stale
+        # one. Excluding the whole code sidesteps that: an excluded code can
+        # never reach `success_codes`, so it never enters the dirty computation
+        # at all (that loop only ever runs `for code in success_codes`) and
+        # never poisons another code's credit. In practice every producer that
+        # queues here writes exactly ONE column per code, so this is not a
+        # meaningfully bigger hold than a genuinely per-field one would be.
+        # named `stale_field_map` (never `stale`) — `stale` below is already the
+        # UNRELATED `stale_blocked(settled)` result and the two must never collide.
+        stale_field_map = shoptet_outbox.stale_fields(
+            pending, datetime.now(timezone.utc), QUEUED_FIELD_MAX_AGE_S)
+        stale_codes = set(stale_field_map)
+        rows = [r for r in rows_all
+               if r[0] not in absent and r[0] not in stuck and r[0] not in stale_codes]
         blocked = {c: "not-in-catalog" for c in sorted(pending) if c in absent}
         blocked.update({c: "stuck-unconfirmed" for c in sorted(pending)
                         if c in stuck and c not in blocked})
+        blocked.update({c: "stale-field" for c in sorted(pending)
+                        if c in stale_codes and c not in blocked})
         # What THIS import is about to put on the wire, per code+column — the
         # snapshot `settle` compares against later, never `pending` itself (C1).
         cols = header.split(";")[len(shoptet_outbox.KEY_COLUMNS):]
@@ -7667,6 +7707,12 @@ def run_shoptet_upload() -> dict:
                       "behu sa neposielajú, aby nedržali ostatné riadky v tej "
                       "istej dávke: %s", len(stuck), STALE_UNCONFIRMED_MIN_ATTEMPTS,
                       sorted(stuck)[:10])
+        if stale_field_map:
+            log.error("sync do Shoptetu: %d kódov má pole staršie než %.0f h — "
+                      "tento beh ich neposiela (hodnota mohla medzitým zastarať): "
+                      "%s", len(stale_field_map), QUEUED_FIELD_MAX_AGE_S / 3600,
+                      ", ".join(f"{c}:{','.join(cols)}"
+                               for c, cols in sorted(stale_field_map.items())[:10]))
         # #299 záverečná recenzia I2 — a manager reading `error` could not tell
         # „Shoptet login/auth genuinely failed" from „the eshop just rejected a
         # couple of variants" from „a chunk timed out and we could not even read
@@ -7708,6 +7754,11 @@ def run_shoptet_upload() -> dict:
             warnings.append(
                 f"{len(stuck)} kódov je {STALE_UNCONFIRMED_MIN_ATTEMPTS}+ behov po sebe "
                 f"nepotvrdených — od tohto behu sa neposielajú, treba ich vyriešiť ručne.")
+        if stale_field_map:
+            warnings.append(
+                f"{len(stale_field_map)} kódov má pole staršie než "
+                f"{QUEUED_FIELD_MAX_AGE_S / 3600:.0f} h — tento beh ich neposiela, "
+                f"pôjdu, keď producent zaradí čerstvé rozhodnutie.")
         warnings.extend(_stale_producer_warnings())
         if skipped and sent:
             warnings.append("Druhé stiahnutie sa preskočilo, hoci sa niečo posielalo.")
@@ -7715,6 +7766,7 @@ def run_shoptet_upload() -> dict:
         return {"ok": ok, "queued": len(pending), "sent": sent,
                 "confirmed": confirmed, "blocked": len(blocked),
                 "stale_blocked": stale, "stuck_unconfirmed": sorted(stuck),
+                "stale_fields_held": sorted(stale_field_map),
                 "resynced": resynced, "skipped_second_sync": skipped,
                 "unconfirmed": unconfirmed, "error": error,
                 "degraded": degraded, "warnings": warnings,

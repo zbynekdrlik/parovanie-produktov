@@ -9,6 +9,8 @@ a single import out of the whole table, and only a CONFIRMED row is credited.
 Pure logic: no Flask, no filesystem, no clock. The caller supplies `now`.
 """
 
+from datetime import datetime, timezone
+
 KEY_COLUMNS = ("code", "pairCode")
 
 
@@ -271,3 +273,58 @@ def stale_blocked(pending, min_attempts=3):
     """
     return sorted(c for c, e in pending.items()
                   if (e.get("blocked") and int(e.get("blocked_runs") or 0) >= min_attempts))
+
+
+def stale_fields(pending, now, max_age_s):
+    """{code: [col, ...]} for every QUEUED field whose OWN `queued_at` is at
+    least `max_age_s` old, or whose `queued_at` cannot be trusted at all
+    (missing, unparsable, or in the FUTURE — a clock step / NTP jump / hand
+    edit). The caller excludes these from what it actually SENDS this cycle —
+    #299 záverečná recenzia I5.
+
+    Why this exists: only the moment a field is QUEUED had an age gate at all
+    (the producer's own export-freshness check) — nothing re-checks it at
+    SEND time. `restock_skladom`/`stock_skladom` have no dedup and re-queue
+    their whole candidate list every day, so while the hourly drain is
+    disabled a "switch to Skladom" decision sits in the table, re-queued
+    fresh-looking every single day (`queue_fields`'s own C2 discipline keeps
+    `queued_at` at the FIRST time a value was queued, not the most recent
+    re-queue of the SAME value) — and once the drain comes back on it would
+    ship a week-old restock decision straight to the live eshop, long after
+    the product may have sold out again. An unparsable timestamp proves
+    NEITHER freshness NOR staleness, so it is refused exactly like a
+    provably-old one — the same fail-closed direction the supplier
+    write-back already takes for an untrustworthy catalogue export.
+
+    A refused field is NEVER dropped from `pending` — the caller only leaves
+    it out of `rows`/`sent_fields` this cycle. The table itself, `attempts`,
+    and `queued_at` are untouched: the field goes right on waiting, and the
+    producer's OWN next run queues a fresh decision (fresh `queued_at`,
+    `queue_fields`' C2 discipline) that sends normally.
+
+    `now` is a `datetime` (aware or naive — naive is read as UTC, the same
+    convention `_queue_stale_while_disabled_warning` in webreview/app.py
+    already uses for the SAME `queued_at` field, so the two readers can never
+    disagree about what "now" means). Pure logic: the caller supplies `now`,
+    never a bare `datetime.now()` call inside this module."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    out = {}
+    for code, entry in pending.items():
+        stale_cols = []
+        for col, field in (entry.get("fields") or {}).items():
+            raw = field.get("queued_at") if isinstance(field, dict) else None
+            age_s = None
+            if raw:
+                try:
+                    dt = datetime.fromisoformat(raw)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age_s = (now - dt).total_seconds()
+                except (ValueError, TypeError):
+                    age_s = None
+            if age_s is None or age_s < 0 or age_s >= max_age_s:
+                stale_cols.append(col)
+        if stale_cols:
+            out[code] = sorted(stale_cols)
+    return out
