@@ -54,7 +54,14 @@ def queue_fields(pending, source, header, rows, credit_group=None,
         out[k] = entry
     queued = 0
     for r in rows:
-        if len(r) < len(cols):
+        # #299 záverečná recenzia — a row LONGER than the header used to be
+        # silently TRUNCATED here: `dict(zip(cols, r))` stops at the shorter of
+        # the two, so `[['A', 'P', 'u', 'EXTRA']]` against a 3-column header
+        # simply dropped 'EXTRA' with no error, no log line, nothing — the one
+        # place in this whole "no write may vanish silently" table where a
+        # value could disappear without a trace. Symmetric with the SHORTER
+        # case right below it: both directions raise now.
+        if len(r) != len(cols):
             raise ValueError(
                 f"row has {len(r)} cells but header {header!r} needs {len(cols)}")
         cells = dict(zip(cols, r))
