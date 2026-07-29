@@ -132,6 +132,17 @@ def test_a_row_shorter_than_the_header_is_refused_loudly():
                         rows=[["A", "P"]], now="T")
 
 
+def test_a_row_LONGER_than_the_header_is_refused_loudly_not_silently_truncated():
+    """The deferred minor from #299 záverečná recenzia: `dict(zip(cols, r))`
+    stops at the shorter of the two, so an EXTRA trailing cell used to vanish
+    with no error and no log line — the one place in this whole "no write may
+    disappear silently" table where a value could be lost without a trace."""
+    import pytest
+    with pytest.raises(ValueError):
+        ob.queue_fields({}, source="s", header="code;pairCode;internalNote",
+                        rows=[["A", "P", "u", "EXTRA"]], now="T")
+
+
 def test_queue_fields_leaves_the_caller_s_table_untouched():
     before = ob.queue_fields({}, source="s", header="code;pairCode;internalNote",
                              rows=[["A", "P", "u"]], now="T1")[0]
