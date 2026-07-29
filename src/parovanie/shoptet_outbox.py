@@ -68,6 +68,7 @@ def queue_fields(pending, source, header, rows, credit_group=None,
         code = (cells.get("code") or "").strip()
         if not code:
             raise ValueError(f"row without a code: {r!r}")
+        existed = code in out
         entry = dict(out.get(code) or {})
         entry.setdefault("pairCode", (cells.get("pairCode") or "").strip())
         entry.setdefault("blocked", None)
@@ -95,6 +96,20 @@ def queue_fields(pending, source, header, rows, credit_group=None,
                                     "value": (credit_value or {}).get(code, val)}
             fields[col] = field
             queued += 1
+        # #299 záverečná recenzia (Minor 5) — a row whose every cell is empty
+        # (all values stripped to "") queues NOTHING (`fields` stays whatever
+        # it was, empty for a brand-new code). Without this guard a genuinely
+        # new code would still get an entry created here — an empty shell
+        # ({"blocked": None, "attempts": 0, "fields": {}}) that then sits in
+        # the table FOREVER: `build_import` skips any code with empty
+        # `fields`, so it can never be sent, confirmed, or blocked either —
+        # nothing downstream ever removes it, while `attempts` grows on every
+        # future `settle()` run for a row that was never actually queueing
+        # anything. Only refuses to CREATE a new ghost; a code that already
+        # existed (real prior work, however it got there) keeps its entry
+        # unconditionally — this never deletes anything.
+        if not fields and not existed:
+            continue
         entry["fields"] = fields
         out[code] = entry
     return out, queued
