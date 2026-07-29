@@ -90,6 +90,43 @@ def test_pending_blocked_reason_sentence_declines_singular_vs_plural(
     assert out[3] == "2× majú pole staršie, než je povolený limit"
 
 
+# ── #299 hĺbková recenzia (7) — client half of the fallback pin (server half: ─
+# ── `test_stale_blocked_reason_sentence_missing_reason_falls_back_to_neznamy_dovod` /
+# ── `..._unknown_reason_falls_back_to_the_raw_string` in
+# ── tests/test_webreview_shoptet_upload.py). The fallback itself was already
+# ── correct — this only pins it, since neither side had a test before. ──────  #
+def test_pending_blocked_reason_sentence_fallback_for_missing_and_unknown_reason(
+        shoptet_upload_server, page):
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    out = page.evaluate("""() => [
+      pendingBlockedReasonSentence([{code: 'X', field: 'internalNote'}]),
+      pendingBlockedReasonSentence([
+        {code: 'Y', field: 'internalNote', reason: 'some-future-reason'}]),
+    ]""")
+
+    assert out[0] == "1× neznámy dôvod"
+    assert out[1] == "1× some-future-reason"
+
+
+# ── #299 hĺbková recenzia (8) — the comment above `PENDING_BLOCKED_REASON_TEXT`
+# ── (app.js) says its KEYS mirror `_STALE_BLOCKED_REASON_TEXT` (app.py); ───── #
+# ── nothing enforced that beyond eyeballing, so a THIRD reason added to only ── #
+# ── one side would silently drift. Pins the KEY SETS, never the Slovak TEXT — ─
+# ── the two maps deliberately carry DIFFERENT sentences (finding 5's ──────── #
+# ── declension needs vs. the server's own `stale_blocked` alarm sentence). ──  #
+def test_client_and_server_blocked_reason_maps_have_the_same_keys(
+        shoptet_upload_server, page):
+    from webreview import app as webapp
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+    client_keys = page.evaluate(
+        "() => Object.keys(PENDING_BLOCKED_REASON_TEXT).sort()")
+    server_keys = sorted(webapp._STALE_BLOCKED_REASON_TEXT)
+    assert client_keys == server_keys
+
+
 def test_the_console_stays_clean(shoptet_upload_server, page):
     msgs = []
     page.on("console", lambda m: msgs.append(m))
