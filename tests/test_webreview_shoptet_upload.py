@@ -535,6 +535,28 @@ def automations_iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp.RUNNER, "state_path", str(tmp_path / "automations.json"))
 
 
+# ── #299 hĺbková recenzia (1, Important) — the PRODUCTION constant that ────── #
+# ── actually deploys had, for the FOURTH time in this ticket, no test pinning ─
+# ── anything but a value DERIVED from itself: every one of the 6 tests below ─
+# ── that exercises this alarm builds its "past the threshold" instant as ───── #
+# ── `webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S + 60`, so a mutation of the ─── #
+# ── constant (3h -> 6h, 3h -> 12h) moves every one of those tests' own ─────── #
+# ── thresholds in lockstep and stays green — measured (see report) 129/129 ─── #
+# ── tests green under exactly those mutations. This test hard-codes the ───── #
+# ── expected literal number of seconds, independent of ─────────────────────── #
+# ── `QUEUE_STALE_WHILE_DISABLED_AFTER_S`'s own expression — same shape as the ─
+# ── sibling `test_queued_field_max_age_s_is_pinned_to_the_literal_24_hours` ── #
+# ── above, for the "manager forgot to flip the cycle on" alarm this ticket's ─
+# ── own #299 opravné kolo 3's playbook entry says a threshold test must NEVER ─
+# ── skip. ───────────────────────────────────────────────────────────────────  #
+def test_queue_stale_while_disabled_after_s_is_pinned_to_the_literal_3_hours():
+    assert webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S == 10800, (
+        "the deployed disabled-cycle alarm threshold must be exactly 3h — "
+        "10800 seconds, written here as a literal so a mutation of the "
+        "constant's OWN expression cannot silently move this test's "
+        "expectation along with it")
+
+
 def _queue_one_field(pend, queued_at):
     pend.write_text(json.dumps({"A": {"fields": {"internalNote": {
         "value": "u", "source": "parovania_eshop", "queued_at": queued_at}}}}),
@@ -1728,3 +1750,75 @@ def test_a_failed_credit_write_leaves_the_queue_UNTOUCHED_not_drained_and_uncred
         "a failed credit write must leave the code STILL queued, never "
         "drained ahead of a credit that never landed")
     assert pending["9/Z"]["fields"]["supplier"]["value"] == "BETALOV"
+
+
+# ── #299 hĺbková recenzia (4, Important) — before this fix, no BACKEND test ── #
+# ── ever pinned that `/api/pending-shoptet` carries the `reason` key on a ──── #
+# ── blocked field at all; the ONE e2e test that named a reason stubbed the ─── #
+# ── whole route, so nothing exercised the real endpoint. Were the server to ── #
+# ── stop sending `reason`, this is the test that would catch it directly, ─── #
+# ── independent of any browser render. ──────────────────────────────────────  #
+def test_api_pending_shoptet_carries_the_real_reason_per_blocked_field(pend):
+    pend.write_text(json.dumps({
+        "A": {"pairCode": "", "blocked": None, "attempts": 0,
+              "fields": {"internalNote": {
+                  "value": "u1", "source": "s",
+                  "queued_at": datetime.now(timezone.utc).isoformat()}}},
+        "B": {"pairCode": "",
+              "blocked": {"reason": "not-in-catalog", "since": "2026-01-01T00:00:00+00:00"},
+              "attempts": 1,
+              "fields": {"internalNote": {
+                  "value": "u2", "source": "s",
+                  "queued_at": datetime.now(timezone.utc).isoformat()}}},
+    }), encoding="utf-8")
+    with webapp.app.test_request_context():
+        j = webapp.api_pending_shoptet().get_json()
+    assert j["pending"] == [{
+        "code": "A", "field": "internalNote", "value": "u1", "source": "s",
+        "queued_at": j["pending"][0]["queued_at"],
+        "first_queued_at": "",
+    }]
+    assert len(j["blocked"]) == 1
+    assert j["blocked"][0]["code"] == "B"
+    assert j["blocked"][0]["reason"] == "not-in-catalog", (
+        "the endpoint must carry the REAL per-field reason — a server "
+        "regression that stopped sending it would still leave the field in "
+        "`blocked`, just without saying why")
+
+
+# ── #299 hĺbková recenzia (10) — the endpoint used to expose only `queued_at` ─
+# ── (the timestamp `queue_fields` REFRESHES on every re-queue of the same ──── #
+# ── value); a future "waiting since" render built on it would show a field a ─
+# ── producer keeps daily re-affirming as "fresh" even while it has genuinely ─
+# ── been waiting for days. `first_queued_at` (frozen at the FIRST queue of ─── #
+# ── the current value) is now exposed alongside it. ─────────────────────────  #
+def test_api_pending_shoptet_also_carries_first_queued_at(pend):
+    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
+                                [["A", "P", "https://x"]])
+    with webapp.app.test_request_context():
+        j = webapp.api_pending_shoptet().get_json()
+    (item,) = j["pending"]
+    assert item["first_queued_at"], (
+        "the endpoint must expose first_queued_at, not just the refreshed "
+        "queued_at, so a future render can pick the non-misleading one")
+    assert item["first_queued_at"] == item["queued_at"], (
+        "a genuinely NEW value gets `now` for BOTH timestamps — they only "
+        "diverge after a same-value re-queue")
+
+
+# ── #299 hĺbková recenzia (7) — the fallback for an unknown/missing `reason` ── #
+# ── (`or "neznámy dôvod"` and `_STALE_BLOCKED_REASON_TEXT.get(r, r)`) was ──── #
+# ── correct but pinned by NO test, server-side or client-side. This is the ── #
+# ── server half; the client half lives in `tests/e2e/test_shoptet_upload.py`. #
+def test_stale_blocked_reason_sentence_missing_reason_falls_back_to_neznamy_dovod():
+    settled = {"A": {"blocked": {}}}   # blocked, but no "reason" key at all
+    s = webapp._stale_blocked_reason_sentence(settled, ["A"])
+    assert s == "1× neznámy dôvod"
+
+
+def test_stale_blocked_reason_sentence_unknown_reason_falls_back_to_the_raw_string():
+    settled = {"A": {"blocked": {"reason": "some-future-reason"}}}
+    s = webapp._stale_blocked_reason_sentence(settled, ["A"])
+    assert s == "1× some-future-reason", (
+        "an unrecognised reason must show the RAW string, never be silently "
+        "relabelled as the catalogue reason")
