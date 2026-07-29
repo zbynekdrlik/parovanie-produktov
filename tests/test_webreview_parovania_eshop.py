@@ -555,6 +555,42 @@ def test_an_UNREADABLE_upload_record_stops_the_run_instead_of_deleting(iso, monk
     assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}
 
 
+# ── #299 opravné kolo 2 review N-C2 (Critical) — the SAME store-prune §1 ────── #
+# ── absence-is-not-evidence rule the block above enforces for ────────────────
+# ── uploaded_suppliers.json was missing for `pending_shoptet.json`: reading it
+# ── through `_load_pending` (plain `_read_json_store`) degrades a CORRUPT file
+# ── to `{}`, and `{}` reads as "nothing is currently queued for ANY code's
+# ── supplier field" — the exact false "nothing in flight" reading that lets
+# ── #215's removal delete the manager's live assignment while the row is
+# ── STILL sitting mid-flight in the (unreadable) queue. A MISSING file is
+# ── different: it is the normal, silent state of a store nothing has queued
+# ── into yet (`_queue_stale_while_disabled_warning` already treats a missing
+# ── pending_shoptet.json this same way, for this SAME file) — only a file
+# ── that genuinely IS there but cannot be trusted refuses the removal. ──────── #
+@pytest.mark.parametrize("why,prepare,removed", [
+    ("missing", lambda p: p.unlink(missing_ok=True), ["5/A"]),
+    ("corrupt", lambda p: p.write_text("{ this is not json", encoding="utf-8"), []),
+    ("wrong-type", lambda p: p.write_text('["A"]', encoding="utf-8"), []),
+])
+def test_a_pending_queue_we_could_not_READ_condemns_nothing(iso, monkeypatch, why,
+                                                            prepare, removed):
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGN"})
+    prepare(iso["tmp"] / "pending_shoptet.json")
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200, (why, result)
+    assert result["obsolete_removed"] == removed, (why, result)
+    if not removed:
+        assert result["obsolete_held"] == ["5/A"], (why, result)
+        assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}, why
+
+
 def test_a_record_that_is_GENUINELY_EMPTY_still_condemns(iso, monkeypatch):
     """The other side of the same coin — an on-disk `{}` is real evidence („nothing has
     ever been written back"), not a degraded read, so #215 still does its job."""
