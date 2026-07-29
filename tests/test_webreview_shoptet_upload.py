@@ -1679,3 +1679,33 @@ def test_a_confirmed_credit_for_parovania_eshop_suppliers_actually_writes_SUPPLI
     assert res["confirmed"] == 1
     d = json.loads(state.read_text(encoding="utf-8"))
     assert d["9/Z"] == "BETALOV"
+
+
+# ── #299 opravné kolo 2 review N-I2 (Important) — credit MUST land BEFORE ──── #
+# ── the queue is drained. Before this fix `_save_pending(settled, prev=fresh)` ─
+# ── ran FIRST and `_credit_producer(...)` ran second, outside the lock: a ──── #
+# ── failure in between (or the process dying right there) left a code gone ── #
+# ── from `pending_shoptet.json` (already drained) AND missing from ─────────── #
+# ── `uploaded_*.json` (credit never landed) — the exact "vanished from BOTH ── #
+# ── places at once" window neither arm of #215's anti-clobber guard (nor ──── #
+# ── N-C2's pending-queue guard above) can detect, since both read that shape ─
+# ── as "nobody ever wrote this". ─────────────────────────────────────────────  #
+def test_a_failed_credit_write_leaves_the_queue_UNTOUCHED_not_drained_and_uncredited(
+        cycle, monkeypatch):
+    webapp.queue_shoptet_fields(
+        "parovania_eshop_suppliers", "code;pairCode;supplier",
+        [["9/Z", "777", "BETALOV"]],
+        credit_group={"9/Z": "9/Z"}, credit_value={"9/Z": "BETALOV"})
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(webapp, "_credit_producer", boom)
+
+    with pytest.raises(OSError):
+        webapp.run_shoptet_upload()
+
+    pending = webapp._load_pending()
+    assert "9/Z" in pending, (
+        "a failed credit write must leave the code STILL queued, never "
+        "drained ahead of a credit that never landed")
+    assert pending["9/Z"]["fields"]["supplier"]["value"] == "BETALOV"
