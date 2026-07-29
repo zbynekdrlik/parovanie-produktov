@@ -373,34 +373,16 @@ def test_blocked_since_is_preserved_across_repeated_blocked_runs():
     assert p["A"]["blocked"]["since"] == "T2"
 
 
-# ── #299 záverečná recenzia I1 (fallback path) / deferred minor "attempts has ─ #
-# ── no upper bound and no consumer" — a code that stays UNCONFIRMED (never ─── #
-# ── explicitly blocked) for many consecutive runs needs its own loud, bounded ─
-# ── escape, distinct from stale_blocked's (which only ever fires for a code ── #
-# ── that IS `blocked`). ──────────────────────────────────────────────────── #
-
-def test_stale_unconfirmed_names_codes_unconfirmed_for_min_attempts_runs():
-    p = _pending_group_of_two()
-    for t in ("T2", "T3", "T4"):
-        p, _ = ob.settle(p, success_codes=set(), blocked={}, sent_fields={},
-                         sent_credits={}, now=t)
-    assert p["A"]["attempts"] == 3
-    assert ob.stale_unconfirmed(p, min_attempts=3) == ["A", "B"]
-    assert ob.stale_unconfirmed(p, min_attempts=99) == []
-
-
-def test_stale_unconfirmed_ignores_a_code_already_blocked_for_its_own_reason():
-    # A code that IS `blocked` (e.g. not-in-catalog) already has its own escape
-    # (stale_blocked) — stale_unconfirmed must not ALSO report it, or the drain
-    # would double-count the same stuck code under two different mechanisms.
-    p = _pending_group_of_two()
-    for t in ("T2", "T3", "T4"):
-        p, _ = ob.settle(p, success_codes=set(),
-                         blocked={"A": "not-in-catalog"}, sent_fields={},
-                         sent_credits={}, now=t)
-    assert p["A"]["attempts"] == 3
-    assert ob.stale_unconfirmed(p, min_attempts=3) == ["B"]
-    assert ob.stale_blocked(p, min_attempts=3) == ["A"]
+# #299 opravné kolo 2 review N-I1 — `stale_unconfirmed` (the "queue hostage"
+# valve) was REMOVED entirely: it stopped protecting a code the moment
+# `settle()` cleared its `blocked` flag one run later (never explicitly
+# blocked in the first place), so the very next run re-sent it and reset
+# `blocked_runs` to 0 — `stale_blocked` (which the removed valve's own
+# docstring claimed as its escape) never actually fired for it. The correct
+# fix (split a partially-accepted chunk so the bad row stops holding its
+# healthy neighbours hostage) is tracked separately; see the GitHub issue
+# cited in the round-2 report. The two tests that pinned this mechanism's
+# behaviour are gone with it.
 
 
 # ── #299 záverečná recenzia I5 — a queued field has an age gate at QUEUEING ── #

@@ -798,44 +798,15 @@ def test_a_code_missing_from_the_catalogue_is_blocked_and_kept(cycle, monkeypatc
     assert webapp._load_pending()["A"]["blocked"]["reason"] == "not-in-catalog"
 
 
-# ── #299 záverečná recenzia I1 — a code that never gets a clean chunk ──────── #
-# ── confirmation (it keeps sharing a chunk with a row Shoptet permanently ──── #
-# ── rejects, so the whole chunk stays "partial" forever) must not hold the ─── #
-# ── queue hostage — after STALE_UNCONFIRMED_MIN_ATTEMPTS consecutive ───────── #
-# ── unconfirmed runs it is excluded from the NEXT send and reported LOUDLY. ── #
-def test_a_code_stuck_unconfirmed_for_many_runs_is_excluded_and_reported(
-        cycle, monkeypatch):
-    monkeypatch.setattr(webapp, "STALE_UNCONFIRMED_MIN_ATTEMPTS", 2)
-    calls = []
-
-    def always_partial(rows, header, dry, prefix, csv_safe=False, timeout=900):
-        calls.append([list(r) for r in rows])
-        codes = {r[0] for r in rows}
-        return {"ok": False, "partial": True, "success_codes": set(),
-                "partial_codes": codes, "partial_failed": 1,
-                "chunks_total": 1, "chunks_ok": 0, "chunks_partial": 1,
-                "rows_ok": 0, "rows_partial": len(rows), "processed": 0,
-                "updated": 0, "failed": 1, "rc": 1, "error_detail": None,
-                "stdout_tail": "", "err": "", "unreadable": False}
-    monkeypatch.setattr(webapp, "_import_rows_chunked", always_partial)
-    webapp.queue_shoptet_fields("parovania_eshop", "code;pairCode;internalNote",
-                                [["A", "P", "u"]])
-
-    res1 = webapp.run_shoptet_upload()          # attempts: 0 -> 1, not yet stuck
-    assert res1["stuck_unconfirmed"] == []
-    assert webapp._load_pending()["A"]["attempts"] == 1
-    assert len(calls) == 1
-
-    res2 = webapp.run_shoptet_upload()          # attempts: 1 -> 2, still sent this run
-    assert res2["stuck_unconfirmed"] == []
-    assert webapp._load_pending()["A"]["attempts"] == 2
-    assert len(calls) == 2
-
-    res3 = webapp.run_shoptet_upload()          # attempts was 2 >= threshold: excluded
-    assert res3["stuck_unconfirmed"] == ["A"]
-    assert any("nepotvrdených" in w for w in res3["warnings"]), res3["warnings"]
-    assert len(calls) == 2, "the stuck code must not have been sent a 3rd time"
-    assert webapp._load_pending()["A"]["blocked"]["reason"] == "stuck-unconfirmed"
+# #299 opravné kolo 2 review N-I1 — the "queue hostage" valve this test used
+# to pin (`STALE_UNCONFIRMED_MIN_ATTEMPTS` / `stuck_unconfirmed`) was REMOVED
+# entirely: `stale_unconfirmed` required `not e.get("blocked")`, but `settle()`
+# cleared that flag one run after it fired, so the code re-entered the send on
+# the VERY NEXT run and `blocked_runs` never accumulated — `stale_blocked`
+# (the escape its own docstring claimed) never actually tripped for it. See
+# the round-2 report for the GitHub issue tracking the real fix (splitting a
+# partially-accepted chunk so one bad row stops holding its healthy
+# neighbours hostage).
 
 
 def test_the_cycle_refuses_to_run_twice_at_once(cycle):

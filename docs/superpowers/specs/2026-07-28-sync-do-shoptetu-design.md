@@ -290,13 +290,16 @@ neskôr) a overuje sa AŽ PO jeho behu, nikdy po ručnom spustení producenta.**
 3. Prepnúť `restock_skladom` a `stock_skladom`, spustiť ich **ručne** cez „⚡ Spustiť
    teraz" (to ich len ZARADÍ do tabuľky), počkať na najbližší beh cyklu, a AŽ POTOM
    v Shoptet administrácii overiť, že sa zmenilo presne ~19 + 16 riadkov. Zároveň
-   sledovať kartu cyklu — `blocked`/`stale_blocked` (kód, ktorý eshop v katalógu
-   nemá, čaká 3+ behy) a `stuck_unconfirmed` (kód, ktorý sa nepotvrdzuje 24+ behov,
-   #299 záverečná recenzia I1) sú prvý signál, že niečo z toho, čo tieto dve
-   automatizácie zaradili, sa v skutočnosti nezapisuje — vyrieš to skôr, než zapneš
-   ďalšieho producenta.
+   sledovať kartu cyklu — pri týchto dvoch automatizáciách zareaguje NAJSKÔR
+   `stale-field` (pole zadržané, lebo je staršie než 24 h — `blocked`/
+   `stale_fields_held`, #299 záverečná recenzia I5/opravné kolo 2 N-C1): sú to
+   JEDINÉ dve automatizácie bez deduplikácie, ktoré rovnaký kandidátsky zoznam
+   zaraďujú znova každý deň, takže práve tu prvýkrát narazí na vekovú bránu.
+   `stale_blocked` (kód, ktorý eshop v katalógu nemá, čaká 3+ behy) je druhý
+   signál — obe sú znak, že niečo z toho, čo tieto dve automatizácie zaradili,
+   sa v skutočnosti nezapisuje — vyrieš to skôr, než zapneš ďalšieho producenta.
 4. Prepnúť `parovania_eshop` (dnes jediný živý zápis) — až keď kroky 1–3 prebehli a
-   cyklus je zdravý (žiadne `stale_blocked`/`stuck_unconfirmed`, ktoré by manažér
+   cyklus je zdravý (žiadne `stale_blocked`/`stale_fields_held`, ktoré by manažér
    nečakal).
 5. Poznámky k objednávkam (3.4) ako posledné.
 

@@ -7326,35 +7326,20 @@ SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 # of "the database is reconciled right away" after an upload.
 SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
 
-# #299 záverečná recenzia I1 — how many CONSECUTIVE unconfirmed drain runs a
-# code may sit through before it is excluded from the combined import. The
-# combined import's own verdict pass (`_export_row_verdicts(rows_all,
-# note_col=None)`) can only ever prove a code ABSENT from the catalogue, never
-# CONFIRMED — there is no single column that means "landed" across a header
-# built from an arbitrary per-code field set — so a code inside a chunk that
-# Shoptet keeps PARTIALLY accepting (one bad row, Shoptet never says which)
-# never reaches `success_codes`, keeps riding the SAME chunk boundary
-# (`sorted(pending)` is deterministic) hour after hour, and holds every other
-# code in that chunk hostage right alongside it — up to IMPORT_CHUNK_ROWS (300)
-# rows stuck together, forever, over one row Shoptet will never accept. The
-# principled fix (re-verify the unconfirmed rows against a freshly re-
-# downloaded export, the way the pairings push already proves a row from the
-# eshop's own bytes) needs the drain's post-import download to run BEFORE
-# `settle`, not after, and a verdict pass generalized across an arbitrary
-# column set — a real restructure of the exact settle()/C1 path this same
-# review round just hardened. This bounded valve is the smaller, well-isolated
-# fix the review's own fallback asks for: reuse the ALREADY-tested `blocked`/
-# `stale_blocked` machinery (a stuck code becomes `blocked` with its own
-# reason, so it stops being SENT and stops sharing a chunk with fresh codes;
-# `stale_blocked` already reports and alarms on it after 3 more runs) instead
-# of inventing a second, parallel exclusion mechanism.
-# 24 consecutive HOURLY runs (this drain's own schedule) ≈ 24 h — long enough
-# that a transient blip (a lock timeout, an import genuinely busy this hour,
-# one bad Shoptet response) never trips it, short enough that a genuinely
-# stuck code surfaces well within the working day it started blocking others.
-# Deliberately NOT self-healing once tripped (same trade-off `stale_blocked`
-# already makes for `not-in-catalog`): a human has to look at it.
-STALE_UNCONFIRMED_MIN_ATTEMPTS = 24
+# #299 opravné kolo 2 review N-I1 — the "queue hostage" valve
+# (`STALE_UNCONFIRMED_MIN_ATTEMPTS`/`shoptet_outbox.stale_unconfirmed`) that
+# used to live here was REMOVED entirely: it required `not e.get("blocked")`
+# to detect a stuck code, but the very act of blocking it made `settle()`
+# clear that flag one run later (the code was never explicitly blocked for a
+# reason of its own) — so it re-entered the send on the NEXT run, `blocked_
+# runs` reset to 0, and `stale_blocked` (the escape its own docstring relied
+# on) never actually tripped. A half-working valve with a docstring that
+# claimed otherwise is worse than none — without it a stuck row simply stays
+# `unconfirmed` (honestly reported every run via the "Shoptet nepotvrdil …"
+# warning below) until a human resolves it. The principled fix — split a
+# chunk Shoptet PARTIALLY accepts so one bad row stops holding its healthy
+# neighbours hostage — is real, separate work; see the GitHub issue cited in
+# the round-2 report.
 
 # #299 záverečná recenzia I5 — a queued field only ever had an age gate at
 # QUEUEING time (each producer's own export-freshness check); nothing
@@ -7505,6 +7490,32 @@ def _disabled_producer_names() -> list[str]:
                  if s["key"] in PRODUCER_QUEUE_KEYS and not s.get("enabled"))
 
 
+# #299 opravné kolo 2 review N-I3 — plain-Slovak text for every `blocked`
+# reason that can reach `stale_blocked()`'s 3-consecutive-runs alarm. A
+# reason this map does not know about (a FUTURE third reason nobody has
+# taught this sentence yet) still shows the raw reason string rather than
+# silently mislabelling it as the catalogue.
+_STALE_BLOCKED_REASON_TEXT = {
+    "not-in-catalog": "eshop ich v katalógu nemá",
+    "stale-field": "majú pole staršie než limit",
+}
+
+
+def _stale_blocked_reason_sentence(settled: dict, stale: list) -> str:
+    """A human sentence fragment naming the REAL reason(s) `stale` codes are
+    stuck `blocked` for — never hard-coded to "the catalogue", since I5 gave
+    `blocked` a second reason (`stale-field`) that reaches this same alarm.
+    Groups by reason so a run with BOTH reasons present names both, instead
+    of picking one arbitrarily."""
+    by_reason: dict[str, list[str]] = {}
+    for c in stale:
+        reason = ((settled.get(c) or {}).get("blocked") or {}).get("reason") \
+            or "neznámy dôvod"
+        by_reason.setdefault(reason, []).append(c)
+    return "; ".join(f"{len(cs)}× {_STALE_BLOCKED_REASON_TEXT.get(r, r)}"
+                     for r, cs in sorted(by_reason.items()))
+
+
 def _sync_downloaded_fresh_export() -> bool:
     """#299 opravné kolo 1 review m3 — `RUNNER.run_sync("shoptet_sync")` returning
     True only means shoptet_sync's own run STATUS was 'ok'; `run_shoptet_sync`
@@ -7598,7 +7609,7 @@ def run_shoptet_upload() -> dict:
         if not got:
             return {"ok": False, "error": "cyklus už beží", "queued": 0, "sent": 0,
                     "confirmed": 0, "blocked": 0, "stale_blocked": [],
-                    "stuck_unconfirmed": [], "stale_fields_held": [],
+                    "stale_fields_held": [],
                     "resynced": 0,
                     "skipped_second_sync": True, "unconfirmed": 0,
                     "degraded": False, "warnings": [],
@@ -7627,16 +7638,9 @@ def run_shoptet_upload() -> dict:
         verdicts = _export_row_verdicts(rows_all, note_col=None) if rows_all else \
             {"confirmed": set(), "absent": set()}
         absent = verdicts["absent"]
-        # #299 záverečná recenzia I1 — a code stuck unconfirmed (never explicitly
-        # blocked) for STALE_UNCONFIRMED_MIN_ATTEMPTS consecutive runs is excluded
-        # from THIS send too, same as an absent one: it stops sharing a chunk with
-        # fresh codes, so the chunk it used to poison can finally go clean. See
-        # `shoptet_outbox.stale_unconfirmed`'s docstring for why.
-        stuck = set(shoptet_outbox.stale_unconfirmed(
-            pending, min_attempts=STALE_UNCONFIRMED_MIN_ATTEMPTS))
         # #299 záverečná recenzia I5 — a code carrying a field queued more than
         # QUEUED_FIELD_MAX_AGE_S ago is held back from THIS send exactly like an
-        # absent/stuck one — WHOLE code, never just the one stale column. A
+        # absent one — WHOLE code, never just the one stale column. A
         # PARTIAL exclusion (send the code's other, fresh fields; withhold only
         # the stale column) was tried and rejected: `settle()` marks a
         # CONFIRMED code `dirty` the moment ANY of its current fields is not in
@@ -7655,10 +7659,8 @@ def run_shoptet_upload() -> dict:
             pending, datetime.now(timezone.utc), QUEUED_FIELD_MAX_AGE_S)
         stale_codes = set(stale_field_map)
         rows = [r for r in rows_all
-               if r[0] not in absent and r[0] not in stuck and r[0] not in stale_codes]
+               if r[0] not in absent and r[0] not in stale_codes]
         blocked = {c: "not-in-catalog" for c in sorted(pending) if c in absent}
-        blocked.update({c: "stuck-unconfirmed" for c in sorted(pending)
-                        if c in stuck and c not in blocked})
         blocked.update({c: "stale-field" for c in sorted(pending)
                         if c in stale_codes and c not in blocked})
         # What THIS import is about to put on the wire, per code+column — the
@@ -7734,6 +7736,14 @@ def run_shoptet_upload() -> dict:
                             and _sync_downloaded_fresh_export())
 
         stale = shoptet_outbox.stale_blocked(settled)
+        # #299 opravné kolo 2 review N-I3 — `stale_blocked()` fires for ANY
+        # `blocked` reason it sees 3+ CONSECUTIVE runs in a row for, and since
+        # I5 that is no longer only `not-in-catalog`: a code held back for
+        # being `stale-field` reaches the same alarm. The old sentence named
+        # the catalogue unconditionally, which sends a manager hunting for a
+        # Shoptet catalogue bug that was never there when the real cause is a
+        # field that just needs a fresh producer run.
+        stale_reason = _stale_blocked_reason_sentence(settled, stale)
         ok = (not import_busy) and (res is None or (res["ok"] and not res["partial"])) \
             and not stale
         if unconfirmed:
@@ -7745,13 +7755,7 @@ def run_shoptet_upload() -> dict:
                           "ostávajú v tabuľke a pôjdu znova", unconfirmed, sent)
         if stale:
             log.error("sync do Shoptetu: %d kódov je zablokovaných 3 a viac behov "
-                      "(eshop ich v katalógu nemá): %s", len(stale), stale[:10])
-        if stuck:
-            log.error("sync do Shoptetu: %d kódov je %d a viac behov po sebe "
-                      "nepotvrdených (nie preto, že ich eshop nepozná) — od tohto "
-                      "behu sa neposielajú, aby nedržali ostatné riadky v tej "
-                      "istej dávke: %s", len(stuck), STALE_UNCONFIRMED_MIN_ATTEMPTS,
-                      sorted(stuck)[:10])
+                      "(%s): %s", len(stale), stale_reason, stale[:10])
         if stale_field_map:
             log.error("sync do Shoptetu: %d kódov má pole staršie než %.0f h — "
                       "tento beh ich neposiela (hodnota mohla medzitým zastarať): "
@@ -7767,7 +7771,7 @@ def run_shoptet_upload() -> dict:
         # restock/stock/raw n8n import); the drain simply never called it. Only
         # when `res` itself is not fully clean (a real chunk failure or a
         # partially-rejected one) does it have anything useful to say — a run
-        # whose only problem is stale/stuck-blocked codes (res is None or fully
+        # whose only problem is stale/stale-blocked codes (res is None or fully
         # clean) keeps its own sentence, since `_chunk_error_msg` has nothing to
         # add for those (their detail is already in `warnings` above).
         error = ""
@@ -7794,11 +7798,7 @@ def run_shoptet_upload() -> dict:
                             f"ostávajú v tabuľke a pôjdu znova.")
         if stale:
             warnings.append(f"{len(stale)} kódov čaká zablokovaných 3 a viac behov — "
-                            f"eshop ich v katalógu nemá.")
-        if stuck:
-            warnings.append(
-                f"{len(stuck)} kódov je {STALE_UNCONFIRMED_MIN_ATTEMPTS}+ behov po sebe "
-                f"nepotvrdených — od tohto behu sa neposielajú, treba ich vyriešiť ručne.")
+                            f"{stale_reason}.")
         if stale_field_map:
             warnings.append(
                 f"{len(stale_field_map)} kódov má pole staršie než "
@@ -7810,7 +7810,7 @@ def run_shoptet_upload() -> dict:
         degraded = bool(warnings)
         return {"ok": ok, "queued": len(pending), "sent": sent,
                 "confirmed": confirmed, "blocked": len(blocked),
-                "stale_blocked": stale, "stuck_unconfirmed": sorted(stuck),
+                "stale_blocked": stale,
                 "stale_fields_held": sorted(stale_field_map),
                 "resynced": resynced, "skipped_second_sync": skipped,
                 "unconfirmed": unconfirmed, "error": error,
