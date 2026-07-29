@@ -312,20 +312,36 @@ def stale_fields(pending, now, max_age_s):
     exactly like a provably-old one — the same fail-closed direction the
     supplier write-back already takes for an untrustworthy catalogue export.
 
-    A refused field is NEVER dropped from `pending` — the caller only leaves
-    it out of `rows`/`sent_fields` this cycle. The table itself, `attempts`,
-    and `queued_at` are untouched: the field goes right on waiting, and the
-    producer's OWN next run queues a fresh decision (fresh `queued_at`,
+    A refused field is NEVER dropped from `pending` — THIS FUNCTION only
+    leaves the code's held-back columns out of the returned map, and never
+    itself writes to `pending`. The CALLER is not this quiet, though: a code
+    held back here is passed to `settle()` as `blocked["stale-field"]`
+    (webreview/app.py's `run_shoptet_upload`), which gives it the same
+    `blocked`/`blocked_runs`/`attempts` treatment as any other blocked code
+    (`settle()` above) — so a field a producer stopped re-affirming does
+    accumulate `blocked_runs` cycle after cycle, and once it reaches
+    `stale_blocked`'s `min_attempts` (3 consecutive runs) it IS the real
+    second signal the design promises, not an untouched, silent wait. Only
+    `queued_at`/`first_queued_at` themselves stay untouched — the producer's
+    OWN next run still queues a fresh decision (fresh `queued_at`,
     `queue_fields`' N-C1 discipline) that sends normally.
 
-    `now` is a `datetime` (aware or naive — naive is read as UTC). NOT the
-    same convention `_queue_stale_while_disabled_warning` in webreview/app.py
-    reads its own alarm from: that alarm watches `first_queued_at` (the
-    FROZEN sibling this function does not touch), so a field this function
-    refuses to send can still sit silently past that OTHER alarm's own
-    threshold — the two are independent gates over independent timestamps,
-    not two readers of one field. Pure logic: the caller supplies `now`,
-    never a bare `datetime.now()` call inside this module."""
+    `now` is a `datetime` (aware or naive — naive is read as UTC), read with
+    the IDENTICAL convention `_queue_stale_while_disabled_warning` in
+    webreview/app.py uses for its own alarm (`if dt.tzinfo is None:
+    dt.replace(tzinfo=timezone.utc)`) — the two differ only in WHICH
+    timestamp field they read: this function reads `queued_at` (refreshed on
+    every re-queue), that alarm reads `first_queued_at` (frozen at the first
+    queue of the current value). Because `queue_fields` never lets
+    `first_queued_at` move past `queued_at`, and this function's own
+    threshold (`QUEUED_FIELD_MAX_AGE_S`, 24h) is larger than that alarm's
+    (`QUEUE_STALE_WHILE_DISABLED_AFTER_S`, 3h), a field this function refuses
+    has ALWAYS already crossed that other alarm's threshold too — it can
+    never silently outlast it undetected. Whether that other alarm is
+    actually VISIBLE at that moment depends solely on `enabled`
+    (`if enabled: return ""` in webreview/app.py) — not on any independence
+    between the two gates. Pure logic: the caller supplies `now`, never a
+    bare `datetime.now()` call inside this module."""
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     out = {}
