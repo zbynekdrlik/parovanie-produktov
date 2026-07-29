@@ -7347,14 +7347,15 @@ SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
 # and re-queue their whole candidate list DAILY, so a "switch to Skladom"
 # decision sitting in the table while this hourly cycle is disabled looks
 # freshly-queued every single day it re-runs (`queue_fields`'s own C2
-# discipline keeps `queued_at` at the FIRST time a value was queued, never
-# bumped by a re-queue of the SAME value) — right up until the cycle comes
-# back on and ships a week-old restock decision to the LIVE eshop, long after
-# the product may have sold out again. 24h matches `STALE_UNCONFIRMED_MIN_
-# ATTEMPTS`'s own reasoning: one full day is longer than any legitimate gap
-# between this hourly drain's own runs, so a healthy queue never trips it,
-# while a field this old was queued against a stock/price snapshot that is no
-# longer trustworthy. A field this catches is NEVER dropped — see
+# discipline keeps `first_queued_at` at the FIRST time a value was queued,
+# never bumped by a re-queue of the SAME value — but `queued_at`, which THIS
+# gate reads, is refreshed on every re-queue of the SAME value too; #299
+# opravné kolo 2 review N-C1) — right up until the cycle comes back on and
+# ships a week-old restock decision to the LIVE eshop, long after the product
+# may have sold out again. 24h is longer than any legitimate gap between this
+# hourly drain's own runs, so a healthy queue never trips it, while a field
+# this old was queued against a stock/price snapshot that is no longer
+# trustworthy. A field this catches is NEVER dropped — see
 # `shoptet_outbox.stale_fields`'s own docstring.
 QUEUED_FIELD_MAX_AGE_S = 24 * 3600
 
@@ -9917,7 +9918,15 @@ def _queue_stale_while_disabled_warning(enabled: bool) -> str:
     now = datetime.now(timezone.utc)
     ages_s = []
     for f in fields:
-        raw = f.get("queued_at")
+        # #299 opravné kolo 2 review N-C1 — this alarm needs the FROZEN
+        # timestamp (`first_queued_at`, never moved by a same-value re-queue),
+        # never the `queued_at` `stale_fields` refreshes on every re-queue —
+        # reading the refreshed one would silence THIS alarm on every
+        # producer tick, the exact C2 regression it exists to catch. A table
+        # written before this split has no `first_queued_at` at all, so its
+        # OWN `queued_at` (which meant "first queued" back then) is the
+        # correct fallback.
+        raw = f.get("first_queued_at") or f.get("queued_at")
         if not raw:
             unreadable += 1
             continue

@@ -34,17 +34,33 @@ def queue_fields(pending, source, header, rows, credit_group=None,
     values nested deeper inside a field (e.g. its `credit` dict) may still
     be shared.
 
-    #299 opravné kolo 1 review C2 (Critical) — `queued_at` is the time this
-    field's CURRENT value was FIRST queued, not the time of the most recent
-    call that happened to queue it again. A producer re-queueing the SAME
-    value it already queued (parovania_eshop runs daily and, while the
-    disabled upload cycle never confirms anything, re-sends its whole backlog
-    every run) must NOT push `queued_at` forward — that silently reset the
-    disabled-cycle staleness alarm (`_queue_stale_while_disabled_warning`) to
-    "just queued" on every producer tick, so a queue that had genuinely been
-    waiting for days never crossed the alarm's threshold. Same discipline
-    `settle()` already applies to a blocked row's `since` (`prev.get("since")
-    or now`): only a genuinely NEW or CHANGED value gets a fresh timestamp.
+    #299 opravné kolo 1 review C2 (Critical), split in two by opravné kolo 2
+    review N-C1 — a field carries TWO timestamps that used to be ONE, because
+    their two consumers need OPPOSITE behaviour on a re-queue of the SAME
+    value:
+
+    * `first_queued_at` — the time this field's CURRENT value was FIRST
+      queued. A re-queue of the SAME value (parovania_eshop runs daily and,
+      while the disabled upload cycle never confirms anything, re-sends its
+      whole backlog every run) NEVER moves it forward — that is what feeds
+      the disabled-cycle staleness alarm
+      (`_queue_stale_while_disabled_warning`): if a re-queue could reset it,
+      a queue that had genuinely been waiting for days would never cross the
+      alarm's threshold. Same discipline `settle()` already applies to a
+      blocked row's `since` (`prev.get("since") or now`).
+    * `queued_at` — the time this field was MOST RECENTLY queued, refreshed
+      on EVERY call, even one that re-sends the SAME value. This feeds
+      `stale_fields`'s send-time age gate: `restock_skladom`/`stock_skladom`
+      have no dedup and re-queue their whole candidate list DAILY, so if
+      this timestamp behaved like `first_queued_at` a field would cross the
+      age gate exactly once and then be held back FOREVER — no later daily
+      re-queue of the identical value could ever move a single frozen
+      timestamp again. Refreshing it every call keeps a field the producer
+      is still actively re-affirming sendable, while a field that genuinely
+      stopped being re-confirmed still ages out normally.
+
+    A genuinely NEW or CHANGED value always gets `now` for BOTH — it is a
+    fresh decision, not a re-affirmation of the old one.
     """
     cols = [c.strip() for c in header.split(";")]
     out = {}
@@ -82,14 +98,19 @@ def queue_fields(pending, source, header, rows, credit_group=None,
             if not val:
                 continue
             prev_field = fields.get(col)
-            # C2 — the field's value is UNCHANGED from what is already sitting in
-            # the table → this is a re-queue of the same fact, so it keeps its
-            # ORIGINAL `queued_at` (falling back to `now` only if that field
-            # somehow has none — never letting a re-queue erase a real timestamp).
-            # A genuinely new or DIFFERENT value always gets `now`, same as before.
+            # N-C1 — the field's value is UNCHANGED from what is already sitting
+            # in the table → this is a re-queue of the same fact. `first_queued_at`
+            # keeps its ORIGINAL time (falling back to a PRE-split field's own
+            # `queued_at` for a table written before this migration, then to `now`
+            # only if neither is present — never letting a re-queue erase a real
+            # timestamp); `queued_at` itself is refreshed to `now` regardless. A
+            # genuinely new or DIFFERENT value gets `now` for BOTH, same as before.
             same_value = prev_field is not None and prev_field.get("value") == val
-            queued_at = (prev_field.get("queued_at") or now) if same_value else now
-            field = {"value": val, "source": source, "queued_at": queued_at}
+            first_queued_at = ((prev_field.get("first_queued_at")
+                               or prev_field.get("queued_at") or now)
+                              if same_value else now)
+            field = {"value": val, "source": source, "queued_at": now,
+                     "first_queued_at": first_queued_at}
             group = (credit_group or {}).get(code)
             if group is not None:
                 field["credit"] = {"store": source, "group": group,
