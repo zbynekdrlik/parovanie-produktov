@@ -458,3 +458,16 @@ predtým — s jediným riadkom v logu. To je „tichá smrť automatizácie" z
   - **Odlíš POPLACH od INFORMÁCIE.** Neznáme stavy (bod 1a) sú legitímne a trvalé, takže
     idú ako pokojný riadok; červený banner patrí odmietnutiu, ktoré treba ísť opraviť.
     Trvalý banner sa prestane čítať a zoberie so sebou aj ten, čo niečo znamená.
+
+## Nová poistka pridaná neskôr musí tiež čítať cez `_read_json_store_state`
+
+Pravidlo hore („loader musí vedieť povedať, ODKIAĽ hodnota je") platí aj pre KAŽDÚ poistku
+pridanú dodatočne. V #299 nová ochrana proti mazaniu priradení čítala frontu cez degradujúci
+`_load_pending()`, ktorý poškodený súbor vráti ako `{}` — a `{}` znamená „nič nie je zaradené"
+o KAŽDOM kóde, takže sa mazalo ďalej. Poistka bola ticho odzbrojená presne tým vstupom, proti
+ktorému mala chrániť (probe: skrátený `pending_shoptet.json` → `obsolete_removed = ['5/A']`).
+
+Rozlišuj pritom dva stavy, nie jeden: **CHÝBAJÚCI súbor** = množina legitímne ešte neexistuje
+(čerstvá inštalácia) → mazanie pusti, inak pravidlo zablokuješ navždy. **EXISTUJÚCI, ale
+nečitateľný/zle otypovaný** = nedôveryhodné dáta → mazanie ODMIETNI (`*_held` + ERROR).
+Absencia záznamu nie je dôkaz, že sa nič nestalo — ale absencia SÚBORU je legitímny prázdny stav.

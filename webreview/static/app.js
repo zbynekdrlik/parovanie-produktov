@@ -1985,16 +1985,36 @@ function pluralZmeny(n) {
   return `${n} ${pluralWord(n, 'zmena', 'zmeny', 'zmien')}`;
 }
 
-// #299 opravné kolo 3 (1, Important) — mirrors `_STALE_BLOCKED_REASON_TEXT` server-side
-// (`app.py`): `/api/pending-shoptet` already carries the REAL `reason` per blocked field
+// #299 opravné kolo 3 (1, Important) — the KEYS of this map mirror
+// `_STALE_BLOCKED_REASON_TEXT` server-side (`app.py`; #299 hĺbková recenzia (8) —
+// the SLOVAK TEXT below is deliberately its own copy, not a mirror of the
+// server's sentence, since this card needs per-count declension the server's
+// sentence does not (see the `pluralWord` calls below); nothing beyond
+// `test_client_and_server_blocked_reason_maps_have_the_same_keys` guards the
+// two KEY SETS from drifting apart if a third reason is added to only one side):
+// `/api/pending-shoptet` already carries the REAL `reason` per blocked field
 // (`not-in-catalog` / `stale-field`), but this card used to print „eshop tento kód v
 // katalógu nemá" for EVERY blocked row regardless of that field — a manager reading the
 // blocked-field banner was told the wrong reason whenever a field was held back for being
 // stale, not for missing from the catalogue. A reason this map does not yet know about (a
 // future third reason) still shows the raw string rather than silently mislabelling it.
+//
+// #299 hĺbková recenzia (5) — each entry is a FUNCTION of the count `n`, not a
+// bare string: „N× eshop tento kód..." read wrong the moment N != 1 (a
+// singular demonstrative/verb next to a plural counter), and „N× majú pole..."
+// read wrong the moment N == 1 (a plural verb for one field). `pluralWord`
+// (already used by `pluralZmeny`/`itemsWord` above) supplies the singular vs.
+// plural(2+) form — Slovak nominative plural does not distinguish "few" (2-4)
+// from "many" (5+) here, so both slots get the same plural text.
 const PENDING_BLOCKED_REASON_TEXT = {
-  'not-in-catalog': 'eshop tento kód v katalógu nemá, čaká, kým sa objaví',
-  'stale-field': 'majú pole staršie, než je povolený limit',
+  'not-in-catalog': (n) => pluralWord(n,
+    'eshop tento kód v katalógu nemá, čaká, kým sa objaví',
+    'eshop tieto kódy v katalógu nemá, čakajú, kým sa objavia',
+    'eshop tieto kódy v katalógu nemá, čakajú, kým sa objavia'),
+  'stale-field': (n) => pluralWord(n,
+    'má pole staršie, než je povolený limit',
+    'majú pole staršie, než je povolený limit',
+    'majú pole staršie, než je povolený limit'),
 };
 
 function pendingBlockedReasonSentence(blocked) {
@@ -2003,9 +2023,11 @@ function pendingBlockedReasonSentence(blocked) {
     const r = item.reason || 'neznámy dôvod';
     (byReason[r] = byReason[r] || []).push(item);
   }
-  return Object.keys(byReason).sort().map(r =>
-    `${byReason[r].length}× ${PENDING_BLOCKED_REASON_TEXT[r] || r}`
-  ).join('; ');
+  return Object.keys(byReason).sort().map(r => {
+    const n = byReason[r].length;
+    const text = PENDING_BLOCKED_REASON_TEXT[r] ? PENDING_BLOCKED_REASON_TEXT[r](n) : r;
+    return `${n}× ${text}`;
+  }).join('; ');
 }
 
 // The tab's own subtitle counts the same lines („7 otvorených položiek u dodávateľov"),
@@ -4500,7 +4522,17 @@ function renderShoptetUpload() {
     b.dataset.testid = 'pending-blocked';
     // #299 opravné kolo 3 (1) — text per skutočný `reason`, nie natvrdo „katalóg" pre
     // všetky (viď `pendingBlockedReasonSentence` vyššie).
-    b.textContent = 'Zablokované: ' + P.blocked.length
+    //
+    // #299 hĺbková recenzia (6) — the label says „polí" (FIELDS), never a bare
+    // „Zablokované: N" — `P.blocked` is `/api/pending-shoptet`'s per-FIELD list
+    // (one entry per code+column), while the run's own „N kódov čaká
+    // zablokovaných" warning (app.py, `_stale_blocked_reason_sentence`'s
+    // caller) counts CODES; the two numbers can legitimately differ (one code
+    // can carry more than one blocked field) and sat on this same card with no
+    // unit at all next to one that already said "kódov" — genitive plural
+    // regardless of count, same invariant convention as "riadkov" elsewhere in
+    // this module (`Shoptet nepotvrdil N … riadkov`).
+    b.textContent = 'Zablokovaných polí: ' + P.blocked.length
       + ' — ' + pendingBlockedReasonSentence(P.blocked);
     st.appendChild(b);
   }

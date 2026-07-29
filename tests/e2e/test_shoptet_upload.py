@@ -6,8 +6,6 @@ never run here). The card reads `/api/pending-shoptet` (read-only over
 `pending_shoptet.json`) to say what the next hourly upload will send and what it
 is holding back.
 """
-import json
-
 from playwright.sync_api import expect
 
 
@@ -45,39 +43,88 @@ def test_the_card_names_how_many_changes_are_waiting_and_which_are_blocked(
         shoptet_upload_server, page):
     """#299 opravné kolo 3 (1, Important) — the blocked banner used to print „eshop
     tento kód v katalógu nemá" for EVERY blocked field, no matter what
-    `/api/pending-shoptet`'s own per-field `reason` actually said (the seeded fixture
-    only ever carries `not-in-catalog`, so that bug never showed up here before).
-    Stubs a SECOND blocked field with `stale-field` alongside the first's
-    `not-in-catalog` — the two reasons must render two DIFFERENT sentences. A
-    reversion to the old hard-coded text would still show „Zablokované: 2" and the
-    catalogue sentence, but never the stale-field one, so it fails the second
-    assertion below."""
-    page.route("**/api/pending-shoptet", lambda route: route.fulfill(
-        content_type="application/json",
-        body=json.dumps({
-            "pending": [
-                {"code": "TESTUP1", "field": "internalNote", "value": "a",
-                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00"},
-                {"code": "TESTUP2", "field": "internalNote", "value": "b",
-                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00"},
-            ],
-            "blocked": [
-                {"code": "TESTUP3", "field": "internalNote", "value": "c",
-                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00",
-                 "reason": "not-in-catalog"},
-                {"code": "TESTUP4", "field": "internalNote", "value": "d",
-                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00",
-                 "reason": "stale-field"},
-            ],
-        })))
+    `/api/pending-shoptet`'s own per-field `reason` actually said.
+
+    #299 hĺbková recenzia (4) — a `page.route` stub for this exact endpoint used to
+    replace the real fixture here, so nothing on this test's own path went through
+    `/api/pending-shoptet` at all: had the server stopped sending the `reason` key
+    (`app.py`'s `api_pending_shoptet`), this test would stay green. Drives the REAL
+    endpoint instead — the seeded fixture (`conftest.py`'s `shoptet_upload_server`)
+    now carries a `not-in-catalog` code (TESTUP3) AND a `stale-field` one (TESTUP4),
+    so the two reasons still render two DIFFERENT sentences, but through the real
+    server round-trip. A reversion to the old hard-coded text would still show
+    „Zablokovaných polí: 2" and the catalogue sentence, but never the stale-field
+    one, so it fails the second assertion below. `test_api_pending_shoptet_carries_the_real_reason_per_blocked_field`
+    (`tests/test_webreview_shoptet_upload.py`) pins the `reason` key at the backend
+    level directly, independent of any browser render."""
     page.goto(shoptet_upload_server)
     page.locator("#systemTabs .tlabel", has_text="Sync do Shoptetu").click()
     expect(page.locator('[data-testid="pending-count"]')).to_have_text(
         "Čaká na nahratie: 2 zmeny", timeout=15000)
     blocked = page.locator('[data-testid="pending-blocked"]')
-    expect(blocked).to_contain_text("Zablokované: 2")
+    expect(blocked).to_contain_text("Zablokovaných polí: 2")
     expect(blocked).to_contain_text("eshop tento kód v katalógu nemá")
     expect(blocked).to_contain_text("staršie, než je povolený limit")
+
+
+# ── #299 hĺbková recenzia (5) — „N× eshop tento kód..." read wrong the moment ─
+# ── N != 1 (singular demonstrative next to a plural counter), and „N× majú ─── #
+# ── pole..." read wrong the moment N == 1 (plural verb for one field). Both ── #
+# ── reasons now decline through `pluralWord` like `pluralZmeny` above. ──────  #
+def test_pending_blocked_reason_sentence_declines_singular_vs_plural(
+        shoptet_upload_server, page):
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    out = page.evaluate("""() => [
+      pendingBlockedReasonSentence([{reason: 'not-in-catalog'}]),
+      pendingBlockedReasonSentence([
+        {reason: 'not-in-catalog'}, {reason: 'not-in-catalog'}, {reason: 'not-in-catalog'}]),
+      pendingBlockedReasonSentence([{reason: 'stale-field'}]),
+      pendingBlockedReasonSentence([{reason: 'stale-field'}, {reason: 'stale-field'}]),
+    ]""")
+
+    assert out[0] == "1× eshop tento kód v katalógu nemá, čaká, kým sa objaví"
+    assert out[1] == "3× eshop tieto kódy v katalógu nemá, čakajú, kým sa objavia"
+    assert out[2] == "1× má pole staršie, než je povolený limit"
+    assert out[3] == "2× majú pole staršie, než je povolený limit"
+
+
+# ── #299 hĺbková recenzia (7) — client half of the fallback pin (server half: ─
+# ── `test_stale_blocked_reason_sentence_missing_reason_falls_back_to_neznamy_dovod` /
+# ── `..._unknown_reason_falls_back_to_the_raw_string` in
+# ── tests/test_webreview_shoptet_upload.py). The fallback itself was already
+# ── correct — this only pins it, since neither side had a test before. ──────  #
+def test_pending_blocked_reason_sentence_fallback_for_missing_and_unknown_reason(
+        shoptet_upload_server, page):
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    out = page.evaluate("""() => [
+      pendingBlockedReasonSentence([{code: 'X', field: 'internalNote'}]),
+      pendingBlockedReasonSentence([
+        {code: 'Y', field: 'internalNote', reason: 'some-future-reason'}]),
+    ]""")
+
+    assert out[0] == "1× neznámy dôvod"
+    assert out[1] == "1× some-future-reason"
+
+
+# ── #299 hĺbková recenzia (8) — the comment above `PENDING_BLOCKED_REASON_TEXT`
+# ── (app.js) says its KEYS mirror `_STALE_BLOCKED_REASON_TEXT` (app.py); ───── #
+# ── nothing enforced that beyond eyeballing, so a THIRD reason added to only ── #
+# ── one side would silently drift. Pins the KEY SETS, never the Slovak TEXT — ─
+# ── the two maps deliberately carry DIFFERENT sentences (finding 5's ──────── #
+# ── declension needs vs. the server's own `stale_blocked` alarm sentence). ──  #
+def test_client_and_server_blocked_reason_maps_have_the_same_keys(
+        shoptet_upload_server, page):
+    from webreview import app as webapp
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+    client_keys = page.evaluate(
+        "() => Object.keys(PENDING_BLOCKED_REASON_TEXT).sort()")
+    server_keys = sorted(webapp._STALE_BLOCKED_REASON_TEXT)
+    assert client_keys == server_keys
 
 
 def test_the_console_stays_clean(shoptet_upload_server, page):

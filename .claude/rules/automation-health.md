@@ -399,3 +399,20 @@ ale rovnaká trieda chyby sa dá spraviť aj OKOLO tohto pravidla, nielen jeho p
   prepisovania manuálne priradených dodávateľov 24× namiesto 1×. Cyklus preto NIKDY nespúšťa
   producentov (`run_shoptet_upload` len sťahuje/nahráva/overuje/vyprázdňuje frontu); každý
   producent beží výhradne na svojom vlastnom rozvrhu.
+- **Dve poistky nad JEDNÝM timestampom sa vylúčia — rozdeľ ho.** Poplach „ako dlho to už čaká"
+  potrebuje čas ZMRAZENÝ (inak ho bežné re-zaradenie umlčí, viď bod vyššie), ale brána „neposielaj
+  staré rozhodnutie" potrebuje čas OBNOVOVANÝ (inak sa pole, ktoré raz prekročí prah, odmieta
+  NAVŽDY — producenti bez dedupu zaraďujú tú istú konštantu denne a nikdy ho neomladia; namerané
+  probe: 10 dní denných re-zaradení, `held: True` v každom behu). Preto `first_queued_at`
+  (zmrazený, číta ho poplach) + `queued_at` (obnovovaný, číta ho veková brána). Starý záznam bez
+  `first_queued_at` padá späť na `queued_at` a pri najbližšom zaradení ho zdedí — migrácia bez
+  tichého zhasnutia poplachu.
+- **Prah poplachu MUSÍ pripínať test s LITERÁLNOU hodnotou** (`assert X == 24*3600`), nie test,
+  ktorý si vek z tej istej konštanty odvodí (`X + 3600`) — taký je voči jej zmene slepý. V #299
+  to zlyhalo TRIKRÁT: mutácia prahu na 10× (resp. 1000 dní) nechala 125, resp. 159 testov zelených.
+  Poistka bez pripnutého prahu je poistka, ktorú vie ktokoľvek ticho vypnúť jedným číslom.
+- **Popis poistky, ktorý nie je doslova pravdivý, je horší než žiadny.** Zrušená úniková vetva
+  v #299 mala tri komentáre, ktoré tvrdili, že sa kód „od tohto behu neposiela" a že „`stale_blocked`
+  na to o 3 behy upozorní" — ani jedno neplatilo (vetva sa každý druhý beh sama zrušila). Keď rušíš
+  polovične fungujúcu poistku, ZRUŠ aj jej texty a over, čo je NÁHRADNÁ záruka — v #299 ňou nie je
+  `stale_blocked` (nepotvrdený riadok sa nikdy nestane `blocked`), ale `ok=False` + `degraded` + ⚠.

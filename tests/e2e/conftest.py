@@ -906,13 +906,17 @@ def shoptet_upload_server(tmp_path_factory):
 
     Seeds `pending_shoptet.json` (the ONE table between our decisions and the eshop,
     read-only over `/api/pending-shoptet`) with two codes carrying one waiting field
-    each (2 changes total) and a third code held `blocked` (eshop's catalogue does
-    not carry it yet) carrying one field of its own. Product codes, not order codes —
-    `automation-health.md` §1's `9900…` convention is for ORDER codes; these are
-    public catalogue identifiers with no customer link, so any obviously-fake shape
-    is fine. `automations.json` is deliberately absent: the tab must render its
-    default 'Zastavené' state (#93 SAFETY contract) with no file on disk at all,
-    same as every other fresh-install automation fixture.
+    each (2 changes total), a third code held `blocked` for `not-in-catalog` (eshop's
+    catalogue does not carry it yet), and a fourth held `blocked` for `stale-field`
+    (#299 hĺbková recenzia (4) — added so the „two DIFFERENT reasons render two
+    DIFFERENT sentences" test can drive `/api/pending-shoptet` for REAL instead of
+    stubbing the route: a stub proves nothing about the endpoint itself, and the
+    server's own `reason` key had no test of its own before this). Product codes,
+    not order codes — `automation-health.md` §1's `9900…` convention is for ORDER
+    codes; these are public catalogue identifiers with no customer link, so any
+    obviously-fake shape is fine. `automations.json` is deliberately absent: the tab
+    must render its default 'Zastavené' state (#93 SAFETY contract) with no file on
+    disk at all, same as every other fresh-install automation fixture.
 
     #299 Task 11 — `queued_at` is computed RELATIVE TO NOW (well under the
     `QUEUE_STALE_WHILE_DISABLED_AFTER_S` 3h alarm threshold), never a fixed
@@ -949,6 +953,14 @@ def shoptet_upload_server(tmp_path_factory):
             "fields": {"internalNote": {"value": "https://dodavatel.example/c",
                                         "source": "test_source",
                                         "queued_at": _ago(90)}},
+        },
+        "TESTUP4": {
+            "pairCode": "",
+            "blocked": {"reason": "stale-field", "since": _ago(45)},
+            "blocked_runs": 3, "attempts": 3,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/d",
+                                        "source": "test_source",
+                                        "queued_at": _ago(80)}},
         },
     }, ensure_ascii=False), encoding="utf-8")
     env = {
