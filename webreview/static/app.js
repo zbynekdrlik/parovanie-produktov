@@ -1985,6 +1985,29 @@ function pluralZmeny(n) {
   return `${n} ${pluralWord(n, 'zmena', 'zmeny', 'zmien')}`;
 }
 
+// #299 opravné kolo 3 (1, Important) — mirrors `_STALE_BLOCKED_REASON_TEXT` server-side
+// (`app.py`): `/api/pending-shoptet` already carries the REAL `reason` per blocked field
+// (`not-in-catalog` / `stale-field`), but this card used to print „eshop tento kód v
+// katalógu nemá" for EVERY blocked row regardless of that field — a manager reading the
+// blocked-field banner was told the wrong reason whenever a field was held back for being
+// stale, not for missing from the catalogue. A reason this map does not yet know about (a
+// future third reason) still shows the raw string rather than silently mislabelling it.
+const PENDING_BLOCKED_REASON_TEXT = {
+  'not-in-catalog': 'eshop tento kód v katalógu nemá, čaká, kým sa objaví',
+  'stale-field': 'majú pole staršie, než je povolený limit',
+};
+
+function pendingBlockedReasonSentence(blocked) {
+  const byReason = {};
+  for (const item of blocked) {
+    const r = item.reason || 'neznámy dôvod';
+    (byReason[r] = byReason[r] || []).push(item);
+  }
+  return Object.keys(byReason).sort().map(r =>
+    `${byReason[r].length}× ${PENDING_BLOCKED_REASON_TEXT[r] || r}`
+  ).join('; ');
+}
+
 // The tab's own subtitle counts the same lines („7 otvorených položiek u dodávateľov"),
 // and it hard-coded the genitive just like the group header did — „1 otvorených položiek"
 // sat a few pixels above the header #240 was filed about. It needs its OWN function rather
@@ -4475,8 +4498,10 @@ function renderShoptetUpload() {
   if (P.blocked.length) {
     const b = el('div', 'pendblocked', '');
     b.dataset.testid = 'pending-blocked';
+    // #299 opravné kolo 3 (1) — text per skutočný `reason`, nie natvrdo „katalóg" pre
+    // všetky (viď `pendingBlockedReasonSentence` vyššie).
     b.textContent = 'Zablokované: ' + P.blocked.length
-      + ' — eshop tento kód v katalógu nemá, čakajú, kým sa objaví';
+      + ' — ' + pendingBlockedReasonSentence(P.blocked);
     st.appendChild(b);
   }
   wrap.appendChild(st);
