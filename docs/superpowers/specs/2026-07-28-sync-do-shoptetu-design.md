@@ -270,15 +270,35 @@ nahrať podľa nedôveryhodného stavu.
 
 ## 5. Poradie zavádzania (aby tri bežiace automatizácie nevypadli)
 
-1. Tabuľka + `queue_shoptet_fields` + drain + karta, **žiadny producent zatiaľ neprepnutý**.
-   Cyklus beží naprázdno (0 čakajúcich), overí sa krok stiahnuť → nič → stiahnuť.
+**#299 záverečná recenzia I4 — tento postup bol napísaný pred migráciou na frontu a
+predpisoval riskantné poradie: ručné spustenie producenta po migrácii do Shoptet
+administrácie nezapíše NIČ (producent len ZARADÍ), takže krok 3 (pôvodne „spustiť
+ručne a v administrácii overiť ~19 + 16 riadkov") by neukázal žiadnu zmenu — a krok 5
+(„zapnúť hodinový cyklus" AŽ NA KONCI) znamená, že producenti bežia s VYPNUTÝM cyklom
+čím dlhšie, tým väčší je jeho prvý import a tým staršie sú rozhodnutia o predajnosti,
+ktoré sa naraz odošlú. Cyklus preto beží od PRVÉHO kroku (nie je čo v ňom zapínať
+neskôr) a overuje sa AŽ PO jeho behu, nikdy po ručnom spustení producenta.**
+
+1. Tabuľka + `queue_shoptet_fields` + drain + karta, **žiadny producent zatiaľ neprepnutý,
+   cyklus JE zapnutý od tohto kroku.** Cyklus beží naprázdno (0 čakajúcich), overí sa
+   krok stiahnuť → nič → stiahnuť.
 2. Prepnúť **vypnutých** producentov (`grube_externalcode`, `split_links`) — nulové
-   riziko, dnes neposielajú nič.
+   riziko, dnes neposielajú nič. Počkať na najbližší beh cyklu a v karte „Sync do
+   Shoptetu" overiť, že tabuľka čakajúcich zmien vyprázdnila presne toľko riadkov,
+   koľko producent zaradil — NIE v Shoptet administrácii, tá sa zmení až behom
+   cyklu, nikdy ručným spustením producenta.
 3. Prepnúť `restock_skladom` a `stock_skladom`, spustiť ich **ručne** cez „⚡ Spustiť
-   teraz" a v Shoptet administrácii overiť, že sa zmenilo presne ~19 + 16 riadkov.
-4. Prepnúť `parovania_eshop` (dnes jediný živý zápis) — až keď kroky 1–3 prebehli.
-5. Zapnúť hodinový cyklus.
-6. Poznámky k objednávkam (3.4) ako posledné.
+   teraz" (to ich len ZARADÍ do tabuľky), počkať na najbližší beh cyklu, a AŽ POTOM
+   v Shoptet administrácii overiť, že sa zmenilo presne ~19 + 16 riadkov. Zároveň
+   sledovať kartu cyklu — `blocked`/`stale_blocked` (kód, ktorý eshop v katalógu
+   nemá, čaká 3+ behy) a `stuck_unconfirmed` (kód, ktorý sa nepotvrdzuje 24+ behov,
+   #299 záverečná recenzia I1) sú prvý signál, že niečo z toho, čo tieto dve
+   automatizácie zaradili, sa v skutočnosti nezapisuje — vyrieš to skôr, než zapneš
+   ďalšieho producenta.
+4. Prepnúť `parovania_eshop` (dnes jediný živý zápis) — až keď kroky 1–3 prebehli a
+   cyklus je zdravý (žiadne `stale_blocked`/`stuck_unconfirmed`, ktoré by manažér
+   nečakal).
+5. Poznámky k objednávkam (3.4) ako posledné.
 
 ---
 

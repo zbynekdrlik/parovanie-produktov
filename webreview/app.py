@@ -9341,12 +9341,27 @@ AUTOMATION_DESCRIPTIONS = {
         "automatizácie „Dodávateľský sklad“) a upozorní na produkty, ktoré máme "
         "skladom, ale dodávateľ ich už nemá — hrozí výpadok.",
     "restock_skladom":
+        # #299 záverečná recenzia I3 — these two run FIRST in the rollout order, so
+        # this is the text a manager sees first; "rovno ich naskladní" ("puts them
+        # back in stock right away") was left over from before the #299 migration
+        # and now overpromises exactly like parovania_eshop/grube_externalcode/
+        # split_links above already had corrected for their own text — this
+        # automation only ZARADÍ (queues) into the shared table; nothing in the
+        # eshop changes until „Sync do Shoptetu“ runs.
         "Denne o 6:00 nájde produkty, ktoré máme označené ako Vypredané, ale "
-        "dodávateľ ich má opäť skladom, a rovno ich naskladní naspäť v eshope.",
+        "dodávateľ ich má opäť skladom, a zaradí ich do spoločnej tabuľky "
+        "čakajúcich zmien — do eshopu ich potom nahrá hodinová automatizácia "
+        "„Sync do Shoptetu“ (musí byť tiež zapnutá).",
     "stock_skladom":
+        # #299 záverečná recenzia I3 — same correction as restock_skladom above:
+        # "a rovno ich prepne" ("switches them right away") is stale since the
+        # #299 migration — this only queues, the switch happens once the hourly
+        # drain confirms the row.
         "Denne o 6:45 nájde produkty, ktoré fyzicky máme na sklade (Shoptet ukazuje "
-        "kusy skladom), ale zákazníkom sa stále zobrazujú ako Vypredané, a rovno ich "
-        "prepne na Skladom. Nedotýka sa produktov, ktoré ste vedome ukončili.",
+        "kusy skladom), ale zákazníkom sa stále zobrazujú ako Vypredané, a zaradí "
+        "ich do spoločnej tabuľky čakajúcich zmien — do eshopu ich potom nahrá "
+        "hodinová automatizácia „Sync do Shoptetu“ (musí byť tiež zapnutá). "
+        "Nedotýka sa produktov, ktoré ste vedome ukončili.",
     "orders_reminder":
         "Denne o 8:00 skontroluje objednávky vo vybavovaní dlhšie ako 4 dni — bez "
         "poznámky len upozorní (žiadny mail), s poznámkou AI vyhodnotí, či bol "
