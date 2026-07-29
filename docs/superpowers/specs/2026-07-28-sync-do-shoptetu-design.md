@@ -308,7 +308,21 @@ nahrať podľa nedôveryhodného stavu.
 
 ## 8. Otvorené, čo sa doplní meraním počas implementácie
 
-- **Oneskorenie exportu po importe** — o koľko neskôr export zo Shoptetu odráža
-  práve nahraté zmeny. Zmeria sa pri prvom potvrdenom zápise (krok 3 zavádzania).
-  Dovtedy platí: dôkazom zápisu je Log, nie druhé stiahnutie.
-- **Trvanie jednej dávky naživo** (predpoklad ~30 s z komentára v kóde).
+- **Oneskorenie exportu po importe — NEZMERANÉ (Task 12, #299).** Nedá sa zmerať z ničoho, čo
+  je dnes k dispozícii v kóde ani v dátach — v repozitári neexistuje žiadny záznam o tom, za
+  ako dlho po potvrdenom importe reálne zmenená hodnota naozaj dorazí do stiahnutého exportu
+  (žiadna konštanta, žiadny log, žiadne dáta z predchádzajúceho behu; `git log`/`grep` cez
+  `export lag`/`export delay`/`oneskorenie exportu` nenašiel nič). **Meranie vyžaduje SKUTOČNÝ
+  potvrdený zápis do produkčného Shoptetu** — presne krok 3 postupnosti zavádzania (§5): prvý
+  reálny import cez appku, po ktorom sa dá porovnať čas potvrdenia z Logu s časom, kedy sa
+  zmenená hodnota objaví v `data/products.csv` pri opakovanom sťahovaní (postup je už
+  napísaný v Task 12 brief — `date -Is` pri potvrdení, potom kontrola `internalNote` daného
+  kódu o 1/5/15/30 min). Táto úloha (task 12) mala výslovný zákaz živého importu/sťahovania a
+  spúšťania automatizácie — takže meranie sa NEDÁ spraviť z tejto session a číslo sa
+  NEVYMÝŠĽA. Kým sa nezmeria: **dôkazom zápisu ostáva Log, nikdy druhé stiahnutie** — druhé
+  stiahnutie v cykle (§3.3 krok 5) beží bez čakania (žiadny `SECOND_SYNC_DELAY_S`), lebo bez
+  nameranej hodnoty sa nedá zdôvodniť ŽIADNE konkrétne čakanie; je to len re-synchronizácia
+  kópie po potvrdenom zápise, nie druhý dôkaz zápisu. Rozhodnutie o `SECOND_SYNC_DELAY_S` (či
+  má druhé stiahnutie čakať, a o koľko) patrí na krok 3 zavádzania — tam, kde sa dá zmerať.
+- **Trvanie jednej dávky naživo** (predpoklad ~30 s z komentára v kóde) — rovnako nezmerané,
+  z rovnakého dôvodu (žiadny reálny import v tejto session).

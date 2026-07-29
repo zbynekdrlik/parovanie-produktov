@@ -344,3 +344,58 @@ Keď nastavenie rozhoduje o tom, komu sa niečo POŠLE, ukáž dôsledok PRED ul
   v store-prune §7). Nechaj v testoch KONTROLU na túto vetvu — musí prejsť pred aj po oprave,
   inak sa záplata „nikdy nezobrazuj dialóg" nedá odlíšiť od opravy.
 - Nič nezakazuj. Cieľ je, aby sa to nedalo spraviť omylom — nie aby sa to nedalo spraviť.
+
+## 6. Tabuľka čakajúcich zmien — kredit AŽ po potvrdení, nikdy pri zaradení (#299)
+
+Piatim producentom (`parovania_eshop`, `grube_externalcode`, `split_links`, `restock_skladom`,
+`stock_skladom`) pribudla spoločná tabuľka `data/out/pending_shoptet.json`
+(`src/parovanie/shoptet_outbox.py`): producent už do eshopu NEPÍŠE, len ZARADÍ polia; hodinový
+`shoptet_upload` postaví jeden import, overí ho z Logu a AŽ POTOM zapíše dedup kredit
+(`_credit_producer`, `webreview/app.py`). To je priama oprava #257 (kredit pred potvrdením) —
+ale rovnaká trieda chyby sa dá spraviť aj OKOLO tohto pravidla, nielen jeho porušením:
+
+- **Kredituj presne ten TVAR hodnoty, ktorý dedup POROVNÁVA, nie tú, ktorú vidí eshop.**
+  `_do_upload_variant_links` kreditoval normalizovanú GRUBE `.de` URL (to, čo ide do importu),
+  kým `new_variant_link_keys` porovnáva SUROVÚ hodnotu z `variant_links.json` — tie dve sa
+  nikdy nestretli, takže riadok sa nikdy neoznačil za nahraný a posielal by sa do eshopu KAŽDÝ
+  hodinový cyklus navždy, s `total_uploaded` zamrznutým na nule (#299 Task 8 review C1). Keď
+  pridávaš `credit_value`, over ho proti tomu istému poľu, ktoré incremental-check číta — nie
+  proti poľu, ktoré ide do CSV.
+- **Kód, ktorého niektorý variant katalóg nemá, sa nesmie kreditovať ako súčasť skupiny.**
+  `settle()` kredituje skupinu len keď `g["codes"] <= success_codes` — jeden `blocked` kód v
+  skupine zadrží kredit CELEJ skupiny navždy, nikdy len svoje pole. Je to zámerne fail-closed
+  (mierne draho — zvyšok skupiny čaká), nie fail-open (lacno, ale ticho zapíše kredit za kód,
+  ktorý sa v skutočnosti nikdy neposlal).
+- **Zablokovaný riadok (`blocked`) sa NIKDY nezahadzuje** — ostáva v tabuľke a je vidieť v
+  karte (#270, #301) — **ale musí mať strop, po ktorom kričí.** `stale_blocked()` sleduje
+  `blocked_runs` (počet PO SEBE IDÚCICH blokovaných behov, resetne sa len keď riadok naozaj
+  vyjde z `blocked`), nikdy `attempts` (ten rastie pri KAŽDOM nepotvrdenom behu, aj keď riadok
+  blokovaný nebol) — inak by sa dlho čakajúci blokovaný riadok nedal odlíšiť od riadku, ktorý
+  bol chvíľu len nepotvrdený.
+- **Producent zapnutý, ktorý N behov po sebe nezaradí nič DO SPOLOČNEJ FRONTY, nie je dôkaz
+  zamrznutého zdroja — meraj to z JEHO VLASTNÉHO rozvrhu, nikdy z prázdnoty fronty.** Prvá
+  verzia tohto poplachu (`_note_empty_producers`, zrušená v opravnom kole 1) počítala „3
+  hodinové cykly po sebe s 0 poľami" — a keďže producenti bežia DENNE a fronta sa vyprázdňuje
+  HODINOVO, to je normálny stav KAŽDÉHO zdravého producenta, nie symptóm (namerané: pískalo na
+  3. cykle pre 4 z 5 producentov na úplne zdravom systéme). **Trvalý poplach = žiadny poplach**
+  — meraj namiesto toho, čo poplach naozaj potrebuje vedieť: `_stale_producer_warnings` číta
+  `RUNNER.status()` (`enabled` + `last_run` proti VLASTNÉMU `interval_minutes`/`daily_at` toho
+  producenta), nikdy obsah frontu. Rovnaký princip ako automation-health §5's "signál sformuluj
+  cez to, čo alarm potrebuje na PRÁCU, nie cez tvar vedľajšieho javu".
+- **Poistka „fronta rastie, ale cyklus, ktorý ju drénuje, je vypnutý" sa NESMIE počítať z
+  výsledku toho cyklu** — vypnutý cyklus nikdy nebeží, takže vlastný `last_result` by mlčal
+  navždy (poistka, ktorá stráži samu seba). `_queue_stale_while_disabled_warning` sa preto
+  počíta na KAŽDOM `/api/automations` polli, priamo z `RUNNER.status()`-ovho `enabled` a z
+  timestampov VO FRONTE — nikdy z toho, čo `run_shoptet_upload` napísal do svojho výsledku.
+- **Alarm, ktorý sa dá umlčať, je horší než žiadny.** `queued_at` sa nesmie posunúť pri
+  bežnom RE-zaradení tej istej hodnoty (`parovania_eshop` beží denne a znovu pošle celý svoj
+  zoznam, kým to vypnutý cyklus nepotvrdí) — inak by opakovaný beh producenta reštartoval hore
+  uvedenú „ako dlho čaká" poistku na nulu pri KAŽDOM svojom tiku, a poplach na trvalo vypnutý
+  cyklus by nikdy nenaskočil. Nový timestamp dostane len GENUINE nová/zmenená hodnota
+  (`queue_fields`, rovnaká disciplína ako `settle()`-ova `since` pri `blocked`).
+- **Orchestrátor, ktorý „pre pohodlie" spustí aj svoje komponenty, im ticho zmení VLASTNÝ
+  rozvrh.** Prvá verzia hodinového cyklu spúšťala aj producentov, čím by z `parovania_eshop`
+  (dnes 1×/deň o 21:00, jediný živý zápis) spravila beh 24×/deň — vrátane deštruktívneho
+  prepisovania manuálne priradených dodávateľov 24× namiesto 1×. Cyklus preto NIKDY nespúšťa
+  producentov (`run_shoptet_upload` len sťahuje/nahráva/overuje/vyprázdňuje frontu); každý
+  producent beží výhradne na svojom vlastnom rozvrhu.

@@ -387,6 +387,23 @@ manažérovho vstupu — takže platia body 1, 2 aj 3 bez zľavy:
 - **Nové pole vracaj na KAŽDEJ vetve** (`obsolete_removed: []` aj v skorých `return`-och) —
   volajúci nemá ako odlíšiť „nič sa nezmazalo" od „táto verzia to nehlási".
 
+## 3b. Nečitateľný zdroj ZÁPISU (nie mazania) NESMIE degradovať na prázdno (#299)
+
+Body 1–3 sú o MAZANÍ. Rovnaké pravidlo platí zrkadlovo pre ZARAĎOVANIE do storu, ktorý
+`protect=True` chráni: nečitateľná tabuľka `pending_shoptet.json` (`_store("pending_shoptet.json")`,
+v `scripts/backup_data.sh`) NESMIE viesť k tomu, že sa na ňu ticho zaradí ako na PRÁZDNU —
+stratili by sa všetky čakajúce zmeny, ktoré tam producenti zaradili predtým.
+
+`queue_shoptet_fields`/`queue_shoptet_field_groups` (`webreview/app.py`) preto **nič nemajú
+hand-rolled** — čítajú cez bežný `_read_json_store` (ktorý pri nečitateľnom súbore degraduje na
+`{}`, ako vždy), ale zápis späť ide cez `_save_pending` → `_atomic_write_json(protect=True)`, TEN
+ISTÝ shrink-guard, čo stráži mazanie (§3). Guard porovná to, čo sa práve zapisuje, so skutočným
+obsahom NA DISKU — a keď bol súbor pred čítaním nečitateľný/poškodený, disk niesol viac záznamov,
+než koľko ich prežilo do `{}` → zápis sa odmietne, `StoreWipeRefused`, appka to premení na 503
+s návodom (rovnaký tvar ako pri mazaní). **Nepíš vlastný `raise` pred tento zápis** — obišiel by
+karanténu poškodeného súboru aj presný typ výnimky, ktorý appka vie zobraziť; nechaj to na
+zdieľaný `protect=True` mechanizmus, presne preto je zdieľaný.
+
 ## 4. Prune patrí k ČERSTVÉMU fetchu, nie na čítaciu cestu
 
 Vešaj ho tam, kde práve prišli nové bajty (`run_shoptet_sync`), nie do `/api/*` GET.
