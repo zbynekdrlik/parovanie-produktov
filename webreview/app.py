@@ -6251,7 +6251,23 @@ def _do_upload_suppliers(dry):
     #     writing this", never as „nobody wrote this" — the same distinction
     #     `shoptet_outbox.settle` itself keeps: a queued field never leaves the
     #     table until the drain proves it landed.
-    queued_supplier_codes = {c for c, e in _load_pending().items()
+    #   * …and this exclusion set is only as good as the READ that built it
+    #     (#299 opravné kolo 2 review N-C2, Critical). `_load_pending` (plain
+    #     `_read_json_store`) degrades a CORRUPT `pending_shoptet.json` to
+    #     `{}` exactly like a legitimately empty queue — and `{}` means
+    #     "nothing is currently queued for ANY code's supplier field", which
+    #     makes the exclusion above a no-op and lets #215's removal fire on a
+    #     false "nothing in flight" reading while the row may genuinely be
+    #     mid-flight to the eshop right now. A MISSING file is different: it
+    #     is the ordinary, silent state of a store nothing has ever queued
+    #     into yet — `_queue_stale_while_disabled_warning` already treats a
+    #     missing `pending_shoptet.json` this same way, for this SAME file
+    #     (store-prune §1: absence of a routinely-written store, before its
+    #     first write, is not evidence of anything hidden). Only a file that
+    #     genuinely IS there but cannot be trusted refuses the removal below.
+    pending_state, pending_from_disk = _read_json_store_state(PENDING_SHOPTET, {})
+    pending_trustworthy = pending_from_disk or not os.path.exists(PENDING_SHOPTET)
+    queued_supplier_codes = {c for c, e in pending_state.items()
                              if "supplier" in (e.get("fields") or {})}
     obsolete = sorted(set(new_codes) & own_supplier & export_codes
                       - set(uploaded) - queued_supplier_codes)
@@ -6266,6 +6282,17 @@ def _do_upload_suppliers(dry):
                   "lebo bez nej sa „nikdy sme to nenahrali\" nedá odlíšiť od „manažér "
                   "práve zmenil meno dodávateľa\": %s",
                   len(obsolete_held), SUPPLIERS_STATE, ", ".join(obsolete_held[:10]))
+    elif obsolete and not pending_trustworthy:
+        # N-C2 — the mirror hold: a poškodená (not missing) queue makes it
+        # impossible to tell "nothing is queued for this code" from "we just
+        # cannot read what IS queued", so the removal is refused exactly the
+        # same way as the uploaded_suppliers.json branch above.
+        obsolete_held, obsolete = obsolete, []
+        log.error("n8n suppliers: %d priradení vyzerá neaktuálne, ale tabuľku "
+                  "čakajúcich zmien (%s) sa nepodarilo prečítať — NEMAŽE SA NIČ, "
+                  "lebo bez nej sa „nič nie je práve zaradené do eshopu\" nedá "
+                  "odlíšiť od „súbor sa nedá prečítať\": %s",
+                  len(obsolete_held), PENDING_SHOPTET, ", ".join(obsolete_held[:10]))
     if obsolete and not dry:
         try:
             with _lock:
