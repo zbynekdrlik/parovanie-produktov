@@ -94,11 +94,13 @@ def test_requeueing_the_SAME_value_keeps_the_ORIGINAL_first_queued_at():
                            rows=[["A", "P", "https://x"]], now="T2")   # SAME value
     f = p["A"]["fields"]["internalNote"]
     assert f["value"] == "https://x"
-    assert f["queued_at"] == "T1", (
-        "a re-queue of the SAME value must not push queued_at forward to T2")
+    assert f["first_queued_at"] == "T1", (
+        "a re-queue of the SAME value must not push first_queued_at forward to T2")
+    assert f["queued_at"] == "T2", (
+        "queued_at itself DOES refresh on every re-queue — that is N-C1's fix")
 
 
-def test_requeueing_a_CHANGED_value_gets_a_fresh_queued_at():
+def test_requeueing_a_CHANGED_value_gets_a_fresh_first_queued_at():
     p, _ = ob.queue_fields({}, source="parovania_eshop",
                            header="code;pairCode;internalNote",
                            rows=[["A", "P", "https://x"]], now="T1")
@@ -107,10 +109,11 @@ def test_requeueing_a_CHANGED_value_gets_a_fresh_queued_at():
                            rows=[["A", "P", "https://y"]], now="T2")   # DIFFERENT value
     f = p["A"]["fields"]["internalNote"]
     assert f["value"] == "https://y"
-    assert f["queued_at"] == "T2", "a genuinely NEW value must get the fresh time"
+    assert f["first_queued_at"] == "T2", "a genuinely NEW value must get the fresh time"
+    assert f["queued_at"] == "T2"
 
 
-def test_requeueing_the_same_value_from_a_DIFFERENT_source_still_preserves_the_time():
+def test_requeueing_the_same_value_from_a_DIFFERENT_source_still_preserves_first_queued_at():
     p, _ = ob.queue_fields({}, source="parovania_eshop",
                            header="code;pairCode;internalNote",
                            rows=[["A", "P", "https://x"]], now="T1")
@@ -119,7 +122,8 @@ def test_requeueing_the_same_value_from_a_DIFFERENT_source_still_preserves_the_t
                            rows=[["A", "P", "https://x"]], now="T2")
     f = p["A"]["fields"]["internalNote"]
     assert f["source"] == "split_links", "source still updates to the latest queuer"
-    assert f["queued_at"] == "T1", "but the timestamp is about the VALUE, not the caller"
+    assert f["first_queued_at"] == "T1", (
+        "but the FIRST-queued timestamp is about the VALUE, not the caller")
 
 
 def test_a_first_time_queue_with_no_prior_field_uses_now_not_a_crash():
@@ -127,18 +131,19 @@ def test_a_first_time_queue_with_no_prior_field_uses_now_not_a_crash():
     # must fall back cleanly to `now`, never raise on a missing prior field.
     p, _ = ob.queue_fields({}, source="s", header="code;pairCode;internalNote",
                            rows=[["A", "P", "u"]], now="T1")
-    assert p["A"]["fields"]["internalNote"]["queued_at"] == "T1"
+    f = p["A"]["fields"]["internalNote"]
+    assert f["queued_at"] == "T1"
+    assert f["first_queued_at"] == "T1"
 
 
 def test_the_later_write_of_the_SAME_field_wins_and_keeps_its_own_source():
-    """#299 opravné kolo 1 review C2 — adapted (per this project's own
-    `toorder-e2e.md` §6: a foreign test pinning the OLD semantics gets fixed in
-    its own note, never silently weakened). This is the SAME value ("Skladom")
+    """#299 opravné kolo 1 review C2, adapted by opravné kolo 2 review N-C1
+    (see the file-header note above). This is the SAME value ("Skladom")
     written by TWO real producers that can legitimately both send it for the
     same code (restock_skladom / stock_skladom) — `source` still tracks
-    whoever wrote it LAST, but `queued_at` no longer does: C2 keeps the time
-    the value was FIRST queued when a later write does not actually change
-    it (see the dedicated C2 tests above)."""
+    whoever wrote it LAST, and now so does `queued_at`; only `first_queued_at`
+    keeps the time the value was FIRST queued (see the dedicated N-C1 tests
+    above)."""
     p, _ = ob.queue_fields({}, source="restock_skladom",
                            header="code;pairCode;availabilityInStock",
                            rows=[["A", "P", "Skladom"]], now="T1")
@@ -147,7 +152,79 @@ def test_the_later_write_of_the_SAME_field_wins_and_keeps_its_own_source():
                            rows=[["A", "P", "Skladom"]], now="T2")
     f = p["A"]["fields"]["availabilityInStock"]
     assert f["source"] == "stock_skladom"
-    assert f["queued_at"] == "T1"
+    assert f["queued_at"] == "T2"
+    assert f["first_queued_at"] == "T1"
+
+
+# ── #299 opravné kolo 2 review N-C1 (Critical) — kolo 1's C2 ("queued_at is ── #
+# ── the time the CURRENT value was FIRST queued, a re-queue of the SAME ────── #
+# ── value never moves it") and kolo 1's I5 (`stale_fields` refuses to SEND a ─ #
+# ── field whose `queued_at` is older than QUEUED_FIELD_MAX_AGE_S) contradict ─ #
+# ── each other on the SAME field: `restock_skladom`/`stock_skladom` have no ── #
+# ── dedup and re-queue their whole candidate list DAILY, so under the single ─
+# ── `queued_at` C2 pinned, the moment it crosses 24h old (drain paused a ───── #
+# ── day, a Shoptet outage, …) I5 refuses it FOREVER — no later daily ───────── #
+# ── re-queue of the SAME value can ever move that one timestamp again. Split ─
+# ── into `first_queued_at` (frozen — feeds the disabled-cycle alarm, C2's ──── #
+# ── ORIGINAL job) and `queued_at` (refreshed on every queue call, even a ───── #
+# ── same-value one — feeds `stale_fields`, I5's job) so both hold at once. ── #
+def test_the_split_first_queued_at_never_moves_queued_at_always_refreshes():
+    p, _ = ob.queue_fields({}, source="restock_skladom",
+                           header="code;pairCode;availabilityInStock",
+                           rows=[["A", "P", "Skladom"]], now="T1")
+    p, _ = ob.queue_fields(p, source="restock_skladom",
+                           header="code;pairCode;availabilityInStock",
+                           rows=[["A", "P", "Skladom"]], now="T2")   # SAME value
+    f = p["A"]["fields"]["availabilityInStock"]
+    assert f["first_queued_at"] == "T1", (
+        "the disabled-cycle alarm's timestamp must still never move on a "
+        "same-value re-queue")
+    assert f["queued_at"] == "T2", (
+        "the send-time age gate's timestamp MUST refresh on every re-queue, "
+        "even a same-value one, or it holds the field forever once it once "
+        "crosses the age limit")
+
+
+def test_first_queued_at_DOES_move_on_a_genuinely_changed_value():
+    p, _ = ob.queue_fields({}, source="restock_skladom",
+                           header="code;pairCode;availabilityInStock",
+                           rows=[["A", "P", "Skladom"]], now="T1")
+    p, _ = ob.queue_fields(p, source="restock_skladom",
+                           header="code;pairCode;availabilityInStock",
+                           rows=[["A", "P", "Vypredané"]], now="T2")   # DIFFERENT value
+    f = p["A"]["fields"]["availabilityInStock"]
+    assert f["first_queued_at"] == "T2", "a genuinely new decision resets both"
+    assert f["queued_at"] == "T2"
+
+
+def test_a_field_re_affirmed_DAILY_never_gets_held_forever_by_stale_fields():
+    """The actual regression, proven end to end through BOTH functions this
+    review round touches: `restock_skladom`'s own daily re-queue of the
+    identical value must keep refreshing `queued_at`, so `stale_fields`
+    (I5's send-time age gate) never permanently excludes a field the
+    producer keeps re-affirming — only a field that GENUINELY stopped being
+    re-confirmed is held."""
+    now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+    p, _ = ob.queue_fields({}, source="restock_skladom",
+                           header="code;pairCode;availabilityInStock",
+                           rows=[["A", "P", "Skladom"]],
+                           now=(now - timedelta(days=40)).isoformat())
+    # 40 daily re-queues of the IDENTICAL value since — simulating the drain
+    # having been disabled/down for well over the 24h age limit while the
+    # producer kept ticking daily regardless
+    for i in range(39, -1, -1):
+        p, _ = ob.queue_fields(p, source="restock_skladom",
+                               header="code;pairCode;availabilityInStock",
+                               rows=[["A", "P", "Skladom"]],
+                               now=(now - timedelta(days=i)).isoformat())
+    assert p["A"]["fields"]["availabilityInStock"]["first_queued_at"] == \
+        (now - timedelta(days=40)).isoformat(), (
+        "the alarm's own timestamp must still show the TRUE age of the "
+        "decision, unaffected by the daily re-queues")
+    stale = ob.stale_fields(p, now, 24 * 3600)
+    assert stale == {}, (
+        "a field the producer keeps re-affirming daily must never be held "
+        "back forever just because its FIRST queue was long ago", stale)
 
 
 def test_credit_group_and_value_ride_with_the_field():
