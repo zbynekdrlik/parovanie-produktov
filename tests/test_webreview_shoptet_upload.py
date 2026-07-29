@@ -216,6 +216,23 @@ def test_restock_and_stock_skladom_descriptions_promise_queueing_not_a_write():
         assert "Sync do Shoptetu" in text, (key, text)
 
 
+# ── #299 opravné kolo 2 review N-I4 (Important) — the PRODUCTION constant ──── #
+# ── that actually deploys had, for the THIRD time in this ticket, no test ──── #
+# ── pinning anything but a value DERIVED from itself: every test above and ── #
+# ── below builds its offsets as `webapp.QUEUED_FIELD_MAX_AGE_S + 3600`, so a ─
+# ── mutation of the constant (e.g. 24h -> 240h) moves every one of those ───── #
+# ── tests' own thresholds in lockstep and passes clean — measured: 125 tests ─
+# ── green under exactly that ×10 mutation. This test hard-codes the expected ─
+# ── literal number of seconds, independent of `QUEUED_FIELD_MAX_AGE_S`'s own ─
+# ── expression, so a mutation of the constant is the ONLY thing that can ───── #
+# ── move the LEFT side of this assertion. ───────────────────────────────────  #
+def test_queued_field_max_age_s_is_pinned_to_the_literal_24_hours():
+    assert webapp.QUEUED_FIELD_MAX_AGE_S == 86400, (
+        "the deployed age gate must be exactly 24h — 86400 seconds, written "
+        "here as a literal so a mutation of the constant's OWN expression "
+        "cannot silently move this test's expectation along with it")
+
+
 # ── #299 záverečná recenzia I5 — a queued field only ever had an age gate at ── #
 # ── QUEUEING time; nothing re-checked it at SEND time. A field this old is ─── #
 # ── withheld this cycle (never dropped), reported, and tried again once the ── #
