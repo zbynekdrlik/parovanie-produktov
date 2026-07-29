@@ -13,6 +13,7 @@ Load the matching skill BEFORE working on that area (don't re-derive):
 - import párov z Discord vlákna cez n8n (forwardnuté notifikácie → páry) → load `.claude/skills/discord-import`
 - GRUBE per-veľkosť kódy / grube.de itemId extrakcia / externalCode zápis → load `.claude/skills/grube`
 - mazanie/prune z manažérových úložísk (`data/out/*.json`), pridanie novej množiny do `order_statuses.json` → `.claude/rules/store-prune.md` (auto-loads on its `paths:`)
+- sync do Shoptetu / tabuľka čakajúcich zmien / kredit po potvrdení → `.claude/rules/automation-health.md`
 
 ## Always
 - Kódovanie I/O = **cp1250** na ČÍTANIE exportu; **import CSV = UTF-8 s BOM** (`utf-8-sig`), `;`, CRLF (cp1250 import → mojibake `č`→`è`).

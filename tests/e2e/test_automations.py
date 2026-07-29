@@ -101,6 +101,59 @@ def test_failed_automation_shows_nav_warning_badge_without_opening_its_tab(page,
     assert console == [], f"console not clean: {console}"
 
 
+# ── `navError()`'s `ok` key collision — image_health carries a COUNT, not a flag (#299
+# Task 7 opravné kolo 1) ───────────────────────────────────────────────────────────
+def test_a_numeric_ok_count_from_image_health_does_not_light_the_nav_badge(
+        page, automations_server):
+    """`navError()` (app.js) lights the sidebar ⚠ on `last_result.ok === false` — added for
+    `shoptet_upload`, which really does use `ok` as a pass/fail flag. `run_image_health`
+    (webreview/app.py) ALSO puts a top-level `ok` key in its `stats`, but there it is a COUNT
+    of images that passed (`ok_n`, an int) — a genuine key collision with a different meaning.
+    The badge stays correct today only because the comparison is the STRICT `=== false`: no
+    number is ever `=== false` in JS. This test pins that a realistic image_health result
+    (`ok: 5`, and the edge case `ok: 0` — zero images passed, still a healthy run) never lights
+    the badge, and that a REAL boolean `false` (the shoptet_upload shape this check exists for)
+    still does. If `navError()` is ever rewritten to a truthy check, this is the test that must
+    catch it — see the WARNING comment right above the `ok` check in `navError()`."""
+    console = _console(page)
+    page.goto(automations_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    badge = page.get_by_role("button", name="Kontrola obrázkov").locator(".navwarn")
+    assert badge.count() == 0, "badge already lit before any mutation"
+
+    # realistic run_image_health() shape: `ok` is a COUNT, everything passed
+    page.evaluate("""() => {
+      const a = AUTOMATIONS.find(x => x.key === 'image_health');
+      a.last_run = '2026-07-28T04:30:00+02:00';
+      a.last_status = 'ok';
+      a.last_error = '';
+      a.last_result = {total_urls: 5, checked: 5, skipped: 0, ok: 5, failed: 0,
+                       dead_urls: 0, cleaned_images: 0};
+      renderTabs();
+    }""")
+    assert badge.count() == 0, "numeric ok:5 (count) wrongly lit the badge"
+
+    # edge case: zero images passed — still just a count, not a failure flag
+    page.evaluate("""() => {
+      const a = AUTOMATIONS.find(x => x.key === 'image_health');
+      a.last_result = {total_urls: 5, checked: 5, skipped: 0, ok: 0, failed: 5,
+                       dead_urls: 0, cleaned_images: 0};
+      renderTabs();
+    }""")
+    assert badge.count() == 0, "numeric ok:0 (count, falsy but not === false) wrongly lit the badge"
+
+    # a REAL boolean false (the shape shoptet_upload actually uses) must still light it
+    page.evaluate("""() => {
+      const a = AUTOMATIONS.find(x => x.key === 'image_health');
+      a.last_result = {ok: false, error: 'test'};
+      renderTabs();
+    }""")
+    assert badge.count() == 1, "boolean ok:false must still light the badge"
+
+    assert console == [], f"console not clean: {console}"
+
+
 def test_run_now_executes_and_reports_result(page, automations_server):
     console = _console(page)
     _open_tab(page, automations_server)

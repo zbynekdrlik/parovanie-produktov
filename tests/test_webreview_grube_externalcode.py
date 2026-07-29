@@ -2,13 +2,20 @@
 per-size externalCodes (grube itemId → the eshop `externalCode` field), the cron
 follow-up to the MVP manual zip, on the generic automation runner (#93).
 
-Hermetic: run_import (the careful Shoptet import subprocess) is monkeypatched —
-NO real eshop write ever happens in a test. Every store path is redirected to
-tmp. Mirrors test_webreview_parovania_eshop.py's isolation pattern; the automation
-reuses the SAME upload core (_do_upload_externalcodes) as the n8n endpoint, so the
-logic lives in one place (NEkopíruj logiku).
+#299 Task 8 rewrite: since the migration this automation no longer imports directly
+— `_do_upload_externalcodes` (the SAME core function this file drives, via
+`run_grube_externalcode`) only QUEUES rows into the shared pending_shoptet table for
+the next hourly „Sync do Shoptetu" drain (`tests/test_webreview_shoptet_upload.py`
+covers that drain + the credit path). This file therefore no longer monkeypatches
+`run_import` for the success path — there is no import left to intercept at this
+layer — but keeps the registration/endpoint/runner-integration tests, adapted to
+assert against the pending table and against `queued`/`count` instead of a
+completed import.
+
+Hermetic: every store path (incl. the shared pending_shoptet table) is redirected to
+tmp — no real eshop write, and no accidental write to the shared table another test
+might read.
 """
-import csv as _csv
 import json
 import os
 import sys
@@ -23,11 +30,13 @@ from tests.conftest import authed_client  # noqa: E402
 
 @pytest.fixture
 def iso(tmp_path, monkeypatch):
-    """Isolate every store the automation reads/writes + the import subprocess."""
+    """Isolate every store the automation reads/writes, incl. the shared
+    pending_shoptet table the queue drops rows into (#299 Task 8)."""
     monkeypatch.setattr(webapp.RUNNER, "state_path", str(tmp_path / "automations.json"))
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     monkeypatch.setattr(webapp, "GRUBE_CODES", str(tmp_path / "grube_codes.json"))
     monkeypatch.setattr(webapp, "EXTERNALCODES_STATE", str(tmp_path / "uploaded_externalcodes.json"))
+    monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending_shoptet.json"))
     monkeypatch.setattr(webapp, "CODE2PAIR", {"60645/L": "395", "60645/S": "395", "70000/M": "700"})
     return {"tmp": tmp_path}
 
@@ -37,39 +46,6 @@ def _seed_grube(codes):
     with open(webapp.GRUBE_CODES, "w", encoding="utf-8") as f:
         json.dump({c: {"itemId": iid, "size": "L", "deUrl": "https://grube.de/x",
                        "productId": "3959"} for c, iid in codes.items()}, f)
-
-
-def _ok_import():
-    """A run_import stub that records every CSV it was handed (header + rows) and
-    reports a clean success."""
-    calls = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        calls.append({"header": rd[0], "rows": rd[1:], "dry_run": dry_run})
-        # report back exactly as many rows as the CSV carried — the real script always
-        # does (Shoptet's 'Spracované: N' == the rows we submitted), and an rc-0 result
-        # whose count disagrees is now correctly refused as a chunk we may not credit
-        n = len(rd) - 1
-        return 0, f"VÝSLEDOK: spracované={n} upravené={n} zlyhania=0", ""
-    return fake_run, calls
-
-
-def _recording_import(fail_on_call=None):
-    """run_import stub recording each chunk CSV's rows; optionally FAIL the Nth call
-    (1-based) to simulate a mid-batch chunk failure."""
-    calls = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        rows = rd[1:]
-        calls.append({"header": rd[0], "rows": rows})
-        if fail_on_call is not None and len(calls) == fail_on_call:
-            return 2, "POZOR: Shoptet hlási zlyhania", "boom"
-        return 0, f"VÝSLEDOK: spracované={len(rows)} upravené={len(rows)} zlyhania=0", ""
-    return fake_run, calls
 
 
 # ── registration + status ──────────────────────────────────────────────────────
@@ -85,165 +61,132 @@ def test_grube_externalcode_registered_disabled_daily_0330(iso):
     assert a["description"]                       # #173 plain-language description present
 
 
-# ── successful nightly push ─────────────────────────────────────────────────────
-def test_run_pushes_externalcodes_and_records_counts(iso, monkeypatch):
+# ── successful nightly queueing ─────────────────────────────────────────────────
+def test_run_queues_externalcodes_and_records_counts(iso, monkeypatch):
+    """#299 Task 8: the automation no longer imports — it queues into the shared
+    pending table. Kills a regression that re-introduces a direct import call."""
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     _seed_grube({"60645/L": "1547734519", "60645/S": "1547734523"})
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
 
     result = webapp.run_grube_externalcode()
 
     assert result["status"] == "ok"
     e = result["externalcodes"]
-    assert e["count"] == 2
-    assert e["total_uploaded"] == 2
+    assert e["count"] == 2                         # 2 field values queued
     assert e["total_codes"] == 2
-    assert e["remaining"] == 0
+    # nothing is CREDITED yet — that only happens once the hourly drain's OWN
+    # import confirms the row (the #257 class of bug: an "uploaded" mark written
+    # on our own say-so, before Shoptet confirmed anything)
+    assert e["total_uploaded"] == 0
+    assert e["remaining"] == 2
     assert result["review_url"].startswith("https://")
 
-    # the careful import ran with the externalCode header, itemId in the value column
-    (call,) = calls
-    assert call["header"] == ["code", "pairCode", "externalCode"]
-    assert ["60645/L", "395", "1547734519"] in call["rows"]
-    assert ["60645/S", "395", "1547734523"] in call["rows"]
-    assert call["dry_run"] is False               # a nightly write is NEVER a dry run
+    d = webapp._load_pending()
+    assert d["60645/L"]["fields"]["externalCode"]["value"] == "1547734519"
+    assert d["60645/L"]["fields"]["externalCode"]["source"] == "grube_externalcode"
+    assert d["60645/S"]["fields"]["externalCode"]["value"] == "1547734523"
+    # #299 review I2 — field["credit"]["value"] was never asserted anywhere in the
+    # whole suite (the exact gap C1 slipped through in the sibling split_links
+    # producer). Here it's the same raw itemId as the queued value (no
+    # normalization happens for externalCode), but it must still be pinned.
+    assert d["60645/L"]["fields"]["externalCode"]["credit"]["value"] == "1547734519"
+    assert d["60645/S"]["fields"]["externalCode"]["credit"]["value"] == "1547734523"
 
-    # its OWN incremental state written (idempotency) — {code: itemId}
-    st = json.loads((iso["tmp"] / "uploaded_externalcodes.json").read_text())
-    assert st == {"60645/L": "1547734519", "60645/S": "1547734523"}
+    # the producer itself never writes its own "uploaded" state (decision carried
+    # over from Task 6/7, not in this task's brief — see automation-health.md)
+    assert not (iso["tmp"] / "uploaded_externalcodes.json").exists()
 
 
-def test_run_is_incremental_only_new_or_changed_itemid(iso, monkeypatch):
-    _seed_grube({"60645/L": "111", "60645/S": "222"})
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-    webapp.run_grube_externalcode()
-    assert len(calls) == 1
+def test_run_requeues_the_same_code_until_it_is_actually_credited(iso, monkeypatch):
+    """Without a credited entry in uploaded_externalcodes.json (only the hourly
+    drain's `_credit_producer` writes it, after Shoptet confirms), the SAME code is
+    a "new" candidate on every call — harmless (queueing just overwrites the same
+    pending field), but proves the incremental check now keys off the credited
+    store, not off anything this function writes itself."""
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
+    _seed_grube({"60645/L": "111"})
 
-    # second run, nothing changed → the careful import must NOT run again
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-import")))
+    r1 = webapp.run_grube_externalcode()
+    assert r1["externalcodes"]["count"] == 1
     r2 = webapp.run_grube_externalcode()
-    assert r2["status"] == "ok" and r2["externalcodes"]["count"] == 0
+    assert r2["externalcodes"]["count"] == 1        # re-queued again, not skipped
 
-    # change ONE itemId + add a NEW code → only those two go up (not the unchanged one)
-    _seed_grube({"60645/L": "111", "60645/S": "999", "70000/M": "333"})
-    fake_run2, calls2 = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run2)
+    # simulate what the hourly drain's `_credit_producer` does once Shoptet confirms
+    with open(webapp.EXTERNALCODES_STATE, "w", encoding="utf-8") as f:
+        json.dump({"60645/L": "111"}, f)
+
     r3 = webapp.run_grube_externalcode()
-    assert r3["externalcodes"]["count"] == 2
-    (call,) = calls2
-    pushed = {r[0]: r[2] for r in call["rows"]}
-    assert pushed == {"60645/S": "999", "70000/M": "333"}   # 60645/L (unchanged) skipped
+    assert r3["externalcodes"]["count"] == 0         # now genuinely unchanged → skipped
+
+    # change the itemId + add a new code → only those two are candidates
+    _seed_grube({"60645/L": "111", "60645/S": "999", "70000/M": "333"})
+    r4 = webapp.run_grube_externalcode()
+    assert r4["externalcodes"]["count"] == 2          # only the 2 CHANGED/new codes
+    d = webapp._load_pending()
+    assert d["60645/S"]["fields"]["externalCode"]["value"] == "999"
+    assert d["70000/M"]["fields"]["externalCode"]["value"] == "333"
+    # 60645/L's queued field is untouched by this run (still the value r1/r2 queued —
+    # queueing never removes a pending entry; only the drain's settle() does that)
+    assert d["60645/L"]["fields"]["externalCode"]["value"] == "111"
 
 
-def test_run_zero_new_reports_ok_without_importing(iso, monkeypatch):
-    # no grube_codes.json at all → clean no-op run (never touches the eshop)
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not run")))
+def test_run_zero_new_reports_ok_without_queuing(iso, monkeypatch):
+    # no grube_codes.json at all → clean no-op run (never touches the shared table)
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("must not queue"))
     result = webapp.run_grube_externalcode()
     assert result["status"] == "ok"
     assert result["externalcodes"]["count"] == 0
     assert result["externalcodes"]["total_codes"] == 0
+    assert not (iso["tmp"] / "pending_shoptet.json").exists()
 
 
-def test_nonnumeric_itemid_never_pushed(iso, monkeypatch):
+def test_nonnumeric_itemid_never_queued(iso, monkeypatch):
     # a non-numeric / empty itemId is junk (possible formula-injection lead) — it must
     # never reach the eshop AND must not count toward totals (never uploadable).
     _seed_grube({"60645/L": "=EVIL", "60645/S": "", "70000/M": "42"})
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
 
     result = webapp.run_grube_externalcode()
 
-    (call,) = calls
-    assert [r[0] for r in call["rows"]] == ["70000/M"]   # ONLY the numeric one
     assert result["externalcodes"]["count"] == 1
     assert result["externalcodes"]["total_codes"] == 1   # non-numeric excluded from total
-    st = json.loads((iso["tmp"] / "uploaded_externalcodes.json").read_text())
-    assert st == {"70000/M": "42"}
+    d = webapp._load_pending()
+    assert list(d) == ["70000/M"]                          # ONLY the numeric one queued
+    assert d["70000/M"]["fields"]["externalCode"]["value"] == "42"
 
 
 # ── graceful degradation ────────────────────────────────────────────────────────
-def test_import_failure_surfaces_failed_status_and_does_not_mark_uploaded(iso, monkeypatch):
+def test_a_corrupt_pending_table_makes_the_runner_record_error_not_crash(iso):
+    """#299 Task 8: queueing can no longer "fail" via a returned dict (there is no
+    import to fail) — the ONE way it can fail now is `queue_shoptet_fields` refusing
+    to write on top of an unreadable pending table (`StoreWipeRefused`). The runner
+    must still survive that (records last_status='error'), same contract as an
+    import raising used to have. #299 Task 9 review finding — `last_error` is the
+    ONLY place the manager learns WHY a run failed; a test that stops at
+    last_status='error' would pass even if `last_error` were silently left empty."""
     _seed_grube({"60645/L": "111"})
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (1, "chyba", "boom"))
-    result = webapp.run_grube_externalcode()
-    assert result["status"] == "failed"
-    assert result["externalcodes"]["ok"] is False
-    # a failed import never records the code as uploaded → retried next run
-    assert (not (iso["tmp"] / "uploaded_externalcodes.json").exists()
-            or json.loads((iso["tmp"] / "uploaded_externalcodes.json").read_text()) == {})
+    with open(webapp.PENDING_SHOPTET, "w", encoding="utf-8") as f:
+        f.write("{ this is not json")
 
-
-# ── #156: a large batch is split into chunked imports ──────────────────────────
-def test_large_batch_split_into_chunks(iso, monkeypatch):
-    n = 650
-    codes = {f"{i}/M": str(1000000 + i) for i in range(n)}
-    monkeypatch.setattr(webapp, "CODE2PAIR", {c: "P" for c in codes})
-    _seed_grube(codes)
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
-    result = webapp.run_grube_externalcode()
-
-    assert len(calls) >= 2                                   # split, not one giant import
-    assert max(len(c["rows"]) for c in calls) <= webapp.IMPORT_CHUNK_ROWS
-    imported = [r[0] for c in calls for r in c["rows"]]
-    assert sorted(imported) == sorted(codes)                # each code exactly once
-    assert result["status"] == "ok"
-    assert result["externalcodes"]["ok"] is True and result["externalcodes"]["count"] == n
-
-
-def test_mid_batch_chunk_failure_records_partial_and_releases_lock(iso, monkeypatch):
-    # #156: a chunk failing mid-batch → failed status, record ONLY the codes from the
-    # SUCCESSFUL chunk(s) (resumable — never all-or-nothing silent success), and
-    # release the import lock (no stuck lock → no cascade failure).
-    n = 650
-    codes = {f"{i}/M": str(1000000 + i) for i in range(n)}
-    monkeypatch.setattr(webapp, "CODE2PAIR", {c: "P" for c in codes})
-    _seed_grube(codes)
-    fake_run, calls = _recording_import(fail_on_call=2)     # 1st chunk ok, 2nd fails
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
-    result = webapp.run_grube_externalcode()
-
-    assert result["status"] == "failed"
-    assert result["externalcodes"]["ok"] is False
-    assert "časti 2/" in result["externalcodes"]["error"]
-    assert "z 650 riadkov" in result["externalcodes"]["error"]
-    assert len(calls) == 2                                  # batch STOPS after the failing chunk
-    uploaded = json.loads((iso["tmp"] / "uploaded_externalcodes.json").read_text())
-    chunk1_codes = {r[0] for r in calls[0]["rows"]}
-    chunk2_codes = {r[0] for r in calls[1]["rows"]}
-    assert set(uploaded) == chunk1_codes
-    assert not (set(uploaded) & chunk2_codes)
-    assert 0 < len(uploaded) < n
-    # the import lock was released despite the failure (else the next import 409s)
-    assert webapp._import_lock.acquire(blocking=False)
-    webapp._import_lock.release()
-
-
-def test_run_via_runner_records_error_when_import_raises(iso, monkeypatch):
-    _seed_grube({"60645/L": "111"})
-
-    def boom(*a, **k):
-        raise RuntimeError("shoptet_import.py spadol")
-    monkeypatch.setattr(webapp, "run_import", boom)
-
-    assert webapp.RUNNER._execute("grube_externalcode") is True    # runner survives
+    # #299 Task 11 finding 1 — the RETURN value now reports whether the run
+    # SUCCEEDED, not merely whether it ran; this run raised, so it is False.
+    # The runner surviving (not crashing, `last_status`/`last_error` recorded)
+    # is still pinned by the assertions right below.
+    assert webapp.RUNNER._execute("grube_externalcode") is False
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "grube_externalcode"]
     assert st["last_status"] == "error"
-    assert "shoptet_import.py spadol" in st["last_error"]
     assert st["running"] is False
+    assert st["last_error"]                        # non-empty
+    assert "poškoden" in st["last_error"].lower() or "StoreWipeRefused" in st["last_error"]
 
 
 # ── disabled automation never runs on a scheduler tick ──────────────────────────
 def test_disabled_automation_is_not_ticked(iso, monkeypatch):
     _seed_grube({"60645/L": "111"})
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("disabled must not run")))
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("disabled must not run"))
     webapp.RUNNER.tick_once()                    # default state = disabled
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "grube_externalcode"]
     assert st["enabled"] is False
@@ -251,10 +194,8 @@ def test_disabled_automation_is_not_ticked(iso, monkeypatch):
 
 
 # ── http run endpoint + runner integration ──────────────────────────────────────
-def test_run_now_via_http_endpoint_and_runner(iso, monkeypatch):
+def test_run_now_via_http_endpoint_and_runner(iso):
     _seed_grube({"60645/L": "111"})
-    fake_run, _calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
     c = authed_client()
     r = c.post("/api/automations/grube_externalcode/run")
     assert r.status_code == 200 and r.get_json()["started"] is True
@@ -267,11 +208,9 @@ def test_run_now_via_http_endpoint_and_runner(iso, monkeypatch):
 
 
 # ── never modifies the durable grube_codes store (reads only) ───────────────────
-def test_run_reads_but_never_writes_grube_codes_store(iso, monkeypatch):
+def test_run_reads_but_never_writes_grube_codes_store(iso):
     _seed_grube({"60645/L": "111"})
     gc_before = (iso["tmp"] / "grube_codes.json").read_text()
-    fake_run, _calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
 
     webapp.run_grube_externalcode()
 
@@ -287,16 +226,23 @@ def test_n8n_endpoint_requires_bearer_token(iso, monkeypatch):
                   headers={"Authorization": "Bearer WRONG"}).status_code == 401
 
 
-def test_n8n_endpoint_dry_run_reaches_import_without_recording(iso, monkeypatch):
+def test_n8n_endpoint_dry_run_queues_nothing(iso, monkeypatch):
+    """#299 review m3 — dry_run used to reach a real Shoptet dry-run import
+    (`test_n8n_endpoint_dry_run_reaches_import_without_recording`, pre-migration);
+    the Task 8 rewrite made it an early-return no-op that ALWAYS said `queued: 0`
+    regardless of how many codes were actually candidates — a silent contract
+    change nobody could tell from the response. `would_queue` restores that
+    meaning (a genuine preview) without reintroducing any live write."""
     _seed_grube({"60645/L": "111"})
     monkeypatch.setattr(webapp, "_import_token", lambda: "SEKRET")
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
     c = authed_client()
     r = c.post("/api/n8n/upload-externalcode?dry_run=1",
                headers={"Authorization": "Bearer SEKRET"})
     assert r.status_code == 200
-    assert r.get_json()["dry_run"] is True
-    assert calls and calls[0]["dry_run"] is True
-    # dry run records NOTHING (so the real nightly run still pushes it)
+    j = r.get_json()
+    assert j["dry_run"] is True
+    assert j["queued"] == 0
+    assert j["would_queue"] == 1        # the honest preview of what WOULD be queued
+    # dry run queues NOTHING (so the real nightly run still pushes it)
+    assert not (iso["tmp"] / "pending_shoptet.json").exists()
     assert not (iso["tmp"] / "uploaded_externalcodes.json").exists()

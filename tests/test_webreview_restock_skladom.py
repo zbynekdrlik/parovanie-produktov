@@ -1,15 +1,27 @@
 """In-app „Vypredané → Skladom" restock automation (#108) — Flask wiring: run
 function, store, endpoints, registration, wired through the generic automation
-runner (#93). WRITES to the eshop — but every test monkeypatches run_import (the
-careful Shoptet import subprocess), so NO real eshop write ever happens.
+runner (#93).
 
-Hermetic: SRC (the export), SUPPLIER_STOCK_STATE and RESTOCK_STATE are redirected
-to tmp fixture content; run_import is stubbed. Mirrors
-test_webreview_riziko_vypadku.py's isolation + test_webreview_parovania_eshop.py's
-import-stub pattern. Reuses the SAME import path as the n8n endpoint
-(import_builder.restock_rows → run_import), so the existing import tests stay green.
+#299 Task 9 rewrite: since the migration this automation no longer imports
+directly — `run_restock_skladom` only QUEUES rows into the shared pending_shoptet
+table for the next hourly „Sync do Shoptetu" drain
+(`tests/test_webreview_shoptet_upload.py` covers that drain). This producer never
+credits itself and needs no dedup store (unlike grube_externalcode/split_links): a
+candidate is entirely state-driven (Vypredané+visible in the LIVE export), so once
+Shoptet confirms the flip and the export next refreshes, `_restock_candidates`
+simply stops selecting it. This file keeps the registration/JOIN-detection/
+endpoint/runner-integration tests (the detection logic itself, `_restock_candidates`,
+is UNCHANGED by this task), adapted to assert against the pending table and
+`queued`/`candidates` instead of a completed import. The chunked-import-batch tests
+(#156/#158) are gone — chunking existed only for Shoptet's own import subprocess,
+which this producer no longer calls; that same protection now lives ONE layer up,
+already covered for the shared queue by
+`test_webreview_shoptet_upload.py::test_a_queued_change_goes_up_in_ONE_import_and_leaves_the_table`
+and the hourly drain's own `_import_rows_chunked` call.
+
+Hermetic: SRC (the export), SUPPLIER_STOCK_STATE, RESTOCK_STATE and the shared
+pending_shoptet table are all redirected to tmp fixture content.
 """
-import csv as _csv
 import json
 import os
 import sys
@@ -56,8 +68,9 @@ _MANAGER_STORES = (("DECISIONS", "decisions.json"), ("ORDERED", "ordered_items.j
 
 @pytest.fixture
 def iso(tmp_path, monkeypatch):
-    """Isolate every store this automation touches + the export + supplier_stock +
-    the import subprocess. Manager stores get sentinels (asserted untouched)."""
+    """Isolate every store this automation touches, incl. the shared pending_shoptet
+    table the queue drops rows into (#299 Task 9). Manager stores get sentinels
+    (asserted untouched)."""
     monkeypatch.setattr(webapp.RUNNER, "state_path", str(tmp_path / "automations.json"))
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))
     src = tmp_path / "products.csv"
@@ -65,6 +78,7 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "SRC", str(src))
     monkeypatch.setattr(webapp, "SUPPLIER_STOCK_STATE", str(tmp_path / "supplier_stock.json"))
     monkeypatch.setattr(webapp, "RESTOCK_STATE", str(tmp_path / "restock_skladom.json"))
+    monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending_shoptet.json"))
     monkeypatch.setattr(webapp, "CODE2PAIR", {})
 
     sentinels = {}
@@ -98,26 +112,13 @@ def _seed_supplier_stock(p1_available=True, p2_fresh=True):
     })
 
 
-def _ok_import():
-    """A run_import stub that records every CSV it was handed (header + rows) and
-    reports a clean success."""
-    calls = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        calls.append({"header": rd[0], "rows": rd[1:], "dry_run": dry_run})
-        return 0, "Spracované: 1. Upravené: 1. Zlyhanie variantov: 0.", ""
-    return fake_run, calls
-
-
 # ── registration + status ──────────────────────────────────────────────────────
 def test_registered_disabled_daily_0600(iso):
     c = authed_client()
     (a,) = [x for x in c.get("/api/automations").get_json()["automations"]
             if x["key"] == "restock_skladom"]
     assert a["name"] == "Vypredané → Skladom"
-    # SAFETY: this automation WRITES to the live eshop → deploy starts stopped (#93 contract)
+    # SAFETY: this automation feeds the live eshop → deploy starts stopped (#93 contract)
     assert a["enabled"] is False
     assert a["schedule"] == "denne o 06:00"
     assert a["running"] is False
@@ -125,116 +126,81 @@ def test_registered_disabled_daily_0600(iso):
 
 def test_disabled_automation_does_not_run(iso, monkeypatch):
     _seed_supplier_stock()
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("disabled must not run")))
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("disabled must not run"))
     webapp.RUNNER.tick_once()                    # default state = disabled
     (a,) = [x for x in webapp.RUNNER.status() if x["key"] == "restock_skladom"]
     assert a["last_run"] == ""
     assert not os.path.exists(webapp.RESTOCK_STATE)
 
 
-# ── the run: JOIN detection + import ────────────────────────────────────────────
-def test_run_flips_only_fresh_available_vypredane_product(iso, monkeypatch):
-    # p/1 = vypredané + supplier fresh+available -> flip. p/2 = vypredané + supplier
-    # available but STALE -> NOT flipped. p/3 = already Skladom -> NOT a candidate.
+# ── the run: JOIN detection + queueing (#299 Task 9) ────────────────────────────
+def test_run_queues_only_fresh_available_vypredane_product(iso, monkeypatch):
+    # p/1 = vypredané + supplier fresh+available -> candidate. p/2 = vypredané +
+    # supplier available but STALE -> NOT a candidate. p/3 = already Skladom -> NOT
+    # a candidate.
     _seed_supplier_stock(p1_available=True, p2_fresh=False)
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "_import_rows_chunked",
+                        lambda *a, **k: pytest.fail("producer must not import"))
 
     stats = webapp.run_restock_skladom()
+    assert stats["ok"] is True
     assert stats["status"] == "ok"
     assert stats["candidates"] == 1
-    assert stats["imported_rows"] == 1
     assert stats["has_supplier_data"] is True
+    # #299 Task 8 review finding: `candidates` (rows) and `queued` (field values)
+    # are DELIBERATELY different units, unlike the sibling producers' ambiguous
+    # `would_queue` — one restock candidate carries FOUR writable columns
+    # (productVisibility/availabilityInStock/availabilityOutOfStock/stock), so a
+    # regression that confuses the two units is visible here (1 != 4).
+    assert stats["queued"] == 4
 
-    # exactly one import ran, with the whitelisted RESTOCK_COLS header
-    assert len(calls) == 1
-    assert calls[0]["header"] == webapp.import_builder.RESTOCK_COLS
-    assert calls[0]["dry_run"] is False
-    # only the fresh+available vypredané product 1/M was flipped
-    assert [r[0] for r in calls[0]["rows"]] == ["1/M"]
+    d = webapp._load_pending()
+    assert list(d) == ["1/M"]                     # only the fresh+available product
+    f = d["1/M"]["fields"]
+    assert f["productVisibility"]["value"] == "visible"
+    assert f["availabilityInStock"]["value"] == "Skladom"
+    assert f["availabilityOutOfStock"]["value"] == "Skladom"
+    assert f["stock"]["value"] == "5"
+    # #299 Task 9 decision — this producer has NO credit/dedup store: a candidate
+    # stops being a candidate once the export reflects the flip, so nothing is
+    # ever credited by this producer itself.
+    for col in f.values():
+        assert "credit" not in col
+    assert f["stock"]["source"] == "restock_skladom"
 
     st = json.loads(open(webapp.RESTOCK_STATE, encoding="utf-8").read())
     assert st["has_supplier_data"] is True and st["status"] == "ok"
     assert [c["code"] for c in st["candidates"]] == ["1/M"]
     assert st["candidates"][0]["supplierPrice"] == "79.9"
+    assert st["queued"] == 4
 
 
-def test_import_row_sets_both_availability_fields_to_skladom(iso, monkeypatch):
-    # regression guard (CEO 2026-07-14): the restock import row must set BOTH
-    # availabilityInStock AND availabilityOutOfStock to 'Skladom', visible, stock
-    _seed_supplier_stock(p1_available=True, p2_fresh=False)
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-    webapp.run_restock_skladom()
-
-    hdr = calls[0]["header"]
-    row = calls[0]["rows"][0]
-    got = dict(zip(hdr, row))
-    assert got["productVisibility"] == "visible"
-    assert got["availabilityInStock"] == "Skladom"
-    assert got["availabilityOutOfStock"] == "Skladom"
-    assert got["stock"] == "5"
-
-
-def test_run_no_supplier_data_yet_flips_nothing(iso, monkeypatch):
-    # #106 has never run -> SUPPLIER_STOCK_STATE doesn't exist -> flip nothing
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not import")))
+def test_run_no_supplier_data_yet_queues_nothing(iso, monkeypatch):
+    # #106 has never run -> SUPPLIER_STOCK_STATE doesn't exist -> queue nothing
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("must not queue"))
     stats = webapp.run_restock_skladom()
     assert stats["candidates"] == 0 and stats["has_supplier_data"] is False
+    assert stats["queued"] == 0
     assert stats["status"] == "ok"
     st = json.loads(open(webapp.RESTOCK_STATE, encoding="utf-8").read())
     assert st["has_supplier_data"] is False and st["candidates"] == []
+    assert not os.path.exists(webapp.PENDING_SHOPTET)
 
 
-def test_run_supplier_sold_out_flips_nothing(iso, monkeypatch):
-    # supplier NOT available for p/1, p/2 stale -> zero candidates -> no import
+def test_run_supplier_sold_out_queues_nothing(iso, monkeypatch):
+    # supplier NOT available for p/1, p/2 stale -> zero candidates -> nothing queued
     _seed_supplier_stock(p1_available=False, p2_fresh=False)
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not import")))
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("must not queue"))
     stats = webapp.run_restock_skladom()
-    assert stats["candidates"] == 0 and stats["imported_rows"] == 0
+    assert stats["candidates"] == 0 and stats["queued"] == 0
     assert stats["status"] == "ok"
-
-
-def test_failed_import_read_back_records_error_not_success(iso, monkeypatch):
-    # a HARD Shoptet abort (rc!=0, no summary) must land status=error, not 'ok'
-    _seed_supplier_stock(p1_available=True, p2_fresh=False)
-
-    def boom(csv_path, dry_run=False, timeout=300):
-        # as the real script prints it: its own result marker, then the Shoptet line
-        return 1, ("\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
-                   "CHYBA LOGU: Chyba | Číslo riadku: 1 - Data in column code are not unique"), "boom"
-    monkeypatch.setattr(webapp, "run_import", boom)
-
-    stats = webapp.run_restock_skladom()
-    assert stats["status"] == "error"
-    st = json.loads(open(webapp.RESTOCK_STATE, encoding="utf-8").read())
-    assert st["status"] == "error"
-    assert "not unique" in st["error_detail"]
-    # candidates are still recorded so the tab shows what it TRIED to flip
-    assert [c["code"] for c in st["candidates"]] == ["1/M"]
-
-
-def test_run_busy_when_another_import_holds_the_lock(iso, monkeypatch):
-    _seed_supplier_stock(p1_available=True, p2_fresh=False)
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not import while locked")))
-    webapp._import_lock.acquire()
-    try:
-        stats = webapp.run_restock_skladom()
-    finally:
-        webapp._import_lock.release()
-    assert stats["status"] == "busy"
-    st = json.loads(open(webapp.RESTOCK_STATE, encoding="utf-8").read())
-    assert st["status"] == "busy" and "iný import" in st["error_detail"]
 
 
 def test_run_via_runner_records_ok_status(iso, monkeypatch):
     _seed_supplier_stock(p1_available=True, p2_fresh=False)
-    fake_run, _calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
     c = authed_client()
     r = c.post("/api/automations/restock_skladom/run")
     assert r.get_json()["started"] is True
@@ -242,6 +208,7 @@ def test_run_via_runner_records_ok_status(iso, monkeypatch):
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "restock_skladom"]
     assert st["last_status"] == "ok"
     assert st["last_result"]["candidates"] == 1
+    assert st["last_result"]["queued"] == 4
     assert st["enabled"] is False               # run-now must not enable the schedule
 
 
@@ -253,119 +220,135 @@ def test_endpoint_requires_login(iso):
 
 def test_endpoint_serves_candidates(iso, monkeypatch):
     _seed_supplier_stock(p1_available=True, p2_fresh=False)
-    fake_run, _calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
     webapp.run_restock_skladom()
     c = authed_client()
     j = c.get("/api/restock-skladom").get_json()
     assert j["has_supplier_data"] is True and len(j["candidates"]) == 1
     assert j["status"] == "ok" and j["last_check"]
     assert j["candidates"][0]["code"] == "1/M"
+    assert j["queued"] == 4
 
 
 # ── isolation: never touches the manager's live decision stores ────────────────
 def test_run_never_touches_manager_stores(iso, monkeypatch):
     _seed_supplier_stock(p1_available=True, p2_fresh=False)
-    fake_run, _calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
     webapp.run_restock_skladom()
     for _name, path in iso["manager_stores"].items():
         assert path.read_text(encoding="utf-8") == '{"sentinel": true}'
 
 
-# ── #158: the restock batch has the SAME 120s browser-redirect-timeout risk #156
-#    fixed for the pairings/suppliers pushes — must route through the SAME chunked
-#    import helper (_import_rows_chunked). Hermetic: run_import stubbed. ──────────
-def _large_restock_fixture(n):
-    """n Vypredané+visible products, each with a fresh+available supplier link —
-    every one is a restock candidate. Returns (export_csv_bytes, supplier_stock_rows)."""
-    header = ("code;pairCode;name;supplier;productVisibility;availabilityInStock;"
-              "availabilityOutOfStock;price;stock;internalNote\r\n")
-    lines = []
-    stock_rows = []
-    fresh = _fresh_ts()
-    for i in range(n):
-        code = f"{i}/M"
-        link = f"https://supplier.test/p/{i}"
-        lines.append(f"{code};P{i};Bunda {i};TESTSUP;visible;Vypredané;Vypredané;"
-                     f"9.90;0;{link}\r\n")
-        stock_rows.append({"link": link, "ok": True, "available": True,
-                           "price": 9.0, "availabilityText": "Skladom",
-                           "supplier": "TESTSUP", "checkedAt": fresh})
-    return (header + "".join(lines)).encode("cp1250"), stock_rows
-
-
-def _recording_import(fail_on_call=None):
-    """run_import stub recording each chunk CSV's rows; optionally FAIL the Nth call
-    (1-based) to simulate a mid-batch chunk failure (mirrors
-    test_webreview_parovania_eshop.py's #156 pattern)."""
-    calls = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        rows = rd[1:]
-        calls.append({"header": rd[0], "rows": rows, "dry_run": dry_run})
-        if fail_on_call is not None and len(calls) == fail_on_call:
-            return 2, "POZOR: Shoptet hlási zlyhania", "boom"
-        return 0, f"VÝSLEDOK: spracované={len(rows)} upravené={len(rows)} zlyhania=0", ""
-    return fake_run, calls
-
-
-def test_large_restock_batch_split_into_chunks(iso, monkeypatch):
-    # 650 candidates -> must be imported in >=2 chunks, each <= IMPORT_CHUNK_ROWS.
-    # RED before the fix: a single 650-row import call.
-    n = 650
-    export_csv, stock_rows = _large_restock_fixture(n)
-    src = iso["tmp"] / "products.csv"
-    src.write_bytes(export_csv)
-    monkeypatch.setattr(webapp, "SRC", str(src))
-    webapp._save_supplier_stock({"last_check": "now", "rows": stock_rows, "stats": {}})
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
+# ── #299 Task 9: an empty cell in a candidate row must be SKIPPED, never queued ─
+def test_a_candidate_row_with_an_empty_cell_never_queues_that_field(iso, monkeypatch):
+    """`queue_fields`'s own contract: an empty cell means "leave this field alone"
+    in a Shoptet import, so queueing it would be a promise this producer cannot
+    keep. Exercised end-to-end through `run_restock_skladom` (not just at the
+    `queue_shoptet_fields` unit level in test_webreview_shoptet_upload.py) via
+    `_restock_candidate_rows`, mirroring the Step 1 fixture in
+    test_webreview_shoptet_upload.py but with ONE cell deliberately blank.
+    #299 Task 9 review I1: the seam now takes the already-computed `candidates`
+    (unused here, hence `_c`) instead of recomputing its own JOIN."""
+    monkeypatch.setattr(webapp, "_restock_candidate_rows",
+                        lambda _c: [["A", "P", "visible", "Skladom", "", "5"]])
     stats = webapp.run_restock_skladom()
-
-    assert len(calls) >= 2                                   # split, not one giant import
-    assert max(len(c["rows"]) for c in calls) <= webapp.IMPORT_CHUNK_ROWS
-    imported = [r[0] for c in calls for r in c["rows"]]
-    assert sorted(imported) == sorted(f"{i}/M" for i in range(n))
-    assert all(c["dry_run"] is False for c in calls)          # never a dry run
-    assert stats["status"] == "ok"
-    assert stats["candidates"] == n and stats["imported_rows"] == n
+    assert stats["queued"] == 3                  # 4 columns, 1 empty -> 3 queued
+    f = webapp._load_pending()["A"]["fields"]
+    assert set(f) == {"productVisibility", "availabilityInStock", "stock"}
+    assert "availabilityOutOfStock" not in f      # the empty cell never landed
 
 
-def test_restock_mid_batch_chunk_failure_records_error_and_releases_lock(iso, monkeypatch):
-    # a chunk failing mid-batch must -> status='error' with a clear tab-surfaced
-    # message, STOP after the failing chunk, and release the import lock (no stuck
-    # lock -> no cascade failure on the next scheduled run).
-    n = 650
-    export_csv, stock_rows = _large_restock_fixture(n)
-    src = iso["tmp"] / "products.csv"
-    src.write_bytes(export_csv)
-    monkeypatch.setattr(webapp, "SRC", str(src))
-    webapp._save_supplier_stock({"last_check": "now", "rows": stock_rows, "stats": {}})
-    fake_run, calls = _recording_import(fail_on_call=2)      # 1st chunk ok, 2nd fails
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+# ── #299 Task 9 review I1 — candidates (audit/store) and rows (what actually ─── #
+# ── queues) must come from ONE read of the export + supplier_stock, never two ── #
+def test_run_reads_the_export_and_supplier_stock_only_once(iso, monkeypatch):
+    """Before this fix, `candidates` (the audit/store snapshot) and `rows` (what
+    actually gets queued) came from TWO independent `_restock_candidates()` calls —
+    a second full products.csv + supplier_stock.json read. Between the two reads
+    `run_shoptet_sync` could atomically swap products.csv (its own hourly schedule,
+    not mutually exclusive with this producer), so the queued rows could diverge
+    from what the card/store recorded. Pin the read count to ONE of each."""
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    calls = {"export": 0, "stock": 0}
+    real_export = webapp._read_export_for_links
+    real_stock = webapp._load_supplier_stock
 
+    def counted_export():
+        calls["export"] += 1
+        return real_export()
+
+    def counted_stock():
+        calls["stock"] += 1
+        return real_stock()
+
+    monkeypatch.setattr(webapp, "_read_export_for_links", counted_export)
+    monkeypatch.setattr(webapp, "_load_supplier_stock", counted_stock)
     stats = webapp.run_restock_skladom()
+    assert stats["queued"] == 4                  # the run still did real work
+    assert calls["export"] == 1
+    assert calls["stock"] == 1
 
+
+# ── #299 Task 9 review I2 — export-age gate: stale/unknown age must refuse ───── #
+# ── EVERYTHING (never a silent "0 candidates" success) ────────────────────────── #
+def test_run_refuses_everything_when_the_export_is_stale(iso, monkeypatch):
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 6 * 3600 + 1)   # > limit
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("must not queue on a stale export"))
+    stats = webapp.run_restock_skladom()
+    assert stats["ok"] is False
+    assert stats["queued"] == 0 and stats["candidates"] == 0
     assert stats["status"] == "error"
-    assert len(calls) == 2                                   # batch STOPS after the failing chunk
+    assert "starý" in stats["error"] and "6.0 h" in stats["error"]
+    assert not os.path.exists(webapp.PENDING_SHOPTET)
     st = json.loads(open(webapp.RESTOCK_STATE, encoding="utf-8").read())
     assert st["status"] == "error"
-    assert "časti 2/" in st["error_detail"]
-    # candidates are still recorded (what the run TRIED to flip), even on failure
-    assert len(st["candidates"]) == n
-    # the import lock was released despite the failure
-    assert webapp._import_lock.acquire(blocking=False)
-    webapp._import_lock.release()
+    assert st["error"]
 
 
-def test_small_restock_batch_still_single_import(iso, monkeypatch):
-    # a small batch must NOT be needlessly chunked — one import call, as before.
+def test_run_refuses_everything_when_the_export_age_is_unknown(iso, monkeypatch):
+    """Unknown age (file missing / unstat-able) is NEVER treated as fresh — same
+    fail-closed stance as every other EXPORT_MAX_AGE_S gate in this file."""
     _seed_supplier_stock(p1_available=True, p2_fresh=False)
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-    webapp.run_restock_skladom()
-    assert len(calls) == 1 and len(calls[0]["rows"]) == 1
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
+    monkeypatch.setattr(webapp, "queue_shoptet_fields",
+                        lambda *a, **k: pytest.fail("unknown age must not be treated as fresh"))
+    stats = webapp.run_restock_skladom()
+    assert stats["ok"] is False
+    assert stats["queued"] == 0
+    assert "nedá zistiť" in stats["error"]
+
+
+def test_run_still_queues_when_the_export_is_explicitly_fresh(iso, monkeypatch):
+    """The gate must not become fail-closed-always: an export inside the window
+    still queues normally. Freshness is pinned explicitly (not left to the
+    fixture's write-time mtime), so this proves the GATE lets it through."""
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    monkeypatch.setattr(webapp, "_export_age_s", lambda: 60.0)
+    stats = webapp.run_restock_skladom()
+    assert stats["ok"] is True
+    assert stats["queued"] == 4
+
+
+# ── graceful degradation ─────────────────────────────────────────────────────── #
+# ── #299 Task 8 review finding: `last_error` is the ONLY place the runner tells ─ #
+# ── the manager WHY a run failed — a test that only checks last_status='error' ── #
+# ── would pass even if `last_error` were silently left empty. ────────────────── #
+def test_a_corrupt_pending_table_makes_the_runner_record_error_not_crash(iso, monkeypatch):
+    """#299 Task 9: queueing can no longer "fail" via a returned dict (there is no
+    import to fail) — the ONE way it can fail now is `queue_shoptet_fields` refusing
+    to write on top of an unreadable pending table (`StoreWipeRefused`). The runner
+    must still survive that (records last_status='error') AND must give the manager
+    a meaningful reason, not just an opaque failure flag."""
+    _seed_supplier_stock(p1_available=True, p2_fresh=False)
+    with open(webapp.PENDING_SHOPTET, "w", encoding="utf-8") as f:
+        f.write("{ this is not json")
+
+    # #299 Task 11 finding 1 — the RETURN value now reports whether the run
+    # SUCCEEDED, not merely whether it ran; this run raised, so it is False.
+    # The runner surviving (not crashing, `last_status`/`last_error` recorded)
+    # is still pinned by the assertions right below.
+    assert webapp.RUNNER._execute("restock_skladom") is False
+    (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "restock_skladom"]
+    assert st["last_status"] == "error"
+    assert st["running"] is False
+    assert st["last_error"]                        # non-empty
+    assert "poškoden" in st["last_error"].lower() or "StoreWipeRefused" in st["last_error"]

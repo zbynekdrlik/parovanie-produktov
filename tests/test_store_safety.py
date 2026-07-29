@@ -38,7 +38,7 @@ STORE_ATTRS = [
     "SUPPLIERS_STATE", "EXTERNALCODES_STATE", "VARIANT_LINKS_STATE",
     "AUTOMATIONS_STATE", "POSTA_STATE", "ORDERS_REMINDER_STATE",
     "SUPPLIER_STOCK_STATE", "RIZIKO_STATE", "RESTOCK_STATE", "STOCK_SKLADOM_STATE",
-    "IMAGE_HEALTH_STATE", "EXPORT_WATERMARK",
+    "IMAGE_HEALTH_STATE", "EXPORT_WATERMARK", "PENDING_SHOPTET",
 ]
 
 
@@ -265,6 +265,7 @@ def test_a_wipe_is_refused_when_someone_else_wrote_after_our_read(monkeypatch, t
     ("_save_order_comments", "_load_order_comments"),
     ("_save_supplier_assign", "_load_supplier_assign"),
     ("_save_nedostupne", "_load_nedostupne"),
+    ("_save_pending", "_load_pending"),
 ])
 def test_every_manager_work_store_refuses_a_wipe(monkeypatch, tmp_path, save_fn, load_fn):
     monkeypatch.setattr(webapp, "OUT", str(tmp_path))

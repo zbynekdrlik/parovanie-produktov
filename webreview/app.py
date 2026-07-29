@@ -6,6 +6,7 @@ Run: PYTHONPATH=src .venv/bin/python webreview/app.py   (počúva na 0.0.0.0:879
 """
 from __future__ import annotations
 import collections
+import contextlib
 import csv
 import fcntl
 import hmac
@@ -39,10 +40,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from parovanie import (
     __version__, config, image_health, import_builder, nedostupne, orders_reminder,
-    posta_uncollected, restock_skladom, riziko_vypadku, stock_skladom,
+    posta_uncollected, restock_skladom, riziko_vypadku, shoptet_outbox, stock_skladom,
     supplier_stock, vystavy_imap, writer)
 from parovanie.automation_runner import (
-    Automation, AutomationRunner, AutomationStateCorrupt)
+    Automation, AutomationRunner, AutomationStateCorrupt, schedule_interval_s)
 from parovanie.catalog_index import (
     build_catalog_index, build_promoted_entry, search_catalog, supplier_from_url)
 from parovanie.export_helpers import current_of, norm_status, resync_current
@@ -5525,7 +5526,14 @@ def _export_row_verdicts(rows, note_col=2) -> dict:
     optimisation „read the export once, pass it down" could credit rows from bytes
     whose age was never checked — the guard below can only hold while the read and
     the freshness check stay in the same place. The same guard now protects the
-    `absent` verdict, which is a WRITE condition too (it withholds a row)."""
+    `absent` verdict, which is a WRITE condition too (it withholds a row).
+
+    `note_col=None` (#299 — the combined-import verdict pass over the WHOLE pending
+    table, which has no single fixed column layout: every row can carry a different
+    set of queued fields) skips the `confirmed` comparison entirely — there is no
+    single column that means "internalNote" across a header built from `sorted(cols)`
+    over an arbitrary field set — and returns only `absent`. Never index `r[note_col]`
+    when it is `None`; every other caller keeps the default `2` and is unaffected."""
     none = {"confirmed": set(), "absent": set()}
     age = _export_age_s()
     if age is not None and age > EXPORT_MAX_AGE_S:
@@ -5543,8 +5551,11 @@ def _export_row_verdicts(rows, note_col=2) -> dict:
             log.warning("export nesie len %d kódov (limit %d) — vyzerá neúplne, "
                         "nepotvrdzujem ani nezadržiavam nič", len(codes), floor)
         return none
-    confirmed = {r[0] for r in rows
-                 if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
+    if note_col is None:
+        confirmed = set()
+    else:
+        confirmed = {r[0] for r in rows
+                     if r[0] in notes and notes[r[0]] == (r[note_col] or "").strip()}
     absent = {r[0] for r in rows if r[0] not in codes}
     return {"confirmed": confirmed, "absent": absent}
 
@@ -5632,6 +5643,87 @@ def n8n_shoptet_import():
 
 
 # --------------------------------------------------------------------------- #
+# #299 — the ONE table between our decisions and the eshop. Producers queue the
+# field values they want; the hourly `shoptet_upload` cycle turns the whole table
+# into a single import. protect=True: a queued change that is lost never reaches
+# the eshop and nothing notices, which is exactly the silent loss the table exists
+# to end.
+# --------------------------------------------------------------------------- #
+PENDING_SHOPTET = _store("pending_shoptet.json")
+
+
+def _load_pending() -> dict:
+    return _read_json_store(PENDING_SHOPTET, {})
+
+
+def _save_pending(d: dict, *, prev: dict | None = None) -> None:
+    """`prev=` names the read `d` was DERIVED from (#299 Task 6): `queue_fields`
+    always GROWS or holds the count (an existing code only ever gains fields), so
+    the shrink-guard's `new >= was` skip covers every queueing write without it.
+    `settle` is the one caller that legitimately SHRINKS the table (confirmed rows
+    drop out) — it hands back a brand-new dict, not the object `_load_pending`
+    read, so without `prev=` naming that read the guard cannot tell this shrink
+    apart from an unrelated smaller map and correctly refuses it (store-prune.md
+    §3: "ak staviaš NOVÚ mapu, musíš pridať prev=d0")."""
+    _atomic_write_json(PENDING_SHOPTET, d, protect=True, prev=prev)
+
+
+def queue_shoptet_field_groups(groups) -> list[int]:
+    """Queue several (source, header, rows, credit_group, credit_value) groups
+    against ONE read + ONE atomic write. Returns how many field values each
+    group queued, in the SAME order as `groups`.
+
+    #299 opravné kolo 1 review m4 — `_do_upload_pairings` used to queue its two
+    row groups (reviewed-decision rows, then inline order-pairing rows) via TWO
+    SEPARATE `queue_shoptet_fields` calls — two INDEPENDENT locked
+    read-modify-writes. If the SECOND one raised (a bad row, a lock timeout,
+    anything `shoptet_outbox.queue_fields`/`_atomic_write_json` can throw), the
+    FIRST had already landed on disk: a partial queue, with nothing in the
+    caller's return value (it never returned at all) to say so. Chaining both
+    groups through the SAME in-memory `pending` inside ONE `with _lock:` and
+    writing ONCE at the end means either every group's rows land, or — if any
+    of them raises — NONE do; the exception still propagates (this is
+    deliberately not swallowed), but it can never leave a half-queued table
+    behind it. `queue_shoptet_fields` below is now this function called with a
+    single group, so single-producer callers keep the exact same contract for
+    free — no logic duplicated between the two (`NEkopíruj logiku`)."""
+    non_empty = [(i, g) for i, g in enumerate(groups) if g[2]]
+    counts = [0] * len(groups)
+    if not non_empty:
+        return counts
+    now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    with _lock:
+        # A table we could not read is NOT an empty table — queueing on top of the
+        # default would silently drop everything already waiting. That refusal is
+        # NOT hand-rolled here: `_atomic_write_json(protect=True)` in `_save_pending`
+        # already refuses the wipe, quarantines the corrupt file and raises
+        # StoreWipeRefused, which the app turns into a 503 with instructions. A
+        # hand-rolled `raise` in front of it short-circuits exactly that machinery
+        # (no quarantine, wrong exception type, and an empty file — a real
+        # post-crash shape — would brick queueing for ever).
+        pending = _read_json_store(PENDING_SHOPTET, {})
+        for i, (source, header, rows, credit_group, credit_value) in non_empty:
+            pending, n = shoptet_outbox.queue_fields(
+                pending, source, header, rows,
+                credit_group=credit_group, credit_value=credit_value, now=now)
+            counts[i] = n
+        if any(counts):
+            _save_pending(pending)
+    for i, (source, header, rows, credit_group, credit_value) in non_empty:
+        if counts[i]:
+            log.info("outbox: %s zaradil %d polí (%d kódov)", source, counts[i],
+                     len(rows))
+    return counts
+
+
+def queue_shoptet_fields(source, header, rows, credit_group=None,
+                         credit_value=None) -> int:
+    """Queue rows for the next hourly upload. Returns how many field values landed."""
+    return queue_shoptet_field_groups(
+        [(source, header, rows, credit_group, credit_value)])[0]
+
+
+# --------------------------------------------------------------------------- #
 # n8n → nightly upload of worker pairings (reorder links → eshop internalNote)
 # --------------------------------------------------------------------------- #
 PAIRINGS_STATE = _store("uploaded_pairings.json")
@@ -5696,7 +5788,9 @@ def _do_upload_pairings(dry):
 
     if not new_keys and not new_order_codes:
         log.info("n8n pairings: 0 new pairings")
-        return {"ok": True, "count": 0, "products": [], "order_count": 0, "order_blocked": 0,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": [], "order_count": 0, "order_blocked": 0,
+                "confirmed_in_export": 0,
                 "missing_count": 0, "missing_in_eshop": [],
                 **_pairing_summary(uploaded)}, 200
 
@@ -5723,8 +5817,10 @@ def _do_upload_pairings(dry):
         # already owned by a reviewed decision (uploaded on an earlier night, so not
         # in `rows`) is excluded here too, which is precisely the point — it stays
         # "new" and blocked forever rather than reverting the eshop.
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": products,
                 "order_count": 0, "order_blocked": len(new_order_codes),
+                "confirmed_in_export": 0,
                 "message": "no import rows", "blocked": len(new_keys),
                 "missing_count": 0, "missing_in_eshop": [],
                 **_pairing_summary(uploaded)}, 200
@@ -5771,17 +5867,33 @@ def _do_upload_pairings(dry):
     # rows Shoptet accepted inside a partially-rejected batch (whose identity the
     # import log never reveals) get credited on the next run instead of being
     # rebuilt and re-sent every night forever.
-    # #270: the mirror image — a code the catalogue does NOT carry at all can never
-    # import (Shoptet rejects that row on every run, for ever). Hold it back and LIST
-    # it with the URL we tried to write, so the manager can fix the code instead of
-    # reading a bare „Shoptet odmietol 2 riadkov" every morning. Never credited, so
-    # the moment the code appears in the catalogue it is written.
+    # #270 / #299 opravné kolo 1 review C1: the mirror image — a code the catalogue
+    # does NOT carry at all can never import (Shoptet rejects that row on every
+    # run, for ever). It is QUEUED anyway, together with the rest of its key's
+    # codes — never excluded from `send_rows` below — so `credit_group`/
+    # `credit_value` (built from `written_codes`, upstream of this verdict split)
+    # still carry it. The hourly drain's OWN `build_import` independently marks it
+    # `not-in-catalog` and holds it out of the actual Shoptet import; `settle` then
+    # sees an unconfirmed code inside the group and withholds the WHOLE key's
+    # credit, exactly the #49 rule this producer exists to keep. Queueing it also
+    # keeps it growing `blocked_runs` in the shared table until `stale_blocked`
+    # catches it, and it stays listed below (`_missing_report`) so the manager can
+    # fix the code. C1 (opravné kolo 1): before this fix the row was excluded from
+    # `send_rows` here while `credit_group` still carried it (built earlier, from
+    # `written_codes`) — so the OTHER codes of the same key got queued, Shoptet
+    # confirmed them, and the whole key was credited even though this code's link
+    # was never actually written to the eshop — a silent, permanent loss of the
+    # #49 protection, and the code vanished from „chýba v eshope" too since a
+    # credited key is no longer „new".
     verdicts = _export_row_verdicts(all_rows)
     confirmed = verdicts["confirmed"]
     # (the two sets are disjoint by construction — confirmed ⊆ notes ⊆ codes, absent is
     # „not in codes" — the subtraction is belt-and-braces against a future verdict change)
     absent = verdicts["absent"] - confirmed
-    send_rows = [r for r in all_rows if r[0] not in confirmed and r[0] not in absent]
+    # Only a CONFIRMED row is excluded from what gets queued — an ABSENT one IS
+    # queued (see the #270/C1 comment above); the drain, not this producer,
+    # decides whether it can actually reach Shoptet.
+    send_rows = [r for r in all_rows if r[0] not in confirmed]
     missing = _missing_report(sorted(absent), {r[0]: r[2] for r in all_rows})
     if confirmed:
         log.info("n8n pairings: %d z %d riadkov už eshop má presne tak, ako by sme "
@@ -5789,82 +5901,118 @@ def _do_upload_pairings(dry):
                  len(confirmed), len(all_rows))
     if absent:
         # A review key with SEVERAL variant codes, one of them absent, can never be
-        # recorded uploaded (its landed codes get confirmed, the absent one never
-        # enters `success`, and a key is credited only when ALL its written codes did
-        # — the #49 rule). It therefore stays „new" and reports +0 nových every night
-        # until the code is fixed. That is the safe direction, and the card names the
-        # exact offending code below, which is what the manager has to act on.
+        # recorded uploaded (its landed codes get confirmed once the drain sends and
+        # Shoptet confirms them; the absent one is queued too, but the drain blocks
+        # it as not-in-catalog and it never enters `success` — a key is credited
+        # only when ALL its written codes did, the #49 rule, kept intact since C1's
+        # fix). It therefore stays „new" and reports +0 nových every night until the
+        # code is fixed. That is the safe direction, and the card names the exact
+        # offending code below, which is what the manager has to act on.
         log.warning("n8n pairings: %d kódov eshop v katalógu vôbec nemá — "
-                    "neposielam ich (Shoptet by ich zakaždým odmietol): %s",
+                    "zaraďujem ich do frontu, no hodinový cyklus ich zablokuje "
+                    "(Shoptet by ich zakaždým odmietol): %s",
                     len(absent), sorted(absent)[:10])
 
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n pairings: another import already running")
-        return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n pairings: %d products, %d order codes, %d rows to send of %d "
-             "(chunks of %d), dry_run=%s", len(new_keys), len(new_order_codes),
-             len(send_rows), len(all_rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: import in chunks so no single large import overruns the browser
-        # redirect timeout. A HARD-failing chunk stops the batch; a partially
-        # accepted one does not (#257) — its rows are simply not credited from the
-        # log, they wait for the export to confirm them.
-        res = _import_rows_chunked(send_rows, import_builder.LINK_HEADER, dry,
-                                   prefix="import_links_", timeout=900)
-        # `partial` already forces a non-zero rc (so res["ok"] is False); the explicit
-        # term keeps that invariant local — a partially rejected push is never "ok".
-        ok = res["ok"] and not res["partial"]
-        success = res["success_codes"] | confirmed
-        if res["partial_codes"]:
-            log.warning("n8n pairings: %d riadkov čaká na potvrdenie z exportu "
-                        "(Shoptet ich prijal v čiastočne odmietnutej dávke): %s",
-                        len(res["partial_codes"]), sorted(res["partial_codes"])[:10])
-        # A decision key is recorded uploaded only when EVERY one of its written codes
-        # landed in a SUCCESSFUL chunk — a key straddling the failed boundary stays
-        # "new" (re-uploading its done codes next run is idempotent, same URL; marking
-        # it done would lose its un-uploaded codes, the #49 class). On partial failure
-        # this records the successful chunks so the next run only retries the rest
-        # (resumable), never all-or-nothing.
-        uploaded_keys = [
-            k for k in uploadable_keys
-            if (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])) <= success]
-        uploaded_order_codes = [c for c in new_order_codes
-                                if c in order_written_codes and c in success]
-        if not dry:
-            done = {k: (dec[k].get("url") or "").strip()      # keys fully imported OK
-                    for k in uploaded_keys}
-            done.update({f"order:{c}": (order_pairings[c] or "").strip()
-                         for c in uploaded_order_codes})      # order codes imported OK
-            uploaded = _record_uploaded(_load_uploaded, _save_uploaded, done)
-    finally:
-        _import_lock.release()
+    # #299 Task 10 — a CONFIRMED row is proof from the eshop's OWN export, not "our
+    # own say-so" (the #257 bug class this migration otherwise ends), so it is
+    # recorded RIGHT AWAY exactly as before this migration — the launching brief's
+    # explicit instruction was to leave this path unchanged. A decision key (or
+    # order code) is credited immediately only when EVERY one of its written codes
+    # is already confirmed; a key straddling confirmed+unconfirmed codes waits for
+    # the unconfirmed ones to clear the drain below (never partially credited —
+    # the #49 rule survives the migration unchanged).
+    uploaded_keys = [
+        k for k in uploadable_keys
+        if (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])) <= confirmed]
+    uploaded_order_codes = [c for c in new_order_codes
+                            if c in order_written_codes and c in confirmed]
+    if not dry:
+        done = {k: (dec[k].get("url") or "").strip()      # keys already confirmed
+                for k in uploaded_keys}
+        done.update({f"order:{c}": (order_pairings[c] or "").strip()
+                     for c in uploaded_order_codes})       # order codes already confirmed
+        uploaded = _record_uploaded(_load_uploaded, _save_uploaded, done)
 
-    err_msg = ""
-    if not ok:                               # clear, tab-surfaced message: which chunk + progress
-        err_msg = _chunk_error_msg(res, len(send_rows), confirms_from_export=True)
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_keys),
-              "rows": len(all_rows), "rows_sent": len(send_rows),
+    if dry:
+        # #299 Task 8/9 precedent (m3) — dry_run no longer reaches a real Shoptet
+        # dry-run import (there is no import left here to dry-run); the honest
+        # equivalent is a PREVIEW of how many field values WOULD be queued, while
+        # queueing (and crediting) nothing at all.
+        log.info("n8n pairings: dry run — %d rows would be queued, nothing written",
+                 len(send_rows))
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(send_rows),
+                "dry_run": True, "confirmed_in_export": len(confirmed),
+                "products": products, "blocked": len(blocked_keys),
+                **missing,
+                "order_count": 0, "order_blocked": len(blocked_order_codes),
+                **_pairing_summary(uploaded)}, 200
+
+    # Everything not already confirmed from the export (`send_rows` — excludes
+    # confirmed codes only; an absent code IS included, see the #270/C1 comment
+    # above) is no longer imported directly: it is QUEUED into the shared
+    # pending_shoptet table for the next hourly "Sync do Shoptetu"
+    # drain, which is the only place left that writes uploaded_pairings.json for a
+    # freshly-sent row (via `_credit_producer`, only once Shoptet's own import
+    # actually confirms it — never on this producer's own say-so). credit_group is
+    # keyed by CODE and carries the owning decision key (or `order:<code>`) so the
+    # drain credits the WHOLE group only once every one of ITS OWN queued codes is
+    # confirmed; credit_value MUST be the exact shape `new_pairing_keys`/
+    # `new_order_pairing_keys` compare against on the NEXT run (Task 8's C1 lesson:
+    # crediting a DIFFERENT shape than the comparison uses means the same link
+    # requeues to the live eshop forever and total_uploaded never moves).
+    credit_group = {}
+    credit_value = {}
+    for k in uploadable_keys:
+        for c in (written_codes & set(by_key.get(k, {}).get("variant_codes") or [])):
+            credit_group[c] = k
+            credit_value[c] = (dec[k].get("url") or "").strip()
+    order_credit_group = {c: f"order:{c}" for c in order_written_codes}
+    order_credit_value = {c: (order_pairings[c] or "").strip() for c in order_written_codes}
+    # #299 Task 11 finding 3 — a reviewed-decision row and an inline order-pairing
+    # row are queued as TWO SEPARATE groups, not one combined `send_rows` call as
+    # before: they used to go up TOGETHER, so the single `n` that returned could
+    # not be attributed to either bucket. That made BOTH card counters lie —
+    # `queued` ("🔗 Párovania") silently included inline pairs, and `order_count`
+    # ("📦 Inline páry: +N nových") stayed 0 forever because it was actually
+    # `len(uploaded_order_codes)` — codes confirmed RIGHT AWAY from the export
+    # match, never the ones this run just queued (the whole point of "+N
+    # nových").
+    # #299 opravné kolo 1 review m4 — the two groups now go through
+    # `queue_shoptet_field_groups`, which chains them over ONE read and ONE
+    # atomic write (see its own docstring): if queueing the SECOND group ever
+    # raised, the OLD two-separate-calls shape would have already committed the
+    # FIRST group to disk with no trace of the partial state in the return
+    # value. One shared write means either both groups land or neither does,
+    # while each counter still means exactly what its label says.
+    pairing_send_rows = [r for r in rows if r[0] not in confirmed]
+    order_send_rows = [r for r in order_rows if r[0] not in confirmed]
+    # queue_fields() takes a ";"-joined HEADER STRING (it splits on ";" itself,
+    # like every other producer's call site) — LINK_HEADER is a plain list, so
+    # this must be joined, never passed raw (`header.split(";")` on a list raises
+    # AttributeError — caught only by actually RUNNING this call, not by reading
+    # the task brief's own literal snippet, which passed the list unjoined).
+    link_header = ";".join(import_builder.LINK_HEADER)
+    queued, order_queued = queue_shoptet_field_groups([
+        ("parovania_eshop", link_header, pairing_send_rows, credit_group, credit_value),
+        ("parovania_eshop", link_header, order_send_rows,
+         order_credit_group, order_credit_value),
+    ])
+
+    result = {"ok": True, "queued": queued, "count": len(uploaded_keys),
+              "would_queue": 0, "dry_run": False,
               "confirmed_in_export": len(confirmed),
-              "partial": res["partial"], "rejected": res["partial_failed"],
-              "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
-              "blocked": len(blocked_keys),
+              "products": products, "blocked": len(blocked_keys),
               **missing,
-              "order_count": len(uploaded_order_codes),
+              "order_count": order_queued,
               "order_blocked": len(blocked_order_codes),
               **_pairing_summary(uploaded)}
-    log.info("n8n pairings: rc=%s chunks=%d/%d processed=%s products=%d order_codes=%d "
-             "confirmed_from_export=%d rejected=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"],
-             len(uploaded_keys), len(uploaded_order_codes), len(confirmed),
-             res["partial_failed"])
-    if not ok:
-        log.error("n8n pairings FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    log.info("n8n pairings: queued %d pairing field(s) + %d inline order field(s) "
+             "of %d candidate rows, %d key(s) + %d order code(s) confirmed "
+             "immediately from export, %d blocked, %d order_blocked",
+             queued, order_queued, len(pairing_send_rows) + len(order_send_rows),
+             len(uploaded_keys), len(uploaded_order_codes), len(blocked_keys),
+             len(blocked_order_codes))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-pairings", methods=["POST"])
@@ -5975,7 +6123,8 @@ def _do_upload_suppliers(dry):
         # `obsolete_removed` / `obsolete_held` are part of the shape on EVERY path, so a
         # caller never has to tell „nothing was removed" from „this build does not report
         # it" — nor „nothing was obsolete" from „we refused to judge"
-        return {"ok": True, "count": 0, "products": [], "obsolete_removed": [],
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": [], "obsolete_removed": [],
                 "obsolete_held": [],
                 "missing_count": 0, "missing_in_eshop": [],
                 **_supplier_summary(uploaded, assigns)}, 200
@@ -6028,7 +6177,8 @@ def _do_upload_suppliers(dry):
                     "no eshop write)", reason, len(export_codes), min_codes,
                     f"{export_age / 3600:.1f}" if export_age is not None else "?",
                     len(new_codes))
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": products,
                 "message": "export unavailable — upload blocked (fail-closed)",
                 "blocked": len(new_codes),
                 "obsolete_removed": [], "obsolete_held": [],
@@ -6081,7 +6231,46 @@ def _do_upload_suppliers(dry):
     #   * never on a DRY run, in-place `pop` under one `with _lock:`, no write at all when
     #     there is nothing to remove, and the concrete codes AND the values dropped go into
     #     the log — a count alone defends nothing three weeks later.
-    obsolete = sorted(set(new_codes) & own_supplier & export_codes - set(uploaded))
+    #   * …and NEVER on a code that is CURRENTLY QUEUED for its supplier value
+    #     (#299 záverečná recenzia, Critical C1). Since the #299 migration, credit
+    #     for this table lands only AFTER the hourly drain's own import CONFIRMS the
+    #     row (store-prune.md §6 — the whole reason that migration exists), so there
+    #     is a real window where a code is genuinely being written right now and
+    #     `uploaded_suppliers.json` legitimately does not know it yet — `c not in
+    #     uploaded` reads exactly like „nobody ever wrote this" even though WE are
+    #     the ones writing it. Without this exclusion: the drain sends the row,
+    #     Shoptet accepts it, but the chunk comes back partial (or this code alone
+    #     is `dirty`) — so it never reaches `success_codes`, `uploaded_suppliers.
+    #     json` is never updated, and the NEXT nightly `parovania_eshop` sees the
+    #     code as „new" while the export already shows the eshop's own supplier —
+    #     the one we JUST wrote. `c not in uploaded` then fires and the manager's
+    #     assignment is deleted from `supplier_assignments.json`, while the row is
+    #     STILL sitting in the queue and STILL going out to the live eshop every
+    #     hour, with a value the manager can no longer see or change anywhere in
+    #     this app. „Zaradené, ešte nepotvrdené" therefore counts as „we are the one
+    #     writing this", never as „nobody wrote this" — the same distinction
+    #     `shoptet_outbox.settle` itself keeps: a queued field never leaves the
+    #     table until the drain proves it landed.
+    #   * …and this exclusion set is only as good as the READ that built it
+    #     (#299 opravné kolo 2 review N-C2, Critical). `_load_pending` (plain
+    #     `_read_json_store`) degrades a CORRUPT `pending_shoptet.json` to
+    #     `{}` exactly like a legitimately empty queue — and `{}` means
+    #     "nothing is currently queued for ANY code's supplier field", which
+    #     makes the exclusion above a no-op and lets #215's removal fire on a
+    #     false "nothing in flight" reading while the row may genuinely be
+    #     mid-flight to the eshop right now. A MISSING file is different: it
+    #     is the ordinary, silent state of a store nothing has ever queued
+    #     into yet — `_queue_stale_while_disabled_warning` already treats a
+    #     missing `pending_shoptet.json` this same way, for this SAME file
+    #     (store-prune §1: absence of a routinely-written store, before its
+    #     first write, is not evidence of anything hidden). Only a file that
+    #     genuinely IS there but cannot be trusted refuses the removal below.
+    pending_state, pending_from_disk = _read_json_store_state(PENDING_SHOPTET, {})
+    pending_trustworthy = pending_from_disk or not os.path.exists(PENDING_SHOPTET)
+    queued_supplier_codes = {c for c, e in pending_state.items()
+                             if "supplier" in (e.get("fields") or {})}
+    obsolete = sorted(set(new_codes) & own_supplier & export_codes
+                      - set(uploaded) - queued_supplier_codes)
     obsolete_removed, obsolete_held = [], []
     if obsolete and not uploaded_on_disk:
         # Fail-CLOSED and LOUD (automation-health §3): a permanent hold that nobody can
@@ -6093,6 +6282,17 @@ def _do_upload_suppliers(dry):
                   "lebo bez nej sa „nikdy sme to nenahrali\" nedá odlíšiť od „manažér "
                   "práve zmenil meno dodávateľa\": %s",
                   len(obsolete_held), SUPPLIERS_STATE, ", ".join(obsolete_held[:10]))
+    elif obsolete and not pending_trustworthy:
+        # N-C2 — the mirror hold: a poškodená (not missing) queue makes it
+        # impossible to tell "nothing is queued for this code" from "we just
+        # cannot read what IS queued", so the removal is refused exactly the
+        # same way as the uploaded_suppliers.json branch above.
+        obsolete_held, obsolete = obsolete, []
+        log.error("n8n suppliers: %d priradení vyzerá neaktuálne, ale tabuľku "
+                  "čakajúcich zmien (%s) sa nepodarilo prečítať — NEMAŽE SA NIČ, "
+                  "lebo bez nej sa „nič nie je práve zaradené do eshopu\" nedá "
+                  "odlíšiť od „súbor sa nedá prečítať\": %s",
+                  len(obsolete_held), PENDING_SHOPTET, ", ".join(obsolete_held[:10]))
     if obsolete and not dry:
         try:
             with _lock:
@@ -6168,61 +6368,59 @@ def _do_upload_suppliers(dry):
                     "(%d already have their own eshop supplier, %d held as absent "
                     "from the catalogue)",
                     len(new_codes), len(own_supplier & set(new_codes)), len(missing_codes))
-        return {"ok": True, "count": 0, "products": products,
+        return {"ok": True, "queued": 0, "would_queue": 0, "dry_run": dry,
+                "count": 0, "products": products,
                 "message": "no import rows", "blocked": len(new_codes),
                 "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
                 **_missing_report(missing_codes, assigns),
                 **_supplier_summary(uploaded, assigns)}, 200
 
-    # supplier_rows is 1:1 with codes (no product→variant indirection), but codes with
-    # their own eshop supplier — and, since #275, codes the catalogue does not carry —
-    # are excluded, so written_codes ⊆ new_codes. A held code therefore never enters
-    # `success` and so is never recorded uploaded: it is simply retried next run.
-    written_codes = {r[0] for r in rows}
+    if dry:
+        # #299 Task 8/9 precedent (m3) — dry_run no longer reaches a real Shoptet
+        # dry-run import; the honest equivalent is a PREVIEW of how many field
+        # values WOULD be queued, while queueing (and crediting) nothing.
+        log.info("n8n suppliers: dry run — %d rows would be queued, nothing written",
+                 len(rows))
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(rows),
+                "dry_run": True, "products": products,
+                "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
+                **_missing_report(missing_codes, assigns),
+                **_supplier_summary(uploaded, assigns)}, 200
 
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n suppliers: another import already running")
-        # this return sits AFTER the cleanup above, so it is the one path where a removal
-        # may already have happened — it has to say so like every other
-        return {"ok": False, "error": "import already running",
-                "obsolete_removed": obsolete_removed,
-                "obsolete_held": obsolete_held}, 409
-    log.info("n8n suppliers: %d codes, %d rows (chunks of %d), dry_run=%s",
-             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: chunked import (formula-injection guard applied per cell — supplier
-        # name is free text). FIRST failing chunk stops the batch; success_codes are
-        # the codes imported by a successful chunk (partial progress → resumable).
-        res = _import_rows_chunked(rows, import_builder.SUPPLIER_HEADER, dry,
-                                   prefix="import_suppliers_", csv_safe=True, timeout=900)
-        ok = res["ok"]
-        success = res["success_codes"]
-        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry:                          # record only codes that imported OK
-            uploaded = _record_uploaded(
-                _load_uploaded_suppliers, _save_uploaded_suppliers,
-                {c: (assigns[c] or "").strip() for c in uploaded_codes})
-    finally:
-        _import_lock.release()
-
-    err_msg = ""
-    if not ok:
-        err_msg = _chunk_error_msg(res, len(rows))
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
-              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
+    # #299 Task 10 — no longer imported directly: QUEUED into the shared
+    # pending_shoptet table for the next hourly "Sync do Shoptetu" drain, which is
+    # the only place left that writes uploaded_suppliers.json for a freshly-sent
+    # code (via `_credit_producer`, only once Shoptet's own import actually
+    # confirms it). 1:1 code↔group, like the externalCode/split-link write-backs —
+    # no cross-code grouping needed here. `source`/`store` is
+    # "parovania_eshop_suppliers" — a distinct name from the pairings push's
+    # "parovania_eshop" even though both share the SAME automation key on the
+    # runner, because they need distinct credit stores (uploaded_suppliers.json
+    # vs uploaded_pairings.json — see `_credit_producer`).
+    queued = queue_shoptet_fields(
+        "parovania_eshop_suppliers", ";".join(import_builder.SUPPLIER_HEADER), rows,
+        credit_group={r[0]: r[0] for r in rows},
+        # r[2] is supplier_rows' own `(sup or "").strip()` output — the EXACT shape
+        # new_supplier_keys compares against uploaded_suppliers.json on the next
+        # run (Task 8's C1 lesson: crediting anything else means the same
+        # assignment re-queues forever and total_uploaded never moves).
+        credit_value={r[0]: r[2] for r in rows})
+    # #299 záverečná recenzia (Minor) — `queued` is a FIELD count (what
+    # `queue_shoptet_fields` returns); `_supplier_summary`'s `total_assigned` /
+    # `total_uploaded` / `remaining` are CODE counts. Today the supplier write
+    # queues exactly one column per row (`supplier`), so the two happen to be
+    # numerically equal — but `count` is meant to answer "how many CODES did
+    # this run queue", the same question the summary's other numbers answer,
+    # so it is built from `len(rows)` (codes) explicitly rather than riding on
+    # a coincidence that a future second column on this write would break
+    # silently. `queued` itself keeps meaning "field values", unchanged.
+    result = {"ok": True, "queued": queued, "count": len(rows), "would_queue": 0,
+              "dry_run": False, "products": products,
               "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
               **_missing_report(missing_codes, assigns),
               **_supplier_summary(uploaded, assigns)}
-    log.info("n8n suppliers: rc=%s chunks=%d/%d processed=%s codes=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
-    if not ok:
-        log.error("n8n suppliers FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    log.info("n8n suppliers: queued %d field(s) for %d code(s)", queued, len(rows))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-suppliers", methods=["POST"])
@@ -6276,16 +6474,27 @@ def _externalcode_summary(uploaded, grube_codes):
 def _do_upload_externalcodes(dry):
     """Core of the nightly GRUBE externalCode write-back — the SINGLE place the logic
     lives (NEkopíruj logiku). Reads the durable grube_codes.json store, builds
-    code;pairCode;externalCode for only the codes not yet uploaded (or whose itemId
-    changed), runs the careful chunked import, records what went up, and returns
-    (result, status). Shared by the n8n HTTP endpoint (below) and the in-app „GRUBE
-    kódy → eshop" automation (#62) — no auth / Flask request access here. Touches ONLY
-    the `externalCode` column (own file → a present-but-empty cell can't wipe
-    internalNote/state/prices). The externalCode is the grube per-size `itemId`, which
-    MUST be purely numeric — the numeric guard lives in both new_externalcode_keys and
-    externalcode_rows (a non-numeric cell is junk / a possible formula-injection lead,
-    dropped, never an empty cell that would WIPE the existing externalCode). GRUBE-only
-    is guaranteed by the source store (grube_codes.json is built only for GRUBE)."""
+    code;pairCode;externalCode rows for the codes not yet uploaded (or whose itemId
+    changed), and QUEUES them into the shared pending_shoptet table for the next
+    hourly „Sync do Shoptetu" drain (#299 Task 8) — it never imports directly
+    (`_import_rows_chunked` is never called here) and never writes
+    uploaded_externalcodes.json itself; that credit is written only by
+    `_credit_producer` once the hourly cycle's OWN import actually confirms the row
+    (the #257 class of bug: an „uploaded" mark written on our own say-so, before
+    Shoptet confirmed anything — decision carried over from Task 6/7, not in this
+    task's original brief). Shared by the n8n HTTP endpoint (below) and the in-app
+    „GRUBE kódy → eshop" automation (#62) — no auth / Flask request access here.
+    Touches ONLY the `externalCode` column (own file → a present-but-empty cell can't
+    wipe internalNote/state/prices). The externalCode is the grube per-size `itemId`,
+    which MUST be purely numeric — the numeric guard lives in both new_externalcode_keys
+    and externalcode_rows (a non-numeric cell is junk / a possible formula-injection
+    lead, dropped, never an empty cell that would WIPE the existing externalCode).
+    GRUBE-only is guaranteed by the source store (grube_codes.json is built only for
+    GRUBE). `dry=True` builds the same candidate rows but queues nothing — same
+    "changes nothing" contract the old dry-run import had. `credit_group`/
+    `credit_value` are keyed by the code itself (1:1, no cross-code grouping needed
+    here) so the drain can only ever credit a code once every one of its own fields
+    is confirmed."""
     grube = _load_grube_codes()
     uploaded = _load_uploaded_externalcodes()
     new_codes = import_builder.new_externalcode_keys(grube, uploaded)
@@ -6293,59 +6502,37 @@ def _do_upload_externalcodes(dry):
                 for c in new_codes]
     if not new_codes:
         log.info("n8n externalcode: 0 new codes")
-        return {"ok": True, "count": 0, "products": [],
-                **_externalcode_summary(uploaded, grube)}, 200
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": [], **_externalcode_summary(uploaded, grube)}, 200
 
     rows = import_builder.externalcode_rows({c: grube[c] for c in new_codes}, CODE2PAIR)
     if not rows:
         log.warning("n8n externalcode: %d new codes but 0 import rows", len(new_codes))
-        return {"ok": True, "count": 0, "products": products,
-                "message": "no import rows", "blocked": len(new_codes),
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": products, "message": "no import rows",
+                "blocked": len(new_codes), **_externalcode_summary(uploaded, grube)}, 200
+
+    if dry:
+        # #299 review m3 — dry_run used to reach a real Shoptet dry-run import that
+        # genuinely validated the payload; post-migration there is no import left
+        # to dry-run (the producer only queues). `would_queue` restores the
+        # security-check's actual purpose — "what would this run send" — as a
+        # true preview of `len(rows)` candidate field values, while queueing
+        # nothing (no queue_shoptet_fields call on this branch at all).
+        log.info("n8n externalcode: dry run — %d rows would be queued, nothing written",
+                 len(rows))
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(rows),
+                "dry_run": True, "products": products,
                 **_externalcode_summary(uploaded, grube)}, 200
 
-    # externalcode_rows is 1:1 with codes (no product→variant indirection) and applies
-    # the same numeric guard, so every new code that survived new_externalcode_keys has
-    # exactly one row — written_codes == set(new_codes).
-    written_codes = {r[0] for r in rows}
-
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n externalcode: another import already running")
-        return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n externalcode: %d codes, %d rows (chunks of %d), dry_run=%s",
-             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: chunked import (formula-injection guard applied per cell — belt-and-
-        # braces alongside the numeric itemId guard). FIRST failing chunk stops the
-        # batch; success_codes are the codes imported by a successful chunk (partial
-        # progress → resumable).
-        res = _import_rows_chunked(rows, import_builder.EXTERNALCODE_HEADER, dry,
-                                   prefix="import_externalcode_", csv_safe=True, timeout=900)
-        ok = res["ok"]
-        success = res["success_codes"]
-        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry:                          # record only codes that imported OK
-            uploaded = _record_uploaded(
-                _load_uploaded_externalcodes, _save_uploaded_externalcodes,
-                {c: str(grube[c].get("itemId", "")).strip() for c in uploaded_codes})
-    finally:
-        _import_lock.release()
-
-    err_msg = ""
-    if not ok:
-        err_msg = _chunk_error_msg(res, len(rows))
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
-              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
-              **_externalcode_summary(uploaded, grube)}
-    log.info("n8n externalcode: rc=%s chunks=%d/%d processed=%s codes=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
-    if not ok:
-        log.error("n8n externalcode FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    queued = queue_shoptet_fields(
+        "grube_externalcode", ";".join(import_builder.EXTERNALCODE_HEADER), rows,
+        credit_group={r[0]: r[0] for r in rows},
+        credit_value={r[0]: r[2] for r in rows})
+    result = {"ok": True, "queued": queued, "count": queued, "would_queue": queued,
+              "dry_run": dry, "products": products, **_externalcode_summary(uploaded, grube)}
+    log.info("n8n externalcode: queued %d field(s) for %d code(s)", queued, len(rows))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-externalcode", methods=["POST"])
@@ -6404,18 +6591,26 @@ def _variant_link_summary(uploaded, vlinks, split_codes):
 def _do_upload_variant_links(dry):
     """Core of the nightly per-size split-link write-back (#192) — the SINGLE place
     the logic lives (NEkopíruj logiku). Reads the durable variant_links.json store +
-    the live split decisions, builds code;pairCode;internalNote rows for only the split
+    the live split decisions, builds code;pairCode;internalNote rows for the split
     variants not yet uploaded (or whose URL changed) via import_builder.link_rows (the
     SAME row builder the manual zip uses — GRUBE .de normalization + per-variant
-    skip-empty included), runs the careful chunked import, records what went up, and
-    returns (result, status). Shared by the n8n HTTP endpoint (below) and the in-app
-    „Veľkostné linky → eshop" automation (#192) — no auth / Flask request access here.
-    Touches ONLY the `internalNote` column (LINK_HEADER → a present-but-empty cell
-    can't wipe state/prices; and a variant with no stored link is skipped by link_rows,
-    never an empty cell that would WIPE the existing link). A non-http(s) URL is dropped
-    in new_variant_link_keys (fail-safe — never reaches the live eshop). Only `split`
-    decisions are passed to link_rows, so good/manual links (already pushed by
-    „Párovania → eshop") are never re-written here."""
+    skip-empty included), and QUEUES them into the shared pending_shoptet table for the
+    next hourly „Sync do Shoptetu" drain (#299 Task 8) — it never imports directly
+    (`_import_rows_chunked` is never called here) and never writes
+    uploaded_variant_links.json itself; that credit is written only by
+    `_credit_producer` once the hourly cycle's OWN import actually confirms the row
+    (same #257-class reasoning as `_do_upload_externalcodes` above; carried over from
+    Task 6/7, not in this task's original brief). Shared by the n8n HTTP endpoint
+    (below) and the in-app „Veľkostné linky → eshop" automation (#192) — no auth /
+    Flask request access here. Touches ONLY the `internalNote` column (LINK_HEADER →
+    a present-but-empty cell can't wipe state/prices; and a variant with no stored
+    link is skipped by link_rows, never an empty cell that would WIPE the existing
+    link). A non-http(s) URL is dropped in new_variant_link_keys (fail-safe — never
+    reaches the live eshop). Only `split` decisions are passed to link_rows, so
+    good/manual links (already pushed by „Párovania → eshop") are never re-written
+    here. `dry=True` builds the same candidate rows but queues nothing. `credit_group`/
+    `credit_value` are keyed by the variant code itself (1:1, no cross-code grouping
+    needed here, unlike the pairing-decision credit groups Task 10 will add)."""
     vlinks = _load_variant_links()
     uploaded = _load_uploaded_variant_links()
     dec = _load_decisions()
@@ -6427,8 +6622,8 @@ def _do_upload_variant_links(dry):
     products = [{"code": c, "url": (vlinks.get(c) or "").strip()} for c in new_codes]
     if not new_codes:
         log.info("n8n variant-links: 0 new split links")
-        return {"ok": True, "count": 0, "products": [],
-                **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": [], **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
     # Build rows via link_rows (the manual-zip builder). Passing ONLY split_dec keeps
     # good/manual links out (they go via _do_upload_pairings); passing ONLY the new
@@ -6438,8 +6633,9 @@ def _do_upload_variant_links(dry):
                                     {c: vlinks[c] for c in new_codes})
     if not rows:
         log.warning("n8n variant-links: %d new codes but 0 import rows", len(new_codes))
-        return {"ok": True, "count": 0, "products": products,
-                "message": "no import rows", "blocked": len(new_codes),
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": 0, "dry_run": dry,
+                "products": products, "message": "no import rows",
+                "blocked": len(new_codes),
                 **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
     # A new code can miss a row: link_rows dedups per variant code (first-wins across
@@ -6452,45 +6648,33 @@ def _do_upload_variant_links(dry):
         log.warning("n8n variant-links: %d of %d codes generated no row (deduped): %s",
                     len(blocked), len(new_codes), blocked[:10])
 
-    if not _import_lock.acquire(blocking=False):
-        log.warning("n8n variant-links: another import already running")
-        return {"ok": False, "error": "import already running"}, 409
-    log.info("n8n variant-links: %d codes, %d rows (chunks of %d), dry_run=%s",
-             len(new_codes), len(rows), IMPORT_CHUNK_ROWS, dry)
-    try:
-        # #156: chunked import. csv_safe per cell (belt-and-braces — the URL is already
-        # http(s)-guarded so the '-prefix never actually fires, but the nightly sink
-        # must not be weaker than the manual zip). FIRST failing chunk stops the batch;
-        # success_codes are the codes imported by a successful chunk (partial → resumable).
-        res = _import_rows_chunked(rows, import_builder.LINK_HEADER, dry,
-                                   prefix="import_variant_links_", csv_safe=True, timeout=900)
-        ok = res["ok"]
-        success = res["success_codes"]
-        uploaded_codes = [c for c in new_codes if c in written_codes and c in success]
-        if not dry:                          # record only codes that imported OK
-            uploaded = _record_uploaded(
-                _load_uploaded_variant_links, _save_uploaded_variant_links,
-                {c: (vlinks[c] or "").strip() for c in uploaded_codes})
-    finally:
-        _import_lock.release()
+    if dry:
+        # #299 review m3 — same reasoning as _do_upload_externalcodes' dry branch:
+        # no import is left to dry-run post-migration, so `would_queue` (a true
+        # preview of `len(rows)` candidate field values) restores the security
+        # check's actual purpose without queueing anything on this branch.
+        log.info("n8n variant-links: dry run — %d rows would be queued, nothing written",
+                 len(rows))
+        return {"ok": True, "queued": 0, "count": 0, "would_queue": len(rows),
+                "dry_run": True, "products": products, "blocked": len(blocked),
+                **_variant_link_summary(uploaded, vlinks, split_codes)}, 200
 
-    err_msg = ""
-    if not ok:
-        err_msg = _chunk_error_msg(res, len(rows))
-    result = {"ok": ok, "exit_code": res["rc"], "count": len(uploaded_codes),
-              "rows": len(rows), "dry_run": dry, "processed": res["processed"],
-              "updated": res["updated"], "failed": res["failed"],
-              "error_detail": res["error_detail"], "error": err_msg,
-              "chunks_total": res["chunks_total"], "chunks_ok": res["chunks_ok"],
-              "products": products, "stdout_tail": res["stdout_tail"],
-              "blocked": len(blocked),
+    queued = queue_shoptet_fields(
+        "split_links", ";".join(import_builder.LINK_HEADER), rows,
+        credit_group={r[0]: r[0] for r in rows},
+        # #299 review C1 — the credit MUST be the RAW variant_links.json value
+        # new_variant_link_keys compares against (never `r[2]`, the row's eshop
+        # cell value): for GRUBE that cell is the NORMALIZED .de URL
+        # (import_builder.to_grube_de via link_rows), a DIFFERENT string than the
+        # raw stored link. Crediting the normalized value meant the incremental
+        # check could never match, so the same GRUBE split link requeued to the
+        # live eshop every hour, forever, with total_uploaded stuck at 0.
+        credit_value={r[0]: (vlinks.get(r[0]) or "").strip() for r in rows})
+    result = {"ok": True, "queued": queued, "count": queued, "would_queue": queued,
+              "dry_run": dry, "products": products, "blocked": len(blocked),
               **_variant_link_summary(uploaded, vlinks, split_codes)}
-    log.info("n8n variant-links: rc=%s chunks=%d/%d processed=%s codes=%d",
-             res["rc"], res["chunks_ok"], res["chunks_total"], res["processed"], len(uploaded_codes))
-    if not ok:
-        log.error("n8n variant-links FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                  res["rc"], res["chunks_ok"], res["chunks_total"], (res["err"] or "")[-400:])
-    return result, (200 if ok else 502)
+    log.info("n8n variant-links: queued %d field(s) for %d code(s)", queued, len(rows))
+    return result, 200
 
 
 @app.route("/api/n8n/upload-variant-links", methods=["POST"])
@@ -7130,22 +7314,584 @@ def run_shoptet_sync() -> dict:
     return result
 
 
+SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
+# #299 review N3 — shoptet_sync and shoptet_upload share the SAME 60-minute
+# schedule, so their scheduler ticks synchronize: without this, the cycle's own
+# PRE-import download re-fetches the 57 MB catalogue a second time in the same
+# tick shoptet_sync already refreshed it on its own schedule. Skip the PRE-
+# import download ONLY when the export is still fresh (younger than this) —
+# an export that age can only have come from THIS tick's own shoptet_sync run,
+# never a stale leftover, so nothing is lost by not re-downloading it. The
+# POST-import download is NEVER skipped by this — that one is the whole point
+# of "the database is reconciled right away" after an upload.
+SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
+
+# #299 opravné kolo 2 review N-I1 — the "queue hostage" valve
+# (`STALE_UNCONFIRMED_MIN_ATTEMPTS`/`shoptet_outbox.stale_unconfirmed`) that
+# used to live here was REMOVED entirely: it required `not e.get("blocked")`
+# to detect a stuck code, but the very act of blocking it made `settle()`
+# clear that flag one run later (the code was never explicitly blocked for a
+# reason of its own) — so it re-entered the send on the NEXT run, `blocked_
+# runs` reset to 0, and `stale_blocked` (the escape its own docstring relied
+# on) never actually tripped. A half-working valve with a docstring that
+# claimed otherwise is worse than none — without it a stuck row simply stays
+# `unconfirmed` (honestly reported every run via the "Shoptet nepotvrdil …"
+# warning below) until a human resolves it. The principled fix — split a
+# chunk Shoptet PARTIALLY accepts so one bad row stops holding its healthy
+# neighbours hostage — is real, separate work; see the GitHub issue cited in
+# the round-2 report.
+
+# #299 záverečná recenzia I5 — a queued field only ever had an age gate at
+# QUEUEING time (each producer's own export-freshness check); nothing
+# re-checked it at SEND time. `restock_skladom`/`stock_skladom` have no dedup
+# and re-queue their whole candidate list DAILY, so a "switch to Skladom"
+# decision sitting in the table while this hourly cycle is disabled looks
+# freshly-queued every single day it re-runs (`queue_fields`'s own C2
+# discipline keeps `first_queued_at` at the FIRST time a value was queued,
+# never bumped by a re-queue of the SAME value — but `queued_at`, which THIS
+# gate reads, is refreshed on every re-queue of the SAME value too; #299
+# opravné kolo 2 review N-C1) — right up until the cycle comes back on and
+# ships a week-old restock decision to the LIVE eshop, long after the product
+# may have sold out again. 24h is longer than any legitimate gap between this
+# hourly drain's own runs, so a healthy queue never trips it, while a field
+# this old was queued against a stock/price snapshot that is no longer
+# trustworthy. A field this catches is NEVER dropped — see
+# `shoptet_outbox.stale_fields`'s own docstring.
+QUEUED_FIELD_MAX_AGE_S = 24 * 3600
+
+# #299 Task 11 — the fixed list of automation keys that feed `pending_shoptet.json`
+# (Task 10's migration: every one of them only QUEUES now, see `run_shoptet_upload`'s
+# own docstring). Used by `_stale_producer_warnings`/`_disabled_producer_names`
+# below to know which automations to watch for a silently-dead source — NOT to
+# decide whether this cycle runs them (it never does; each queues on its own
+# schedule).
+PRODUCER_QUEUE_KEYS = ("parovania_eshop", "grube_externalcode", "split_links",
+                       "restock_skladom", "stock_skladom")
+
+# #299 opravné kolo 1 review C1 (Critical) — REPLACES the deleted "3 consecutive
+# hourly cycles with 0 fields of its own in the queue" streak signal
+# (`_note_empty_producers`/`UPLOAD_EMPTY_STREAK_STATE`/`UPLOAD_EMPTY_STREAK_THRESHOLD`,
+# all gone — see the report's "Opravné kolo 1" section for the full removal note).
+# That signal measured the WRONG thing: these five producers run DAILY and this
+# drain runs HOURLY, and a confirmed row drops out of the queue the very next
+# time it settles — so a healthy producer's own fields sit in the shared table
+# for well under an hour out of every 24. "0 fields of its own for 3 straight
+# HOURLY cycles" is therefore the NORMAL state of a perfectly healthy producer,
+# not a symptom: the review's own probe measured it firing on the THIRD cycle for
+# 4 of 5 producers and on the FOURTH for all five, on a system with nothing
+# wrong — a permanent, un-clearable "DEGRADOVANÝ" (the exact "trvalý poplach =
+# žiadny poplach" failure this whole task exists to prevent).
+#
+# The real quiet death this alarm exists to catch (#300: an automation nobody
+# ever turned on, or one whose source silently broke) is measured from the
+# producer's OWN `last_run` against its OWN schedule — entirely independent of
+# the shared queue, which was never the right place to look. A producer that is
+# ENABLED but has not run for substantially longer than its own interval is
+# suspicious; a DISABLED producer is its own category (see
+# `_disabled_producer_names` below) — not an error, since #93's safety contract
+# makes "freshly deployed, not yet turned on" a normal, expected state.
+PRODUCER_STALE_RUN_MULTIPLIER = 2
+
+
+def _stale_producer_warnings() -> list[str]:
+    """One Slovak sentence per ENABLED producer (of `PRODUCER_QUEUE_KEYS`) that
+    has not run in more than `PRODUCER_STALE_RUN_MULTIPLIER` × its own schedule
+    interval — computed fresh from `RUNNER.status()` every call, never from
+    anything this cycle itself writes (so, like `_queue_stale_while_disabled_
+    warning`, it cannot become a safeguard that guards itself).
+
+    Silent (no warning) for:
+      * a DISABLED producer — its own category, see `_disabled_producer_names`;
+      * a key `PRODUCER_QUEUE_KEYS` names that is no longer a registered
+        automation (#299 opravné kolo 1 review m5 — a renamed/removed key must
+        never crash this cycle; reading names straight off `RUNNER.status()`
+        instead of indexing `RUNNER.automations[k].name` on a hard-coded list
+        also means there is no dict lookup left here that CAN raise `KeyError`).
+
+    Loud (a warning, in the fail-safe direction) for an ENABLED producer that:
+      * has NEVER run at all (`last_run` empty) AND its `next_run` (plus this
+        SAME threshold, as extra grace) has genuinely passed — see the N1 note
+        below for why "immediately" was wrong;
+      * carries an unparsable `last_run` — same "loud, never silently fine"
+        direction the disabled-cycle alarm takes for a bad `queued_at` (I2);
+      * has a parsable `last_run` older than its threshold.
+
+    #299 opravné kolo 2 review N1 (Important) — a freshly ENABLED producer
+    used to warn the INSTANT it appeared here, because `last_run` is
+    genuinely empty until its first run — and a daily producer's first run is
+    up to ~24h away, so the card read red for a whole day after the manager
+    did exactly the right thing (enable it), which is precisely the moment
+    this rollout plan has him watching the card. `AutomationRunner.set_enabled`
+    already persists `next_run` at the moment of enabling (`status()` surfaces
+    it, empty only while disabled) — this now stays silent until `next_run`
+    PLUS the same staleness threshold this function already uses has actually
+    passed, i.e. the producer is allowed one full missed cycle beyond its
+    first scheduled run before it is called suspicious, exactly like a
+    producer that already ran once. A missing/unparsable `next_run` on an
+    enabled producer (should not happen via `set_enabled`, but a hand-edited
+    state file can do it) falls through to the immediate warning below — the
+    fail-safe direction, since without `next_run` there is nothing here that
+    CAN wait safely."""
+    warnings = []
+    by_key = {s["key"]: s for s in RUNNER.status()}
+    now = datetime.now(timezone.utc)
+    for key in PRODUCER_QUEUE_KEYS:
+        s = by_key.get(key)
+        if s is None or not s.get("enabled"):
+            continue
+        automation = RUNNER.automations.get(key)
+        interval_s = schedule_interval_s(automation.schedule) if automation \
+            else 24 * 3600
+        threshold_s = interval_s * PRODUCER_STALE_RUN_MULTIPLIER
+        name = s.get("name") or key
+        last_run = s.get("last_run") or ""
+        if not last_run:
+            next_run = s.get("next_run") or ""
+            if next_run:
+                try:
+                    nr_dt = datetime.fromisoformat(next_run)
+                    if nr_dt.tzinfo is None:
+                        nr_dt = nr_dt.replace(tzinfo=timezone.utc)
+                    if now <= nr_dt + timedelta(seconds=threshold_s):
+                        continue    # N1 — still within its first grace window
+                except ValueError:
+                    log.error("automation %s: next_run %r nečitateľný — "
+                              "neviem posúdiť prvé grace obdobie, hlásim "
+                              "okamžite (fail-safe)", key, next_run)
+                    # fall through — loud, same fail-safe direction as I2
+            warnings.append(f"Automatizácia {name} je zapnutá, ale ešte ani raz "
+                            f"nebežala — over, či beží plánovač.")
+            continue
+        try:
+            dt = datetime.fromisoformat(last_run)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_s = (now - dt).total_seconds()
+        except ValueError:
+            warnings.append(f"Automatizácia {name} má nečitateľný čas posledného "
+                            f"behu — over jej stav.")
+            continue
+        if age_s > threshold_s:
+            hrs = int(age_s // 3600)
+            warnings.append(f"Automatizácia {name} je zapnutá, ale nebežala už "
+                            f"{hrs} h — over, či jej nezlyhal zdroj dát alebo "
+                            f"plánovač.")
+    return warnings
+
+
+def _disabled_producer_names() -> list[str]:
+    """#299 opravné kolo 1 review C1 — a DISABLED producer is its own category,
+    "nie chyba, ale nech je to vidieť" (the brief's own words): #93's safety
+    contract means every producer starts disabled straight after a deploy, so
+    "not yet turned on" is a normal, temporary state, not a fault — it must
+    never feed `_stale_producer_warnings`/`degraded` above. Returned as its own
+    field on `run_shoptet_upload`'s result so it stays VISIBLE rather than
+    silently dropped."""
+    return sorted(s["name"] for s in RUNNER.status()
+                 if s["key"] in PRODUCER_QUEUE_KEYS and not s.get("enabled"))
+
+
+# #299 opravné kolo 2 review N-I3 — plain-Slovak text for every `blocked`
+# reason that can reach `stale_blocked()`'s 3-consecutive-runs alarm. A
+# reason this map does not know about (a FUTURE third reason nobody has
+# taught this sentence yet) still shows the raw reason string rather than
+# silently mislabelling it as the catalogue.
+_STALE_BLOCKED_REASON_TEXT = {
+    "not-in-catalog": "eshop ich v katalógu nemá",
+    "stale-field": "majú pole staršie než limit",
+}
+
+
+def _stale_blocked_reason_sentence(settled: dict, stale: list) -> str:
+    """A human sentence fragment naming the REAL reason(s) `stale` codes are
+    stuck `blocked` for — never hard-coded to "the catalogue", since I5 gave
+    `blocked` a second reason (`stale-field`) that reaches this same alarm.
+    Groups by reason so a run with BOTH reasons present names both, instead
+    of picking one arbitrarily."""
+    by_reason: dict[str, list[str]] = {}
+    for c in stale:
+        reason = ((settled.get(c) or {}).get("blocked") or {}).get("reason") \
+            or "neznámy dôvod"
+        by_reason.setdefault(reason, []).append(c)
+    return "; ".join(f"{len(cs)}× {_STALE_BLOCKED_REASON_TEXT.get(r, r)}"
+                     for r, cs in sorted(by_reason.items()))
+
+
+def _sync_downloaded_fresh_export() -> bool:
+    """#299 opravné kolo 1 review m3 — `RUNNER.run_sync("shoptet_sync")` returning
+    True only means shoptet_sync's own run STATUS was 'ok'; `run_shoptet_sync`
+    (PR #280) deliberately reports `ok` even when the catalogue download itself
+    was REFUSED (a fresh-enough copy already on disk, `ExportDownloadRefused`,
+    non-fatal by design) — it just keeps serving the old bytes. Counting that as
+    a real download inflated `resynced` with a run that fetched nothing new.
+    Reads straight off the state `_execute` just persisted (synchronously, under
+    its own lock, before `run_sync` returns) — the one place `export_error` is
+    recorded. Missing the automation entirely reads as "not fresh", the same
+    fail-safe direction `_export_age_s`/`presync_fresh` already take."""
+    for a in RUNNER.status():
+        if a["key"] == "shoptet_sync":
+            return not (a.get("last_result") or {}).get("export_error")
+    return False
+
+
+def run_shoptet_upload() -> dict:
+    """#299 — the hourly cycle: download → ONE import of whatever the producers
+    already queued → settle → download again.
+
+    #299 opravné kolo 1 review I2 — this cycle used to ALSO run each queue-
+    migrated producer (`RUNNER.run_sync(key)` for every key in a `QUEUE_MIGRATED`
+    gate) before importing. That silently turned `parovania_eshop` — the ONE
+    producer already ENABLED on forestshop.sk, normally a 1x/day 21:00 push — into
+    a 24x/day run the moment a manager enabled this hourly automation, INCLUDING
+    `_do_upload_suppliers`'s #215 removal of the manager's own manual supplier
+    assignments (deštruktívny zápis, 24x/day instead of 1x/day) — a side effect
+    the brief and the first implementation never mentioned or tested. Fixed by
+    removing producer-running from the cycle entirely: each producer queues on
+    its OWN schedule (unchanged), and this cycle ONLY drains whatever is already
+    in the shared table — download, import once, settle, download again. Nothing
+    here decides which producers ran or when; `QUEUE_MIGRATED`/`CYCLE_PRODUCERS`
+    are gone with their sole consumer. It writes nothing to the eshop itself:
+    only rows the import log confirmed AND still hold their sent value are
+    credited and dropped (see `sent_fields` below — #299 review C1). The second
+    download is skipped when nothing went up (most hours) — it would re-fetch the
+    57 MB catalogue for no reason.
+
+    Every step below waits for its automation to actually finish
+    (`RUNNER.run_sync`, #299 review I3) — the download really is on disk before
+    the export is read; `RUNNER.run_now`'s background thread only made that
+    ordering look true. `resynced` counts the REAL outcome of each `run_sync`
+    call (0, 1 or 2), never a hard-coded guess — a `shoptet_sync` already in
+    flight from its own hourly schedule returns False and must not be reported
+    as "downloaded". (Opravné kolo 1 review I2 removed the THIRD thing this used
+    to wait for — running each queue-migrated producer — see above.)
+
+    #299 review C1 — `pending` is read once here to build the import, then read
+    AGAIN under `_lock` right before `settle`: a producer can legitimately queue
+    a NEW value for the same code while the import is still running (up to 15
+    min/chunk). `sent_fields` is what THIS import actually put on the wire, built
+    from the very `rows` handed to `_import_rows_chunked` — never re-derived from
+    `pending` — so `settle` can tell a field Shoptet confirmed from a field that
+    merely happens to belong to a code Shoptet confirmed. A field that changed
+    mid-flight is kept and goes out again next hour; its credit does not fire.
+
+    #299 review N2 — `sent_credits` is the same kind of send-time snapshot as
+    `sent_fields`, built from the SAME `pending` read that produced `rows`, and
+    carries what a field's `credit` dict looked like when it was sent. A
+    re-queue mid-import can leave a field's plain VALUE unchanged (so it is not
+    dirty and IS confirmed) while writing a NEW `credit.value` — `settle` must
+    still credit the value Shoptet actually saw, never whatever `fresh` holds.
+
+    #299 review (Task 4 minor, deferred to Task 6 — M2): the drain reads the table
+    through `_load_pending`, which DEGRADES a corrupt/unreadable file to `{}` —
+    same as every other reader in this module. That degrade is safe HERE, on
+    purpose, and deliberately NOT special-cased: the two `_load_pending()` calls
+    below only ever decide what THIS run attempts to send; the strictness that
+    matters is at the END of the cycle, where `_save_pending(settled)` runs
+    UNCONDITIONALLY. `_atomic_write_json(protect=True)` re-reads the file straight
+    off disk at write time (never trusts what an earlier read handed back), so a
+    genuinely corrupt table still makes this run raise `StoreWipeRefused` out of
+    this function — the exact same refusal `queue_shoptet_fields` gets from the
+    same guard — instead of quietly completing a run that settled and credited
+    nothing while looking like a clean, empty hour. Skipping that final write
+    when `settled` happens to be empty (to avoid a "redundant" save) would throw
+    this refusal away and turn a corrupt table into a silent no-op every single
+    hour; that is exactly why it is never skipped.
+
+    #299 review N3 — the PRE-import download is skipped when the on-disk export
+    is already fresher than `SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S`: on the
+    shared 60-minute schedule, shoptet_sync's own tick usually lands moments
+    before this cycle's, so re-downloading here is a second 57 MB fetch of a
+    catalogue that is already current. An unknown age (no export on disk, or a
+    test double) is NEVER treated as fresh — the download always runs then, the
+    same fail-safe direction `_export_age_s`/`_export_row_verdicts` already
+    take. The POST-import download is untouched by this — it is what actually
+    reconciles the database right after an upload."""
+    with _shoptet_cycle_claim() as got:
+        if not got:
+            return {"ok": False, "error": "cyklus už beží", "queued": 0, "sent": 0,
+                    "confirmed": 0, "blocked": 0, "stale_blocked": [],
+                    "stale_fields_held": [],
+                    "resynced": 0,
+                    "skipped_second_sync": True, "unconfirmed": 0,
+                    "degraded": False, "warnings": [],
+                    "producers_disabled": _disabled_producer_names()}
+
+        presync_age = _export_age_s()
+        presync_fresh = (presync_age is not None
+                          and presync_age < SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S)
+        if presync_fresh:
+            resynced = 0
+            log.info("sync do Shoptetu: export je čerstvý (%.1f min, limit %.1f "
+                      "min) — preskakujem predimportné stiahnutie",
+                      presync_age / 60, SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S / 60)
+        else:
+            resynced = int(bool(RUNNER.run_sync("shoptet_sync"))
+                          and _sync_downloaded_fresh_export())
+            log.info("sync do Shoptetu: predimportné stiahnutie spúšťam (vek "
+                      "exportu %s)", "neznámy" if presync_age is None
+                      else f"{presync_age / 60:.1f} min")
+
+        # M5: build_import(pending) once — not once for the verdict pass and
+        # once more for the actual send — and filter `absent` over the result
+        # instead of re-walking the whole table a second time.
+        pending = _load_pending()
+        header, rows_all, _ = shoptet_outbox.build_import(pending)
+        verdicts = _export_row_verdicts(rows_all, note_col=None) if rows_all else \
+            {"confirmed": set(), "absent": set()}
+        absent = verdicts["absent"]
+        # #299 záverečná recenzia I5 — a code carrying a field queued more than
+        # QUEUED_FIELD_MAX_AGE_S ago is held back from THIS send exactly like an
+        # absent one — WHOLE code, never just the one stale column. A
+        # PARTIAL exclusion (send the code's other, fresh fields; withhold only
+        # the stale column) was tried and rejected: `settle()` marks a
+        # CONFIRMED code `dirty` the moment ANY of its current fields is not in
+        # `sent_fields` — which a withheld-but-still-queued stale field always
+        # is — and a dirty code withholds credit for EVERY group it belongs to,
+        # including one whose confirmed field has nothing to do with the stale
+        # one. Excluding the whole code sidesteps that: an excluded code can
+        # never reach `success_codes`, so it never enters the dirty computation
+        # at all (that loop only ever runs `for code in success_codes`) and
+        # never poisons another code's credit. In practice every producer that
+        # queues here writes exactly ONE column per code, so this is not a
+        # meaningfully bigger hold than a genuinely per-field one would be.
+        # named `stale_field_map` (never `stale`) — `stale` below is already the
+        # UNRELATED `stale_blocked(settled)` result and the two must never collide.
+        stale_field_map = shoptet_outbox.stale_fields(
+            pending, datetime.now(timezone.utc), QUEUED_FIELD_MAX_AGE_S)
+        stale_codes = set(stale_field_map)
+        rows = [r for r in rows_all
+               if r[0] not in absent and r[0] not in stale_codes]
+        blocked = {c: "not-in-catalog" for c in sorted(pending) if c in absent}
+        blocked.update({c: "stale-field" for c in sorted(pending)
+                        if c in stale_codes and c not in blocked})
+        # What THIS import is about to put on the wire, per code+column — the
+        # snapshot `settle` compares against later, never `pending` itself (C1).
+        cols = header.split(";")[len(shoptet_outbox.KEY_COLUMNS):]
+        sent_fields = {r[0]: dict(zip(cols, r[len(shoptet_outbox.KEY_COLUMNS):]))
+                       for r in rows}
+        # #299 review N2 — the credit VALUE settle() may award must come from
+        # this same send-time snapshot, never from `fresh` below: a producer
+        # that re-queues the SAME field value but a NEW credit_value mid-import
+        # must not have that new value picked up, since Shoptet never saw it.
+        # Built from THIS `pending` (the one that produced `rows`), never from
+        # `fresh` — exactly like `sent_fields` above.
+        sent_credits = {}
+        for code, entry in pending.items():
+            for col, field in (entry.get("fields") or {}).items():
+                c = field.get("credit")
+                if c:
+                    sent_credits.setdefault(code, {})[col] = c
+
+        # _import_rows_chunked's own contract (its docstring): the caller MUST hold
+        # _import_lock across the call and release it in a `finally` — every other
+        # of its call sites in this module does exactly this, because it drives a
+        # single shared browser automation that cannot run twice at once. Not in
+        # the brief's original sketch; added here because skipping it would let a
+        # manual "Spustiť teraz" of a producer still bypassing the queue — since
+        # #299 Task 10 that is only the raw n8n restock feed (n8n_shoptet_import,
+        # #158) and any future direct import; all five producers (parovania_eshop,
+        # grube_externalcode, split_links, restock_skladom, stock_skladom) are
+        # queue-migrated as of Task 10 and never import directly at all any more —
+        # race this cycle's own import against the very same Shoptet session.
+        res = None
+        import_busy = False
+        if rows:
+            if not _import_lock.acquire(blocking=False):
+                import_busy = True
+                log.warning("sync do Shoptetu: iný import práve beží — táto vlna "
+                           "sa preskakuje, riadky ostávajú v tabuľke na ďalší beh")
+            else:
+                try:
+                    # M3: the combined import must not lose the formula-injection
+                    # guard every direct-import producer used to send on its own.
+                    res = _import_rows_chunked(rows, header, False,
+                                               prefix="import_sync_", csv_safe=True,
+                                               timeout=900)
+                finally:
+                    _import_lock.release()
+        success = set(res["success_codes"]) if res else set()
+        # #299 záverečná recenzia (Minor) — `queue_fields` stamps `queued_at` with
+        # a TIMEZONE-AWARE local time (`datetime.now(timezone.utc).astimezone()`);
+        # this `now` (stored as a blocked field's `since`) was a NAIVE local time.
+        # `since` has no reader today, so the mismatch is currently harmless, but
+        # the moment something DOES compare the two (exactly the trap this
+        # codebase's own playbook warns about repeatedly — store-prune.md §1c),
+        # a naive-vs-aware `datetime` comparison raises `TypeError` outright.
+        # Same construction as `queue_fields`'s own `now`, so every timestamp this
+        # table ever stores means the same thing.
+        now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        with _lock:
+            fresh = _load_pending()
+            settled, credits = shoptet_outbox.settle(fresh, success, blocked,
+                                                      sent_fields, sent_credits,
+                                                      now=now)
+            # #299 opravné kolo 2 review N-I2 (Important) — credit MUST land
+            # BEFORE the queue is drained, and BOTH writes must happen under
+            # the SAME lock acquisition (`_lock` is deliberately re-entrant —
+            # see its own docstring — so `_credit_producer`'s own internal
+            # `with _lock:` nests safely here). The two used to run in the
+            # OPPOSITE order and OUTSIDE this block: a failure between them
+            # (or the process dying right there) left a code gone from
+            # `pending_shoptet.json` (the queue already drained) AND missing
+            # from `uploaded_*.json` (the credit never landed) — and BOTH
+            # arms of the anti-clobber guard (#215 in `_do_upload_suppliers`,
+            # N-C2 above) read that as "nobody ever wrote this", deleting the
+            # manager's live assignment. Credit-first means a failure here
+            # simply raises out of this whole cycle — same as a genuinely
+            # corrupt pending table already does (see the M2 note above) —
+            # with `pending_shoptet.json` UNTOUCHED: the code stays queued
+            # and goes out again next hour, never vanishing from both places
+            # at once.
+            for store, entries in credits.items():
+                _credit_producer(store, entries)
+            _save_pending(settled, prev=fresh)
+
+        sent, confirmed = len(rows), len(success)
+        unconfirmed = sent - confirmed
+        skipped = SECOND_SYNC_SKIP_WHEN_NOTHING_SENT and confirmed == 0
+        if not skipped:
+            resynced += int(bool(RUNNER.run_sync("shoptet_sync"))
+                            and _sync_downloaded_fresh_export())
+
+        stale = shoptet_outbox.stale_blocked(settled)
+        # #299 opravné kolo 2 review N-I3 — `stale_blocked()` fires for ANY
+        # `blocked` reason it sees 3+ CONSECUTIVE runs in a row for, and since
+        # I5 that is no longer only `not-in-catalog`: a code held back for
+        # being `stale-field` reaches the same alarm. The old sentence named
+        # the catalogue unconditionally, which sends a manager hunting for a
+        # Shoptet catalogue bug that was never there when the real cause is a
+        # field that just needs a fresh producer run.
+        stale_reason = _stale_blocked_reason_sentence(settled, stale)
+        ok = (not import_busy) and (res is None or (res["ok"] and not res["partial"])) \
+            and not stale
+        if unconfirmed:
+            if import_busy:
+                log.error("sync do Shoptetu: %d riadkov čaká, lebo iný import práve "
+                          "bežal — pôjdu v ďalšom hodinovom behu", unconfirmed)
+            else:
+                log.error("sync do Shoptetu: %d z %d riadkov Shoptet nepotvrdil — "
+                          "ostávajú v tabuľke a pôjdu znova", unconfirmed, sent)
+        if stale:
+            log.error("sync do Shoptetu: %d kódov je zablokovaných 3 a viac behov "
+                      "(%s): %s", len(stale), stale_reason, stale[:10])
+        if stale_field_map:
+            log.error("sync do Shoptetu: %d kódov má pole staršie než %.0f h — "
+                      "tento beh ich neposiela (hodnota mohla medzitým zastarať): "
+                      "%s", len(stale_field_map), QUEUED_FIELD_MAX_AGE_S / 3600,
+                      ", ".join(f"{c}:{','.join(cols)}"
+                               for c, cols in sorted(stale_field_map.items())[:10]))
+        # #299 záverečná recenzia I2 — a manager reading `error` could not tell
+        # „Shoptet login/auth genuinely failed" from „the eshop just rejected a
+        # couple of variants" from „a chunk timed out and we could not even read
+        # its own answer" — every one of those collapsed into the SAME generic
+        # sentence. `_chunk_error_msg` already exists to translate `res` into a
+        # human sentence for every OTHER write path (pairings/externalcode/
+        # restock/stock/raw n8n import); the drain simply never called it. Only
+        # when `res` itself is not fully clean (a real chunk failure or a
+        # partially-rejected one) does it have anything useful to say — a run
+        # whose only problem is stale/stale-blocked codes (res is None or fully
+        # clean) keeps its own sentence, since `_chunk_error_msg` has nothing to
+        # add for those (their detail is already in `warnings` above).
+        error = ""
+        if not ok:
+            if import_busy:
+                error = "iný import práve beží"
+            elif res is not None and (not res["ok"] or res["partial"]):
+                error = _chunk_error_msg(res, sent)
+            else:
+                error = "zablokované alebo dlho nepotvrdené riadky — pozri varovania"
+
+        # #299 Task 11 — say out loud what this run could not do, even the parts
+        # that never turn `ok` False (a producer's dead source, a second download
+        # skipped while something was on the wire). `warnings`/`degraded` are the
+        # WHOLE point of this task: `ok` alone already went False for the
+        # unconfirmed/stale/busy cases (Task 7's decision), but a manager reading
+        # only the pill still had no SENTENCE saying what actually happened, and
+        # `_stale_producer_warnings` below can degrade a run that itself reports
+        # `ok: True` (nothing this cycle attempted failed — the problem is
+        # upstream, in a producer that stopped running).
+        warnings = []
+        if unconfirmed:
+            warnings.append(f"Shoptet nepotvrdil {unconfirmed} z {sent} riadkov — "
+                            f"ostávajú v tabuľke a pôjdu znova.")
+        if stale:
+            warnings.append(f"{len(stale)} kódov čaká zablokovaných 3 a viac behov — "
+                            f"{stale_reason}.")
+        if stale_field_map:
+            warnings.append(
+                f"{len(stale_field_map)} kódov má pole staršie než "
+                f"{QUEUED_FIELD_MAX_AGE_S / 3600:.0f} h — tento beh ich neposiela, "
+                f"pôjdu, keď producent zaradí čerstvé rozhodnutie.")
+        warnings.extend(_stale_producer_warnings())
+        if skipped and sent:
+            warnings.append("Druhé stiahnutie sa preskočilo, hoci sa niečo posielalo.")
+        degraded = bool(warnings)
+        return {"ok": ok, "queued": len(pending), "sent": sent,
+                "confirmed": confirmed, "blocked": len(blocked),
+                "stale_blocked": stale,
+                "stale_fields_held": sorted(stale_field_map),
+                "resynced": resynced, "skipped_second_sync": skipped,
+                "unconfirmed": unconfirmed, "error": error,
+                "degraded": degraded, "warnings": warnings,
+                "producers_disabled": _disabled_producer_names()}
+
+
+def _credit_producer(store: str, entries: dict) -> None:
+    """Write a producer's uploaded-state for groups the import confirmed.
+
+    #299 Task 10 — "parovania_eshop" (pairing decisions + inline order pairings,
+    LINK_HEADER → internalNote) and "parovania_eshop_suppliers" (assigned supplier
+    names, SUPPLIER_HEADER → supplier) are TWO distinct sources sharing one
+    automation key on the runner (`run_parovania_eshop` calls both cores) — they
+    need distinct credit stores (uploaded_pairings.json vs uploaded_suppliers.json),
+    so they carry distinct `source`/`store` names here even though neither maps to
+    its own Automation registration."""
+    path = {"parovania_eshop": PAIRINGS_STATE,
+            "parovania_eshop_suppliers": SUPPLIERS_STATE,
+            "grube_externalcode": EXTERNALCODES_STATE,
+            "split_links": VARIANT_LINKS_STATE}.get(store)
+    if path is None:
+        log.warning("outbox: neznámy kredit store %s (%d skupín)", store, len(entries))
+        return
+    _record_uploaded(lambda: _read_json_store(path, {}),
+                     lambda d: _atomic_write_json(path, d, protect=True),
+                     entries)
+
+
 def run_parovania_eshop() -> dict:
     """Nightly push (daily 21:00) of the workers' NEW pairings (reorder links →
     internalNote) + newly assigned suppliers (→ supplier field) to the Shoptet
     eshop — the in-app migration of the n8n „Forestshop — Párovania → eshop"
-    workflow (YuDugCCOnwejRfva, #109). Reuses the SAME careful upload path as the
-    two n8n endpoints (_do_upload_pairings / _do_upload_suppliers — no Shoptet
-    logic reimplemented). The write stays IDEMPOTENT: already-uploaded pairings/
-    suppliers are skipped via uploaded_pairings.json / uploaded_suppliers.json,
-    so a re-run never double-uploads. Records combined counts for the tab. Both
-    steps run sequentially (mirroring the n8n chain); a step that completes with
-    ok:false (import failed) or blocked is surfaced in the returned `status`
-    without crashing the run. A genuine exception propagates to the runner, which
+    workflow (YuDugCCOnwejRfva, #109). Reuses the SAME two cores as the n8n
+    endpoints (_do_upload_pairings / _do_upload_suppliers — no Shoptet logic
+    reimplemented).
+
+    Since #299 Task 10 this does NOT import directly: both cores only QUEUE their
+    candidate rows into the shared pending_shoptet table; the actual upload to
+    Shoptet, and the "nahraté" write to uploaded_pairings.json /
+    uploaded_suppliers.json for anything freshly QUEUED, are the hourly „Sync do
+    Shoptetu" drain's job (`run_shoptet_upload`), not this function's — this is the
+    ONLY one of the five #299 producers that was already ENABLED on forestshop.sk
+    (the other four start DISABLED), so this migration is a live-write change, not
+    a zero-risk one. A row the eshop's own export ALREADY carries (an
+    `_export_row_verdicts` "confirmed" row, pairings only) is still recorded RIGHT
+    AWAY as before this migration — that credit comes from Shoptet's own state, not
+    "our own say-so", so it does not need the drain.
+
+    Neither core can itself return a failed queueing outcome any more (#299
+    Task 8's I1 precedent — it always queues successfully or reports 0
+    candidates); the only way this step can fail is `queue_shoptet_fields`
+    refusing to write on top of an unreadable pending table (`StoreWipeRefused`)
+    or another genuine exception — that propagates straight to the runner, which
     records last_status='error' and keeps the app alive (degrade, never crash).
+    `blocked` (codes/keys that produced no row) is the only other-than-`ok` status
+    either step itself can report.
 
     Reads ONLY the manager's decision/assignment stores (what to push) — never
-    modifies them; its own progress lives in the two uploaded_*.json state files."""
+    modifies them; the WRITE-BACK progress this automation contributes to lives in
+    pending_shoptet.json → uploaded_pairings.json / uploaded_suppliers.json, both
+    owned by the hourly drain (except the immediately-confirmed pairings above),
+    not by this function."""
     pairings, _ps = _do_upload_pairings(dry=False)
     suppliers, _ss = _do_upload_suppliers(dry=False)
 
@@ -7173,6 +7919,10 @@ def run_parovania_eshop() -> dict:
         "status": status,
         "pairings": {
             "count": pairings.get("count", 0),
+            # #299 Task 10 — how many field values were QUEUED this run (pending the
+            # next hourly drain), distinct from `count` (keys already credited RIGHT
+            # AWAY because the export already confirmed them — see _do_upload_pairings).
+            "queued": int(pairings.get("queued") or 0),
             "total_uploaded": pairings.get("total_uploaded", 0),
             "total_products": pairings.get("total_products", 0),
             "remaining": pairings.get("remaining", 0),
@@ -7187,17 +7937,22 @@ def run_parovania_eshop() -> dict:
             "missing_count": _missing(pairings),
             "missing_in_eshop": pairings.get("missing_in_eshop") or [],
             # #257: how many rows the eshop already had exactly as we would write
-            # them (proven from its export → credited, not re-sent), and how many
-            # Shoptet REJECTED out of the ones we did send. Both were invisible
-            # while a partially-accepted batch was booked as a plain failure.
+            # them — proven from its OWN export, so credited right away without
+            # going through the queue. #299 opravné kolo 1 review I1 — `rejected`/
+            # `partial` used to live here too, but since this producer only QUEUES
+            # (it never imports), it cannot know what Shoptet accepts or rejects —
+            # that verdict belongs solely to the hourly "Sync do Shoptetu" drain.
+            # Both fields were always 0/false after the Task 10 migration (this
+            # producer never set them), so they were removed rather than kept as a
+            # standing lie the card could still read.
             "confirmed_in_export": int(pairings.get("confirmed_in_export") or 0),
-            "rejected": int(pairings.get("rejected") or 0),
-            "partial": bool(pairings.get("partial")),
             "ok": p_ok,
             "error": pairings.get("error", ""),
         },
         "suppliers": {
             "count": suppliers.get("count", 0),
+            # #299 Task 10 — see the matching note under "pairings" above.
+            "queued": int(suppliers.get("queued") or 0),
             "total_uploaded": suppliers.get("total_uploaded", 0),
             "total_assigned": suppliers.get("total_assigned", 0),
             "remaining": suppliers.get("remaining", 0),
@@ -7226,30 +7981,37 @@ def run_parovania_eshop() -> dict:
 def run_grube_externalcode() -> dict:
     """Nightly push (daily 03:30) of the GRUBE per-size externalCodes (grube itemId
     → the eshop `externalCode` field) — the in-app cron follow-up (#62) to the MVP
-    manual zip. Reuses the SAME careful chunked import path as the n8n endpoint
-    (_do_upload_externalcodes — no Shoptet logic reimplemented). The write stays
-    IDEMPOTENT: an already-uploaded itemId is skipped via uploaded_externalcodes.json,
-    so a re-run never re-pushes an unchanged itemId; only a NEW code or a CHANGED
-    itemId goes up. A step that completes with ok:false (import failed) or blocked is
-    surfaced in the returned `status` without crashing the run; a genuine exception
-    propagates to the runner (records last_status='error', keeps the app alive).
+    manual zip. Since #299 Task 8 this does NOT import directly: it calls
+    `_do_upload_externalcodes` — the SAME core the n8n endpoint uses — which only
+    QUEUES the candidate rows into the shared pending_shoptet table; the actual
+    upload to Shoptet, and the "nahraté" write to uploaded_externalcodes.json, are
+    the hourly „Sync do Shoptetu" drain's job (`run_shoptet_upload`), not this
+    function's. The write stays IDEMPOTENT: an itemId the drain has already
+    CONFIRMED is skipped (`new_externalcode_keys` reads uploaded_externalcodes.json,
+    which only `_credit_producer` writes, only after Shoptet confirms), so a re-run
+    never re-queues an unchanged itemId; only a NEW code or a CHANGED itemId goes
+    up.
+
+    `_do_upload_externalcodes` cannot itself return a failed queueing outcome (#299
+    review I1 — it always queues successfully or reports 0 candidates); the only
+    way THIS step can fail is `queue_shoptet_fields` refusing to write on top of an
+    unreadable pending table (`StoreWipeRefused`) or another genuine exception —
+    that propagates straight to the runner, which records last_status='error' and
+    keeps the app alive. `blocked` (a numeric-itemId code that produced no import
+    row) is the only other-than-`ok` status this step itself can report.
 
     Reads ONLY the durable grube_codes.json store (built by scripts/build_grube_codes.py)
-    — never modifies it; its own progress lives in uploaded_externalcodes.json.
+    — never modifies it; the WRITE-BACK progress this automation contributes to
+    lives in pending_shoptet.json → uploaded_externalcodes.json, both owned by the
+    hourly drain, not by this function.
 
     SEPARATE from „Párovania → eshop": that automation is ALREADY enabled on prod, and
     externalCode is a distinct write field — folding it in would auto-activate on the
     live eshop, breaking the #93 default-disabled-for-new-live-write contract. This one
     starts DISABLED on its own."""
     ext, _es = _do_upload_externalcodes(dry=False)
-    e_ok = bool(ext.get("ok"))
     blocked = int(ext.get("blocked") or 0)
-    if not e_ok:
-        status = "failed"          # an import (or lock/timeout) failed → red row
-    elif blocked:
-        status = "blocked"         # numeric-itemId codes that produced no row → orange
-    else:
-        status = "ok"
+    status = "blocked" if blocked else "ok"   # numeric-itemId codes with no row → orange
     result = {
         "status": status,
         "externalcodes": {
@@ -7258,8 +8020,6 @@ def run_grube_externalcode() -> dict:
             "total_codes": ext.get("total_codes", 0),
             "remaining": ext.get("remaining", 0),
             "blocked": blocked,
-            "ok": e_ok,
-            "error": ext.get("error", ""),
         },
         "review_url": PUBLIC_URL,
     }
@@ -7271,17 +8031,29 @@ def run_grube_externalcode() -> dict:
 def run_split_links() -> dict:
     """Nightly push (daily 03:45) of the per-size SPLIT links (#174 „✂ Rozdeliť na
     veľkosti") to the eshop `internalNote` field, per variant — the in-app cron
-    follow-up (#192) to the MVP manual zip. Reuses the SAME careful chunked import path
-    + row builder as the n8n endpoint (_do_upload_variant_links → link_rows — no Shoptet
-    logic reimplemented). The write stays IDEMPOTENT: an already-uploaded URL is skipped
-    via uploaded_variant_links.json, so a re-run never re-pushes an unchanged link; only
-    a NEW split variant or a CHANGED URL goes up. A step that completes with ok:false
-    (import failed) or blocked is surfaced in the returned `status` without crashing the
-    run; a genuine exception propagates to the runner (records last_status='error',
-    keeps the app alive).
+    follow-up (#192) to the MVP manual zip. Since #299 Task 8 this does NOT import
+    directly: it calls `_do_upload_variant_links` — the SAME core the n8n endpoint
+    uses (→ link_rows for the rows — no Shoptet logic reimplemented) — which only
+    QUEUES the candidate rows into the shared pending_shoptet table; the actual
+    upload to Shoptet, and the "nahraté" write to uploaded_variant_links.json, are
+    the hourly „Sync do Shoptetu" drain's job (`run_shoptet_upload`), not this
+    function's. The write stays IDEMPOTENT: a link the drain has already CONFIRMED
+    is skipped (`new_variant_link_keys` reads uploaded_variant_links.json, which
+    only `_credit_producer` writes, only after Shoptet confirms), so a re-run never
+    re-queues an unchanged link; only a NEW split variant or a CHANGED URL goes up.
 
-    Reads ONLY the durable variant_links.json store + the live split decisions — never
-    modifies them; its own progress lives in uploaded_variant_links.json.
+    `_do_upload_variant_links` cannot itself return a failed queueing outcome (#299
+    review I1 — it always queues successfully or reports 0 candidates); the only
+    way THIS step can fail is `queue_shoptet_fields` refusing to write on top of an
+    unreadable pending table (`StoreWipeRefused`) or another genuine exception —
+    that propagates straight to the runner, which records last_status='error' and
+    keeps the app alive. `blocked` (a split variant whose row got deduped away by
+    link_rows) is the only other-than-`ok` status this step itself can report.
+
+    Reads ONLY the durable variant_links.json store + the live split decisions —
+    never modifies them; the WRITE-BACK progress this automation contributes to
+    lives in pending_shoptet.json → uploaded_variant_links.json, both owned by the
+    hourly drain, not by this function.
 
     SEPARATE from „Párovania → eshop" (which is already enabled on prod): a split link
     is a distinct write (internalNote per variant via link_rows, keyed per variant
@@ -7289,14 +8061,8 @@ def run_split_links() -> dict:
     the live eshop, breaking the #93 default-disabled-for-new-live-write contract. This
     one starts DISABLED on its own."""
     vl, _vs = _do_upload_variant_links(dry=False)
-    v_ok = bool(vl.get("ok"))
     blocked = int(vl.get("blocked") or 0)
-    if not v_ok:
-        status = "failed"          # an import (or lock/timeout) failed → red row
-    elif blocked:
-        status = "blocked"         # split codes that produced no row → orange
-    else:
-        status = "ok"
+    status = "blocked" if blocked else "ok"   # split codes with no row (deduped) → orange
     result = {
         "status": status,
         "variantlinks": {
@@ -7305,8 +8071,6 @@ def run_split_links() -> dict:
             "total_codes": vl.get("total_codes", 0),
             "remaining": vl.get("remaining", 0),
             "blocked": blocked,
-            "ok": v_ok,
-            "error": vl.get("error", ""),
         },
         "review_url": PUBLIC_URL,
     }
@@ -7571,14 +8335,15 @@ def run_riziko_vypadku() -> dict:
 
 # --------------------------------------------------------------------------- #
 # #108 — „Vypredané → Skladom": daily restock (in-app migration of the LIVE n8n
-# workflow „Forestshop — Vypredané → Skladom v2" KN1BE18HLdM8mfTc). WRITES to the
-# live eshop: JOINS our catalog export (Vypredané + visible products, state 2)
-# against #106's ALREADY-SCRAPED supplier_stock.json and, for every product whose
-# supplier now has FRESH confirmed stock, builds the restock rows (both availability
-# fields → Skladom, visible, stock) and pushes them through the SAME careful Shoptet
-# import path the n8n endpoint uses (import_builder.restock_rows → run_import →
-# #23-hardened read-back). Detection logic lives in parovanie.restock_skladom; this
-# wires it to the store + the import + the display endpoint.
+# workflow „Forestshop — Vypredané → Skladom v2" KN1BE18HLdM8mfTc). JOINS our
+# catalog export (Vypredané + visible products, state 2) against #106's
+# ALREADY-SCRAPED supplier_stock.json and, for every product whose supplier now has
+# FRESH confirmed stock, builds the restock rows (both availability fields →
+# Skladom, visible, stock). Since #299 Task 9 it no longer writes to the eshop
+# itself — it QUEUES the rows into the shared pending_shoptet table
+# (`queue_shoptet_fields`); the hourly „Sync do Shoptetu" drain (`run_shoptet_upload`)
+# does the actual write. Detection logic lives in parovanie.restock_skladom; this
+# wires it to the store + the queue + the display endpoint.
 # --------------------------------------------------------------------------- #
 RESTOCK_STATE = _store("restock_skladom.json")
 
@@ -7596,27 +8361,19 @@ def _save_restock(d: dict) -> None:
     _atomic_write_json(RESTOCK_STATE, d, mode=0o600)
 
 
-def run_restock_skladom() -> dict:
-    """One restock run (daily ~06:00 or „Spustiť teraz"): join OUR catalog export
-    (Vypredané + visible products, state 2) against the „Dodávateľský sklad" scraper's
-    LAST result (data/out/supplier_stock.json) and flip back to Skladom every product
-    whose supplier now has FRESH confirmed stock — by building the restock import rows
-    (both availability fields → Skladom, visible, stock 5 via
-    import_builder.restock_rows) and pushing them through the SAME careful chunked
-    Shoptet import path the n8n endpoints use (_import_rows_chunked → run_import →
-    parse_import_log read-back — #158: a large restock batch has the same 120s
-    browser-redirect-timeout risk #156 fixed for the pairings/suppliers pushes).
-    WRITES to the live eshop.
+def _restock_candidates() -> tuple:
+    """The Vypredané+visible × fresh-supplier-confirmed JOIN (#108's own detection —
+    unchanged by the #299 Task 9 queueing migration below). Returns
+    `(candidates, has_supplier_data, stock)`.
 
-    Safe by construction: no supplier data (scraper never ran) → flips NOTHING and
-    surfaces has_supplier_data=False; a candidate needs ok+available+FRESH (checkedAt
-    within 48h), so a stale or negative supplier confirmation never flips a product.
-    Idempotent — only state-2 (Vypredané) products are candidates, so a product already
-    Skladom is never re-flipped once the export refreshes. A failed import is detected
-    via the #23-hardened read-back and recorded status='error', not a silent success
-    (the run itself never raises on an import failure — it degrades to a red row, like
-    parovania_eshop). Reads ONLY its own store + the export + supplier_stock; never
-    touches the manager's decision stores."""
+    Two existing safeguards against stale data survive here exactly as before:
+    `has_supplier_data=False` (the #106 scraper never ran, or its store is empty) —
+    the whole JOIN is skipped and `candidates` stays `[]` rather than guessing; and
+    the per-row FRESHNESS check (`restock_skladom.MAX_PAIR_AGE_H` / `_is_fresh`,
+    48h) INSIDE `compute_candidates` itself — a supplier confirmation older than
+    that is never trusted, however recent the export. Neither of those two gates
+    changed by this task; only WHAT happens with a resulting candidate did (queue,
+    not import)."""
     with _lock:
         stock = _load_supplier_stock()
     supplier_rows = stock.get("rows") or []
@@ -7625,53 +8382,137 @@ def run_restock_skladom() -> dict:
     now = datetime.now(timezone.utc).astimezone()
     candidates = (restock_skladom.compute_candidates(csv_text, supplier_rows, now)
                   if has_data else [])
-    rows = import_builder.restock_rows(candidates, CODE2PAIR)
+    return candidates, has_data, stock
 
-    status = "ok"
-    processed = updated = failed = None
-    error_detail = ""
+
+def _restock_candidate_rows(candidates) -> list:
+    """Convert an ALREADY-COMPUTED `candidates` list (from `_restock_candidates()`)
+    into restock CSV rows, `import_builder.RESTOCK_COLS` order. Pure — no I/O of its
+    own, so it can never observe a different products.csv/supplier_stock.json than
+    the one `run_restock_skladom` already read for the review-tab store below.
+
+    #299 Task 9 review I1: the previous zero-arg version recomputed the WHOLE JOIN a
+    SECOND time (its own `_restock_candidates()` call — a second read of the export
+    and supplier_stock.json), purely as a testing seam. Between the two reads
+    `run_shoptet_sync` could atomically swap products.csv (it has its own hourly
+    schedule and is not mutually exclusive with this producer), so what actually got
+    queued could diverge from what the audit/store/card recorded — for automations
+    that decide whether a product is SELLABLE, "we wrote something different than we
+    logged" is exactly the class of bug that takes a week to find. A test that wants
+    to control the row shape now monkeypatches this function WITH the `candidates`
+    parameter (a param carrying preloaded data — see test_webreview_shoptet_upload.py
+    and test_webreview_restock_skladom.py), never the JOIN itself."""
+    return import_builder.restock_rows(candidates, CODE2PAIR)
+
+
+def _export_age_gate_reason(age) -> str | None:
+    """Slovak reason `run_restock_skladom`/`run_stock_skladom` must refuse to queue
+    ANYTHING this run, or `None` when the export is fresh enough to trust (#299 Task
+    9 review I2). Both automations decide product SALEABILITY *purely* from the
+    catalog export (stock_skladom has no other signal at all; restock_skladom's own
+    48h supplier-freshness check, MAX_PAIR_AGE_H, only ever makes the JOIN narrower —
+    it cannot rescue a stale export). Unlike the write-back gates elsewhere
+    (`_export_row_verdicts`, `_do_upload_suppliers`) that merely HOLD or re-send a
+    write, flipping Vypredané→Skladom on stale data can put a sold-out product back
+    on sale. Reuses the SAME constant + measurement as every other export-age gate
+    in this file (`EXPORT_MAX_AGE_S`, `_export_age_s()`) — no second threshold, no
+    second clock. Unknown age (`None` — file missing / unstat-able) is NEVER treated
+    as fresh; that is the same fail-closed stance every other EXPORT_MAX_AGE_S gate
+    takes, and it is deliberate: a missing export could mean anything, and „we don't
+    know" must never read as „it's fine"."""
+    if age is None:
+        return "vek exportu sa nedá zistiť (chýba data/products.csv?)"
+    if age > EXPORT_MAX_AGE_S:
+        return (f"export je starý {age / 3600:.1f} h (limit "
+                f"{EXPORT_MAX_AGE_S / 3600:.1f} h)")
+    return None
+
+
+def run_restock_skladom() -> dict:
+    """One restock run (daily ~06:00 or „Spustiť teraz"): join OUR catalog export
+    (Vypredané + visible products, state 2) against the „Dodávateľský sklad" scraper's
+    LAST result (data/out/supplier_stock.json) and, for every product whose supplier
+    now has FRESH confirmed stock, build the restock rows (both availability fields →
+    Skladom, visible, stock 5 via import_builder.restock_rows) — same JOIN as before
+    (`_restock_candidates`, unchanged).
+
+    Since #299 Task 9 this does NOT import directly: it QUEUES the rows into the
+    shared pending_shoptet table (`queue_shoptet_fields`) for the next hourly „Sync do
+    Shoptetu" drain to actually write to the eshop — no `_import_lock`, no chunked
+    import, no busy/error-from-import status here any more (that whole class of
+    failure moved to the drain, `run_shoptet_upload`). This producer never credits
+    itself and needs no dedup store (unlike grube_externalcode/split_links): a
+    candidate is entirely state-driven (Vypredané+visible in the LIVE export), so once
+    Shoptet confirms the flip and the export next refreshes, the product's own state
+    changes to Skladom and `_restock_candidates` simply stops selecting it — no
+    separate "already uploaded" bookkeeping needed, and none is written.
+
+    #299 Task 9 review I2 — a NEW gate ahead of everything else: the queueing
+    migration adds up to another hour of delay between this decision and the actual
+    eshop write (the next hourly drain), so an export gone stale here is even more
+    dangerous than before. `_export_age_gate_reason` refuses to queue ANYTHING (not
+    even a partial batch) and reports `ok: False` with a Slovak reason — a silent
+    `candidates: 0` would look like a healthy "nothing to do" run instead of "I could
+    not tell". How the manager gets to SEE this failure (banner/⚠ badge) is Task 11
+    (`.claude/rules/automation-health.md` §3); this run only needs to make the wrong
+    thing impossible and leave a record that it refused.
+
+    Two DELIBERATELY DIFFERENT counts are returned/stored, named unambiguously (#299
+    Task 8 review finding: the sibling `_do_upload_externalcodes`/
+    `_do_upload_variant_links`'s `would_queue` conflated a ROW count in its dry-run
+    preview with a FIELD count in its real run, invisibly, because every one of
+    THEIR rows carries exactly one writable column — restock rows carry FOUR
+    (productVisibility/availabilityInStock/availabilityOutOfStock/stock), so the
+    same conflation here would be visibly wrong): `candidates` is the number of
+    PRODUCTS (rows) the JOIN selected; `queued` is `queue_shoptet_fields`'s own
+    return value — the number of individual FIELD VALUES actually written into
+    pending_shoptet (empty cells are skipped by `queue_fields`, so `queued` can be
+    less than `4 * candidates`, never more).
+
+    Safe by construction: no supplier data (scraper never ran) → flips NOTHING and
+    surfaces has_supplier_data=False; a candidate needs ok+available+FRESH (checkedAt
+    within 48h), so a stale or negative supplier confirmation never flips a product.
+    Idempotent — only state-2 (Vypredané) products are candidates, so a product already
+    Skladom is never re-flipped once the export refreshes. Reads ONLY its own store +
+    the export + supplier_stock; never touches the manager's decision stores."""
+    now = datetime.now(timezone.utc).astimezone()
+    gate_reason = _export_age_gate_reason(_export_age_s())
+    if gate_reason:
+        msg = f"{gate_reason} — nezaraďujem nič, radšej počkám na čerstvý export"
+        log.warning("restock_skladom: %s", msg)
+        with _lock:
+            _save_restock({
+                "last_check": now.isoformat(timespec="seconds"),
+                "has_supplier_data": False,
+                "status": "error",
+                "error": msg,
+                "candidates": [],
+                "queued": 0,
+            })
+        return {"ok": False, "error": msg, "status": "error",
+                "candidates": 0, "queued": 0, "has_supplier_data": False}
+
+    candidates, has_data, stock = _restock_candidates()
+    rows = _restock_candidate_rows(candidates)
+
+    queued = 0
     if rows:
-        if not _import_lock.acquire(blocking=False):
-            log.warning("restock_skladom: iný import práve beží — beh preskočený")
-            status, error_detail = "busy", "iný import práve beží"
-        else:
-            try:
-                # #158: chunked import (like #156) so a large restock batch never
-                # overruns the browser redirect timeout. A chunk that times out is
-                # caught INSIDE _import_rows_chunked (never raises) and treated as
-                # a failed chunk — the lock is always released.
-                res = _import_rows_chunked(rows, import_builder.RESTOCK_COLS, False,
-                                           prefix="restock_", timeout=900)
-            finally:
-                _import_lock.release()
-            processed, updated, failed = res["processed"], res["updated"], res["failed"]
-            if res["ok"]:
-                status = "ok"
-            else:
-                status = "error"
-                # _chunk_error_msg already carries res["error_detail"]; add the
-                # stderr tail only when there is no Shoptet reason to show
-                tail = "" if res["error_detail"] else (res["err"] or "")[-300:]
-                error_detail = _chunk_error_msg(res, len(rows)) + (f": {tail}" if tail else "")
-                log.error("restock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                          res["rc"], res["chunks_ok"], res["chunks_total"],
-                          (res["err"] or "")[-400:])
+        queued = queue_shoptet_fields("restock_skladom",
+                                      ";".join(import_builder.RESTOCK_COLS), rows)
 
-    # `candidates` are always stored (what WOULD be flipped) so the tab shows them
-    # even on a failed import; on success they ARE what was flipped.
+    # `candidates` are always stored (what this run found/queued) so the tab shows
+    # them even when nothing ended up queued (e.g. every cell happened to be empty).
     with _lock:
         _save_restock({
             "last_check": now.isoformat(timespec="seconds"),
             "has_supplier_data": has_data,
             "supplier_last_check": stock.get("last_check", ""),
-            "status": status,
+            "status": "ok",
             "candidates": candidates,
-            "processed": processed, "updated": updated, "failed": failed,
-            "error_detail": error_detail,
+            "queued": queued,
         })
-    stats = {"candidates": len(candidates), "imported_rows": len(rows),
-             "status": status, "processed": processed, "updated": updated,
-             "failed": failed, "has_supplier_data": has_data}
+    stats = {"ok": True, "candidates": len(candidates), "queued": queued,
+             "status": "ok", "has_supplier_data": has_data}
     log.info("restock_skladom: run done %s", stats)
     return stats
 
@@ -7681,10 +8522,12 @@ def run_restock_skladom() -> dict:
 # Distinct from #108 restock_skladom (which triggers on a scraped SUPPLIER
 # confirmation): this finds OUR products that physically HAVE stock (stock>0 — the
 # green „máme" bars in the Shoptet admin) yet are still shown as Vypredané (state 2,
-# visible), and flips them back to Skladom by importing the rows to Shoptet. It
-# needs NO supplier data. Detection lives in parovanie.stock_skladom; the write is
-# import_builder.skladom_rows (visible + both availability Skladom; the real stock
-# is NEVER overwritten) through the SAME careful chunked import path.
+# visible). It needs NO supplier data. Detection lives in parovanie.stock_skladom;
+# the row shape is import_builder.skladom_rows (visible + both availability
+# Skladom; the real stock is NEVER overwritten). Since #299 Task 9 it no longer
+# writes to the eshop itself — it QUEUES the rows into the shared pending_shoptet
+# table (`queue_shoptet_fields`); the hourly „Sync do Shoptetu" drain does the
+# actual write.
 # --------------------------------------------------------------------------- #
 STOCK_SKLADOM_STATE = _store("stock_skladom.json")
 
@@ -7702,68 +8545,100 @@ def _save_stock_skladom(d: dict) -> None:
     _atomic_write_json(STOCK_SKLADOM_STATE, d, mode=0o600)
 
 
+def _stock_skladom_candidates() -> list:
+    """The have-real-stock+still-Vypredané JOIN (#98's own detection — unchanged by
+    the #299 Task 9 queueing migration below). Needs no supplier data (unlike
+    restock_skladom) — the trigger is Shoptet's own export stock column, so the
+    ONLY existing safeguard against stale data is reading the CURRENT on-disk
+    export (refreshed hourly by „Sync zo Shoptetu") — there is no separate
+    freshness window to preserve here (no supplier confirmation involved)."""
+    csv_text = _read_export_for_links()          # same cp1250 export reader as #106
+    return stock_skladom.compute_candidates(csv_text)
+
+
+def _stock_skladom_candidate_rows(candidates) -> list:
+    """Convert an ALREADY-COMPUTED `candidates` list (from `_stock_skladom_candidates()`)
+    into auto-skladom CSV rows, `import_builder.SKLADOM_COLS` order. Pure — no I/O of
+    its own; mirrors `_restock_candidate_rows` (#299 Task 9 review I1 — see its
+    docstring for why the previous zero-arg/second-read version was a real bug, not
+    just a wasted export read, for an automation that decides saleability)."""
+    return import_builder.skladom_rows(candidates, CODE2PAIR)
+
+
 def run_stock_skladom() -> dict:
     """One auto-skladom run (daily or „Spustiť teraz"): read OUR catalog export and
-    flip back to Skladom every product that PHYSICALLY has stock (stock>0) but is
-    still shown as Vypredané (state 2, visible) — the manager's „máme skladom" bars
-    in Shoptet — by building the rows (both availability fields → Skladom, visible,
-    stock left untouched via import_builder.skladom_rows) and pushing them through
-    the SAME careful chunked Shoptet import path the n8n endpoints use
-    (_import_rows_chunked → run_import → #23-hardened read-back). WRITES to the live
-    eshop.
+    find every product that PHYSICALLY has stock (stock>0) but is still shown as
+    Vypredané (state 2, visible) — the manager's „máme skladom" bars in Shoptet — by
+    building the rows (both availability fields → Skladom, visible, stock left
+    untouched via import_builder.skladom_rows) — same JOIN as before
+    (`_stock_skladom_candidates`, unchanged).
 
-    Needs no supplier data (unlike restock_skladom) — the trigger is Shoptet's own
-    stock. Safe by construction: a conscious-off product (detailOnly/discontinued/
+    Since #299 Task 9 this does NOT import directly: it QUEUES the rows into the
+    shared pending_shoptet table (`queue_shoptet_fields`) for the next hourly „Sync do
+    Shoptetu" drain to actually write to the eshop — no `_import_lock`, no chunked
+    import, no busy/error-from-import status here any more. This producer never
+    credits itself and needs no dedup store (unlike grube_externalcode/split_links):
+    a candidate is entirely state-driven (Vypredané+visible with real stock in the
+    LIVE export), so once Shoptet confirms the flip and the export next refreshes,
+    the product's own state changes to Skladom and `_stock_skladom_candidates`
+    simply stops selecting it — no separate "already uploaded" bookkeeping needed,
+    and none is written.
+
+    Two DELIBERATELY DIFFERENT counts, same naming discipline as
+    `run_restock_skladom` (see its docstring for the #299 Task 8 review finding this
+    fixes): `candidates` is the number of PRODUCTS (rows) the JOIN selected;
+    `queued` is `queue_shoptet_fields`'s own return value — the number of individual
+    FIELD VALUES actually written into pending_shoptet (up to THREE per candidate —
+    productVisibility/availabilityInStock/availabilityOutOfStock — fewer if a cell
+    was empty).
+
+    Safe by construction: a conscious-off product (detailOnly/discontinued/
     hidden = state 3) or an already-Skladom one (state 1) is never a candidate, so a
     residual unit on a discontinued product is never re-listed and a live product is
-    never re-flipped (idempotent). A failed import is detected via the #23-hardened
-    read-back and recorded status='error', not a silent success (the run never raises
-    on an import failure — it degrades to a red row, like parovania_eshop). Reads
-    ONLY its own store + the export; never touches the manager's decision stores."""
-    csv_text = _read_export_for_links()          # same cp1250 export reader as #106
+    never re-flipped (idempotent). Reads ONLY its own store + the export; never
+    touches the manager's decision stores.
+
+    #299 Task 9 review I2 — same export-age gate as `run_restock_skladom` (see its
+    docstring), and MORE load-bearing here: this automation's ONLY signal is the
+    export (no supplier confirmation to fall back on), and it decides saleability
+    from stock>0 directly — a stale export could put a product back on sale that
+    has since sold out for real. `_export_age_gate_reason` refuses to queue
+    ANYTHING and reports `ok: False` with a Slovak reason; surfacing that to the
+    manager (banner/⚠ badge) is Task 11."""
     now = datetime.now(timezone.utc).astimezone()
-    candidates = stock_skladom.compute_candidates(csv_text)
-    rows = import_builder.skladom_rows(candidates, CODE2PAIR)
+    gate_reason = _export_age_gate_reason(_export_age_s())
+    if gate_reason:
+        msg = f"{gate_reason} — nezaraďujem nič, radšej počkám na čerstvý export"
+        log.warning("stock_skladom: %s", msg)
+        with _lock:
+            _save_stock_skladom({
+                "last_check": now.isoformat(timespec="seconds"),
+                "status": "error",
+                "error": msg,
+                "candidates": [],
+                "queued": 0,
+            })
+        return {"ok": False, "error": msg, "status": "error",
+                "candidates": 0, "queued": 0}
 
-    status = "ok"
-    processed = updated = failed = None
-    error_detail = ""
+    candidates = _stock_skladom_candidates()
+    rows = _stock_skladom_candidate_rows(candidates)
+
+    queued = 0
     if rows:
-        if not _import_lock.acquire(blocking=False):
-            log.warning("stock_skladom: iný import práve beží — beh preskočený")
-            status, error_detail = "busy", "iný import práve beží"
-        else:
-            try:
-                res = _import_rows_chunked(rows, import_builder.SKLADOM_COLS, False,
-                                           prefix="skladom_", timeout=900)
-            finally:
-                _import_lock.release()
-            processed, updated, failed = res["processed"], res["updated"], res["failed"]
-            if res["ok"]:
-                status = "ok"
-            else:
-                status = "error"
-                # _chunk_error_msg already carries res["error_detail"]; add the
-                # stderr tail only when there is no Shoptet reason to show
-                tail = "" if res["error_detail"] else (res["err"] or "")[-300:]
-                error_detail = _chunk_error_msg(res, len(rows)) + (f": {tail}" if tail else "")
-                log.error("stock_skladom: import FAILED rc=%s chunks_ok=%d/%d stderr=%s",
-                          res["rc"], res["chunks_ok"], res["chunks_total"],
-                          (res["err"] or "")[-400:])
+        queued = queue_shoptet_fields("stock_skladom",
+                                      ";".join(import_builder.SKLADOM_COLS), rows)
 
-    # `candidates` are always stored (what WOULD be flipped) so the tab shows them
-    # even on a failed import; on success they ARE what was flipped.
+    # `candidates` are always stored (what this run found/queued) so the tab shows
+    # them even when nothing ended up queued (e.g. every cell happened to be empty).
     with _lock:
         _save_stock_skladom({
             "last_check": now.isoformat(timespec="seconds"),
-            "status": status,
+            "status": "ok",
             "candidates": candidates,
-            "processed": processed, "updated": updated, "failed": failed,
-            "error_detail": error_detail,
+            "queued": queued,
         })
-    stats = {"candidates": len(candidates), "imported_rows": len(rows),
-             "status": status, "processed": processed, "updated": updated,
-             "failed": failed}
+    stats = {"ok": True, "candidates": len(candidates), "queued": queued, "status": "ok"}
     log.info("stock_skladom: run done %s", stats)
     return stats
 
@@ -8531,17 +9406,48 @@ AUTOMATION_DESCRIPTIONS = {
         # tab could never show him again.
         "review kartách. Zmaže pritom značky pri riadkoch tých objednávok, ktoré sú už "
         "vybavené a na tabe sa nedajú zobraziť — nič iné z tvojej práce nemení.",
+    "shoptet_upload":
+        # #299 opravné kolo 1 review I2 — all five producers finished migrating
+        # (Task 10 added the last one, parovania_eshop); this cycle no longer runs
+        # any of them — each queues on its OWN schedule, this description must say
+        # that plainly (it used to name only 2 of 5 and implied the rest were
+        # still direct-import, which stopped being true).
+        "Každú hodinu stiahne čerstvý stav zo Shoptetu, jedným importom nahrá do "
+        "eshopu všetko, čo je zapísané v tabuľke čakajúcich zmien, a potom stav "
+        "stiahne znova. Nahraté označí až vtedy, keď to Shoptet potvrdí; čo eshop "
+        "v katalógu nemá, ostane čakať a je to tu vidieť. Do tabuľky zapisuje "
+        "všetkých päť automatizácií („Párovania → eshop“, „GRUBE kódy → eshop“, "
+        "„Veľkostné linky → eshop“, „Vypredané → Skladom“, „Máme skladom → "
+        "Skladom“) — každá na svojom vlastnom rozvrhu; táto automatizácia ich "
+        "nespúšťa, len raz za hodinu nahrá, čo medzičasom zaradili.",
     "parovania_eshop":
-        "Denne o 21:00 nahrá nové napárované produkty a doplnených dodávateľov do "
-        "Shoptet eshopu — zapíše doobjednávacie odkazy do poznámky produktu.",
+        # #299 opravné kolo 1 review I2 — since this migration it only ZARADÍ
+        # (queues) into the shared table; the hourly „Sync do Shoptetu“
+        # automation does the actual upload up to an hour later, same as
+        # grube_externalcode/split_links below.
+        "Denne o 21:00 zaradí nové napárované produkty a doplnených dodávateľov do "
+        "spoločnej tabuľky čakajúcich zmien — do eshopu ich potom nahrá hodinová "
+        "automatizácia „Sync do Shoptetu“ (musí byť tiež zapnutá). Zapisuje "
+        "doobjednávacie odkazy do poznámky produktu.",
     "grube_externalcode":
-        "Denne o 3:30 nahrá do Shoptet eshopu kódy dodávateľa GRUBE pre jednotlivé "
-        "veľkosti (do poľa externalCode). Nahrá len nové alebo zmenené kódy — čo už "
-        "raz nahrala, znova neposiela.",
+        # #299 review I1 — since Task 8 this only ZARADÍ (queues) into the shared
+        # table; the hourly „Sync do Shoptetu“ automation does the actual upload
+        # up to an hour later. The description must say that, not imply an
+        # immediate 3:30 upload — a manager reading this needs BOTH automations
+        # enabled to see codes actually land in the eshop.
+        "Denne o 3:30 zaradí kódy dodávateľa GRUBE pre jednotlivé veľkosti (pole "
+        "externalCode) do spoločnej tabuľky čakajúcich zmien — do eshopu ich potom "
+        "nahrá hodinová automatizácia „Sync do Shoptetu“ (musí byť tiež zapnutá). "
+        "Zaradí len nové alebo zmenené kódy — čo je už v eshope potvrdené, znova "
+        "neposiela.",
     "split_links":
-        "Denne o 3:45 nahrá do Shoptet eshopu odkazy na jednotlivé veľkosti pri "
-        "produktoch rozdelených na veľkosti (do internej poznámky produktu). Nahrá "
-        "len nové alebo zmenené odkazy — čo už raz nahrala, znova neposiela.",
+        # #299 review I1 — same correction as grube_externalcode above: this
+        # queues, it does not upload.
+        "Denne o 3:45 zaradí odkazy na jednotlivé veľkosti pri produktoch "
+        "rozdelených na veľkosti (interná poznámka produktu) do spoločnej tabuľky "
+        "čakajúcich zmien — do eshopu ich potom nahrá hodinová automatizácia „Sync "
+        "do Shoptetu“ (musí byť tiež zapnutá). Zaradí len nové alebo zmenené "
+        "odkazy — čo je už v eshope potvrdené, znova neposiela.",
     "dodavatelsky_sklad":
         "Denne o 5:00 prejde weby dodávateľov (pri nejasnej dostupnosti pomôže AI) "
         "a zistí, čo majú skladom a za akú cenu.",
@@ -8550,12 +9456,27 @@ AUTOMATION_DESCRIPTIONS = {
         "automatizácie „Dodávateľský sklad“) a upozorní na produkty, ktoré máme "
         "skladom, ale dodávateľ ich už nemá — hrozí výpadok.",
     "restock_skladom":
+        # #299 záverečná recenzia I3 — these two run FIRST in the rollout order, so
+        # this is the text a manager sees first; "rovno ich naskladní" ("puts them
+        # back in stock right away") was left over from before the #299 migration
+        # and now overpromises exactly like parovania_eshop/grube_externalcode/
+        # split_links above already had corrected for their own text — this
+        # automation only ZARADÍ (queues) into the shared table; nothing in the
+        # eshop changes until „Sync do Shoptetu“ runs.
         "Denne o 6:00 nájde produkty, ktoré máme označené ako Vypredané, ale "
-        "dodávateľ ich má opäť skladom, a rovno ich naskladní naspäť v eshope.",
+        "dodávateľ ich má opäť skladom, a zaradí ich do spoločnej tabuľky "
+        "čakajúcich zmien — do eshopu ich potom nahrá hodinová automatizácia "
+        "„Sync do Shoptetu“ (musí byť tiež zapnutá).",
     "stock_skladom":
+        # #299 záverečná recenzia I3 — same correction as restock_skladom above:
+        # "a rovno ich prepne" ("switches them right away") is stale since the
+        # #299 migration — this only queues, the switch happens once the hourly
+        # drain confirms the row.
         "Denne o 6:45 nájde produkty, ktoré fyzicky máme na sklade (Shoptet ukazuje "
-        "kusy skladom), ale zákazníkom sa stále zobrazujú ako Vypredané, a rovno ich "
-        "prepne na Skladom. Nedotýka sa produktov, ktoré ste vedome ukončili.",
+        "kusy skladom), ale zákazníkom sa stále zobrazujú ako Vypredané, a zaradí "
+        "ich do spoločnej tabuľky čakajúcich zmien — do eshopu ich potom nahrá "
+        "hodinová automatizácia „Sync do Shoptetu“ (musí byť tiež zapnutá). "
+        "Nedotýka sa produktov, ktoré ste vedome ukončili.",
     "orders_reminder":
         "Denne o 8:00 skontroluje objednávky vo vybavovaní dlhšie ako 4 dni — bez "
         "poznámky len upozorní (žiadny mail), s poznámkou AI vyhodnotí, či bol "
@@ -8589,6 +9510,12 @@ AUTOMATIONS_REG = [
                name="Sync zo Shoptetu",
                schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
                run_fn=run_shoptet_sync),
+    # #299 — the write-side counterpart of shoptet_sync. Starts DISABLED (#93):
+    # it pushes to the live eshop, so the manager turns it on himself.
+    Automation(key="shoptet_upload",
+               name="Sync do Shoptetu",
+               schedule={"interval_minutes": 60, "tz": "Europe/Bratislava"},
+               run_fn=run_shoptet_upload),
     # #109 — nightly push of new pairings + assigned suppliers to the Shoptet
     # eshop (migrated from n8n YuDugCCOnwejRfva). SAFETY (#93 contract): starts
     # DISABLED — this one WRITES to the live production eshop, so it runs ONLY
@@ -8642,18 +9569,22 @@ AUTOMATIONS_REG = [
                run_fn=run_riziko_vypadku),
     # #108 — daily restock (products WE show as Vypredané but our supplier has stock
     # again → flip back to Skladom). SAFETY (#93 contract): starts DISABLED — this one
-    # WRITES to the live production eshop, so it runs ONLY after the manager clicks
-    # ▶ Štart; a deploy never auto-restocks on its own. Scheduled after the 05:00
-    # supplier scrape (fresh data) and the 06:15 riziko report brackets it.
+    # feeds the live production eshop (queues into pending_shoptet since #299 Task 9;
+    # the hourly „Sync do Shoptetu" drain does the actual write), so it runs ONLY
+    # after the manager clicks ▶ Štart; a deploy never auto-restocks on its own.
+    # Scheduled after the 05:00 supplier scrape (fresh data) and the 06:15 riziko
+    # report brackets it.
     Automation(key="restock_skladom",
                name="Vypredané → Skladom",
                schedule={"daily_at": "06:00", "tz": "Europe/Bratislava"},
                run_fn=run_restock_skladom),
     # #98 — daily auto-skladom from Shoptet's OWN physical stock (products we HAVE
     # stock of but that still show Vypredané → flip to Skladom). SAFETY (#93
-    # contract): starts DISABLED — this one WRITES to the live production eshop, so
-    # it runs ONLY after the manager clicks ▶ Štart; a deploy never auto-restocks on
-    # its own. Scheduled 06:45, after the hourly export sync + the 06:00 restock.
+    # contract): starts DISABLED — this one feeds the live production eshop (queues
+    # into pending_shoptet since #299 Task 9; the hourly „Sync do Shoptetu" drain
+    # does the actual write), so it runs ONLY after the manager clicks ▶ Štart; a
+    # deploy never auto-restocks on its own. Scheduled 06:45, after the hourly
+    # export sync + the 06:00 restock.
     Automation(key="stock_skladom",
                name="Máme skladom → Skladom",
                schedule={"daily_at": "06:45", "tz": "Europe/Bratislava"},
@@ -8782,6 +9713,87 @@ def _start_scheduler() -> bool:
     SCHEDULER_INTENT = "running"
     return True
 
+
+# #299 — the whole download → let the automations queue changes → one upload →
+# download-again cycle holds ONE claim, so a SECOND `run_shoptet_upload` cannot
+# start while one is already running (`test_the_cycle_refuses_to_run_twice_at_once`).
+# Same flock shape as SCHEDULER_CLAIM above — but that one is held for the whole
+# process lifetime, while THIS claim must be released the moment the cycle ends
+# (success or exception), so the next hourly run can take it. Hence the context
+# manager, not a boot-time `_claim_*() -> bool` function.
+#
+# #299 záverečná recenzia (Minor) — this comment used to ALSO claim that "a
+# standalone hourly download cannot land in the middle of it", which is NOT
+# true: `run_shoptet_sync` (the separate catalog-download automation) never
+# takes THIS claim at all — grep `_shoptet_cycle_claim()` and it has exactly
+# ONE caller, `run_shoptet_upload` itself. Nothing stops `run_shoptet_sync`'s
+# own independent hourly tick from running concurrently with a drain cycle;
+# `run_shoptet_upload` merely calls `RUNNER.run_sync("shoptet_sync")` itself
+# (pre- and post-import) as its OWN download steps, which is what the docstring
+# above actually protects — a THIRD, unrelated `shoptet_sync` tick overlapping
+# is a real possibility this claim does nothing about. Left as a documentation
+# fix only (Minor, not a data-safety bug) — a stray extra catalogue refresh is
+# harmless idempotent re-work, never a corrupting race.
+CYCLE_CLAIM = _store(".shoptet_cycle.lock")
+
+
+def _cycle_busy() -> bool:
+    """True while some process is inside the upload cycle."""
+    p = os.fspath(CYCLE_CLAIM)
+    fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def _shoptet_cycle_claim():
+    """Take the exclusive cross-process claim for the whole Shoptet upload cycle.
+
+    Yields `True` when the claim was taken (the caller owns the cycle) or `False`
+    when another process already holds it (the caller must skip this run, never
+    proceed anyway). The claim is ALWAYS released when the `with` block exits —
+    including on an exception — so a crashed cycle never wedges the next hourly
+    run open forever.
+
+    #299 review (Task 5 minor, deferred to Task 6): opening the claim file itself
+    can fail — a full disk, wrong permissions, a missing/unwritable data dir — and
+    that is NOT the same event as another process already holding the claim. Left
+    unguarded, an hourly `os.open` failure would raise straight out of this
+    generator and crash the WHOLE automation (recorded as a hard error) instead of
+    the same clean "skip this run, try again next hour" the busy-claim branch
+    already gives. Same yield-`False` shape, so a caller cannot tell the two apart
+    from the return value alone — that is fine, since both mean exactly the same
+    thing to the caller (skip this hour); the log line is what tells them apart."""
+    p = os.fspath(CYCLE_CLAIM)
+    try:
+        fd = os.open(p, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        log.error("sync do Shoptetu: claim súbor %s sa nedá otvoriť (%r) — cyklus "
+                  "preskakujem, o hodinu znova", p, e)
+        yield False
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            log.warning("sync do Shoptetu: cyklus už beží inde, preskakujem")
+            yield False
+            return
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()} "
+                     f"started={datetime.now().isoformat(timespec='seconds')}\n".encode())
+        yield True
+    finally:
+        os.close(fd)
+
+
 # Valid /api/ui-label rename keys (#173): every NAV key the frontend actually
 # renders a button for — mirrors app.js's TABS + AUTOMATION_TABS arrays + the
 # two standalone admin/dev tabs, verbatim. Deliberately NOT derived from
@@ -8791,14 +9803,162 @@ def _start_scheduler() -> bool:
 # is ever looked up by UI_LABELS on the frontend (_navButton/PAGE_TITLES key on
 # the nav key). Keep this set in sync with app.js's TABS/AUTOMATION_TABS keys
 # whenever a nav tab is added/renamed-in-code.
+#
+# "shoptet_upload" (#299 Task 7) now HAS its own nav tab (SYSTEM_TABS in app.js,
+# alongside "shoptet_sync") — added here in the SAME commit as app.js's
+# #tab-shoptet_upload card, NAV_ICONS entry and PAGE_TITLE, per the comment this
+# replaced: test_nav_keys_match_appjs (test_webreview_ui_labels.py) cross-checks
+# this exact set against app.js's TABS/AUTOMATION_TABS/SYSTEM_TABS arrays and
+# fails on ANY key present on only one side.
 NAV_KEYS = {
     "toorder", "nedostupne", "vystavy", "search", "notes", "review",     # TABS
-    "posta", "orders_reminder", "shoptet_sync", "parovania_eshop",
+    "shoptet_sync", "shoptet_upload",                                    # SYSTEM_TABS
+    "posta", "orders_reminder", "parovania_eshop",
     "grube_externalcode", "split_links",
     "dodavatelsky_sklad", "riziko_vypadku", "restock_skladom", "stock_skladom",
     "image_health",                                                      # AUTOMATION_TABS
     "users", "dev",
 }
+
+
+# #299 Task 11 — the NAJDÔLEŽITEJŠIA POŽIADAVKA. Since Task 10, the hourly „Sync
+# do Shoptetu" cycle is the ONLY path anything reaches the live eshop by — every
+# producer only queues now. That cycle also deploys DISABLED, as every automation
+# must (#93 safety contract). If a manager forgets to flip it on, the queue grows
+# forever and nothing ever reaches the eshop, with the only warning a sentence in
+# a description box nobody opens — the single worst "quiet death" this project
+# has, because it silences the WHOLE system at once, not one producer.
+# "Staršie než pár hodín" per the brief's own example.
+QUEUE_STALE_WHILE_DISABLED_AFTER_S = 3 * 3600
+
+
+def _queue_stale_while_disabled_warning(enabled: bool) -> str:
+    """Empty string when there is nothing to say; a self-contained Slovak sentence
+    (what is happening + what to do about it) when the upload cycle is switched
+    OFF and something has been sitting in the queue longer than
+    `QUEUE_STALE_WHILE_DISABLED_AFTER_S`.
+
+    Computed FRESH on every `/api/automations` poll, straight from `enabled` (the
+    runner's own persisted flag) and the pending table's own timestamps — NEVER
+    from `run_shoptet_upload`'s `last_result`. A safeguard that itself needed the
+    disabled cycle to run would be guarding itself, which the brief explicitly
+    rules out ("poistka nesmie sama vyžadovať, aby bežal vypnutý cyklus"). This is
+    also why it lives on the TOP-LEVEL automation status dict (`api_automations`
+    below), not inside `last_result`: the badge and the card must show it even
+    when `shoptet_upload` has NEVER run at all.
+
+    #299 opravné kolo 1 review I1/I2/m1 — three ways the ORIGINAL version of
+    this alarm could read "nothing to worry about" for the one input shape it
+    actually cannot judge, which is the opposite of every other branch here:
+      * I1 — an UNREADABLE `pending_shoptet.json` used to degrade to `{}`
+        (`_load_pending`, same as a legitimately empty table) and read as
+        "queue is empty" — the one branch in this whole module that is
+        dangerously QUIET about the case it cannot see. Distinguished here from
+        a genuinely MISSING file (a fresh install — still legitimately silent,
+        `store-prune.md` §1's "absence is never evidence") by asking
+        `_read_json_store_state` for provenance AND checking the file really
+        exists on disk: present-but-unparsable fires LOUD.
+      * I2 — a field with NO `queued_at` at all used to be silently filtered
+        out of the "oldest" computation (`if f.get("queued_at")`); if every
+        field in a non-empty queue lacked one, the whole alarm still read
+        "nothing queued". Now treated exactly like an unparsable timestamp —
+        loud, never silently dropped.
+      * m1 — `min()` over the ISO STRINGS themselves is LEXICOGRAPHIC, not
+        chronological: two timestamps that differ only in UTC OFFSET (a DST
+        transition either side of the queue) can sort backwards from their
+        real chronological order, misjudging staleness by up to an hour.
+        Every timestamp is now parsed to a real `datetime` and compared by
+        actual elapsed seconds, never by string order.
+
+    #299 opravné kolo 2 review N3 — the table is valid JSON but any of its
+    values can still be a shape this code never wrote (a hand-edit, a bug in
+    some OTHER writer, or plain corruption that stays valid JSON): a bare
+    string instead of `{"fields": …}`, a `fields` that is a list instead of a
+    dict, or a field entry that is a string instead of `{"queued_at": …}`.
+    Before this fix any of those raised `AttributeError`/`TypeError` straight
+    out of `.get()`/`.values()` — uncaught, so `/api/automations` returned
+    500 and EVERY automation card vanished from the manager's screen, not
+    just this one. Every shape that is not a dict where a dict is expected
+    now counts as `unreadable` (below) — loud, same direction as an
+    unparsable/missing timestamp, never a crash.
+
+    #299 opravné kolo 2 review N4 — a `queued_at` in the FUTURE (a clock
+    step, an NTP jump, a hand-edited value) gives a NEGATIVE age. Age
+    comparisons below are all `>=`/`<` against a positive threshold, so a
+    negative age reads as "very fresh" and, if it happens to be the ONLY
+    field in the table, silences the alarm entirely — the one remaining
+    branch that stayed quiet on data this function cannot trust. Treated
+    exactly like an unparsable timestamp: loud."""
+    if enabled:
+        return ""
+    pending, from_disk = _read_json_store_state(PENDING_SHOPTET, {})
+    if not from_disk and os.path.exists(PENDING_SHOPTET):
+        log.error("sync do Shoptetu: %s sa nedá prečítať — neviem posúdiť "
+                  "starnutie fronty pri vypnutom cykle", PENDING_SHOPTET)
+        return ("Tabuľka čakajúcich zmien (pending_shoptet.json) sa nedá "
+                "prečítať — neviem posúdiť, či v nej niečo starne, kým je "
+                "hodinový cyklus „Sync do Shoptetu“ vypnutý. Over súbor.")
+    fields = []
+    unreadable = 0
+    for e in pending.values():
+        if not isinstance(e, dict):            # N3 — e.g. {"A": "x"}
+            unreadable += 1
+            continue
+        fs = e.get("fields")
+        if fs is None:
+            continue                           # legitimately no fields queued for this code
+        if not isinstance(fs, dict):            # N3 — e.g. {"fields": ["x"]}
+            unreadable += 1
+            continue
+        for f in fs.values():
+            if isinstance(f, dict):
+                fields.append(f)
+            else:
+                unreadable += 1                # N3 — e.g. {"fields": {"n": "x"}}
+    now = datetime.now(timezone.utc)
+    ages_s = []
+    for f in fields:
+        # #299 opravné kolo 2 review N-C1 — this alarm needs the FROZEN
+        # timestamp (`first_queued_at`, never moved by a same-value re-queue),
+        # never the `queued_at` `stale_fields` refreshes on every re-queue —
+        # reading the refreshed one would silence THIS alarm on every
+        # producer tick, the exact C2 regression it exists to catch. A table
+        # written before this split has no `first_queued_at` at all, so its
+        # OWN `queued_at` (which meant "first queued" back then) is the
+        # correct fallback.
+        raw = f.get("first_queued_at") or f.get("queued_at")
+        if not raw:
+            unreadable += 1
+            continue
+        try:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_s = (now - dt).total_seconds()
+        except (ValueError, TypeError):        # TypeError — e.g. a numeric queued_at (N3)
+            unreadable += 1
+            continue
+        if age_s < 0:                          # N4 — queued_at in the future
+            unreadable += 1
+            continue
+        ages_s.append(age_s)
+    if unreadable:
+        log.error("sync do Shoptetu: %d polí vo fronte je poškodených alebo "
+                  "nemá čitateľný čas zaradenia — neviem posúdiť starnutie "
+                  "pri vypnutom cykle", unreadable)
+        return (f"{unreadable} polí vo fronte je poškodených alebo nemá "
+                f"čitateľný čas zaradenia a hodinový cyklus „Sync do "
+                f"Shoptetu“ je vypnutý — neviem povedať, ako dlho tam čakajú. "
+                f"Over pending_shoptet.json.")
+    if not ages_s:
+        return ""
+    age_s = max(ages_s)          # m1 — oldest = the LARGEST real elapsed time
+    if age_s < QUEUE_STALE_WHILE_DISABLED_AFTER_S:
+        return ""
+    hrs = int(age_s // 3600)
+    return (f"Hodinový cyklus „Sync do Shoptetu“ je vypnutý a vo fronte na "
+            f"neho čaká práca už {hrs} h — nič z toho sa nedostane do eshopu, kým "
+            f"ho nezapneš (▶ Štart na karte „Sync do Shoptetu“).")
 
 
 @app.route("/api/automations")
@@ -8809,10 +9969,34 @@ def api_automations():
     out = []
     for a in RUNNER.status():
         a["description"] = AUTOMATION_DESCRIPTIONS.get(a["key"], "")
+        if a["key"] == "shoptet_upload":
+            # #299 Task 11 — see `_queue_stale_while_disabled_warning`'s own
+            # docstring: this is the ONE alarm in this task that must fire even
+            # when the automation it is ABOUT has never run.
+            a["queue_stale_warning"] = _queue_stale_while_disabled_warning(a["enabled"])
         out.append(a)
     # `scheduler` — see `_scheduler_state`: without it a blocked / switched-off / dead
     # instance is indistinguishable from a healthy one in the UI.
     return jsonify({"automations": out, "scheduler": _scheduler_state()})
+
+
+@app.route("/api/pending-shoptet")
+def api_pending_shoptet():
+    """What the next hourly `shoptet_upload` will send, and what it cannot send yet
+    (#299 Task 7 — the „Sync do Shoptetu" card). Read-only over `pending_shoptet.json`;
+    writes nothing, triggers nothing. Session-gated like every other endpoint."""
+    pending = _load_pending()
+    waiting, blocked = [], []
+    for code in sorted(pending):
+        e = pending[code]
+        for field, f in sorted((e.get("fields") or {}).items()):
+            item = {"code": code, "field": field, "value": f.get("value", ""),
+                    "source": f.get("source", ""), "queued_at": f.get("queued_at", "")}
+            if e.get("blocked"):
+                blocked.append({**item, "reason": e["blocked"].get("reason", "")})
+            else:
+                waiting.append(item)
+    return jsonify({"pending": waiting, "blocked": blocked})
 
 
 @app.route("/api/ui-labels")
@@ -9458,10 +10642,13 @@ def api_riziko_vypadku_csv():
 @app.route("/api/restock-skladom")
 def api_restock_skladom():
     """Display data for the „Vypredané → Skladom" tab — the last restock run's
-    candidate products (kód, názov, naša cena vs cena dodávateľa, linky), the import
-    outcome (spracované / naskladnené / zlyhania), and whether the '#106 Dodávateľský
-    sklad' scraper has produced data at all (has_supplier_data=False → the tab shows
-    'najprv spusti Dodávateľský sklad', never a misleading empty list)."""
+    candidate products (kód, názov, naša cena vs cena dodávateľa, linky), how many
+    field values it QUEUED for the next hourly „Sync do Shoptetu" drain (#299 Task 9
+    — this producer no longer imports directly, so `processed`/`updated`/`failed`
+    from a completed import no longer apply and are gone from this response), and
+    whether the '#106 Dodávateľský sklad' scraper has produced data at all
+    (has_supplier_data=False → the tab shows 'najprv spusti Dodávateľský sklad',
+    never a misleading empty list)."""
     with _lock:
         st = _load_restock()
     return jsonify({
@@ -9470,28 +10657,24 @@ def api_restock_skladom():
         "supplier_last_check": st.get("supplier_last_check", ""),
         "status": st.get("status", ""),
         "candidates": st.get("candidates") or [],
-        "processed": st.get("processed"),
-        "updated": st.get("updated"),
-        "failed": st.get("failed"),
-        "error_detail": st.get("error_detail", ""),
+        "queued": st.get("queued", 0),
     })
 
 
 @app.route("/api/stock-skladom")
 def api_stock_skladom():
     """Display data for the „Máme skladom → Skladom" tab (#98) — the last run's
-    candidate products (kód, názov, naša cena, náš sklad, čo teraz zobrazujú), the
-    import outcome (spracované / naskladnené / zlyhania) and the run status."""
+    candidate products (kód, názov, naša cena, náš sklad, čo teraz zobrazujú), how
+    many field values it QUEUED for the next hourly „Sync do Shoptetu" drain (#299
+    Task 9 — no more `processed`/`updated`/`failed` from a completed import) and the
+    run status."""
     with _lock:
         st = _load_stock_skladom()
     return jsonify({
         "last_check": st.get("last_check", ""),
         "status": st.get("status", ""),
         "candidates": st.get("candidates") or [],
-        "processed": st.get("processed"),
-        "updated": st.get("updated"),
-        "failed": st.get("failed"),
-        "error_detail": st.get("error_detail", ""),
+        "queued": st.get("queued", 0),
     })
 
 

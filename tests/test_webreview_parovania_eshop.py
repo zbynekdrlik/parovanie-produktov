@@ -16,7 +16,6 @@ import io
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -82,6 +81,9 @@ def iso(tmp_path, monkeypatch):
     monkeypatch.setattr(webapp, "ORDER_PAIRINGS", str(tmp_path / "order_pairings.json"))
     monkeypatch.setattr(webapp, "SUPPLIER_ASSIGN", str(tmp_path / "supplier_assignments.json"))
     monkeypatch.setattr(webapp, "SUPPLIERS_STATE", str(tmp_path / "uploaded_suppliers.json"))
+    # #299 Task 10: both cores now QUEUE into the shared pending_shoptet table
+    # instead of importing directly — isolate it like every other store here.
+    monkeypatch.setattr(webapp, "PENDING_SHOPTET", str(tmp_path / "pending_shoptet.json"))
     products = [_product()]
     monkeypatch.setattr(webapp, "PRODUCTS", products)
     monkeypatch.setattr(webapp, "CODE2PAIR", {"1/M": "P1", "9/Z": "777"})
@@ -154,34 +156,47 @@ def test_parovania_eshop_registered_disabled_daily_2100(iso):
 
 # ── successful nightly push ─────────────────────────────────────────────────────
 def test_run_pushes_pairings_and_suppliers_and_records_counts(iso, monkeypatch):
+    """#299 Task 10 — `run_parovania_eshop` no longer imports directly through
+    either core: both now QUEUE their candidate rows into the shared
+    pending_shoptet table for the next hourly "Sync do Shoptetu" drain
+    (`test_webreview_shoptet_upload.py` covers the drain + credit path end to
+    end). `count`/`total_uploaded` stay 0 here — the `iso` fixture's catalog
+    export lists both codes but with a DIFFERENT internalNote, so neither row is
+    export-confirmed; `queued` is what actually landed in the pending table."""
     _seed_pairing()
     _seed_supplier()
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result = webapp.run_parovania_eshop()
 
     assert result["status"] == "ok"
-    assert result["pairings"]["count"] == 1
-    assert result["pairings"]["total_uploaded"] == 1
+    assert result["pairings"]["queued"] == 1
+    assert result["pairings"]["count"] == 0
+    assert result["pairings"]["total_uploaded"] == 0
     assert result["pairings"]["total_products"] == 1
-    assert result["suppliers"]["count"] == 1
-    assert result["suppliers"]["total_uploaded"] == 1
+    assert result["suppliers"]["queued"] == 1
+    assert result["suppliers"]["count"] == 1     # suppliers has no confirm step — count==queued
+    assert result["suppliers"]["total_uploaded"] == 0
     assert result["suppliers"]["total_assigned"] == 1
     assert result["review_url"].startswith("https://")
 
-    # BOTH cores actually ran the careful import — one links CSV, one suppliers CSV
-    headers = sorted(c["header"] for c in calls)
-    assert headers == [["code", "pairCode", "internalNote"], ["code", "pairCode", "supplier"]]
-    # the reorder link went into internalNote, the supplier name into the supplier column
-    links = next(c for c in calls if c["header"][2] == "internalNote")
-    assert ["1/M", "P1", "https://supplier/x"] in links["rows"]
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert ["9/Z", "777", "BETALOV"] in sup["rows"]
-    # a nightly write is NEVER a dry run
-    assert all(c["dry_run"] is False for c in calls)
+    # BOTH cores queued — one links field, one supplier field, distinct sources
+    pending = webapp._load_pending()
+    assert pending["1/M"]["fields"]["internalNote"]["value"] == "https://supplier/x"
+    assert pending["1/M"]["fields"]["internalNote"]["source"] == "parovania_eshop"
+    assert pending["9/Z"]["fields"]["supplier"]["value"] == "BETALOV"
+    assert pending["9/Z"]["fields"]["supplier"]["source"] == "parovania_eshop_suppliers"
 
-    # its OWN incremental state written (idempotency) — NOT the manager stores
+    # neither core writes its own incremental state — that credit belongs to the
+    # hourly drain (`_credit_producer`), only once Shoptet actually confirms it
+    assert not (iso["tmp"] / "uploaded_pairings.json").exists()
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {}
+
+    # simulate the drain confirming + crediting both (its own confirm→credit path
+    # is test_webreview_shoptet_upload.py's job)
+    webapp._credit_producer("parovania_eshop", {"BETALOV|P1": "https://supplier/x"})
+    webapp._credit_producer("parovania_eshop_suppliers", {"9/Z": "BETALOV"})
     assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())["BETALOV|P1"] \
         == "https://supplier/x"
     assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text())["9/Z"] == "BETALOV"
@@ -190,26 +205,67 @@ def test_run_pushes_pairings_and_suppliers_and_records_counts(iso, monkeypatch):
 # ── #38: the nightly push ALSO covers inline order_pairings (via the SAME shared
 #    _do_upload_pairings core, no new HTTP round-trip / no duplicated logic) ────
 def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
+    """#299 Task 10 — an inline order pairing now QUEUES exactly like a reviewed
+    decision, credit_group `order:<code>`; credited only by the drain.
+
+    #299 Task 11 finding 3 — `order_count` used to be
+    `len(uploaded_order_codes)` (codes confirmed RIGHT AWAY from the export
+    match), so it read 0 here even though "7/Y" genuinely queued this run — the
+    card's "📦 Inline páry: +0 nových" was always zero. It now reports what THIS
+    run actually queued for the inline-order bucket, so it is 1 here (the one
+    order pairing this test seeds)."""
     _seed_pairing()
     _seed_order_pairing()
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result = webapp.run_parovania_eshop()
 
     assert result["status"] == "ok"
-    assert result["pairings"]["order_count"] == 1
+    assert result["pairings"]["order_count"] == 1     # "7/Y" queued this run
     assert result["pairings"]["order_blocked"] == 0
-    links = next(c for c in calls if c["header"][2] == "internalNote")
-    assert ["7/Y", "", "https://supplier/inline"] in links["rows"]
+    pending = webapp._load_pending()
+    assert pending["7/Y"]["fields"]["internalNote"]["value"] == "https://supplier/inline"
+    assert pending["7/Y"]["fields"]["internalNote"]["credit"]["group"] == "order:7/Y"
+    assert not (iso["tmp"] / "uploaded_pairings.json").exists()
+
+    # the drain confirms + credits both overnight (simulated directly)
+    webapp._credit_producer("parovania_eshop", {
+        "BETALOV|P1": "https://supplier/x", "order:7/Y": "https://supplier/inline"})
     assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())["order:7/Y"] \
         == "https://supplier/inline"
 
-    # idempotent: a second run pushes neither the decision nor the order pairing again
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-import")))
+    # idempotent: a second run queues neither the decision nor the order pairing again
     result2 = webapp.run_parovania_eshop()
-    assert result2["pairings"]["count"] == 0 and result2["pairings"]["order_count"] == 0
+    assert result2["pairings"]["queued"] == 0 and result2["pairings"]["order_count"] == 0
+
+
+# ── #299 opravné kolo 1 review m4 (Minor) — the pairing-decision group and the ─
+# ── inline order-pairing group must land ATOMICALLY: before this fix they went ─
+# ── up via TWO INDEPENDENT `queue_shoptet_fields` calls (two separate locked ── #
+# ── read-modify-writes), so a failure queueing the SECOND group left the FIRST ─
+# ── already committed to disk — a partial queue the caller could never see, ── #
+# ── since the call never returned at all. ───────────────────────────────────── #
+def test_a_failure_queueing_the_order_group_leaves_NOTHING_half_queued(iso, monkeypatch):
+    _seed_pairing()
+    _seed_order_pairing()
+    real_queue_fields = webapp.shoptet_outbox.queue_fields
+    calls = []
+
+    def spy(pending, source, header, rows, **kw):
+        calls.append(rows)
+        if len(calls) == 2:             # the order-pairing group, queued SECOND
+            raise RuntimeError("boom")
+        return real_queue_fields(pending, source, header, rows, **kw)
+    monkeypatch.setattr(webapp.shoptet_outbox, "queue_fields", spy)
+
+    with pytest.raises(RuntimeError):
+        webapp._do_upload_pairings(dry=False)
+
+    assert len(calls) == 2, "both groups must have been attempted"
+    assert webapp._load_pending() == {}, (
+        "a failure queueing the SECOND group must not leave the FIRST group "
+        "already committed to disk — either both land or neither does")
 
 
 # ── BUG 1: the nightly supplier write-back must NOT overwrite a REAL eshop
@@ -218,7 +274,7 @@ def test_run_also_pushes_inline_order_pairings(iso, monkeypatch):
 #    a code whose product ALREADY carries its own `supplier` in the current export
 #    is excluded, so the automation never clobbers live catalog data. ──────────────
 def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkeypatch):
-    # two assignments: 9/Z (no own supplier in the export → should be written) and
+    # two assignments: 9/Z (no own supplier in the export → should be queued) and
     # 5/A (product ALREADY has its own supplier in the export → must be excluded).
     webapp._save_supplier_assign({"9/Z": "BETALOV", "5/A": "STALE_ASSIGN"})
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
@@ -226,16 +282,19 @@ def test_do_upload_suppliers_skips_codes_with_own_supplier_in_export(iso, monkey
               "9/Z;777;\r\n"
               "5/A;555;REAL_SUPPLIER\r\n")
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(export))
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result, status = webapp._do_upload_suppliers(dry=False)
     assert status == 200
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    written = {r[0] for r in sup["rows"]}
+    pending = webapp._load_pending()
+    written = set(pending)
     assert written == {"9/Z"}          # 5/A excluded (own supplier already in export)
     assert "5/A" not in written
-    # only the code we actually wrote is recorded as uploaded
+    # #299 Task 10 — the producer never writes uploaded_suppliers.json itself
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {}
+    # once the drain credits it, it IS the code we queued (never the excluded one)
+    webapp._credit_producer("parovania_eshop_suppliers", {"9/Z": "BETALOV"})
     up = json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text())
     assert up == {"9/Z": "BETALOV"}
 
@@ -252,18 +311,55 @@ def test_an_assignment_the_eshop_has_OVERTAKEN_is_removed_from_the_store(iso, mo
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
         "code;pairCode;supplier\r\n9/Z;777;\r\n5/A;555;REAL_SUPPLIER\r\n"))
-    fake_run, _calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result, status = webapp._do_upload_suppliers(dry=False)
 
     assert status == 200
-    # the overtaken one is gone; the one we legitimately wrote stays (it is the record of
-    # what the manager assigned, and `uploaded_suppliers.json` is keyed against it)
+    # the overtaken one is gone from the manager's store — this half is UNCHANGED
+    # by #299 Task 10 (the removal never went through import at all)
     assert webapp._load_supplier_assign() == {"9/Z": "BETALOV"}
     assert result["obsolete_removed"] == ["5/A"], result
-    # …and it stops being counted as work still waiting to go up
-    assert result["remaining"] == 0, result
+    # 9/Z is QUEUED but not yet credited (nothing confirms it until the drain runs)
+    assert result["remaining"] == 1, result
+    webapp._credit_producer("parovania_eshop_suppliers", {"9/Z": "BETALOV"})
+    # …and it stops being counted as work still waiting to go up, once credited
+    result2, _s2 = webapp._do_upload_suppliers(dry=False)
+    assert result2["remaining"] == 0, result2
+
+
+def test_a_queued_but_not_yet_confirmed_supplier_is_never_treated_as_obsolete(
+        iso, monkeypatch):
+    """#299 záverečná recenzia — Critical C1. Since the #299 migration, credit for
+    this table (uploaded_suppliers.json) lands only AFTER the hourly drain's OWN
+    import confirms the row — never at send time. That opens a real window: a code
+    can be CURRENTLY QUEUED (sent by an earlier run, or by this very one, still
+    waiting for the drain to confirm it) while `uploaded_suppliers.json` genuinely
+    has not caught up yet. Before the fix, `c not in uploaded` reads that exactly
+    like „nobody ever wrote this" — and if the export already shows the eshop's
+    own supplier (the value we are literally in the middle of sending), #215's
+    removal fires and deletes the manager's live assignment, while the row is
+    STILL sitting in the queue and STILL going out to the live eshop every hour
+    with a value he can no longer see anywhere in this app."""
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    # the export already carries the value we are sending — the exact ambiguous
+    # shape #215's own comment warns about (own_supplier is true for 5/A)
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;BETALOV\r\n"))
+    # 5/A is CURRENTLY QUEUED for its supplier field — not yet confirmed, so
+    # uploaded_suppliers.json (seeded empty by `iso`) does not know about it yet
+    webapp.queue_shoptet_fields("parovania_eshop_suppliers", "code;pairCode;supplier",
+                                [["5/A", "555", "BETALOV"]])
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200, result
+    assert result["obsolete_removed"] == [], result
+    assert webapp._load_supplier_assign() == {"5/A": "BETALOV"}, (
+        "the manager's assignment must survive while its own write is still "
+        "in flight in the queue")
 
 
 def test_an_assignment_whose_name_the_manager_CHANGED_is_never_removed(iso, monkeypatch):
@@ -298,8 +394,8 @@ def test_a_failure_to_clean_up_does_not_take_the_whole_NIGHTLY_RUN_down(iso, mon
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "5/A": "555"})
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
         "code;pairCode;supplier\r\n9/Z;777;\r\n5/A;555;REAL_SUPPLIER\r\n"))
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     def boom(_d):
         raise webapp.StoreWipeRefused("concurrent write")
@@ -309,8 +405,7 @@ def test_a_failure_to_clean_up_does_not_take_the_whole_NIGHTLY_RUN_down(iso, mon
 
     assert status == 200, result
     assert result["obsolete_removed"] == [], result   # nothing was removed, and it says so
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert {r[0] for r in sup["rows"]} == {"9/Z"}     # the run itself carried on
+    assert set(webapp._load_pending()) == {"9/Z"}     # the run itself carried on
 
 
 def test_the_result_reports_what_was_ACTUALLY_dropped(iso, monkeypatch):
@@ -460,6 +555,42 @@ def test_an_UNREADABLE_upload_record_stops_the_run_instead_of_deleting(iso, monk
     assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}
 
 
+# ── #299 opravné kolo 2 review N-C2 (Critical) — the SAME store-prune §1 ────── #
+# ── absence-is-not-evidence rule the block above enforces for ────────────────
+# ── uploaded_suppliers.json was missing for `pending_shoptet.json`: reading it
+# ── through `_load_pending` (plain `_read_json_store`) degrades a CORRUPT file
+# ── to `{}`, and `{}` reads as "nothing is currently queued for ANY code's
+# ── supplier field" — the exact false "nothing in flight" reading that lets
+# ── #215's removal delete the manager's live assignment while the row is
+# ── STILL sitting mid-flight in the (unreadable) queue. A MISSING file is
+# ── different: it is the normal, silent state of a store nothing has queued
+# ── into yet (`_queue_stale_while_disabled_warning` already treats a missing
+# ── pending_shoptet.json this same way, for this SAME file) — only a file
+# ── that genuinely IS there but cannot be trusted refuses the removal. ──────── #
+@pytest.mark.parametrize("why,prepare,removed", [
+    ("missing", lambda p: p.unlink(missing_ok=True), ["5/A"]),
+    ("corrupt", lambda p: p.write_text("{ this is not json", encoding="utf-8"), []),
+    ("wrong-type", lambda p: p.write_text('["A"]', encoding="utf-8"), []),
+])
+def test_a_pending_queue_we_could_not_READ_condemns_nothing(iso, monkeypatch, why,
+                                                            prepare, removed):
+    webapp._save_supplier_assign({"5/A": "STALE_ASSIGN"})
+    prepare(iso["tmp"] / "pending_shoptet.json")
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;REAL_SUPPLIER\r\n"))
+    fake_run, _calls = _ok_import()
+    monkeypatch.setattr(webapp, "run_import", fake_run)
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200, (why, result)
+    assert result["obsolete_removed"] == removed, (why, result)
+    if not removed:
+        assert result["obsolete_held"] == ["5/A"], (why, result)
+        assert webapp._load_supplier_assign() == {"5/A": "STALE_ASSIGN"}, why
+
+
 def test_a_record_that_is_GENUINELY_EMPTY_still_condemns(iso, monkeypatch):
     """The other side of the same coin — an on-disk `{}` is real evidence („nothing has
     ever been written back"), not a degraded read, so #215 still does its job."""
@@ -480,8 +611,15 @@ def test_a_record_that_is_GENUINELY_EMPTY_still_condemns(iso, monkeypatch):
 
 def test_obsolete_removed_is_on_the_result_of_EVERY_path(iso, monkeypatch):
     """A caller must never have to tell „nothing was removed" from „this build does not
-    report it" — including the two paths that return before the upload: nothing new to do,
-    and another import already running (which is reached AFTER the removal)."""
+    report it" — every early-return path must carry the field.
+
+    #299 Task 10 — the SECOND path this test originally pinned ("another import
+    already running", reached via `_import_lock` AFTER the removal) no longer
+    exists: `_do_upload_suppliers` does not import at all any more, so there is
+    no `_import_lock` acquisition left to race. That protection is gone WITH the
+    code path it guarded, not silently dropped — replaced here with the DRY-run
+    early-return branch, the other path this migration adds that returns before
+    reaching the queue."""
     webapp._save_supplier_assign({"9/Z": "BETALOV"})
     webapp._save_uploaded_suppliers({"9/Z": "BETALOV"})           # nothing new to send
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777", "7/Y": "P1"})
@@ -489,15 +627,11 @@ def test_obsolete_removed_is_on_the_result_of_EVERY_path(iso, monkeypatch):
     assert r1["obsolete_removed"] == [], r1
     assert r1["obsolete_held"] == [], r1
 
-    # now there IS something new (a code the fixture export really lists, so the run gets
-    # as far as the import), and another import is already running
+    # now there IS something new (a code the fixture export really lists) — the
+    # DRY-run path must ALSO carry the field
     webapp._save_supplier_assign({"9/Z": "BETALOV", "7/Y": "BETALOV"})
-    assert webapp._import_lock.acquire(blocking=False)
-    try:
-        r2, s2 = webapp._do_upload_suppliers(dry=False)
-    finally:
-        webapp._import_lock.release()
-    assert s2 == 409, r2
+    r2, s2 = webapp._do_upload_suppliers(dry=True)
+    assert s2 == 200, r2
     assert r2["obsolete_removed"] == [], r2
     assert r2["obsolete_held"] == [], r2
 
@@ -562,18 +696,23 @@ def test_the_clobber_guard_does_not_flag_a_code_absent_from_the_export(iso, monk
 
 
 def test_run_is_idempotent_second_run_pushes_nothing(iso, monkeypatch):
+    """#299 Task 10 — once the drain has CREDITED both (simulated directly — its
+    own confirm→credit path is test_webreview_shoptet_upload.py's job), a second
+    run queues nothing further: idempotency now depends on the credit record, not
+    on this producer's own memory of what it just sent."""
     _seed_pairing()
     _seed_supplier()
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-    webapp.run_parovania_eshop()
-    assert len(calls) == 2                       # first run: links + suppliers imports
-
-    # nothing new → the careful import must NOT run again (safe re-run, no double upload)
     monkeypatch.setattr(webapp, "run_import",
-                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not re-import")))
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
+    result1 = webapp.run_parovania_eshop()
+    assert result1["pairings"]["queued"] == 1 and result1["suppliers"]["queued"] == 1
+
+    webapp._credit_producer("parovania_eshop", {"BETALOV|P1": "https://supplier/x"})
+    webapp._credit_producer("parovania_eshop_suppliers", {"9/Z": "BETALOV"})
+
     result = webapp.run_parovania_eshop()
     assert result["status"] == "ok"
+    assert result["pairings"]["queued"] == 0 and result["suppliers"]["queued"] == 0
     assert result["pairings"]["count"] == 0 and result["suppliers"]["count"] == 0
 
 
@@ -587,16 +726,14 @@ def test_run_zero_new_reports_ok_without_importing(iso, monkeypatch):
 
 
 # ── graceful degradation ────────────────────────────────────────────────────────
-def test_import_failure_surfaces_failed_status_and_does_not_mark_uploaded(iso, monkeypatch):
-    _seed_pairing()
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (1, "chyba", "boom"))
-    result = webapp.run_parovania_eshop()
-    assert result["status"] == "failed"
-    assert result["pairings"]["ok"] is False
-    # a failed import never records the pairing as uploaded → retried next run
-    assert (not (iso["tmp"] / "uploaded_pairings.json").exists()
-            or json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) == {})
+# #299 Task 10 — `test_import_failure_surfaces_failed_status_and_does_not_mark_uploaded`
+# deleted. `run_parovania_eshop` no longer imports through either core, so an
+# import failure (rc != 0) can no longer happen at THIS level at all — both cores
+# always return `ok: True` now (Task 8's I1 precedent: "producers can no longer
+# return ok:false"). A real Shoptet import failure can only happen inside the
+# hourly drain's OWN `_import_rows_chunked` call, whose "not-yet-credited on
+# failure" protection is `test_webreview_shoptet_upload.py`'s job
+# (`test_a_pairing_key_whose_second_code_failed_is_NOT_credited`).
 
 
 def test_blocked_when_variant_codes_missing(iso, monkeypatch):
@@ -631,108 +768,83 @@ def _recording_import(fail_on_call=None):
     return fake_run, calls
 
 
-def test_large_pairing_batch_split_into_chunks(iso, monkeypatch):
-    # 650 variant codes → one link row each → must be imported in >=2 chunks, each
-    # <= IMPORT_CHUNK_ROWS. RED before the fix: a single 650-row import call.
+# #299 Task 10 — chunking (#156: no single import overruns the 120s browser
+# redirect timeout) is no longer this producer's concern at all: neither core
+# imports directly any more, so there is no batch here to split into chunks —
+# that job (and its mid-batch-failure/lock-release protection) belongs entirely
+# to the hourly drain's OWN `_import_rows_chunked` call, already covered by
+# `test_webreview_shoptet_upload.py`'s `cycle` fixture (chunking itself is
+# generic across every producer, not pairings/suppliers-specific). What THIS
+# producer still owns and must be proven NOT to lose: building and queueing
+# EVERY candidate row of a large batch, not just chunking it correctly — the
+# two tests below replace `test_large_pairing_batch_split_into_chunks` /
+# `test_large_supplier_batch_split_into_chunks`, testing that instead.
+# `test_mid_batch_chunk_failure_records_partial_and_releases_lock` and
+# `test_small_batch_still_single_import` are deleted outright — the first is now
+# purely a drain-level scenario (mirrored, pairings-specific, by
+# `test_webreview_shoptet_upload.py::test_a_pairing_key_whose_second_code_failed_is_NOT_credited`);
+# the second's premise (batching is chunked-vs-single at THIS level) no longer
+# exists — there is no import left here to be "single" or "chunked".
+
+def test_a_large_pairing_batch_queues_every_code(iso, monkeypatch):
     n = 650
     codes = [f"{i}/M" for i in range(n)]
     monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
     monkeypatch.setattr(webapp, "CODE2PAIR", {c: "P1" for c in codes})
     _stub_catalog_export(monkeypatch, codes)
     _seed_pairing()
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result = webapp.run_parovania_eshop()
 
-    assert len(calls) >= 2                                   # split, not one giant import
-    assert max(len(c["rows"]) for c in calls) <= webapp.IMPORT_CHUNK_ROWS
-    # every code imported exactly once across the chunks — no loss, no duplicate
-    imported = [r[0] for c in calls for r in c["rows"]]
-    assert sorted(imported) == sorted(codes)
-    # whole push succeeded → the single key is recorded uploaded (idempotent state)
     assert result["status"] == "ok"
-    assert result["pairings"]["ok"] is True and result["pairings"]["count"] == 1
+    assert result["pairings"]["ok"] is True and result["pairings"]["queued"] == n
+    pending = webapp._load_pending()
+    assert sorted(pending) == sorted(codes)          # every code queued once, none lost
+    # the whole group credits together once the drain confirms all of it
+    webapp._credit_producer("parovania_eshop", {"BETALOV|P1": "https://supplier/x"})
     assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) \
         == {"BETALOV|P1": "https://supplier/x"}
 
 
-def test_large_supplier_batch_split_into_chunks(iso, monkeypatch):
-    # the supplier write-back path is chunked too (#156 names pairings + suppliers).
+def test_a_large_supplier_batch_queues_every_code(iso, monkeypatch):
+    # the supplier write-back path handles a large batch too (#156 named pairings +
+    # suppliers) — same "every code queued, none lost" contract, no cross-code
+    # grouping (each code credits on its own).
     n = 400
     assigns = {f"{i}/S": f"SUP{i}" for i in range(n)}
     monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/S": "P" for i in range(n)})
     webapp._save_supplier_assign(assigns)
     _stub_catalog_export(monkeypatch, list(assigns))
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result = webapp.run_parovania_eshop()
 
-    sup_calls = [c for c in calls if c["header"][2] == "supplier"]
-    assert len(sup_calls) >= 2
-    assert max(len(c["rows"]) for c in sup_calls) <= webapp.IMPORT_CHUNK_ROWS
-    assert result["suppliers"]["ok"] is True and result["suppliers"]["count"] == n
+    assert result["suppliers"]["ok"] is True and result["suppliers"]["queued"] == n
+    pending = webapp._load_pending()
+    assert sorted(pending) == sorted(assigns)
 
 
-def test_mid_batch_chunk_failure_records_partial_and_releases_lock(iso, monkeypatch):
-    # #156: a chunk failing mid-batch must → failed status, record ONLY the codes
-    # from the SUCCESSFUL chunk(s) (resumable — never all-or-nothing silent success),
-    # and release the import lock (no stuck lock → no cascade failure like 21:03).
-    n = 650
-    products = [{"key": f"K{i}", "idx": i, "supplier": "BETALOV", "name": f"P{i}",
-                 "pairCode": "P", "variant_codes": [f"{i}/M"], "our_url": "u",
-                 "ai_status": "matched", "ai_chosen_url": "", "ai_reason": "",
-                 "candidates": [], "current": {}} for i in range(n)]
-    monkeypatch.setattr(webapp, "PRODUCTS", products)
-    monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
-    _stub_catalog_export(monkeypatch, [f"{i}/M" for i in range(n)])
-    webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"} for i in range(n)})
-    fake_run, calls = _recording_import(fail_on_call=2)     # 1st chunk ok, 2nd fails
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
-    result = webapp.run_parovania_eshop()
-
-    assert result["status"] == "failed"
-    assert result["pairings"]["ok"] is False
-    # a clear, tab-surfaced message: WHICH chunk failed + how many rows made it
-    assert "časti 2/" in result["pairings"]["error"]
-    assert "z 650 riadkov" in result["pairings"]["error"]
-    assert len(calls) == 2                                  # batch STOPS after the failing chunk
-    uploaded = json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())
-    # exactly the successful (first) chunk's keys are recorded; the failing chunk's
-    # keys stay "new" so the next run retries them (partial progress, not lost work)
-    chunk1_keys = {"K" + r[0].split("/")[0] for r in calls[0]["rows"]}
-    chunk2_keys = {"K" + r[0].split("/")[0] for r in calls[1]["rows"]}
-    assert set(uploaded) == chunk1_keys
-    assert not (set(uploaded) & chunk2_keys)
-    assert 0 < len(uploaded) < n
-    # the import lock was released despite the failure (else the next import 409s)
-    assert webapp._import_lock.acquire(blocking=False)
-    webapp._import_lock.release()
-
-
-def test_small_batch_still_single_import(iso, monkeypatch):
-    # a small batch must NOT be needlessly chunked — one import call, as before.
+def test_run_via_runner_records_error_when_queueing_raises(iso, monkeypatch):
+    """#299 Task 10 — the ONE way `_do_upload_pairings` can now fail is
+    `queue_shoptet_fields` refusing to write on top of an unreadable pending
+    table (`StoreWipeRefused`) or another genuine exception — that must still
+    propagate to the runner, which records last_status='error' and keeps the app
+    alive (same contract a raising `run_import` used to prove, before this
+    migration removed the import call entirely)."""
     _seed_pairing()
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-    webapp.run_parovania_eshop()
-    link_calls = [c for c in calls if c["header"][2] == "internalNote"]
-    assert len(link_calls) == 1 and len(link_calls[0]["rows"]) == 1
+    with open(webapp.PENDING_SHOPTET, "w", encoding="utf-8") as f:
+        f.write("{ this is not json")
 
-
-def test_run_via_runner_records_error_when_import_raises(iso, monkeypatch):
-    _seed_pairing()
-
-    def boom(*a, **k):
-        raise RuntimeError("shoptet_import.py spadol")
-    monkeypatch.setattr(webapp, "run_import", boom)
-
-    assert webapp.RUNNER._execute("parovania_eshop") is True    # runner survives
+    # #299 Task 11 finding 1 — the RETURN value now reports whether the run
+    # SUCCEEDED, not merely whether it ran; this run raised, so it is False.
+    # The runner surviving (not crashing, `last_status`/`last_error` recorded)
+    # is still pinned by the assertions right below.
+    assert webapp.RUNNER._execute("parovania_eshop") is False
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "parovania_eshop"]
     assert st["last_status"] == "error"
-    assert "shoptet_import.py spadol" in st["last_error"]
     assert st["running"] is False
 
 
@@ -752,8 +864,8 @@ def test_disabled_automation_is_not_ticked(iso, monkeypatch):
 def test_run_now_via_http_endpoint_and_runner(iso, monkeypatch):
     _seed_pairing()
     _seed_supplier()
-    fake_run, _calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     c = authed_client()
     r = c.post("/api/automations/parovania_eshop/run")
     assert r.status_code == 200 and r.get_json()["started"] is True
@@ -761,7 +873,7 @@ def test_run_now_via_http_endpoint_and_runner(iso, monkeypatch):
     (st,) = [x for x in webapp.RUNNER.status() if x["key"] == "parovania_eshop"]
     assert st["last_status"] == "ok"
     assert st["last_result"]["status"] == "ok"
-    assert st["last_result"]["pairings"]["count"] == 1
+    assert st["last_result"]["pairings"]["queued"] == 1
     assert st["enabled"] is False                # run-now must not enable the schedule
 
 
@@ -781,31 +893,33 @@ def test_run_reads_but_never_writes_manager_decision_stores(iso, monkeypatch):
     assert (iso["tmp"] / "supplier_assignments.json").read_text() == sa_before
 
 
-# ── #257 cause 2: a partially-failed chunk is not a batch that imported nothing ──
+# ── #257 cause 2 (historical): a partially-failed chunk is not a batch that
+# imported nothing. #299 Task 10 DELETES the import-log-parsing half of this
+# section — `test_partial_stdout_is_read_from_the_scripts_own_result_line`,
+# `test_partial_message_promises_export_confirmation_only_where_it_happens`,
+# `test_partial_chunk_keeps_importing_the_rest_of_the_batch`,
+# `test_unreadable_result_is_not_reported_as_zero_imported_rows`,
+# `test_hard_shoptet_error_reaches_the_automation_card`,
+# `test_partial_chunk_then_hard_failure_reports_what_really_landed` and
+# `test_timed_out_chunk_is_reported_as_uncertain_not_as_zero_imported` — because
+# `_do_upload_pairings`/`_do_upload_suppliers` no longer call `_import_rows_chunked`
+# or parse a single script's stdout at all: chunking, partial-chunk continuation,
+# the baseline-Log-entry trap, unreadable/timed-out results and hard Shoptet
+# errors are now EXCLUSIVELY the hourly drain's concern
+# (`run_shoptet_upload`'s own `_import_rows_chunked` call), covered generically
+# for every producer by `test_webreview_shoptet_upload.py`'s `cycle` fixture —
+# and, for the credit-withholding shape specifically, by
+# `test_a_pairing_key_whose_second_code_failed_is_NOT_credited` (added by this
+# task). `_chunk_error_msg`'s own "z exportu" / "odmietol N z M riadkov" wording
+# no longer has a per-producer caller to distinguish (the drain reports ONE
+# combined result for the whole pending table, not a separate message per
+# producer) — that distinction dissolved WITH the code path it described.
 #
-# The real 2026-07-26 21:00 run: 35 rows sent, Shoptet answered
-#   '#12689 … Spracované: 35. Upravené: 31. Zlyhanie variantov: 2.'
-# i.e. it took every row we sent and rejected 2 variants. The whole chunk was booked
-# as 0 imported rows, uploaded_pairings.json froze on 2026-07-22 and the same rows
-# were rebuilt + re-sent every night.
-PARTIAL_STDOUT = "VÝSLEDOK: spracované={n} upravené={u} zlyhania=2"
-
-
-def _partial_import(partial_on_call=1):
-    """run_import stub whose Nth chunk answers like the real partial night: Shoptet
-    processed EVERY row we sent, but rejected 2 variants (script exit code 2)."""
-    calls = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rd = list(_csv.reader(f, delimiter=";"))
-        rows = rd[1:]
-        calls.append({"header": rd[0], "rows": rows})
-        if len(calls) == partial_on_call:
-            return 2, PARTIAL_STDOUT.format(n=len(rows), u=len(rows) - 4), ""
-        return 0, f"VÝSLEDOK: spracované={len(rows)} upravené={len(rows)} zlyhania=0", ""
-    return fake_run, calls
-
+# What SURVIVES unchanged and is kept below: `_export_row_verdicts`'s CONFIRMED
+# verdict is still computed and still used by `_do_upload_pairings` exactly as
+# before this migration (the task's explicit instruction) — the two rewrites
+# below prove the SAME verdict logic still holds, just observed through the
+# pending table instead of an intercepted import call.
 
 def _export(pairs):
     """A minimal catalog export (the eshop's own truth) carrying code→internalNote."""
@@ -813,111 +927,23 @@ def _export(pairs):
     return head + "".join(f"{c};P1;{note};\r\n" for c, note in pairs.items())
 
 
-def test_partial_stdout_is_read_from_the_scripts_own_result_line(iso, monkeypatch):
-    """The import script's stdout STARTS with an echo of the baseline Log entry, which
-    carries its own 'Spracované: N'. Parsing the whole stdout read THAT as the result
-    (#196's processed=1/failed=1 while 260 rows really went through) — and it silently
-    disabled the whole partial-chunk fix, because the baseline counts never match the
-    number of rows we sent, so every partial chunk was classified as a hard failure."""
-    codes = ("1/M", "1/L", "1/XL")
-    monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
-    monkeypatch.setattr(webapp, "CODE2PAIR", {c: "P1" for c in codes})
-    _stub_catalog_export(monkeypatch, codes)
-    _seed_pairing()
-    real_stdout = (
-        "Súbor:   data/out/import_links_x.csv\nRiadkov: 3\n"
-        "[import] baseline (posledný riadok Logu pred behom): #12688 26.07.2026 20:12 "
-        "Info Import dobehol úspešne. Spracované: 4. Upravené: 1.\n"
-        "[import] spúšťam import …\n"
-        "\nVÝSLEDOK: spracované=3 upravené=2 zlyhania=1\n")
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (2, real_stdout, ""))
-
-    p, _status = webapp._do_upload_pairings(dry=False)
-
-    assert p["partial"] is True           # 3 rows sent, 3 processed, 1 rejected
-    assert p["rejected"] == 1
-    assert p["processed"] == 3 and p["updated"] == 2   # ours, not the baseline's 4/1
-    # nothing credited: the log cannot say WHICH row failed and here it was the only one
-    assert (not (iso["tmp"] / "uploaded_pairings.json").exists()
-            or json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) == {})
-
-
 def test_export_confirmation_ignores_a_code_the_export_lists_twice(iso, monkeypatch):
     # the catalog holds duplicate products sharing variant codes (see link_rows) — if
     # two export rows disagree about a code's internalNote, neither proves anything,
-    # so the code must stay unconfirmed and be sent.
+    # so the code must stay unconfirmed and be QUEUED.
     _seed_pairing()
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines("code;pairCode;internalNote;supplier\r\n"
                                       "1/M;P1;https://supplier/OTHER;\r\n"
                                       "1/M;P1;https://supplier/x;\r\n"))
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result = webapp.run_parovania_eshop()
 
     assert result["pairings"]["confirmed_in_export"] == 0
-    links = [c for c in calls if c["header"][2] == "internalNote"]
-    assert links and ["1/M", "P1", "https://supplier/x"] in links[0]["rows"]
-
-
-def test_partial_message_promises_export_confirmation_only_where_it_happens(iso, monkeypatch):
-    # only the pairings push reconciles against the export; the supplier write-back
-    # writes a different column and never confirms anything, so its message must not
-    # tell the manager the rows will be confirmed from the export.
-    codes = ("1/M", "1/L", "1/XL")
-    monkeypatch.setattr(webapp, "PRODUCTS", [_product(variant_codes=codes)])
-    monkeypatch.setattr(webapp, "CODE2PAIR", {**{c: "P1" for c in codes},
-                                              "9/Z": "777", "8/Z": "778"})
-    _stub_catalog_export(monkeypatch, [*codes, "9/Z", "8/Z"])
-    _seed_pairing()
-    webapp._save_supplier_assign({"9/Z": "BETALOV", "8/Z": "CITRADE"})
-
-    def partial_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            n = len(list(_csv.reader(f, delimiter=";"))) - 1
-        return 2, f"VÝSLEDOK: spracované={n} upravené={n - 1} zlyhania=1", ""
-
-    monkeypatch.setattr(webapp, "run_import", partial_run)
-
-    result = webapp.run_parovania_eshop()
-
-    assert "odmietol 1 z 3 riadkov" in result["pairings"]["error"]
-    assert "z exportu" in result["pairings"]["error"]
-    assert "odmietol 1 z 2 riadkov" in result["suppliers"]["error"]
-    assert "z exportu" not in result["suppliers"]["error"]
-
-
-def test_partial_chunk_keeps_importing_the_rest_of_the_batch(iso, monkeypatch):
-    n = 650                                     # 3 chunks of <=300
-    products = [{"key": f"K{i}", "idx": i, "supplier": "BETALOV", "name": f"P{i}",
-                 "pairCode": "P", "variant_codes": [f"{i}/M"], "our_url": "u",
-                 "ai_status": "matched", "ai_chosen_url": "", "ai_reason": "",
-                 "candidates": [], "current": {}} for i in range(n)]
-    monkeypatch.setattr(webapp, "PRODUCTS", products)
-    monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
-    _stub_catalog_export(monkeypatch, [f"{i}/M" for i in range(n)])
-    webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"}
-                            for i in range(n)})
-    fake_run, calls = _partial_import(partial_on_call=1)
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
-    result = webapp.run_parovania_eshop()
-
-    # the batch is NOT aborted by a partial chunk — chunks 2 and 3 still go up
-    assert len(calls) == 3
-    p = result["pairings"]
-    # the later, fully clean chunks ARE credited (they used to be lost entirely)
-    uploaded = json.loads((iso["tmp"] / "uploaded_pairings.json").read_text())
-    chunk1_keys = {"K" + r[0].split("/")[0] for r in calls[0]["rows"]}
-    assert len(uploaded) == n - len(chunk1_keys) > 0
-    assert not (set(uploaded) & chunk1_keys)    # the partial chunk stays unconfirmed
-    # …and the rejection is SURFACED, not hidden behind a bare 'ok'
-    assert p["ok"] is False
-    assert p["partial"] is True
-    assert p["rejected"] == 2
-    assert "odmietol 2 z 650 riadkov" in p["error"]
+    pending = webapp._load_pending()
+    assert pending["1/M"]["fields"]["internalNote"]["value"] == "https://supplier/x"
 
 
 def test_rows_already_correct_in_the_eshop_are_credited_from_the_export(iso, monkeypatch):
@@ -940,85 +966,19 @@ def test_rows_already_correct_in_the_eshop_are_credited_from_the_export(iso, mon
         == {"BETALOV|P1": "https://supplier/x"}
 
 
-def test_unreadable_result_is_not_reported_as_zero_imported_rows(iso, monkeypatch):
-    # An unattributable read-back (our Log entry never appeared / two same-sized
-    # imports) says NOTHING about what landed — the rows very likely DID reach the
-    # eshop. Claiming "naimportované 0" as a fact misleads the manager into thinking
-    # nothing was written; say the result could not be read and point at the Log.
-    _seed_pairing()
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300:
-                        (2, "\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n", ""))
-
-    p, _st = webapp._do_upload_pairings(dry=False)
-
-    assert p["ok"] is False
-    assert "nepodarilo" in p["error"] and "Log" in p["error"]
-    assert "naimportované 0" not in p["error"]
-
-
-def test_hard_shoptet_error_reaches_the_automation_card(iso, monkeypatch):
-    # the reason Shoptet aborted must be visible where the manager looks (the card's
-    # error line), not only in the JSON the n8n call gets back
-    _seed_pairing()
-    err = "Chyba | Číslo riadku: 7 - Data in column code are not unique"
-    out = ("\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
-           f"CHYBA LOGU: {err}\n")
-    monkeypatch.setattr(webapp, "run_import",
-                        lambda p, dry_run=False, timeout=300: (2, out, "boom"))
-
-    result = webapp.run_parovania_eshop()
-
-    assert err in result["pairings"]["error"]
-
-
-def test_partial_chunk_then_hard_failure_reports_what_really_landed(iso, monkeypatch):
-    # chunk 1 partially accepted (Shoptet took its 300 rows, rejected 2), chunk 2
-    # hard-fails → the message must not understate the push as "naimportované 0",
-    # and the partially accepted rows must be counted WITHOUT the rejected ones.
-    n = 650
-    products = [{"key": f"K{i}", "idx": i, "supplier": "BETALOV", "name": f"P{i}",
-                 "pairCode": "P", "variant_codes": [f"{i}/M"], "our_url": "u",
-                 "ai_status": "matched", "ai_chosen_url": "", "ai_reason": "",
-                 "candidates": [], "current": {}} for i in range(n)]
-    monkeypatch.setattr(webapp, "PRODUCTS", products)
-    monkeypatch.setattr(webapp, "CODE2PAIR", {f"{i}/M": "P" for i in range(n)})
-    _stub_catalog_export(monkeypatch, [f"{i}/M" for i in range(n)])
-    webapp._save_decisions({f"K{i}": {"status": "good", "url": f"https://s/{i}"}
-                            for i in range(n)})
-    calls = []
-
-    def fake_run(csv_path, dry_run=False, timeout=300):
-        with open(csv_path, encoding="utf-8-sig", newline="") as f:
-            rows = list(_csv.reader(f, delimiter=";"))[1:]
-        calls.append(rows)
-        if len(calls) == 1:
-            return 2, f"VÝSLEDOK: spracované={len(rows)} upravené=10 zlyhania=2", ""
-        return 2, ("\nVÝSLEDOK: spracované=None upravené=None zlyhania=None\n"
-                   "CHYBA LOGU: Chyba | Číslo riadku: 3 - Data in column code are not unique"), ""
-
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-
-    p, _st = webapp._do_upload_pairings(dry=False)
-
-    assert len(calls) == 2                      # the partial chunk did not stop the batch
-    assert "časti 2/3" in p["error"]
-    assert "298 čiastočne prijatých" in p["error"]   # 300 sent, 2 rejected by Shoptet
-
-
 def test_export_confirmation_needs_an_exact_url_match(iso, monkeypatch):
-    # a stale / different note on the eshop proves nothing — the row is still sent
+    # a stale / different note on the eshop proves nothing — the row is still QUEUED
     _seed_pairing()
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines(_export({"1/M": "https://supplier/OLD"})))
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result = webapp.run_parovania_eshop()
 
     assert result["pairings"]["confirmed_in_export"] == 0
-    links = [c for c in calls if c["header"][2] == "internalNote"]
-    assert links and ["1/M", "P1", "https://supplier/x"] in links[0]["rows"]
+    pending = webapp._load_pending()
+    assert pending["1/M"]["fields"]["internalNote"]["value"] == "https://supplier/x"
 
 
 # ── PR #271 review — the four ways this push could still lie about what landed ──
@@ -1082,22 +1042,11 @@ def test_export_confirmation_still_credits_a_fresh_export(tmp_path, monkeypatch)
             == {"1/M"})
 
 
-def test_timed_out_chunk_is_reported_as_uncertain_not_as_zero_imported(iso, monkeypatch):
-    """MINOR — a chunk that TIMED OUT had its rows submitted and very probably landed,
-    yet it was reported with the flat 'import zlyhal … naimportované 0 z N riadkov' —
-    the exact misleading wording this PR fixes for the unreadable case."""
-    _seed_pairing()
-
-    def timeout_run(csv_path, dry_run=False, timeout=300):
-        raise subprocess.TimeoutExpired(cmd="shoptet_import.py", timeout=timeout)
-    monkeypatch.setattr(webapp, "run_import", timeout_run)
-
-    p, _st = webapp._do_upload_pairings(dry=False)
-
-    assert p["ok"] is False
-    assert "nepodarilo prečítať" in p["error"] and "mohli prejsť" in p["error"]
-    assert "naimportované 0" not in p["error"]
-    assert "timeout" in p["error"]           # the reason still reaches the manager
+# #299 Task 10 — `test_timed_out_chunk_is_reported_as_uncertain_not_as_zero_imported`
+# deleted, same reasoning as the section above: `_do_upload_pairings` no longer
+# calls `run_import`/`_import_rows_chunked`, so a chunk timing out can only
+# happen inside the hourly drain's own import call now
+# (`test_webreview_shoptet_upload.py`).
 
 
 def test_partially_accepted_row_count_never_goes_negative():
@@ -1221,37 +1170,57 @@ def test_a_code_the_catalogue_does_not_have_is_held_back_and_listed(iso, monkeyp
 
 def test_a_code_that_reappears_in_the_catalogue_is_sent_on_the_next_run(iso, monkeypatch):
     """Holding a row back is never permanent: it is not credited, so once the
-    manager fixes the code in the eshop the very next run writes it."""
+    manager fixes the code in the eshop the very next run still QUEUES it (idempotent
+    re-write of the same field value).
+
+    #299 opravné kolo 1 review C1 — before that fix `_do_upload_pairings` itself
+    excluded an absent code from what it queued (`r1["queued"] == 0` here). C1
+    changed that: the producer now queues an absent code too (this key has only
+    ONE variant code, so C1's actual bug — several codes sharing a key, one
+    absent — never showed up on THIS single-code test; see
+    `test_a_key_with_an_absent_code_is_not_credited_until_the_missing_code_is_fixed`
+    in test_webreview_shoptet_upload.py for the multi-code regression). Holding the
+    row back is now the DRAIN's job (`build_import`'s `not-in-catalog`), not this
+    producer's — this producer only decides WHAT is not-yet-confirmed."""
     _seed_pairing()
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines(_export({"9/Z": ""})))
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
-    webapp._do_upload_pairings(dry=False)
-    assert calls == []
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
+    r1, _s1 = webapp._do_upload_pairings(dry=False)
+    assert r1["queued"] == 1
+    assert r1["missing_count"] == 1          # still reported "chýba v eshope"
+    assert webapp._load_pending()["1/M"]["fields"]["internalNote"]["value"] == \
+        "https://supplier/x"
+    assert not (iso["tmp"] / "uploaded_pairings.json").exists()
 
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines(_export({"9/Z": "", "1/M": ""})))
     p, _st = webapp._do_upload_pairings(dry=False)
 
     assert p["missing_count"] == 0
-    assert calls and ["1/M", "P1", "https://supplier/x"] in calls[0]["rows"]
-    assert json.loads((iso["tmp"] / "uploaded_pairings.json").read_text()) \
-        == {"BETALOV|P1": "https://supplier/x"}
+    assert p["queued"] == 1
+    pending = webapp._load_pending()
+    assert pending["1/M"]["fields"]["internalNote"]["value"] == "https://supplier/x"
+    # not credited yet (the note in the export is "", never matches the URL) — the
+    # drain credits it once Shoptet's own import confirms it
+    assert not (iso["tmp"] / "uploaded_pairings.json").exists()
 
 
 def test_an_empty_export_never_holds_a_row_back(iso, monkeypatch):
     """FAIL-SAFE: no export = we know NOTHING about the catalogue, so nothing may be
-    called missing. Everything is sent, exactly as before (an idempotent re-write)."""
+    called missing. Everything is QUEUED, exactly as before (an idempotent re-write)."""
     _seed_pairing()
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(""))
-    fake_run, calls = _recording_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     p, _st = webapp._do_upload_pairings(dry=False)
 
     assert p["missing_count"] == 0
-    assert calls and ["1/M", "P1", "https://supplier/x"] in calls[0]["rows"]
+    assert p["queued"] == 1
+    pending = webapp._load_pending()
+    assert pending["1/M"]["fields"]["internalNote"]["value"] == "https://supplier/x"
 
 
 def test_a_stale_export_never_holds_a_row_back(tmp_path, monkeypatch):
@@ -1328,15 +1297,18 @@ def test_supplier_codes_absent_from_the_catalogue_are_HELD_not_written(iso, monk
     # a trusted export that carries 1/M but NOT 9/Z
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines("code;pairCode;supplier\r\n1/M;P1;\r\n5/A;555;REAL\r\n"))
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     s, status = webapp._do_upload_suppliers(dry=False)
 
     assert status == 200
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert {r[0] for r in sup["rows"]} == {"1/M"}          # 9/Z withheld, 1/M still sent
-    # …and it is NEVER recorded uploaded, so it is retried the moment the code exists
+    pending = webapp._load_pending()
+    assert set(pending) == {"1/M"}          # 9/Z withheld, 1/M still queued
+    # …and it is NEVER recorded uploaded by the producer, so it is retried the
+    # moment the code exists — the drain credits it once Shoptet confirms it
+    assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {}
+    webapp._credit_producer("parovania_eshop_suppliers", {"1/M": "ORBIS"})
     assert json.loads((iso["tmp"] / "uploaded_suppliers.json").read_text()) == {"1/M": "ORBIS"}
     # still surfaced by name, with the value we wanted to write (the tab renders this)
     assert s["missing_in_eshop"] == [{"code": "9/Z", "value": "BETALOV"}]
@@ -1349,10 +1321,10 @@ def test_a_held_supplier_code_goes_up_once_the_catalogue_carries_it(iso, monkeyp
     monkeypatch.setattr(webapp, "CODE2PAIR", {"9/Z": "777"})
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines("code;pairCode;supplier\r\n5/A;555;REAL\r\n"))
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     assert webapp._do_upload_suppliers(dry=False)[0]["count"] == 0
-    assert calls == []
+    assert webapp._load_pending() == {}
 
     # the manager fixes the code in the eshop → it appears in the next export
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
@@ -1361,7 +1333,7 @@ def test_a_held_supplier_code_goes_up_once_the_catalogue_carries_it(iso, monkeyp
     s, _st = webapp._do_upload_suppliers(dry=False)
 
     assert s["count"] == 1 and s["missing_count"] == 0
-    assert {r[0] for r in calls[0]["rows"]} == {"9/Z"}
+    assert set(webapp._load_pending()) == {"9/Z"}
 
 
 # RETIRED (PR #280 review) — `test_an_untrusted_export_holds_nothing_on_the_supplier_side`
@@ -1430,10 +1402,10 @@ def test_a_held_stale_run_goes_up_in_full_once_the_export_is_fresh_again(iso, mo
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
     monkeypatch.setattr(webapp, "_export_age_s", lambda: webapp.EXPORT_MAX_AGE_S + 1)
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
     assert webapp._do_upload_suppliers(dry=False)[0]["count"] == 0
-    assert calls == []
+    assert webapp._load_pending() == {}
 
     # the hourly sync recovers → the export on disk is fresh again
     monkeypatch.setattr(webapp, "_export_age_s", lambda: 60.0)
@@ -1442,7 +1414,7 @@ def test_a_held_stale_run_goes_up_in_full_once_the_export_is_fresh_again(iso, mo
 
     # the success path carries no block at all (neither the count nor the reason)
     assert s["count"] == 1 and not s.get("blocked") and "gate_blocked" not in s
-    assert {r[0] for r in calls[0]["rows"]} == {"5/A"}
+    assert set(webapp._load_pending()) == {"5/A"}
 
 
 def test_an_unknown_export_age_does_not_block_the_supplier_write_back(iso, monkeypatch):
@@ -1455,13 +1427,13 @@ def test_an_unknown_export_age_does_not_block_the_supplier_write_back(iso, monke
     monkeypatch.setattr(webapp, "_iter_export_lines",
                         _export_lines("code;pairCode;supplier\r\n5/A;5;\r\n"))
     monkeypatch.setattr(webapp, "_export_age_s", lambda: None)
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     s, _st = webapp._do_upload_suppliers(dry=False)
 
     assert s["count"] == 1
-    assert {r[0] for r in calls[0]["rows"]} == {"5/A"}
+    assert set(webapp._load_pending()) == {"5/A"}
 
 
 def test_a_run_whose_only_fault_is_a_missing_code_is_orange_not_red(iso, monkeypatch):
@@ -1544,13 +1516,13 @@ def test_an_implausibly_small_export_blocks_the_supplier_write_back(iso, monkeyp
     # fresh, non-empty, and carrying THREE codes out of a ~14 000-code catalogue
     monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
         "code;pairCode;supplier\r\n1/A;1;OWN\r\n2/A;2;OWN\r\n3/A;3;OWN\r\n"))
-    fake_run, calls = _ok_import()
-    monkeypatch.setattr(webapp, "run_import", fake_run)
+    monkeypatch.setattr(webapp, "run_import",
+                        lambda *a, **k: pytest.fail("must not import — must queue"))
 
     result, status = webapp._do_upload_suppliers(dry=False)
 
     assert status == 200
-    assert calls == []                       # NOTHING reached the live eshop
+    assert webapp._load_pending() == {}      # NOTHING reached the live eshop
     assert result["count"] == 0
     assert result["blocked"] == 1            # held, not dropped
     assert result["products"] == [{"code": "9/Z", "supplier": "STALE_ASSIGNMENT"}]
@@ -1566,8 +1538,7 @@ def test_an_implausibly_small_export_blocks_the_supplier_write_back(iso, monkeyp
     result2, status2 = webapp._do_upload_suppliers(dry=False)
 
     assert status2 == 200
-    sup = next(c for c in calls if c["header"][2] == "supplier")
-    assert {r[0] for r in sup["rows"]} == {"9/Z"}
+    assert set(webapp._load_pending()) == {"9/Z"}
     assert result2["count"] == 1
 
 

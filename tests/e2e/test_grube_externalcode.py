@@ -77,7 +77,10 @@ def test_run_now_zero_new_reports_ok_without_touching_eshop(page, automations_se
     meta = page.locator(".autometa").inner_text()
     assert "Posledný beh" in meta and "OK" in meta and "CHYBA" not in meta
     result_text = page.locator(".autoresult").inner_text()
-    assert "GRUBE kódy" in result_text and "+0 nových" in result_text
+    # #299 review m1 — the card text changed from "+N nových" (implied "freshly
+    # uploaded") to "N zaradených do frontu" (queued), since Task 8 this producer
+    # only queues into the shared table; the hourly drain does the actual upload.
+    assert "GRUBE kódy" in result_text and "0 zaradených do frontu" in result_text
 
     # the app itself survived (no crash) — other tabs stay usable
     page.get_by_role("button", name="Nevyzdvihnuté zásielky").click()

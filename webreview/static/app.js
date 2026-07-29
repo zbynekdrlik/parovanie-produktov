@@ -33,6 +33,7 @@ let RIZIKO = null;          // /api/riziko-vypadku — last risk-report run (#10
 let RESTOCK = null;         // /api/restock-skladom — last restock run (#108)
 let STOCK_SKLADOM = null;   // /api/stock-skladom — last auto-skladom run (#98)
 let ORDERS_REMINDER = null; // /api/orders-reminder — last orders-reminder run (#105)
+let PENDING_SHOPTET = null; // /api/pending-shoptet — {pending:[...], blocked:[...]} (#299 Task 7)
 let DEV = null;             // /api/dev/issues — {available, issues:[...]} or null (#115)
 let DEV_FILTER = 'open';    // 'Vývoj' tab filter: open | closed | all
 let UI_LABELS = {};         // /api/ui-labels — admin-set custom names {key: label} (#173)
@@ -487,7 +488,11 @@ const TABS = [['toorder', 'Na objednanie'], ['nedostupne', 'Nedostupné tovary']
 // 'System' — foundational automations in their own top nav folder (#systemTabs).
 // 'Sync zo Shoptetu' lives here: it fetches the fresh orders + catalog that
 // everything else reads, so it is the base of the system, not an eshop feature.
-const SYSTEM_TABS = [['shoptet_sync', 'Sync zo Shoptetu']];
+// 'Sync do Shoptetu' (#299 Task 7) is its write-side counterpart — it sits right
+// below it for the same reason, never in 'Automatizácie': it is the ONE table
+// between our decisions and the live eshop, not a single-purpose eshop feature.
+const SYSTEM_TABS = [['shoptet_sync', 'Sync zo Shoptetu'],
+                     ['shoptet_upload', 'Sync do Shoptetu']];
 
 // In-app automations (#93) — each gets its own nav item in the 'Automatizácie'
 // sidebar folder (#autoTabs) + its own tab section. New automations: add here.
@@ -511,6 +516,10 @@ const NAV_ICONS = {
   posta: '<path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><path d="M3 8l9 5 9-5"/><path d="M12 13v8"/>',
   shoptet_sync: '<path d="M21 12a9 9 0 01-15.3 6.4M3 12a9 9 0 0115.3-6.4"/>'
     + '<path d="M21 3v6h-6M3 21v-6h6"/>',
+  // #299 Task 7 — upward arrow: this automation UPLOADS to Shoptet (shoptet_sync's
+  // pair of refresh arrows above pulls FROM it).
+  shoptet_upload: '<path d="M12 19V5M5 12l7-7 7 7"/>'
+    + '<path d="M3 21h18"/>',
   parovania_eshop: '<path d="M12 3v12"/><path d="M8 7l4-4 4 4"/>'
     + '<path d="M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
   // #274 — these two were MISSING, so `${NAV_ICONS[key]}` interpolated the string
@@ -573,7 +582,39 @@ const NAV_AUTOMATION_KEY = { posta: 'posta_uncollected' };
 // own input has failed, whether or not it threw.
 function navError(key) {
   const a = autoByKey(NAV_AUTOMATION_KEY[key] || key);
-  return !!(a && (a.last_status === 'error' || (a.last_result || {}).source_degraded));
+  // #299 review decision 2 — `shoptet_upload` reports its own failure states
+  // ("cyklus už beží" / "iný import práve beží" / unconfirmed-or-blocked rows)
+  // through `last_result.ok === false`, by a NORMAL return, so `last_status`
+  // stays 'ok' for them (same fail-silently-ok shape as `source_degraded`
+  // above).
+  // WARNING (Task 7 opravné kolo 1) — the `ok` key is NOT unique to
+  // `shoptet_upload`. `run_image_health`'s `stats` ALSO carries a top-level
+  // `ok` key (`webreview/app.py` `run_image_health`, ~line 8705) — but there
+  // it is a COUNT of images that passed the check (`ok_n`, an int), not a
+  // pass/fail flag. The check below is safe TODAY only because it is the
+  // STRICT `=== false`: a number is never `=== false` in JS, so
+  // `image_health`'s count can never light this badge, however that count
+  // reads. If you ever rewrite this to a truthy/falsy check (`!a.last_result.ok`
+  // or similar), `image_health` reporting `ok: 0` (zero images passed) would
+  // wrongly flip this badge on — a REAL collision, not a hypothetical one.
+  // Before touching this comparison, re-grep every `run_*()` for an `ok` key
+  // (`grep -n '"ok"' webreview/app.py`) and check what each one MEANS.
+  //
+  // #299 Task 11 — two MORE ways `shoptet_upload` specifically can be degraded
+  // without `last_status`/`last_result.ok` ever saying so:
+  //   * `last_result.degraded` — a run that itself reports `ok: true` (nothing
+  //     THIS cycle attempted failed) but found something wrong upstream (an
+  //     enabled producer that stopped running, a skipped second download while
+  //     something was on the wire). Named DIFFERENTLY from `source_degraded` above on purpose
+  //     — that one is Pošta/shoptet_sync's own established flag; conflating the
+  //     two would make an unrelated automation's degrade light THIS tab's badge.
+  //   * `queue_stale_warning` — lives on `a` itself, NOT inside `last_result`,
+  //     because it must fire even when `shoptet_upload` has NEVER run at all
+  //     (the cycle deploys disabled — see `_queue_stale_while_disabled_warning`
+  //     in app.py). last_result-only checks can never see this one.
+  return !!(a && (a.last_status === 'error' || (a.last_result || {}).source_degraded
+    || (a.last_result || {}).ok === false || (a.last_result || {}).degraded
+    || a.queue_stale_warning));
 }
 
 // `defaultLbl` = the built-in name; an admin-set override in UI_LABELS (#173)
@@ -647,6 +688,7 @@ const PAGE_TITLES = {
   vystavy: 'Poľovnícke výstavy',
   search: 'Hľadať / opraviť', notes: 'Poznámky', users: 'Užívatelia',
   posta: 'Nevyzdvihnuté zásielky', shoptet_sync: 'Sync zo Shoptetu',
+  shoptet_upload: 'Sync do Shoptetu',
   parovania_eshop: 'Párovania → eshop', grube_externalcode: 'GRUBE kódy → eshop',
   split_links: 'Veľkostné linky → eshop', dodavatelsky_sklad: 'Dodávateľský sklad',
   riziko_vypadku: 'Riziko výpadku', restock_skladom: 'Vypredané → Skladom',
@@ -788,6 +830,7 @@ async function switchTab(tab) {
   if (tab === 'users') await loadUsers();   // always fresh — small list
   if (tab === 'posta') await loadPosta();   // always fresh — status can change
   if (tab === 'shoptet_sync') await loadShoptetSync();   // always fresh — status can change
+  if (tab === 'shoptet_upload') await loadShoptetUpload();   // always fresh — queue changes hourly
   if (tab === 'parovania_eshop') await loadAutomations();   // always fresh — status can change
   if (tab === 'dodavatelsky_sklad') await loadSupplierStock();   // always fresh — status can change
   if (tab === 'riziko_vypadku') await loadRiziko();   // always fresh — status can change
@@ -1933,6 +1976,36 @@ function pluralWord(n, one, few, many) {
 
 function itemsWord(n, acc) {
   return pluralWord(n, acc ? 'položku' : 'položka', 'položky', 'položiek');
+}
+
+// #299 Task 7 — „Sync do Shoptetu" card: 1 zmena / 2 zmeny / 0 a 5+ zmien.
+// Same one-place-only rule as `itemsWord` — a second copy of the declension is
+// exactly what #238/#240 were filed about.
+function pluralZmeny(n) {
+  return `${n} ${pluralWord(n, 'zmena', 'zmeny', 'zmien')}`;
+}
+
+// #299 opravné kolo 3 (1, Important) — mirrors `_STALE_BLOCKED_REASON_TEXT` server-side
+// (`app.py`): `/api/pending-shoptet` already carries the REAL `reason` per blocked field
+// (`not-in-catalog` / `stale-field`), but this card used to print „eshop tento kód v
+// katalógu nemá" for EVERY blocked row regardless of that field — a manager reading the
+// blocked-field banner was told the wrong reason whenever a field was held back for being
+// stale, not for missing from the catalogue. A reason this map does not yet know about (a
+// future third reason) still shows the raw string rather than silently mislabelling it.
+const PENDING_BLOCKED_REASON_TEXT = {
+  'not-in-catalog': 'eshop tento kód v katalógu nemá, čaká, kým sa objaví',
+  'stale-field': 'majú pole staršie, než je povolený limit',
+};
+
+function pendingBlockedReasonSentence(blocked) {
+  const byReason = {};
+  for (const item of blocked) {
+    const r = item.reason || 'neznámy dôvod';
+    (byReason[r] = byReason[r] || []).push(item);
+  }
+  return Object.keys(byReason).sort().map(r =>
+    `${byReason[r].length}× ${PENDING_BLOCKED_REASON_TEXT[r] || r}`
+  ).join('; ');
 }
 
 // The tab's own subtitle counts the same lines („7 otvorených položiek u dodávateľov"),
@@ -3820,6 +3893,14 @@ async function loadOrdersReminder() {
   catch (_) { ORDERS_REMINDER = null; }
 }
 
+// #299 Task 7 — „Sync do Shoptetu" tab: what the next hourly upload will send,
+// and what it cannot send yet.
+async function loadShoptetUpload() {
+  await loadAutomations();
+  try { PENDING_SHOPTET = await (await fetch('/api/pending-shoptet')).json(); }
+  catch (_) { PENDING_SHOPTET = null; }
+}
+
 // Reload AUTOMATIONS + the active tab's display data (used by toggle + run poll,
 // so a live run refreshes whichever automation tab is open).
 async function _reloadAuto(tab) {
@@ -3829,6 +3910,7 @@ async function _reloadAuto(tab) {
   if (tab === 'restock_skladom') { await loadRestock(); return; }
   if (tab === 'stock_skladom') { await loadStockSkladom(); return; }
   if (tab === 'orders_reminder') { await loadOrdersReminder(); return; }
+  if (tab === 'shoptet_upload') { await loadShoptetUpload(); return; }
   await loadPosta();   // loads AUTOMATIONS too; POSTA fetch is harmless elsewhere
 }
 
@@ -4295,6 +4377,136 @@ function renderShoptetSync() {
   wrap.appendChild(renderOrderStatusConfig());
 }
 
+// ---- #299 Task 7: tab „Sync do Shoptetu" ------------------------------------ //
+// Same skeleton as renderShoptetSync() (pill, Štart/Stop, ⚡ Spustiť teraz,
+// .autodesc/.autometa/.autoerr — never a SECOND `.auto*` on this tab, #209), plus
+// two tab-own blocks (`.pendcount`/`.pendblocked`) naming what the next hourly
+// import will send and what it is holding back.
+function renderShoptetUpload() {
+  const wrap = document.getElementById('tab-shoptet_upload');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  const a = autoByKey('shoptet_upload');
+  if (!a) {
+    wrap.appendChild(el('div', 'muted', 'Automatizácia nie je dostupná (server nevrátil stav).'));
+    return;
+  }
+  const st = el('div', 'autostatus');
+  const head = el('div', 'autohead');
+  const pill = el('span', 'pill ' + (a.enabled ? 'on' : 'off'), a.enabled ? 'Beží' : 'Zastavené');
+  pill.dataset.testid = 'shoptet-upload-status';
+  head.appendChild(pill);
+  if (a.running) head.appendChild(el('span', 'runningdot', '⏳ práve prebieha nahrávanie…'));
+  const btn = el('button', 'btn sm ' + (a.enabled ? 'warn' : 'good'),
+    a.enabled ? '⏹ Stop' : '▶ Štart');
+  btn.dataset.testid = 'shoptet-upload-toggle';
+  btn.onclick = () => toggleAutomation('shoptet_upload', !a.enabled);
+  head.appendChild(btn);
+  const run = el('button', 'btn sm ghost', '⚡ Spustiť teraz');
+  run.dataset.testid = 'shoptet-upload-run';
+  run.disabled = !!a.running;
+  run.onclick = () => runAutomation('shoptet_upload', 'shoptet_upload');
+  head.appendChild(run);
+  st.appendChild(head);
+  if (a.description) st.appendChild(el('div', 'autodesc', escapeHtml(a.description)));
+
+  // #299 review decisions (Task 7 brief) — `run_shoptet_upload` returns `ok: false`
+  // by a NORMAL return (not a raised exception) for "cyklus už beží" / "iný import
+  // práve beží" / unconfirmed-or-blocked rows, so `AutomationRunner._execute` still
+  // stamps `last_status='ok'`. Reading only `last_status`/`last_error` (like
+  // renderShoptetSync does) would never show these three states — read
+  // `last_result.ok`/`last_result.error` instead, and feed the same verdict into
+  // `lastRunLabel` so "Posledný beh" does not claim ✅ OK for them either.
+  //
+  // #299 Task 11 — `lr.degraded` widens this: a run can be `ok: true` (nothing
+  // THIS cycle attempted failed) and still be degraded (e.g. a producer's source
+  // looks frozen — the problem is upstream, not in this cycle's own import). Both
+  // feed the SAME verdict, never a separate fourth state to keep in sync.
+  const lr = a.last_result || {};
+  const failed = lr.ok === false;
+  const degraded = failed || !!lr.degraded;
+  const meta = el('div', 'autometa');
+  const bits = [`Plán: ${escapeHtml(a.schedule || '')}`];
+  bits.push('Posledný beh: ' + lastRunLabel(a, degraded));
+  if (a.enabled && a.next_run) bits.push('Ďalší beh: ' + fmtDt(a.next_run));
+  meta.innerHTML = bits.map(b => `<span>${b}</span>`).join(' · ');
+  st.appendChild(meta);
+  if (a.last_status === 'error' && a.last_error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(a.last_error)));
+  } else if (a.last_run && failed && lr.error) {
+    st.appendChild(el('div', 'autoerr', '❌ ' + escapeHtml(lr.error)));
+  }
+
+  // #299 Task 11 — the NAJDÔLEŽITEJŠIA POŽIADAVKA: the cycle deploys DISABLED
+  // and is now the ONLY path anything reaches the eshop by, so a manager who
+  // forgets to turn it on must not be able to miss it. `queue_stale_warning` is
+  // computed server-side straight off the pending table + `enabled` — it is
+  // truthy even when this automation has NEVER run (last_run empty), which is
+  // exactly the "forgot to start it" case this exists for. Own class
+  // (`.uploadwarn`, sharing `.autowarn`'s look — see style.css) rather than
+  // reusing `.auto*` directly on this tab: per this project's own convention
+  // (toorder-e2e.md §14 / #209), a NEW element on an automation card never
+  // carries an existing `.auto*` class — it is the same defence-in-depth as
+  // `.automiss`/`.pendblocked` below, protecting a FUTURE unscoped locator
+  // even though, as of opravné kolo 1's review m2, no test today locates
+  // `.autowarn` unscoped — every banner this file adds is found via
+  // `data-testid`, and the earlier claim here (that an unscoped `.autowarn`
+  // locator was already ambiguous between the two tabs) was not literally
+  // true.
+  if (a.queue_stale_warning) {
+    const w = el('div', 'uploadwarn', '');
+    w.dataset.testid = 'shoptet-upload-stale-disabled';
+    w.textContent = '⚠️ ' + a.queue_stale_warning;
+    st.appendChild(w);
+  }
+  // …and the run's OWN warnings (Task 11's `warnings: []` — unconfirmed rows,
+  // stale-blocked codes, an enabled producer that stopped running (opravné
+  // kolo 1 review C1 — replaces the old empty-queue-streak signal), a skipped
+  // second download). Same `.uploadwarn` class, one block per sentence —
+  // `warnings` is already a list of complete, ready-to-read Slovak sentences.
+  for (const w of (lr.warnings || [])) {
+    const wd = el('div', 'uploadwarn', '');
+    wd.dataset.testid = 'shoptet-upload-warning';
+    wd.textContent = '⚠️ ' + w;
+    st.appendChild(wd);
+  }
+
+  // #299 opravné kolo 1 review C1 — `producers_disabled` is its own category,
+  // "nie chyba, ale nech je to vidieť": #93's safety contract means a producer
+  // deploys disabled by default, so this is normal, NOT a warning — plain
+  // `.muted` text (not `.uploadwarn`/amber), never counted into `degraded`.
+  if ((lr.producers_disabled || []).length) {
+    const d = el('div', 'muted', '');
+    d.dataset.testid = 'shoptet-upload-producers-disabled';
+    // #299 opravné kolo 2 — "zváženie 1": plain "Vypnuté: …" is ambiguous on
+    // THIS card, which can ALSO show the cycle itself switched off (▶ Štart /
+    // ⏸ Stop up top) — "Producenti vypnutí" names what is disabled.
+    d.textContent = 'Producenti vypnutí: ' + lr.producers_disabled.join(', ');
+    st.appendChild(d);
+  }
+
+  // #299 review decision 4 — the two Task 8 producers (grube_externalcode,
+  // split_links) both start DISABLED (#93 contract), so this table is still
+  // legitimately empty on a healthy install until a manager opts one in; the
+  // text below states only what IS true today, never that something is
+  // already collecting.
+  const P = PENDING_SHOPTET || { pending: [], blocked: [] };
+  const cnt = el('div', 'pendcount', '');
+  cnt.dataset.testid = 'pending-count';
+  cnt.textContent = 'Čaká na nahratie: ' + pluralZmeny(P.pending.length);
+  st.appendChild(cnt);
+  if (P.blocked.length) {
+    const b = el('div', 'pendblocked', '');
+    b.dataset.testid = 'pending-blocked';
+    // #299 opravné kolo 3 (1) — text per skutočný `reason`, nie natvrdo „katalóg" pre
+    // všetky (viď `pendingBlockedReasonSentence` vyššie).
+    b.textContent = 'Zablokované: ' + P.blocked.length
+      + ' — ' + pendingBlockedReasonSentence(P.blocked);
+    st.appendChild(b);
+  }
+  wrap.appendChild(st);
+}
+
 // ---- #209: which order statuses mean WHAT ---------------------------------- //
 // It lives on THIS card and nowhere else on purpose: this is where the manager is told
 // that a status he does not recognise appeared (the „nepoznám" line above) and where the
@@ -4692,31 +4904,35 @@ function renderParovaniaEshop() {
     const [label, cls] = _PAROVANIA_STATUS[lr.status] || [lr.status, 'ok'];
     const box = el('div', 'autoresult ' + cls);
     box.appendChild(el('div', 'autoresult-head', label));
+    // #299 opravné kolo 1 review I1/m3 — this producer only QUEUES (since Task
+    // 10 it never imports), so the headline must say "zaradených do frontu"
+    // (queued == `p.queued`/`s.queued`, the SAME field name and the SAME
+    // meaning on both halves — mirrors renderGrubeExternalcode/renderSplitLinks
+    // below), never "nových" off `count` — pairings' `count` means something
+    // ELSE entirely (keys credited RIGHT AWAY from the export match, see
+    // `_do_upload_pairings`), and the card must never conflate the two.
     box.appendChild(el('div', '',
-      `🔗 Párovania: +${p.count ?? 0} nových`
+      `🔗 Párovania: ${p.queued ?? 0} zaradených do frontu`
       + (p.blocked ? ` · ${p.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${p.total_uploaded ?? 0} / ${p.total_products ?? 0} napárovaných`
       + ` · chýba ${p.remaining ?? 0}`));
-    // #257: the two facts a partially-accepted push turns on. Both come from the API
-    // result and were invisible here, so the manager could not see that Shoptet had
-    // rejected rows at all — only the generic error line below (if any).
-    //   • potvrdené z exportu = rows the eshop already had exactly as we would write
-    //     them, credited from its own export and NOT re-sent;
-    //   • odmietol = rows Shoptet refused out of the ones we did send (they stay
-    //     pending and are re-sent until the export confirms them).
+    // #257 / #299 opravné kolo 1 review I1 — the ONE fact this producer can still
+    // honestly claim: rows the eshop's OWN export already showed exactly as we
+    // would write them, credited right away without going through the queue.
+    // Whether Shoptet later ACCEPTS or REJECTS a queued row is now decided by
+    // the hourly "Sync do Shoptetu" drain, not here — a producer that only
+    // queues must never claim to know an outcome that hasn't happened yet (the
+    // "⛔ Shoptet odmietol: 0 riadkov" line this used to show every single run
+    // was always false — it was a promise, not a fact).
     box.appendChild(el('div', 'sub2',
-      `✔ Už v eshope (potvrdené z exportu): ${p.confirmed_in_export ?? 0}`
-      + ` · ⛔ Shoptet odmietol: ${p.rejected ?? 0} riadkov`
-      + (p.partial ? ' · časť dávky odmietnutá — zvyšok sa potvrdí z exportu' : '')));
-    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
-    // successful chunks ARE saved → the next run only retries the rest)
+      `✔ Už v eshope (potvrdené z exportu): ${p.confirmed_in_export ?? 0}`));
     if (p.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(p.error)));
     // #38: inline páry pridané priamo na riadku „Na objednanie" (mimo review setu)
     box.appendChild(el('div', '',
       `📦 Inline páry: +${p.order_count ?? 0} nových`
       + (p.order_blocked ? ` · ${p.order_blocked} prekrytých recenziou` : '')));
     box.appendChild(el('div', '',
-      `🏷️ Dodávatelia: +${s.count ?? 0} nových`
+      `🏷️ Dodávatelia: ${s.queued ?? 0} zaradených do frontu`
       + (s.blocked ? ` · ${s.blocked} zablokovaných${gateBlockedWhy(s.gate_blocked)}` : '')
       + ` · spolu ${s.total_uploaded ?? 0} / ${s.total_assigned ?? 0} doplnených`
       + ` · chýba ${s.remaining ?? 0}`));
@@ -4782,13 +4998,15 @@ function renderGrubeExternalcode() {
     const box = el('div', 'autoresult ' + cls);
     box.appendChild(el('div', 'autoresult-head', label));
     box.appendChild(el('div', '',
-      `🏷️ GRUBE kódy: +${e.count ?? 0} nových`
+      // #299 review m1 — since Task 8 this producer only QUEUES field values into
+      // the shared table (the hourly „Sync do Shoptetu" drain does the actual
+      // upload + credit), so "nových" here means "candidates just queued this
+      // run", never "freshly uploaded" — that would-be-misleading claim belongs
+      // to `total_uploaded`/`total_codes` below, which stay genuinely credited.
+      `🏷️ GRUBE kódy: ${e.count ?? 0} zaradených do frontu`
       + (e.blocked ? ` · ${e.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${e.total_uploaded ?? 0} / ${e.total_codes ?? 0} nahraných`
       + ` · chýba ${e.remaining ?? 0}`));
-    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
-    // successful chunks ARE saved → the next run only retries the rest)
-    if (e.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(e.error)));
     st.appendChild(box);
   } else if (!a.last_run) {
     st.appendChild(el('div', 'muted',
@@ -4848,13 +5066,15 @@ function renderSplitLinks() {
     const box = el('div', 'autoresult ' + cls);
     box.appendChild(el('div', 'autoresult-head', label));
     box.appendChild(el('div', '',
-      `🔗 Veľkostné linky: +${e.count ?? 0} nových`
+      // #299 review m1 — since Task 8 this producer only QUEUES field values into
+      // the shared table (the hourly „Sync do Shoptetu" drain does the actual
+      // upload + credit), so "nových" here means "candidates just queued this
+      // run", never "freshly uploaded" — that would-be-misleading claim belongs
+      // to `total_uploaded`/`total_codes` below, which stay genuinely credited.
+      `🔗 Veľkostné linky: ${e.count ?? 0} zaradených do frontu`
       + (e.blocked ? ` · ${e.blocked} zablokovaných (chýbajú kódy)` : '')
       + ` · spolu ${e.total_uploaded ?? 0} / ${e.total_codes ?? 0} nahraných`
       + ` · chýba ${e.remaining ?? 0}`));
-    // #156: on a chunk failure, show WHICH chunk failed + how many rows made it (the
-    // successful chunks ARE saved → the next run only retries the rest)
-    if (e.error) box.appendChild(el('div', 'sub2 err', '❌ ' + escapeHtml(e.error)));
     st.appendChild(box);
   } else if (!a.last_run) {
     st.appendChild(el('div', 'muted',
@@ -5135,16 +5355,17 @@ function renderRestockSkladom() {
   wrap.appendChild(st);
 
   const r = RESTOCK || {};
-  // import outcome of the last run (naskladnené = upravené v Shoptete)
-  if (r.status === 'error') {
-    st.appendChild(el('div', 'autoerr',
-      '❌ Import zlyhal — nič sa nenaskladnilo. ' + escapeHtml(r.error_detail || '')));
-  } else if (r.status === 'busy') {
-    st.appendChild(el('div', 'muted', '⏳ Iný import práve bežal — beh sa preskočil, skús neskôr.'));
-  } else if (r.last_check && (r.candidates || []).length) {
+  // #299 Task 9 — this producer only QUEUES field values into the shared
+  // pending_shoptet table now; the hourly „Sync do Shoptetu" drain does the
+  // actual write, so there is no import outcome (processed/updated/failed) to
+  // show here any more — just how many field values THIS run queued.
+  // #299 Task 9 review m3 — "zaradené" is NOT "nahraté": the drain can still
+  // BLOCK a row (not-in-catalog/stale/import-busy), so the text must not
+  // promise an upload it cannot guarantee.
+  if (r.last_check && (r.candidates || []).length) {
     st.appendChild(el('div', 'muted',
-      `Naskladnených: ${r.updated ?? 0} · spracované: ${r.processed ?? 0}`
-      + (r.failed ? ` · zlyhania: ${r.failed}` : '')));
+      `📦 Zaradené do frontu: ${r.queued ?? 0} — o zápis sa pokúsi najbližší `
+      + '„Sync do Shoptetu" (do hodiny); nemusí sa podariť pre každú položku.'));
   }
 
   if (!r.has_supplier_data) {
@@ -5229,15 +5450,13 @@ function renderStockSkladom() {
   wrap.appendChild(st);
 
   const r = STOCK_SKLADOM || {};
-  if (r.status === 'error') {
-    st.appendChild(el('div', 'autoerr',
-      '❌ Import zlyhal — nič sa neprepolo. ' + escapeHtml(r.error_detail || '')));
-  } else if (r.status === 'busy') {
-    st.appendChild(el('div', 'muted', '⏳ Iný import práve bežal — beh sa preskočil, skús neskôr.'));
-  } else if (r.last_check && (r.candidates || []).length) {
+  // #299 Task 9 — same change as renderRestockSkladom above: this producer only
+  // QUEUES now, so there is no import outcome to show — just what THIS run queued.
+  // #299 Task 9 review m3 — same wording fix as renderRestockSkladom above.
+  if (r.last_check && (r.candidates || []).length) {
     st.appendChild(el('div', 'muted',
-      `Prepnutých na Skladom: ${r.updated ?? 0} · spracované: ${r.processed ?? 0}`
-      + (r.failed ? ` · zlyhania: ${r.failed}` : '')));
+      `📦 Zaradené do frontu: ${r.queued ?? 0} — o zápis sa pokúsi najbližší `
+      + '„Sync do Shoptetu" (do hodiny); nemusí sa podariť pre každú položku.'));
   }
 
   const cands = r.candidates || [];
@@ -5520,6 +5739,7 @@ function render() {
   const users = ACTIVE_TAB === 'users';
   const posta = ACTIVE_TAB === 'posta';
   const shoptetSync = ACTIVE_TAB === 'shoptet_sync';
+  const shoptetUpload = ACTIVE_TAB === 'shoptet_upload';
   const parovaniaEshop = ACTIVE_TAB === 'parovania_eshop';
   const grubeExternalcode = ACTIVE_TAB === 'grube_externalcode';
   const splitLinks = ACTIVE_TAB === 'split_links';
@@ -5530,7 +5750,7 @@ function render() {
   const ordersReminder = ACTIVE_TAB === 'orders_reminder';
   const imageHealth = ACTIVE_TAB === 'image_health';
   const dev = ACTIVE_TAB === 'dev';
-  const auto = posta || shoptetSync || parovaniaEshop || grubeExternalcode || splitLinks || dodavatelskySklad || rizikoVypadku || restockSkladom || stockSkladom || ordersReminder || imageHealth;  // any automation tab
+  const auto = posta || shoptetSync || shoptetUpload || parovaniaEshop || grubeExternalcode || splitLinks || dodavatelskySklad || rizikoVypadku || restockSkladom || stockSkladom || ordersReminder || imageHealth;  // any automation tab
   const plain = nedostupne || vystavy || search || notes || users || auto || dev;   // non-review/non-toorder full-width tabs
   renderSchedulerWarning(auto || vystavy);   // výstavy majú vlastnú automatizáciu v tabe
   document.body.classList.toggle('toorder-wide', toorder);   // od kraja po kraj len na tabe „Na objednanie"
@@ -5549,6 +5769,7 @@ function render() {
   const secUsers = document.getElementById('tab-users'); if (secUsers) secUsers.hidden = !users;
   const secPosta = document.getElementById('tab-posta'); if (secPosta) secPosta.hidden = !posta;
   const secShoptetSync = document.getElementById('tab-shoptet_sync'); if (secShoptetSync) secShoptetSync.hidden = !shoptetSync;
+  const secShoptetUpload = document.getElementById('tab-shoptet_upload'); if (secShoptetUpload) secShoptetUpload.hidden = !shoptetUpload;
   const secParovania = document.getElementById('tab-parovania_eshop'); if (secParovania) secParovania.hidden = !parovaniaEshop;
   const secGrubeExt = document.getElementById('tab-grube_externalcode'); if (secGrubeExt) secGrubeExt.hidden = !grubeExternalcode;
   const secSplitLinks = document.getElementById('tab-split_links'); if (secSplitLinks) secSplitLinks.hidden = !splitLinks;
@@ -5573,6 +5794,7 @@ function render() {
   if (grubeExternalcode) { document.getElementById('empty').hidden = true; renderGrubeExternalcode(); return; }
   if (splitLinks) { document.getElementById('empty').hidden = true; renderSplitLinks(); return; }
   if (shoptetSync) { document.getElementById('empty').hidden = true; renderShoptetSync(); return; }
+  if (shoptetUpload) { document.getElementById('empty').hidden = true; renderShoptetUpload(); return; }
   if (posta) { document.getElementById('empty').hidden = true; renderPosta(); return; }
   if (users) { document.getElementById('empty').hidden = true; renderUsers(); return; }
   if (notes) { document.getElementById('empty').hidden = true; renderNotes(); return; }

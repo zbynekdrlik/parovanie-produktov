@@ -3,7 +3,7 @@
 Against the seeded automations_server (a pre-existing stock_skladom.json with one
 flipped candidate, NO automations.json -> runner defaults DISABLED). Verifies the
 tab renders default-Zastavené with Štart/Stop + Spustiť teraz, the candidate table +
-import outcome render, and the toggle persists across a reload. It NEVER clicks
+queue outcome render, and the toggle persists across a reload. It NEVER clicks
 „Spustiť teraz" — that WRITES to the live eshop (needs a real products.csv + import).
 """
 
@@ -36,7 +36,7 @@ def test_tab_renders_default_stopped_with_controls(page, automations_server):
     assert console == [], f"console not clean: {console}"
 
 
-def test_candidate_table_and_import_outcome_render(page, automations_server):
+def test_candidate_table_and_queue_outcome_render(page, automations_server):
     console = _console(page)
     _open_tab(page, automations_server)
 
@@ -46,9 +46,9 @@ def test_candidate_table_and_import_outcome_render(page, automations_server):
     assert "Fotopasca Máme Skladom Test" in body and "9/M" in body
     assert "129.90" in body and "5 ks" in body and "Vypredané" in body
 
-    # the last run's import outcome line (prepnuté = updated)
+    # the last run's queue outcome line (#299 Task 9 — queues, no longer imports)
     status = page.locator('#tab-stock_skladom .autostatus').inner_text()
-    assert "Prepnutých na Skladom: 1" in status
+    assert "Zaradené do frontu: 3" in status
 
     assert console == [], f"console not clean: {console}"
 

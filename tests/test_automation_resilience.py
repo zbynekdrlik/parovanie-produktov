@@ -85,12 +85,17 @@ def test_the_automation_can_run_again_after_the_other_process_lets_go(tmp_path):
 
 def test_a_failing_run_still_clears_its_claim(tmp_path):
     """Unchanged behaviour, pinned: a run that RAISES is recorded as an error and the
-    automation stays runnable."""
+    automation stays runnable.
+
+    #299 Task 11 finding 1 — the RETURN value changed (it used to be an
+    unconditional `True` the moment `_execute` ran at all; now it reports
+    whether the run SUCCEEDED). The claim-clearing behaviour this test is
+    actually about is unaffected either way."""
     def boom():
         raise RuntimeError("nope")
 
     r = _runner(tmp_path, _LockHeldByAnother(raise_on=[]), boom)
-    assert r._execute("a", claimed=True) is True
+    assert r._execute("a", claimed=True) is False
     assert not r._running.get("a")
     assert r.status()[0]["last_status"] == "error"
 

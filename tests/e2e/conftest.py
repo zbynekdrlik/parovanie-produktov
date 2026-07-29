@@ -70,7 +70,8 @@ _SERVER_FIXTURES = ("live_server", "matched_server",
                     "sync_prune_blocked_server", "imgfail_server",
                     "imgflood_server", "dev_server",
                     "nedostupne_server", "vystavy_server", "toorder_server",
-                    "toorder_wide_server", "bad_status_config_server")
+                    "toorder_wide_server", "bad_status_config_server",
+                    "shoptet_upload_server", "shoptet_upload_stale_disabled_server")
 
 
 @pytest.fixture(autouse=True)
@@ -468,9 +469,13 @@ def automations_server(tmp_path_factory):
         ],
     }, ensure_ascii=False), encoding="utf-8")
     # #108 — pre-existing „Vypredané → Skladom" restock result (one candidate that
-    # WAS flipped) so the tab's status + table + import-outcome render WITHOUT any
-    # network. The E2E never clicks Spustiť teraz (it WRITES to the live eshop) —
-    # same rationale as the parovania_eshop / supplier_stock fixtures.
+    # WAS QUEUED — #299 Task 9: this producer only queues into pending_shoptet now,
+    # the hourly „Sync do Shoptetu" drain does the actual eshop write) so the tab's
+    # status + table + queue-outcome render WITHOUT any network. The E2E never
+    # clicks Spustiť teraz (it feeds the live eshop) — same rationale as the
+    # parovania_eshop / supplier_stock fixtures. queued=4 — one field value per
+    # RESTOCK_COLS non-key column (productVisibility/availabilityInStock/
+    # availabilityOutOfStock/stock).
     (out / "restock_skladom.json").write_text(json.dumps({
         "last_check": "2026-07-22T06:00:05+02:00",
         "has_supplier_data": True,
@@ -483,12 +488,15 @@ def automations_server(tmp_path_factory):
              "link": "https://www.huntingshop.eu/p/bunda-restock",
              "checkedAt": "2026-07-22T05:00:03+02:00"},
         ],
-        "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
+        "queued": 4,
     }, ensure_ascii=False), encoding="utf-8")
     # #98 — pre-existing „Máme skladom → Skladom" result (one product we physically
-    # have but that still shows Vypredané, flipped) so the tab's status + table +
-    # import-outcome render WITHOUT any network. The E2E never clicks Spustiť teraz
-    # (it WRITES to the live eshop) — same rationale as the restock fixture above.
+    # have but that still shows Vypredané, QUEUED — #299 Task 9, same rationale as
+    # the restock fixture above) so the tab's status + table + queue-outcome render
+    # WITHOUT any network. The E2E never clicks Spustiť teraz (it feeds the live
+    # eshop). queued=3 — one field value per SKLADOM_COLS non-key column
+    # (productVisibility/availabilityInStock/availabilityOutOfStock — `stock` is
+    # deliberately absent from this producer's own columns).
     (out / "stock_skladom.json").write_text(json.dumps({
         "last_check": "2026-07-22T06:45:05+02:00",
         "status": "ok",
@@ -496,7 +504,7 @@ def automations_server(tmp_path_factory):
             {"code": "9/M", "pairCode": "P9", "name": "Fotopasca Máme Skladom Test",
              "ourPrice": "129.90", "stock": "5", "availabilityText": "Vypredané"},
         ],
-        "processed": 1, "updated": 1, "failed": 0, "error_detail": "",
+        "queued": 3,
     }, ensure_ascii=False), encoding="utf-8")
     # #105 — pre-existing „Pripomienky objednávok" result (one red no-note order + one order
     # where a reminder WAS e-mailed) so the tab's status + both sections render WITHOUT any
@@ -870,6 +878,131 @@ def toorder_server(tmp_path_factory):
         "99000890;2026-05-15 09:00:00;Vybavuje sa;;Nohavice Orb Test;2;S1;Veľkosť: M;ORBIS\r\n"
         "99000001;2026-01-05 10:00:00;Vybavuje sa;;Bez Dodavatela Test;1;N1;Veľkosť: Z;\r\n",
         encoding="cp1250")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(out / "no_products_here.csv"),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def shoptet_upload_server(tmp_path_factory):
+    """Isolated webreview instance for the „Sync do Shoptetu" tab E2E (#299 Task 7).
+
+    Seeds `pending_shoptet.json` (the ONE table between our decisions and the eshop,
+    read-only over `/api/pending-shoptet`) with two codes carrying one waiting field
+    each (2 changes total) and a third code held `blocked` (eshop's catalogue does
+    not carry it yet) carrying one field of its own. Product codes, not order codes —
+    `automation-health.md` §1's `9900…` convention is for ORDER codes; these are
+    public catalogue identifiers with no customer link, so any obviously-fake shape
+    is fine. `automations.json` is deliberately absent: the tab must render its
+    default 'Zastavené' state (#93 SAFETY contract) with no file on disk at all,
+    same as every other fresh-install automation fixture.
+
+    #299 Task 11 — `queued_at` is computed RELATIVE TO NOW (well under the
+    `QUEUE_STALE_WHILE_DISABLED_AFTER_S` 3h alarm threshold), never a fixed
+    calendar date. A fixed date is exactly the kind of fixture that silently
+    rots: this one used to read `2026-07-28T09:00...` and passed for months,
+    then quietly started tripping the NEW "queue is old + cycle is disabled"
+    sidebar alarm the moment real time drifted more than 3h past that literal
+    string — a fixture bug this task's own new alarm exposed, not caused."""
+    now = datetime.now().astimezone()
+
+    def _ago(minutes):
+        return (now - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+
+    out = tmp_path_factory.mktemp("wr_shoptet_upload_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "pending_shoptet.json").write_text(json.dumps({
+        "TESTUP1": {
+            "pairCode": "", "blocked": None, "attempts": 0,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/a",
+                                        "source": "test_source",
+                                        "queued_at": _ago(10)}},
+        },
+        "TESTUP2": {
+            "pairCode": "", "blocked": None, "attempts": 0,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/b",
+                                        "source": "test_source",
+                                        "queued_at": _ago(5)}},
+        },
+        "TESTUP3": {
+            "pairCode": "",
+            "blocked": {"reason": "not-in-catalog", "since": _ago(60)},
+            "blocked_runs": 3, "attempts": 3,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/c",
+                                        "source": "test_source",
+                                        "queued_at": _ago(90)}},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
+    env = {
+        **os.environ,
+        **_AUTH_ENV,
+        "WEBREVIEW_OUT": str(out),
+        "WEBREVIEW_PRODUCTS": str(out / "no_products_here.csv"),
+        "WEBREVIEW_PORT": str(port),
+        "PYTHONPATH": os.path.join(ROOT, "src"),
+        "SHOPTET_CRED": str(out / "no_creds_here"),   # hermetic: no live-shop access
+    }
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "webreview", "app.py")], env=env)
+    try:
+        _wait_ready(base + "/api/version", proc)
+        yield base
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.fixture(scope="function")
+def shoptet_upload_stale_disabled_server(tmp_path_factory):
+    """#299 opravné kolo 1 review I3 — every existing test for the disabled-cycle
+    stale-queue alarm injects it via `page.evaluate` (`AUTOMATIONS.find(...).
+    queue_stale_warning = '...'`), so none of them exercises the REAL path this
+    alarm exists for: a genuinely OLD field sitting in `pending_shoptet.json`,
+    the cycle genuinely never started (`automations.json` deliberately absent,
+    same #93 default as `shoptet_upload_server`), `/api/automations` computing
+    the warning server-side on its own poll, and the sidebar + card rendering
+    it from THAT real response — zero injection anywhere.
+
+    Deliberately a SEPARATE fixture from `shoptet_upload_server`, not a shared
+    one with a parameter: that one's `queued_at` values are intentionally kept
+    well UNDER `QUEUE_STALE_WHILE_DISABLED_AFTER_S` (its own docstring explains
+    why — proving the alarm stays quiet on a healthy queue), so reusing it here
+    would either break those tests or need the alarm re-armed mid-test, both
+    messier than one small dedicated fixture."""
+    now = datetime.now().astimezone()
+    old = (now - timedelta(hours=4)).isoformat(timespec="seconds")   # past the 3h threshold
+
+    out = tmp_path_factory.mktemp("wr_shoptet_upload_stale_out")
+    port = _free_port()
+    base = f"http://127.0.0.1:{port}"
+    (out / "pending_shoptet.json").write_text(json.dumps({
+        "TESTSTALE1": {
+            "pairCode": "", "blocked": None, "attempts": 0,
+            "fields": {"internalNote": {"value": "https://dodavatel.example/z",
+                                        "source": "test_source", "queued_at": old}},
+        },
+    }, ensure_ascii=False), encoding="utf-8")
     env = {
         **os.environ,
         **_AUTH_ENV,
