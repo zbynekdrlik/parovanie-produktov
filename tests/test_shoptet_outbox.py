@@ -34,6 +34,35 @@ def test_queue_fields_skips_empty_cells_so_a_blank_never_wipes_a_field():
     assert set(pending["A"]["fields"]) == {"supplier"}
 
 
+def test_a_row_with_only_empty_cells_for_a_BRAND_NEW_code_creates_no_ghost_entry():
+    """#299 záverečná recenzia (Minor 5) — a row whose only non-key cell is
+    empty queues nothing, but used to still CREATE an entry
+    ({"blocked": None, "attempts": 0, "fields": {}}) for a code that never
+    existed before. `build_import` skips any code with empty `fields`, so
+    that shell could never be sent, confirmed, or blocked — nothing ever
+    removed it, and its `attempts` would grow forever on every future
+    `settle()` run for a code that was never actually queueing anything."""
+    pending, n = ob.queue_fields(
+        {}, source="s", header="code;pairCode;internalNote",
+        rows=[["A", "P", ""]], now="T")
+    assert n == 0
+    assert pending == {}, "no ghost entry for a code that never existed"
+
+
+def test_a_row_with_only_empty_cells_for_an_EXISTING_code_keeps_its_entry():
+    """The other side of the guard: it only refuses to CREATE a new ghost —
+    a code that already has real work queued must never lose it just because
+    a LATER call happens to re-send an all-empty row for the same code."""
+    pending, _ = ob.queue_fields(
+        {}, source="parovania_eshop", header="code;pairCode;internalNote",
+        rows=[["A", "P", "u"]], now="T1")
+    pending, n = ob.queue_fields(
+        pending, source="restock_skladom", header="code;pairCode;availabilityInStock",
+        rows=[["A", "P", ""]], now="T2")
+    assert n == 0
+    assert pending["A"]["fields"]["internalNote"]["value"] == "u"
+
+
 def test_a_second_source_adds_its_own_field_to_the_same_code():
     p, _ = ob.queue_fields({}, source="parovania_eshop",
                            header="code;pairCode;internalNote",
