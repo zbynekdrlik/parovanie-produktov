@@ -290,14 +290,29 @@ neskôr) a overuje sa AŽ PO jeho behu, nikdy po ručnom spustení producenta.**
 3. Prepnúť `restock_skladom` a `stock_skladom`, spustiť ich **ručne** cez „⚡ Spustiť
    teraz" (to ich len ZARADÍ do tabuľky), počkať na najbližší beh cyklu, a AŽ POTOM
    v Shoptet administrácii overiť, že sa zmenilo presne ~19 + 16 riadkov. Zároveň
-   sledovať kartu cyklu — pri týchto dvoch automatizáciách zareaguje NAJSKÔR
-   `stale-field` (pole zadržané, lebo je staršie než 24 h — `blocked`/
-   `stale_fields_held`, #299 záverečná recenzia I5/opravné kolo 2 N-C1): sú to
-   JEDINÉ dve automatizácie bez deduplikácie, ktoré rovnaký kandidátsky zoznam
-   zaraďujú znova každý deň, takže práve tu prvýkrát narazí na vekovú bránu.
-   `stale_blocked` (kód, ktorý eshop v katalógu nemá, čaká 3+ behy) je druhý
-   signál — obe sú znak, že niečo z toho, čo tieto dve automatizácie zaradili,
-   sa v skutočnosti nezapisuje — vyrieš to skôr, než zapneš ďalšieho producenta.
+   sledovať kartu cyklu — **opravné kolo 3: text nižšie opravuje pôvodné tvrdenie,
+   že tu ako prvý signál zareaguje veková brána `stale-field` — po rozdelení
+   časov (#299 opravné kolo 2 N-C1) to už neplatí.** `queue_fields` teraz pri
+   KAŽDOM (aj nezmenenom) zaradení znova zapisuje `queued_at` — presne to pole,
+   ktoré 24-hodinová brána (`shoptet_outbox.stale_fields`) sleduje — takže pokým
+   hodinový cyklus beží a riadok sa doň do hodiny potvrdí, pole 24 h staré
+   nikdy nedosiahne; brána prakticky nikdy nezareaguje SKÔR než ostatné signály.
+   Odôvodnenie „sú to jediné dve automatizácie bez deduplikácie" bolo tiež
+   obrátené: kým nie je kód/pole POTVRDENÉ (kredit sa zapisuje až po potvrdení
+   od drainu, nikdy pri zaradení — `automation-health.md` §6), rovnaký
+   kandidátsky/rozhodovací zoznam si pri svojom dennom behu znova zaraďuje
+   VŠETKÝCH päť producentov, nielen tieto dva.
+
+   Čo manažér naozaj uvidí, keď sa niečo nepotvrdí, je beh karty označený
+   „DEGRADOVANÝ" s varovným odznakom a vetou „Shoptet nepotvrdil N z M
+   riadkov" (`unconfirmed` → `warnings` → `degraded`, prípadne aj `ok: false`,
+   keď sa k tomu pridá `stale_blocked` alebo zlyhaná odpoveď importu) — nie
+   zadržanie pre vek. `stale_blocked` (kód, ktorý eshop v katalógu nemá, alebo
+   pole staršie než 24 h, blokované 3+ behy po sebe) je skutočný druhý signál,
+   ktorý sa objaví, keď producent PRESTANE svoje rozhodnutie znova
+   potvrdzovať. Oba (degradovaný beh aj `stale_blocked`) sú znak, že niečo z
+   toho, čo tieto dve automatizácie zaradili, sa v skutočnosti nezapisuje —
+   vyrieš to skôr, než zapneš ďalšieho producenta.
 4. Prepnúť `parovania_eshop` (dnes jediný živý zápis) — až keď kroky 1–3 prebehli a
    cyklus je zdravý (žiadne `stale_blocked`/`stale_fields_held`, ktoré by manažér
    nečakal).
