@@ -216,6 +216,44 @@ def test_restock_and_stock_skladom_descriptions_promise_queueing_not_a_write():
         assert "Sync do Shoptetu" in text, (key, text)
 
 
+# ── #299 záverečná recenzia I5 — a queued field only ever had an age gate at ── #
+# ── QUEUEING time; nothing re-checked it at SEND time. A field this old is ─── #
+# ── withheld this cycle (never dropped), reported, and tried again once the ── #
+# ── producer re-queues a fresh decision. ─────────────────────────────────── #
+def test_a_field_queued_more_than_the_age_limit_ago_is_withheld_and_reported(
+        cycle):
+    webapp.queue_shoptet_fields("restock_skladom", "code;pairCode;availabilityInStock",
+                                [["A", "P", "Skladom"]])
+    pending = webapp._load_pending()
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=webapp.QUEUED_FIELD_MAX_AGE_S + 3600)).isoformat()
+    pending["A"]["fields"]["availabilityInStock"]["queued_at"] = old
+    webapp._save_pending(pending, prev=webapp._load_pending())
+
+    res = webapp.run_shoptet_upload()
+
+    assert res["stale_fields_held"] == ["A"]
+    assert cycle["import"] == [], "the stale field must never reach the eshop"
+    assert webapp._load_pending()["A"]["fields"]["availabilityInStock"]["value"] == \
+        "Skladom", "withheld, never dropped from the table"
+    assert any("staršie" in w for w in res["warnings"]), res["warnings"]
+
+
+def test_a_field_queued_WELL_WITHIN_the_age_limit_is_sent_normally(cycle):
+    webapp.queue_shoptet_fields("restock_skladom", "code;pairCode;availabilityInStock",
+                                [["A", "P", "Skladom"]])
+    pending = webapp._load_pending()
+    fresh = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    pending["A"]["fields"]["availabilityInStock"]["queued_at"] = fresh
+    webapp._save_pending(pending, prev=webapp._load_pending())
+
+    res = webapp.run_shoptet_upload()
+
+    assert res["stale_fields_held"] == []
+    assert len(cycle["import"]) == 1
+    assert res["confirmed"] == 1
+
+
 # ── #299 opravné kolo 1 review C1 (Critical) — replaces the deleted queue-based ─
 # ── streak signal ("3 hourly cycles with 0 fields of its own queued"), which ── #
 # ── fired on EVERY healthy install: these producers run DAILY, this drain runs ─

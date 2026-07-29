@@ -1,4 +1,5 @@
 import copy
+from datetime import datetime, timedelta, timezone
 
 from parovanie import shoptet_outbox as ob
 
@@ -360,6 +361,69 @@ def test_stale_unconfirmed_ignores_a_code_already_blocked_for_its_own_reason():
     assert p["A"]["attempts"] == 3
     assert ob.stale_unconfirmed(p, min_attempts=3) == ["B"]
     assert ob.stale_blocked(p, min_attempts=3) == ["A"]
+
+
+# ── #299 záverečná recenzia I5 — a queued field has an age gate at QUEUEING ── #
+# ── time only; nothing re-checks it at SEND time. `stale_fields` is that ───── #
+# ── missing gate. Absolute hour offsets (23h passes, 25h does not), never ──── #
+# ── derived from MAX_AGE_S itself — a threshold pinned by a value computed ─── #
+# ── from the SAME constant it tests can never fail. ─────────────────────────  #
+_NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+_MAX_AGE_S = 24 * 3600
+
+
+def _field(age_hours=None, queued_at=None):
+    if queued_at is None and age_hours is not None:
+        queued_at = (_NOW - timedelta(hours=age_hours)).isoformat()
+    return {"value": "u", "source": "restock_skladom", "queued_at": queued_at}
+
+
+def test_stale_fields_a_23h_old_field_passes():
+    p = {"A": {"fields": {"availabilityInStock": _field(age_hours=23)}}}
+    assert ob.stale_fields(p, _NOW, _MAX_AGE_S) == {}
+
+
+def test_stale_fields_a_25h_old_field_is_flagged():
+    p = {"A": {"fields": {"availabilityInStock": _field(age_hours=25)}}}
+    assert ob.stale_fields(p, _NOW, _MAX_AGE_S) == {"A": ["availabilityInStock"]}
+
+
+def test_stale_fields_exactly_at_the_boundary_counts_as_stale():
+    # >= max_age_s, not >, so a field EXACTLY 24h old is refused too — never
+    # let a field cross the limit on the same run it trips it.
+    p = {"A": {"fields": {"availabilityInStock": _field(age_hours=24)}}}
+    assert ob.stale_fields(p, _NOW, _MAX_AGE_S) == {"A": ["availabilityInStock"]}
+
+
+def test_stale_fields_treats_a_missing_queued_at_as_stale():
+    p = {"A": {"fields": {"availabilityInStock": _field(queued_at=None)}}}
+    assert ob.stale_fields(p, _NOW, _MAX_AGE_S) == {"A": ["availabilityInStock"]}
+
+
+def test_stale_fields_treats_an_unparsable_queued_at_as_stale():
+    p = {"A": {"fields": {"availabilityInStock": _field(queued_at="not-a-date")}}}
+    assert ob.stale_fields(p, _NOW, _MAX_AGE_S) == {"A": ["availabilityInStock"]}
+
+
+def test_stale_fields_treats_a_future_queued_at_as_stale():
+    p = {"A": {"fields": {"availabilityInStock": _field(age_hours=-1)}}}  # 1h in the future
+    assert ob.stale_fields(p, _NOW, _MAX_AGE_S) == {"A": ["availabilityInStock"]}
+
+
+def test_stale_fields_only_names_the_stale_COLUMN_not_the_whole_code():
+    p = {"A": {"fields": {"internalNote": _field(age_hours=1),          # fresh
+                          "availabilityInStock": _field(age_hours=48)}}}  # stale
+    assert ob.stale_fields(p, _NOW, _MAX_AGE_S) == {"A": ["availabilityInStock"]}
+
+
+def test_stale_fields_never_mutates_or_drops_anything_from_pending():
+    """This function only REPORTS — dropping a field from the table on this
+    function's own say-so would be the exact silent loss #299 is built to
+    end. Pin that the input is untouched."""
+    p = {"A": {"fields": {"availabilityInStock": _field(age_hours=48)}}}
+    before = copy.deepcopy(p)
+    ob.stale_fields(p, _NOW, _MAX_AGE_S)
+    assert p == before
 
 
 # ── #299 review C1 — a value queued WHILE the import is in flight must never ─ #
