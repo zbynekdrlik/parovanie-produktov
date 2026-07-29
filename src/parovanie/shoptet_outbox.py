@@ -296,28 +296,35 @@ def stale_fields(pending, now, max_age_s):
 
     Why this exists: only the moment a field is QUEUED had an age gate at all
     (the producer's own export-freshness check) — nothing re-checks it at
-    SEND time. `restock_skladom`/`stock_skladom` have no dedup and re-queue
-    their whole candidate list every day, so while the hourly drain is
-    disabled a "switch to Skladom" decision sits in the table, re-queued
-    fresh-looking every single day (`queue_fields`'s own C2 discipline keeps
-    `queued_at` at the FIRST time a value was queued, not the most recent
-    re-queue of the SAME value) — and once the drain comes back on it would
-    ship a week-old restock decision straight to the live eshop, long after
-    the product may have sold out again. An unparsable timestamp proves
-    NEITHER freshness NOR staleness, so it is refused exactly like a
-    provably-old one — the same fail-closed direction the supplier
-    write-back already takes for an untrustworthy catalogue export.
+    SEND time. A producer that genuinely STOPS re-affirming a value (crashes,
+    its own automation gets disabled, its data source dies) leaves that
+    value sitting in the table with an ever-older `queued_at`; without this
+    gate it would eventually reach the live eshop no matter how stale the
+    underlying decision had become. `queued_at` is the timestamp `queue_fields`
+    REFRESHES on every re-queue of the SAME value (#299 opravné kolo 2 review
+    N-C1 split it off `first_queued_at`, which stays frozen at the FIRST time
+    a value was queued instead) — so a field a producer keeps re-affirming
+    daily (`restock_skladom`/`stock_skladom` re-queue their whole candidate
+    list every day, dedup-free) never crosses this gate at all, even while
+    the hourly drain that would send it is disabled; only a field whose
+    producer genuinely stopped re-confirming it ages out here. An unparsable
+    timestamp proves NEITHER freshness NOR staleness, so it is refused
+    exactly like a provably-old one — the same fail-closed direction the
+    supplier write-back already takes for an untrustworthy catalogue export.
 
     A refused field is NEVER dropped from `pending` — the caller only leaves
     it out of `rows`/`sent_fields` this cycle. The table itself, `attempts`,
     and `queued_at` are untouched: the field goes right on waiting, and the
     producer's OWN next run queues a fresh decision (fresh `queued_at`,
-    `queue_fields`' C2 discipline) that sends normally.
+    `queue_fields`' N-C1 discipline) that sends normally.
 
-    `now` is a `datetime` (aware or naive — naive is read as UTC, the same
-    convention `_queue_stale_while_disabled_warning` in webreview/app.py
-    already uses for the SAME `queued_at` field, so the two readers can never
-    disagree about what "now" means). Pure logic: the caller supplies `now`,
+    `now` is a `datetime` (aware or naive — naive is read as UTC). NOT the
+    same convention `_queue_stale_while_disabled_warning` in webreview/app.py
+    reads its own alarm from: that alarm watches `first_queued_at` (the
+    FROZEN sibling this function does not touch), so a field this function
+    refuses to send can still sit silently past that OTHER alarm's own
+    threshold — the two are independent gates over independent timestamps,
+    not two readers of one field. Pure logic: the caller supplies `now`,
     never a bare `datetime.now()` call inside this module."""
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
