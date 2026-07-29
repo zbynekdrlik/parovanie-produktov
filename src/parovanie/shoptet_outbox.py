@@ -228,6 +228,37 @@ def settle(pending, success_codes, blocked, sent_fields, sent_credits, now=""):
     return out, credits
 
 
+def stale_unconfirmed(pending, min_attempts=24):
+    """Codes that have been queued for at least `min_attempts` CONSECUTIVE drain
+    runs without ever landing a fully clean confirmation, and are not already
+    `blocked` for a different, self-explaining reason (`not-in-catalog` already
+    has its own escape via `stale_blocked`).
+
+    #299 záverečná recenzia — Important I1 (bounded fallback) / the deferred
+    "attempts has no upper bound and no consumer" minor. The combined import
+    proves confirmation only from the Shoptet import LOG's `success_codes` (a
+    whole chunk cleanly accepted) — a chunk Shoptet PARTIALLY accepts never
+    reveals WHICH of its rows actually landed (`_import_rows_chunked`'s own
+    docstring), so every code sharing that chunk stays unconfirmed and keeps
+    re-riding the SAME chunk boundary (`sorted(pending)`, deterministic) hour
+    after hour, forever, together with whichever code is the real cause. The
+    caller excludes what this returns from the NEXT import's `rows` — so those
+    codes stop crowding a bad chunk with healthy ones, and the healthy 299 (or
+    however many) get to succeed in a chunk of their own. This is deliberately
+    NOT self-healing: once a code is reported here it stays excluded (and its
+    `attempts` keeps climbing) until a human resolves it — the same "loud and
+    bounded, not silent and infinite" trade-off `stale_blocked` already makes
+    for `not-in-catalog`.
+
+    Reads `attempts` (grows on EVERY unconfirmed run, blocked or not — see
+    `settle`), never `blocked_runs` (that already has its own consumer,
+    `stale_blocked`, and starts over at 0 the moment a code clears `blocked`).
+    A code with no `fields` left has nothing to hold back."""
+    return sorted(c for c, e in pending.items()
+                  if (e.get("fields") and not e.get("blocked")
+                      and int(e.get("attempts") or 0) >= min_attempts))
+
+
 def stale_blocked(pending, min_attempts=3):
     """Codes stuck blocked for at least `min_attempts` CONSECUTIVE runs — the
     silent-death guard for the table itself: a held-back row must never wait

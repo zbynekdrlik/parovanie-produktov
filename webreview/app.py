@@ -7290,6 +7290,36 @@ SECOND_SYNC_SKIP_WHEN_NOTHING_SENT = True
 # of "the database is reconciled right away" after an upload.
 SHOPTET_UPLOAD_SKIP_PRESYNC_FRESHER_THAN_S = 15 * 60
 
+# #299 záverečná recenzia I1 — how many CONSECUTIVE unconfirmed drain runs a
+# code may sit through before it is excluded from the combined import. The
+# combined import's own verdict pass (`_export_row_verdicts(rows_all,
+# note_col=None)`) can only ever prove a code ABSENT from the catalogue, never
+# CONFIRMED — there is no single column that means "landed" across a header
+# built from an arbitrary per-code field set — so a code inside a chunk that
+# Shoptet keeps PARTIALLY accepting (one bad row, Shoptet never says which)
+# never reaches `success_codes`, keeps riding the SAME chunk boundary
+# (`sorted(pending)` is deterministic) hour after hour, and holds every other
+# code in that chunk hostage right alongside it — up to IMPORT_CHUNK_ROWS (300)
+# rows stuck together, forever, over one row Shoptet will never accept. The
+# principled fix (re-verify the unconfirmed rows against a freshly re-
+# downloaded export, the way the pairings push already proves a row from the
+# eshop's own bytes) needs the drain's post-import download to run BEFORE
+# `settle`, not after, and a verdict pass generalized across an arbitrary
+# column set — a real restructure of the exact settle()/C1 path this same
+# review round just hardened. This bounded valve is the smaller, well-isolated
+# fix the review's own fallback asks for: reuse the ALREADY-tested `blocked`/
+# `stale_blocked` machinery (a stuck code becomes `blocked` with its own
+# reason, so it stops being SENT and stops sharing a chunk with fresh codes;
+# `stale_blocked` already reports and alarms on it after 3 more runs) instead
+# of inventing a second, parallel exclusion mechanism.
+# 24 consecutive HOURLY runs (this drain's own schedule) ≈ 24 h — long enough
+# that a transient blip (a lock timeout, an import genuinely busy this hour,
+# one bad Shoptet response) never trips it, short enough that a genuinely
+# stuck code surfaces well within the working day it started blocking others.
+# Deliberately NOT self-healing once tripped (same trade-off `stale_blocked`
+# already makes for `not-in-catalog`): a human has to look at it.
+STALE_UNCONFIRMED_MIN_ATTEMPTS = 24
+
 # #299 Task 11 — the fixed list of automation keys that feed `pending_shoptet.json`
 # (Task 10's migration: every one of them only QUEUES now, see `run_shoptet_upload`'s
 # own docstring). Used by `_stale_producer_warnings`/`_disabled_producer_names`
@@ -7515,6 +7545,7 @@ def run_shoptet_upload() -> dict:
         if not got:
             return {"ok": False, "error": "cyklus už beží", "queued": 0, "sent": 0,
                     "confirmed": 0, "blocked": 0, "stale_blocked": [],
+                    "stuck_unconfirmed": [],
                     "resynced": 0,
                     "skipped_second_sync": True, "unconfirmed": 0,
                     "degraded": False, "warnings": [],
@@ -7543,8 +7574,17 @@ def run_shoptet_upload() -> dict:
         verdicts = _export_row_verdicts(rows_all, note_col=None) if rows_all else \
             {"confirmed": set(), "absent": set()}
         absent = verdicts["absent"]
-        rows = [r for r in rows_all if r[0] not in absent]
+        # #299 záverečná recenzia I1 — a code stuck unconfirmed (never explicitly
+        # blocked) for STALE_UNCONFIRMED_MIN_ATTEMPTS consecutive runs is excluded
+        # from THIS send too, same as an absent one: it stops sharing a chunk with
+        # fresh codes, so the chunk it used to poison can finally go clean. See
+        # `shoptet_outbox.stale_unconfirmed`'s docstring for why.
+        stuck = set(shoptet_outbox.stale_unconfirmed(
+            pending, min_attempts=STALE_UNCONFIRMED_MIN_ATTEMPTS))
+        rows = [r for r in rows_all if r[0] not in absent and r[0] not in stuck]
         blocked = {c: "not-in-catalog" for c in sorted(pending) if c in absent}
+        blocked.update({c: "stuck-unconfirmed" for c in sorted(pending)
+                        if c in stuck and c not in blocked})
         # What THIS import is about to put on the wire, per code+column — the
         # snapshot `settle` compares against later, never `pending` itself (C1).
         cols = header.split(";")[len(shoptet_outbox.KEY_COLUMNS):]
@@ -7621,10 +7661,32 @@ def run_shoptet_upload() -> dict:
         if stale:
             log.error("sync do Shoptetu: %d kódov je zablokovaných 3 a viac behov "
                       "(eshop ich v katalógu nemá): %s", len(stale), stale[:10])
+        if stuck:
+            log.error("sync do Shoptetu: %d kódov je %d a viac behov po sebe "
+                      "nepotvrdených (nie preto, že ich eshop nepozná) — od tohto "
+                      "behu sa neposielajú, aby nedržali ostatné riadky v tej "
+                      "istej dávke: %s", len(stuck), STALE_UNCONFIRMED_MIN_ATTEMPTS,
+                      sorted(stuck)[:10])
+        # #299 záverečná recenzia I2 — a manager reading `error` could not tell
+        # „Shoptet login/auth genuinely failed" from „the eshop just rejected a
+        # couple of variants" from „a chunk timed out and we could not even read
+        # its own answer" — every one of those collapsed into the SAME generic
+        # sentence. `_chunk_error_msg` already exists to translate `res` into a
+        # human sentence for every OTHER write path (pairings/externalcode/
+        # restock/stock/raw n8n import); the drain simply never called it. Only
+        # when `res` itself is not fully clean (a real chunk failure or a
+        # partially-rejected one) does it have anything useful to say — a run
+        # whose only problem is stale/stuck-blocked codes (res is None or fully
+        # clean) keeps its own sentence, since `_chunk_error_msg` has nothing to
+        # add for those (their detail is already in `warnings` above).
         error = ""
         if not ok:
-            error = "iný import práve beží" if import_busy else \
-                "nepotvrdené alebo zablokované riadky"
+            if import_busy:
+                error = "iný import práve beží"
+            elif res is not None and (not res["ok"] or res["partial"]):
+                error = _chunk_error_msg(res, sent)
+            else:
+                error = "zablokované alebo dlho nepotvrdené riadky — pozri varovania"
 
         # #299 Task 11 — say out loud what this run could not do, even the parts
         # that never turn `ok` False (a producer's dead source, a second download
@@ -7642,13 +7704,17 @@ def run_shoptet_upload() -> dict:
         if stale:
             warnings.append(f"{len(stale)} kódov čaká zablokovaných 3 a viac behov — "
                             f"eshop ich v katalógu nemá.")
+        if stuck:
+            warnings.append(
+                f"{len(stuck)} kódov je {STALE_UNCONFIRMED_MIN_ATTEMPTS}+ behov po sebe "
+                f"nepotvrdených — od tohto behu sa neposielajú, treba ich vyriešiť ručne.")
         warnings.extend(_stale_producer_warnings())
         if skipped and sent:
             warnings.append("Druhé stiahnutie sa preskočilo, hoci sa niečo posielalo.")
         degraded = bool(warnings)
         return {"ok": ok, "queued": len(pending), "sent": sent,
                 "confirmed": confirmed, "blocked": len(blocked),
-                "stale_blocked": stale,
+                "stale_blocked": stale, "stuck_unconfirmed": sorted(stuck),
                 "resynced": resynced, "skipped_second_sync": skipped,
                 "unconfirmed": unconfirmed, "error": error,
                 "degraded": degraded, "warnings": warnings,
