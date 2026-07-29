@@ -6378,7 +6378,16 @@ def _do_upload_suppliers(dry):
         # run (Task 8's C1 lesson: crediting anything else means the same
         # assignment re-queues forever and total_uploaded never moves).
         credit_value={r[0]: r[2] for r in rows})
-    result = {"ok": True, "queued": queued, "count": queued, "would_queue": 0,
+    # #299 záverečná recenzia (Minor) — `queued` is a FIELD count (what
+    # `queue_shoptet_fields` returns); `_supplier_summary`'s `total_assigned` /
+    # `total_uploaded` / `remaining` are CODE counts. Today the supplier write
+    # queues exactly one column per row (`supplier`), so the two happen to be
+    # numerically equal — but `count` is meant to answer "how many CODES did
+    # this run queue", the same question the summary's other numbers answer,
+    # so it is built from `len(rows)` (codes) explicitly rather than riding on
+    # a coincidence that a future second column on this write would break
+    # silently. `queued` itself keeps meaning "field values", unchanged.
+    result = {"ok": True, "queued": queued, "count": len(rows), "would_queue": 0,
               "dry_run": False, "products": products,
               "obsolete_removed": obsolete_removed, "obsolete_held": obsolete_held,
               **_missing_report(missing_codes, assigns),
@@ -7671,7 +7680,16 @@ def run_shoptet_upload() -> dict:
                 finally:
                     _import_lock.release()
         success = set(res["success_codes"]) if res else set()
-        now = datetime.now().isoformat(timespec="seconds")
+        # #299 záverečná recenzia (Minor) — `queue_fields` stamps `queued_at` with
+        # a TIMEZONE-AWARE local time (`datetime.now(timezone.utc).astimezone()`);
+        # this `now` (stored as a blocked field's `since`) was a NAIVE local time.
+        # `since` has no reader today, so the mismatch is currently harmless, but
+        # the moment something DOES compare the two (exactly the trap this
+        # codebase's own playbook warns about repeatedly — store-prune.md §1c),
+        # a naive-vs-aware `datetime` comparison raises `TypeError` outright.
+        # Same construction as `queue_fields`'s own `now`, so every timestamp this
+        # table ever stores means the same thing.
+        now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         with _lock:
             fresh = _load_pending()
             settled, credits = shoptet_outbox.settle(fresh, success, blocked,
@@ -9652,12 +9670,25 @@ def _start_scheduler() -> bool:
 
 
 # #299 — the whole download → let the automations queue changes → one upload →
-# download-again cycle holds ONE claim, so a standalone hourly download cannot land
-# in the middle of it and hand the drain a catalogue that changed under its feet.
+# download-again cycle holds ONE claim, so a SECOND `run_shoptet_upload` cannot
+# start while one is already running (`test_the_cycle_refuses_to_run_twice_at_once`).
 # Same flock shape as SCHEDULER_CLAIM above — but that one is held for the whole
 # process lifetime, while THIS claim must be released the moment the cycle ends
 # (success or exception), so the next hourly run can take it. Hence the context
 # manager, not a boot-time `_claim_*() -> bool` function.
+#
+# #299 záverečná recenzia (Minor) — this comment used to ALSO claim that "a
+# standalone hourly download cannot land in the middle of it", which is NOT
+# true: `run_shoptet_sync` (the separate catalog-download automation) never
+# takes THIS claim at all — grep `_shoptet_cycle_claim()` and it has exactly
+# ONE caller, `run_shoptet_upload` itself. Nothing stops `run_shoptet_sync`'s
+# own independent hourly tick from running concurrently with a drain cycle;
+# `run_shoptet_upload` merely calls `RUNNER.run_sync("shoptet_sync")` itself
+# (pre- and post-import) as its OWN download steps, which is what the docstring
+# above actually protects — a THIRD, unrelated `shoptet_sync` tick overlapping
+# is a real possibility this claim does nothing about. Left as a documentation
+# fix only (Minor, not a data-safety bug) — a stray extra catalogue refresh is
+# harmless idempotent re-work, never a corrupting race.
 CYCLE_CLAIM = _store(".shoptet_cycle.lock")
 
 
