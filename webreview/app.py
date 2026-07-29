@@ -7724,9 +7724,26 @@ def run_shoptet_upload() -> dict:
             settled, credits = shoptet_outbox.settle(fresh, success, blocked,
                                                       sent_fields, sent_credits,
                                                       now=now)
+            # #299 opravné kolo 2 review N-I2 (Important) — credit MUST land
+            # BEFORE the queue is drained, and BOTH writes must happen under
+            # the SAME lock acquisition (`_lock` is deliberately re-entrant —
+            # see its own docstring — so `_credit_producer`'s own internal
+            # `with _lock:` nests safely here). The two used to run in the
+            # OPPOSITE order and OUTSIDE this block: a failure between them
+            # (or the process dying right there) left a code gone from
+            # `pending_shoptet.json` (the queue already drained) AND missing
+            # from `uploaded_*.json` (the credit never landed) — and BOTH
+            # arms of the anti-clobber guard (#215 in `_do_upload_suppliers`,
+            # N-C2 above) read that as "nobody ever wrote this", deleting the
+            # manager's live assignment. Credit-first means a failure here
+            # simply raises out of this whole cycle — same as a genuinely
+            # corrupt pending table already does (see the M2 note above) —
+            # with `pending_shoptet.json` UNTOUCHED: the code stays queued
+            # and goes out again next hour, never vanishing from both places
+            # at once.
+            for store, entries in credits.items():
+                _credit_producer(store, entries)
             _save_pending(settled, prev=fresh)
-        for store, entries in credits.items():
-            _credit_producer(store, entries)
 
         sent, confirmed = len(rows), len(success)
         unconfirmed = sent - confirmed
