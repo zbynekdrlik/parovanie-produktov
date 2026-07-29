@@ -6,6 +6,8 @@ never run here). The card reads `/api/pending-shoptet` (read-only over
 `pending_shoptet.json`) to say what the next hourly upload will send and what it
 is holding back.
 """
+import json
+
 from playwright.sync_api import expect
 
 
@@ -41,13 +43,41 @@ def test_the_card_sits_in_the_System_folder_under_the_download_sync(shoptet_uplo
 
 def test_the_card_names_how_many_changes_are_waiting_and_which_are_blocked(
         shoptet_upload_server, page):
+    """#299 opravné kolo 3 (1, Important) — the blocked banner used to print „eshop
+    tento kód v katalógu nemá" for EVERY blocked field, no matter what
+    `/api/pending-shoptet`'s own per-field `reason` actually said (the seeded fixture
+    only ever carries `not-in-catalog`, so that bug never showed up here before).
+    Stubs a SECOND blocked field with `stale-field` alongside the first's
+    `not-in-catalog` — the two reasons must render two DIFFERENT sentences. A
+    reversion to the old hard-coded text would still show „Zablokované: 2" and the
+    catalogue sentence, but never the stale-field one, so it fails the second
+    assertion below."""
+    page.route("**/api/pending-shoptet", lambda route: route.fulfill(
+        content_type="application/json",
+        body=json.dumps({
+            "pending": [
+                {"code": "TESTUP1", "field": "internalNote", "value": "a",
+                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00"},
+                {"code": "TESTUP2", "field": "internalNote", "value": "b",
+                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00"},
+            ],
+            "blocked": [
+                {"code": "TESTUP3", "field": "internalNote", "value": "c",
+                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00",
+                 "reason": "not-in-catalog"},
+                {"code": "TESTUP4", "field": "internalNote", "value": "d",
+                 "source": "test", "queued_at": "2026-07-29T00:00:00+02:00",
+                 "reason": "stale-field"},
+            ],
+        })))
     page.goto(shoptet_upload_server)
     page.locator("#systemTabs .tlabel", has_text="Sync do Shoptetu").click()
     expect(page.locator('[data-testid="pending-count"]')).to_have_text(
         "Čaká na nahratie: 2 zmeny", timeout=15000)
     blocked = page.locator('[data-testid="pending-blocked"]')
-    expect(blocked).to_contain_text("Zablokované: 1")
+    expect(blocked).to_contain_text("Zablokované: 2")
     expect(blocked).to_contain_text("eshop tento kód v katalógu nemá")
+    expect(blocked).to_contain_text("staršie, než je povolený limit")
 
 
 def test_the_console_stays_clean(shoptet_upload_server, page):
