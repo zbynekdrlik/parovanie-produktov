@@ -6231,7 +6231,30 @@ def _do_upload_suppliers(dry):
     #   * never on a DRY run, in-place `pop` under one `with _lock:`, no write at all when
     #     there is nothing to remove, and the concrete codes AND the values dropped go into
     #     the log — a count alone defends nothing three weeks later.
-    obsolete = sorted(set(new_codes) & own_supplier & export_codes - set(uploaded))
+    #   * …and NEVER on a code that is CURRENTLY QUEUED for its supplier value
+    #     (#299 záverečná recenzia, Critical C1). Since the #299 migration, credit
+    #     for this table lands only AFTER the hourly drain's own import CONFIRMS the
+    #     row (store-prune.md §6 — the whole reason that migration exists), so there
+    #     is a real window where a code is genuinely being written right now and
+    #     `uploaded_suppliers.json` legitimately does not know it yet — `c not in
+    #     uploaded` reads exactly like „nobody ever wrote this" even though WE are
+    #     the ones writing it. Without this exclusion: the drain sends the row,
+    #     Shoptet accepts it, but the chunk comes back partial (or this code alone
+    #     is `dirty`) — so it never reaches `success_codes`, `uploaded_suppliers.
+    #     json` is never updated, and the NEXT nightly `parovania_eshop` sees the
+    #     code as „new" while the export already shows the eshop's own supplier —
+    #     the one we JUST wrote. `c not in uploaded` then fires and the manager's
+    #     assignment is deleted from `supplier_assignments.json`, while the row is
+    #     STILL sitting in the queue and STILL going out to the live eshop every
+    #     hour, with a value the manager can no longer see or change anywhere in
+    #     this app. „Zaradené, ešte nepotvrdené" therefore counts as „we are the one
+    #     writing this", never as „nobody wrote this" — the same distinction
+    #     `shoptet_outbox.settle` itself keeps: a queued field never leaves the
+    #     table until the drain proves it landed.
+    queued_supplier_codes = {c for c, e in _load_pending().items()
+                             if "supplier" in (e.get("fields") or {})}
+    obsolete = sorted(set(new_codes) & own_supplier & export_codes
+                      - set(uploaded) - queued_supplier_codes)
     obsolete_removed, obsolete_held = [], []
     if obsolete and not uploaded_on_disk:
         # Fail-CLOSED and LOUD (automation-health §3): a permanent hold that nobody can
