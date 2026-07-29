@@ -6265,8 +6265,17 @@ def _do_upload_suppliers(dry):
     #     (store-prune §1: absence of a routinely-written store, before its
     #     first write, is not evidence of anything hidden). Only a file that
     #     genuinely IS there but cannot be trusted refuses the removal below.
+    # #299 hĺbková recenzia (9) — capture `os.path.exists` BEFORE the read, not
+    # after: testing it afterwards leaves a window where a concurrent FIRST
+    # write (nothing there yet -> a fresh `pending_shoptet.json`) between the
+    # read and the exists-check would make an exists-check taken *later* see a
+    # file the read itself never actually saw. Capturing existence first keeps
+    # both readings anchored to the SAME moment; a file that appears only after
+    # that moment is picked up by the read itself (`pending_from_disk=True`,
+    # which already short-circuits the `or` below).
+    pending_existed = os.path.exists(PENDING_SHOPTET)
     pending_state, pending_from_disk = _read_json_store_state(PENDING_SHOPTET, {})
-    pending_trustworthy = pending_from_disk or not os.path.exists(PENDING_SHOPTET)
+    pending_trustworthy = pending_from_disk or not pending_existed
     queued_supplier_codes = {c for c, e in pending_state.items()
                              if "supplier" in (e.get("fields") or {})}
     obsolete = sorted(set(new_codes) & own_supplier & export_codes
