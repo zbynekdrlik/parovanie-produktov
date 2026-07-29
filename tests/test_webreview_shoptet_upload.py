@@ -748,6 +748,25 @@ def test_a_disabled_cycles_stale_alarm_survives_repeated_same_value_requeues_end
     assert w != "", "a re-queue of the SAME value must not silence the alarm"
 
 
+# ── #299 opravné kolo 2 review N-C1 (Critical) — C2's `queued_at` (frozen on ── #
+# ── a same-value re-queue) and I5's need for a timestamp that DOES refresh ─── #
+# ── on a same-value re-queue contradicted each other on one field. Split ───── #
+# ── into `first_queued_at` (frozen, feeds THIS alarm) and `queued_at` ──────── #
+# ── (refreshed every call, feeds `stale_fields`). This alarm must read the ── #
+# ── frozen one — reading the refreshed one would silence it on every ──────── #
+# ── producer tick, the very C2 regression this alarm exists to catch. ──────── #
+def test_queue_stale_warning_reads_first_queued_at_not_the_refreshed_queued_at(pend):
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S + 60)
+           ).isoformat(timespec="seconds")
+    fresh = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    pend.write_text(json.dumps({"A": {"fields": {"internalNote": {
+        "value": "u", "source": "s", "first_queued_at": old,
+        "queued_at": fresh}}}}), encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w != "", "must read first_queued_at, not the freshly refreshed queued_at"
+
+
 def test_api_automations_surfaces_the_stale_warning_for_shoptet_upload(pend, automations_iso):
     """The end-to-end wiring the sidebar badge + card actually depend on:
     `/api/automations` must carry `queue_stale_warning` on the `shoptet_upload`

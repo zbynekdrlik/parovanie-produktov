@@ -74,11 +74,18 @@ def test_a_second_source_adds_its_own_field_to_the_same_code():
     assert p["A"]["fields"]["availabilityInStock"]["source"] == "restock_skladom"
 
 
-# ── #299 opravné kolo 1 review C2 (Critical) — `queued_at` is the time a ────── #
-# ── field's CURRENT value was FIRST queued, never the time of the LATEST ───── #
-# ── call that happened to queue the same value again (same discipline as ──── #
-# ── settle()'s own `blocked.since`, further down this file). ───────────────── #
-def test_requeueing_the_SAME_value_keeps_the_ORIGINAL_queued_at():
+# ── #299 opravné kolo 1 review C2 (Critical), adapted by opravné kolo 2 ────── #
+# ── review N-C1 (per this project's own `toorder-e2e.md` §6: a foreign test ── #
+# ── pinning semantics a later, DELIBERATE design change supersedes gets ────── #
+# ── fixed in its own note, never silently weakened). `queued_at` used to be ── #
+# ── the ONE timestamp C2 pinned frozen on a same-value re-queue; N-C1 split ── #
+# ── that job onto a NEW `first_queued_at` field (still frozen — the assertions
+# ── below now check IT), while `queued_at` itself is DELIBERATELY refreshed ── #
+# ── on every re-queue, even a same-value one — see the dedicated N-C1 tests ── #
+# ── above for why (I5's send-time age gate needs it to keep moving, or a ───── #
+# ── daily-re-queued field is held back forever the moment it once crosses ─── #
+# ── the age limit). ─────────────────────────────────────────────────────────  #
+def test_requeueing_the_SAME_value_keeps_the_ORIGINAL_first_queued_at():
     p, _ = ob.queue_fields({}, source="parovania_eshop",
                            header="code;pairCode;internalNote",
                            rows=[["A", "P", "https://x"]], now="T1")
