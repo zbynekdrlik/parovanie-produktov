@@ -204,6 +204,18 @@ def test_a_hard_chunk_failure_reports_the_REAL_reason_not_a_generic_sentence(
     assert res["error"] != "nepotvrdené alebo zablokované riadky", res["error"]
 
 
+# ── #299 záverečná recenzia I3 — restock_skladom/stock_skladom are the FIRST ── #
+# ── two producers a manager enables in the rollout order, so their card text ── #
+# ── is the first thing he reads; it must never promise an eshop write that ─── #
+# ── this migration turned into a queue instead. ─────────────────────────────  #
+def test_restock_and_stock_skladom_descriptions_promise_queueing_not_a_write():
+    for key in ("restock_skladom", "stock_skladom"):
+        text = webapp.AUTOMATION_DESCRIPTIONS[key]
+        assert "rovno" not in text, (key, text)
+        assert "spoločnej tabuľky čakajúcich zmien" in text, (key, text)
+        assert "Sync do Shoptetu" in text, (key, text)
+
+
 # ── #299 opravné kolo 1 review C1 (Critical) — replaces the deleted queue-based ─
 # ── streak signal ("3 hourly cycles with 0 fields of its own queued"), which ── #
 # ── fired on EVERY healthy install: these producers run DAILY, this drain runs ─
