@@ -191,15 +191,23 @@ def test_unconfirmed_rows_make_the_run_degraded_with_a_slovak_warning(cycle, mon
 def _fake_status(overrides):
     """A `RUNNER.status()`-shaped list built from the REAL registered automations
     (so names/keys always match production), with `enabled`/`last_run`/
-    `last_result` overridden per key. Every other field is a harmless default —
-    `_stale_producer_warnings`/`_disabled_producer_names` never read them."""
+    `last_result`/`next_run` overridden per key. Every other field is a
+    harmless default — `_stale_producer_warnings`/`_disabled_producer_names`
+    never read them.
+
+    #299 opravné kolo 2 review N1 — `next_run` used to be hard-coded to `""`
+    here regardless of `enabled`, which is NOT what the real `AutomationRunner.
+    status()` returns (it persists `next_run` the moment `set_enabled(True)`
+    runs) — every test below that cares about the grace window must be able
+    to set it explicitly."""
     out = []
     for key, a in webapp.RUNNER.automations.items():
         ov = overrides.get(key, {})
         out.append({"key": key, "name": a.name, "enabled": ov.get("enabled", False),
                     "running": False, "last_run": ov.get("last_run", ""),
                     "last_status": ov.get("last_status", ""), "last_error": "",
-                    "last_result": ov.get("last_result", {}), "next_run": ""})
+                    "last_result": ov.get("last_result", {}),
+                    "next_run": ov.get("next_run", "")})
     return out
 
 
@@ -241,8 +249,77 @@ def test_an_enabled_producer_well_within_its_schedule_is_not_reported(cycle, mon
 
 
 def test_an_enabled_producer_that_has_never_run_is_reported(cycle, monkeypatch):
+    """#299 opravné kolo 2 review N1 — `next_run` must have genuinely passed
+    ITS OWN grace threshold too, not just be in the past: 50h (24h daily
+    schedule × 2 = 48h threshold, plus 2h margin) since the scheduled first
+    run, still never having run."""
+    stale_next_run = (datetime.now(timezone.utc)
+                      - timedelta(hours=24 * webapp.PRODUCER_STALE_RUN_MULTIPLIER + 2)
+                      ).isoformat(timespec="seconds")
     monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
-        {"grube_externalcode": {"enabled": True, "last_run": ""}}))
+        {"grube_externalcode": {"enabled": True, "last_run": "",
+                                 "next_run": stale_next_run}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is True
+    assert any("GRUBE" in w and "ešte ani raz nebežala" in w for w in res["warnings"]), (
+        res["warnings"])
+
+
+# ── #299 opravné kolo 2 review N1 (Important) — a freshly ENABLED producer ─── #
+# ── must not warn the instant it appears here: a daily producer's first run ── #
+# ── is up to ~24h away, and the OLD "empty last_run = warn immediately" rule ─ #
+# ── lit the card red for a whole day right after the manager did the ──────── #
+# ── correct thing (clicked ▶ Štart) — precisely the moment this rollout plan ─
+# ── has him watching it. `AutomationRunner.set_enabled` persists `next_run` ── #
+# ── at the moment of enabling; the fix stays silent until next_run PLUS the ── #
+# ── SAME staleness threshold has genuinely passed. ─────────────────────────── #
+def test_an_enabled_producer_that_has_never_run_and_whose_next_run_is_still_ahead_is_silent(
+        cycle, monkeypatch):
+    """The exact deploy-day scenario: enabled moments ago, next scheduled run
+    still ~20h away (well within a daily schedule's window) — must not warn
+    or degrade the cycle at all."""
+    soon = (datetime.now(timezone.utc) + timedelta(hours=20)).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"grube_externalcode": {"enabled": True, "last_run": "", "next_run": soon}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is False
+    assert res["warnings"] == []
+
+
+def test_an_enabled_producer_that_has_never_run_stays_silent_until_grace_past_next_run(
+        cycle, monkeypatch):
+    """`next_run` itself already passed (the scheduled first run came and
+    went) but the EXTRA grace threshold on top of it has not — still silent,
+    proving the grace is `next_run + threshold`, not just `next_run` alone."""
+    just_past_next_run = (datetime.now(timezone.utc) - timedelta(hours=10)
+                          ).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"grube_externalcode": {"enabled": True, "last_run": "",
+                                 "next_run": just_past_next_run}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is False
+    assert res["warnings"] == []
+
+
+def test_an_enabled_producer_that_has_never_run_with_no_next_run_fires_immediately(
+        cycle, monkeypatch):
+    """A hand-edited state file could set `enabled: true` without ever going
+    through `set_enabled` (which always persists `next_run`) — with nothing
+    here to grant grace against, this falls back to the pre-N1 immediate
+    warning (fail-safe direction), never a silent indefinite wait."""
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"grube_externalcode": {"enabled": True, "last_run": ""}}))   # next_run defaults ""
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is True
+    assert any("GRUBE" in w and "ešte ani raz nebežala" in w for w in res["warnings"]), (
+        res["warnings"])
+
+
+def test_an_enabled_producer_that_has_never_run_with_an_unparsable_next_run_fires_immediately(
+        cycle, monkeypatch):
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"grube_externalcode": {"enabled": True, "last_run": "",
+                                 "next_run": "not-a-date"}}))
     res = webapp.run_shoptet_upload()
     assert res["degraded"] is True
     assert any("GRUBE" in w and "ešte ani raz nebežala" in w for w in res["warnings"]), (
@@ -256,6 +333,31 @@ def test_an_enabled_producer_with_an_unparsable_last_run_is_reported_loud(
     res = webapp.run_shoptet_upload()
     assert res["degraded"] is True
     assert any("nečitateľný" in w for w in res["warnings"]), res["warnings"]
+
+
+# ── #299 opravné kolo 2 review N2 (Minor) — pins the ABSOLUTE 48h threshold ── #
+# ── (24h daily schedule × PRODUCER_STALE_RUN_MULTIPLIER=2) so a mutation of ── #
+# ── the constant itself (e.g. →1000, "alarm dead for 1000 days") is caught: ── #
+# ── `test_an_enabled_producer_stale_past_its_own_schedule_is_reported` above ─ #
+# ── derives its age FROM the constant, so it moves in lockstep with any ────── #
+# ── mutation of it and never actually pins an alarm-worthy VALUE — the exact ─ #
+# ── shape of test that let PRODUCER_STALE_RUN_MULTIPLIER=1000 leave 159 ────── #
+# ── tests green. ────────────────────────────────────────────────────────────── #
+def test_a_stale_producer_alarm_fires_past_48h_and_stays_silent_at_47h(cycle, monkeypatch):
+    just_under = (datetime.now(timezone.utc) - timedelta(hours=47)
+                 ).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"parovania_eshop": {"enabled": True, "last_run": just_under}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is False, res["warnings"]
+
+    just_over = (datetime.now(timezone.utc) - timedelta(hours=49)
+                ).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"parovania_eshop": {"enabled": True, "last_run": just_over}}))
+    res = webapp.run_shoptet_upload()
+    assert res["degraded"] is True
+    assert any("Párovania" in w for w in res["warnings"]), res["warnings"]
 
 
 def test_a_disabled_producer_is_its_own_category_never_a_warning(cycle, monkeypatch):
@@ -276,11 +378,29 @@ def test_a_renamed_or_removed_producer_key_never_crashes_the_cycle(cycle, monkey
     `RUNNER.automations[k].name` over a hard-coded key list and would raise
     `KeyError` the moment a producer key was renamed/removed. The replacement
     reads names straight off `RUNNER.status()` and simply skips a key that is
-    no longer a registered automation."""
+    no longer a registered automation.
+
+    #299 opravné kolo 2 review N6 — the ORIGINAL version of this test left
+    EVERY producer disabled (the `cycle` fixture's fresh, isolated
+    `automations.json` default), so the loop body PAST the `enabled` guard —
+    where m5's actual fix lives (`automation = RUNNER.automations.get(key)`,
+    `name = s.get("name") or key`, the `last_run` parse) — never executed for
+    ANY key, real or phantom; the cycle finished before it got anywhere near
+    a name. The test therefore passed against a hypothetical regression back
+    to unguarded `RUNNER.automations[key]` indexing inside that body just as
+    readily as against the real fix. This now ALSO enables a real producer
+    with a fresh `last_run`, so the loop genuinely walks that body — reads
+    its `automation`, resolves its `name`, parses its `last_run` — for one
+    real key while the renamed/removed key sits right next to it in
+    `PRODUCER_QUEUE_KEYS`."""
     monkeypatch.setattr(webapp, "PRODUCER_QUEUE_KEYS",
                         webapp.PRODUCER_QUEUE_KEYS + ("no_longer_exists",))
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    monkeypatch.setattr(webapp.RUNNER, "status", lambda: _fake_status(
+        {"parovania_eshop": {"enabled": True, "last_run": now_iso}}))
     res = webapp.run_shoptet_upload()          # must not raise
     assert res["ok"] is True
+    assert res["degraded"] is False, res["warnings"]   # the real producer is healthy
 
 
 # ── #299 Task 11 — the NAJDÔLEŽITEJŠIA POŽIADAVKA: the hourly cycle deploys ─── #
@@ -371,6 +491,69 @@ def test_queue_stale_warning_a_missing_timestamp_fires_loud_not_silent(pend):
         "value": "u", "source": "parovania_eshop"}}}}), encoding="utf-8")   # no queued_at at all
     w = webapp._queue_stale_while_disabled_warning(enabled=False)
     assert w != "" and "čitateľný čas zaradenia" in w, w
+
+
+# ── #299 opravné kolo 2 review N3 (Minor) — valid JSON, but a SHAPE this ────── #
+# ── code never wrote: before this fix each of these raised straight out of ─── #
+# ── `.get()`/`.values()` (AttributeError/TypeError, never `ValueError`, so ─── #
+# ── `except ValueError` never caught them) — uncaught, `/api/automations` ──── #
+# ── returned 500 and EVERY automation card vanished from the manager's ─────── #
+# ── screen, not just this one. Must degrade to a loud warning instead. ─────── #
+def test_queue_stale_warning_an_entry_that_is_not_a_dict_fires_loud_not_crashes(pend):
+    pend.write_text(json.dumps({"A": "x"}), encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)   # must not raise
+    assert w != "" and "poškoden" in w, w
+
+
+def test_queue_stale_warning_a_fields_that_is_a_list_fires_loud_not_crashes(pend):
+    pend.write_text(json.dumps({"A": {"fields": ["x"]}}), encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)   # must not raise
+    assert w != "" and "poškoden" in w, w
+
+
+def test_queue_stale_warning_a_field_entry_that_is_not_a_dict_fires_loud_not_crashes(pend):
+    pend.write_text(json.dumps({"A": {"fields": {"n": "x"}}}), encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)   # must not raise
+    assert w != "" and "poškoden" in w, w
+
+
+def test_queue_stale_warning_a_numeric_queued_at_fires_loud_not_crashes(pend):
+    """`datetime.fromisoformat(12345)` raises `TypeError`, not `ValueError` —
+    the old `except ValueError` let it straight through."""
+    pend.write_text(json.dumps({"A": {"fields": {"internalNote": {
+        "value": "u", "source": "s", "queued_at": 12345}}}}), encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)   # must not raise
+    assert w != "" and "poškoden" in w, w
+
+
+# ── #299 opravné kolo 2 review N4 (Minor) — a `queued_at` in the FUTURE (a ─── #
+# ── clock step, an NTP jump, a hand-edited value) gives a NEGATIVE age; every ─
+# ── comparison below is against a POSITIVE threshold, so a negative age read ── #
+# ── as "very fresh" and, as the ONLY field in the table, silenced the alarm ── #
+# ── entirely — the one remaining branch that stayed quiet on data this ─────── #
+# ── function cannot trust. ──────────────────────────────────────────────────── #
+def test_queue_stale_warning_a_future_queued_at_fires_loud_not_silent(pend):
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(timespec="seconds")
+    _queue_one_field(pend, future)
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w != "", "a queued_at in the future must never read as fine"
+
+
+def test_queue_stale_warning_a_future_queued_at_does_not_hide_a_genuinely_stale_one(pend):
+    """The future-dated field must not silently WIN against a genuinely stale
+    one either — both must be treated as untrustworthy, loud."""
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=webapp.QUEUE_STALE_WHILE_DISABLED_AFTER_S + 60)
+           ).isoformat(timespec="seconds")
+    future = (datetime.now(timezone.utc) + timedelta(hours=5)).isoformat(timespec="seconds")
+    pend.write_text(json.dumps({
+        "A": {"fields": {"internalNote": {
+            "value": "u", "source": "s", "queued_at": old}}},
+        "B": {"fields": {"internalNote": {
+            "value": "u", "source": "s", "queued_at": future}}},
+    }), encoding="utf-8")
+    w = webapp._queue_stale_while_disabled_warning(enabled=False)
+    assert w != "", w
 
 
 # ── #299 opravné kolo 1 review m1 (Minor) — min() over ISO STRINGS is ───────── #

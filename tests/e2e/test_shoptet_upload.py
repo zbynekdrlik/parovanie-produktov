@@ -183,16 +183,20 @@ def test_run_warnings_render_as_their_own_banner_and_light_the_badge(
                        blocked: 0, stale_blocked: [], resynced: 1,
                        skipped_second_sync: true, unconfirmed: 0,
                        degraded: true,
-                       warnings: ['Automatizácie, ktoré majú zásobovať frontu, '
-                                  + 'nezaradili 3 hodinové behy po sebe nič: '
-                                  + 'GRUBE kódy → eshop — over, či sú zapnuté '
-                                  + 'a či im nezlyhal zdroj dát.']};
+                       // #299 opravné kolo 2 review N5 — the old empty-queue-streak
+                       // signal this text quoted ("nezaradili 3 hodinové behy po
+                       // sebe nič") was removed in opravné kolo 1 (review C1); the
+                       // server can no longer produce that sentence. This is the
+                       // ACTUAL shape `_stale_producer_warnings()` writes today.
+                       warnings: ['Automatizácia GRUBE kódy → eshop je zapnutá, '
+                                  + 'ale nebežala už 50 h — over, či jej nezlyhal '
+                                  + 'zdroj dát alebo plánovač.']};
       renderTabs();
       renderShoptetUpload();
     }""")
 
     warn = page.locator('[data-testid="shoptet-upload-warning"]')
-    expect_text = "nezaradili 3 hodinové behy"
+    expect_text = "nebežala už 50 h"
     assert expect_text in warn.inner_text(), warn.inner_text()
     # `degraded: true` lights the badge even though `ok: true` — the whole
     # point of the widened predicate in navError().
