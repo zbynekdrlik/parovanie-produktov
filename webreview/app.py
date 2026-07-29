@@ -7317,11 +7317,29 @@ def _stale_producer_warnings() -> list[str]:
         also means there is no dict lookup left here that CAN raise `KeyError`).
 
     Loud (a warning, in the fail-safe direction) for an ENABLED producer that:
-      * has NEVER run at all (`last_run` empty) — immediately suspicious, since
-        being enabled at all means a manager acted on it;
+      * has NEVER run at all (`last_run` empty) AND its `next_run` (plus this
+        SAME threshold, as extra grace) has genuinely passed — see the N1 note
+        below for why "immediately" was wrong;
       * carries an unparsable `last_run` — same "loud, never silently fine"
         direction the disabled-cycle alarm takes for a bad `queued_at` (I2);
-      * has a parsable `last_run` older than its threshold."""
+      * has a parsable `last_run` older than its threshold.
+
+    #299 opravné kolo 2 review N1 (Important) — a freshly ENABLED producer
+    used to warn the INSTANT it appeared here, because `last_run` is
+    genuinely empty until its first run — and a daily producer's first run is
+    up to ~24h away, so the card read red for a whole day after the manager
+    did exactly the right thing (enable it), which is precisely the moment
+    this rollout plan has him watching the card. `AutomationRunner.set_enabled`
+    already persists `next_run` at the moment of enabling (`status()` surfaces
+    it, empty only while disabled) — this now stays silent until `next_run`
+    PLUS the same staleness threshold this function already uses has actually
+    passed, i.e. the producer is allowed one full missed cycle beyond its
+    first scheduled run before it is called suspicious, exactly like a
+    producer that already ran once. A missing/unparsable `next_run` on an
+    enabled producer (should not happen via `set_enabled`, but a hand-edited
+    state file can do it) falls through to the immediate warning below — the
+    fail-safe direction, since without `next_run` there is nothing here that
+    CAN wait safely."""
     warnings = []
     by_key = {s["key"]: s for s in RUNNER.status()}
     now = datetime.now(timezone.utc)
@@ -7336,6 +7354,19 @@ def _stale_producer_warnings() -> list[str]:
         name = s.get("name") or key
         last_run = s.get("last_run") or ""
         if not last_run:
+            next_run = s.get("next_run") or ""
+            if next_run:
+                try:
+                    nr_dt = datetime.fromisoformat(next_run)
+                    if nr_dt.tzinfo is None:
+                        nr_dt = nr_dt.replace(tzinfo=timezone.utc)
+                    if now <= nr_dt + timedelta(seconds=threshold_s):
+                        continue    # N1 — still within its first grace window
+                except ValueError:
+                    log.error("automation %s: next_run %r nečitateľný — "
+                              "neviem posúdiť prvé grace obdobie, hlásim "
+                              "okamžite (fail-safe)", key, next_run)
+                    # fall through — loud, same fail-safe direction as I2
             warnings.append(f"Automatizácia {name} je zapnutá, ale ešte ani raz "
                             f"nebežala — over, či beží plánovač.")
             continue
@@ -9605,7 +9636,27 @@ def _queue_stale_while_disabled_warning(enabled: bool) -> str:
         transition either side of the queue) can sort backwards from their
         real chronological order, misjudging staleness by up to an hour.
         Every timestamp is now parsed to a real `datetime` and compared by
-        actual elapsed seconds, never by string order."""
+        actual elapsed seconds, never by string order.
+
+    #299 opravné kolo 2 review N3 — the table is valid JSON but any of its
+    values can still be a shape this code never wrote (a hand-edit, a bug in
+    some OTHER writer, or plain corruption that stays valid JSON): a bare
+    string instead of `{"fields": …}`, a `fields` that is a list instead of a
+    dict, or a field entry that is a string instead of `{"queued_at": …}`.
+    Before this fix any of those raised `AttributeError`/`TypeError` straight
+    out of `.get()`/`.values()` — uncaught, so `/api/automations` returned
+    500 and EVERY automation card vanished from the manager's screen, not
+    just this one. Every shape that is not a dict where a dict is expected
+    now counts as `unreadable` (below) — loud, same direction as an
+    unparsable/missing timestamp, never a crash.
+
+    #299 opravné kolo 2 review N4 — a `queued_at` in the FUTURE (a clock
+    step, an NTP jump, a hand-edited value) gives a NEGATIVE age. Age
+    comparisons below are all `>=`/`<` against a positive threshold, so a
+    negative age reads as "very fresh" and, if it happens to be the ONLY
+    field in the table, silences the alarm entirely — the one remaining
+    branch that stayed quiet on data this function cannot trust. Treated
+    exactly like an unparsable timestamp: loud."""
     if enabled:
         return ""
     pending, from_disk = _read_json_store_state(PENDING_SHOPTET, {})
@@ -9615,12 +9666,25 @@ def _queue_stale_while_disabled_warning(enabled: bool) -> str:
         return ("Tabuľka čakajúcich zmien (pending_shoptet.json) sa nedá "
                 "prečítať — neviem posúdiť, či v nej niečo starne, kým je "
                 "hodinový cyklus „Sync do Shoptetu“ vypnutý. Over súbor.")
-    fields = [f for e in pending.values() for f in (e.get("fields") or {}).values()]
-    if not fields:
-        return ""
+    fields = []
+    unreadable = 0
+    for e in pending.values():
+        if not isinstance(e, dict):            # N3 — e.g. {"A": "x"}
+            unreadable += 1
+            continue
+        fs = e.get("fields")
+        if fs is None:
+            continue                           # legitimately no fields queued for this code
+        if not isinstance(fs, dict):            # N3 — e.g. {"fields": ["x"]}
+            unreadable += 1
+            continue
+        for f in fs.values():
+            if isinstance(f, dict):
+                fields.append(f)
+            else:
+                unreadable += 1                # N3 — e.g. {"fields": {"n": "x"}}
     now = datetime.now(timezone.utc)
     ages_s = []
-    unreadable = 0
     for f in fields:
         raw = f.get("queued_at")
         if not raw:
@@ -9630,16 +9694,22 @@ def _queue_stale_while_disabled_warning(enabled: bool) -> str:
             dt = datetime.fromisoformat(raw)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            ages_s.append((now - dt).total_seconds())
-        except ValueError:
+            age_s = (now - dt).total_seconds()
+        except (ValueError, TypeError):        # TypeError — e.g. a numeric queued_at (N3)
             unreadable += 1
+            continue
+        if age_s < 0:                          # N4 — queued_at in the future
+            unreadable += 1
+            continue
+        ages_s.append(age_s)
     if unreadable:
-        log.error("sync do Shoptetu: %d polí vo fronte nemá čitateľný čas "
-                  "zaradenia — neviem posúdiť starnutie pri vypnutom cykle",
-                  unreadable)
-        return (f"{unreadable} polí vo fronte nemá čitateľný čas zaradenia a "
-                f"hodinový cyklus „Sync do Shoptetu“ je vypnutý — neviem "
-                f"povedať, ako dlho tam čakajú. Over pending_shoptet.json.")
+        log.error("sync do Shoptetu: %d polí vo fronte je poškodených alebo "
+                  "nemá čitateľný čas zaradenia — neviem posúdiť starnutie "
+                  "pri vypnutom cykle", unreadable)
+        return (f"{unreadable} polí vo fronte je poškodených alebo nemá "
+                f"čitateľný čas zaradenia a hodinový cyklus „Sync do "
+                f"Shoptetu“ je vypnutý — neviem povedať, ako dlho tam čakajú. "
+                f"Over pending_shoptet.json.")
     if not ages_s:
         return ""
     age_s = max(ages_s)          # m1 — oldest = the LARGEST real elapsed time

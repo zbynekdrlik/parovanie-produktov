@@ -4455,7 +4455,10 @@ function renderShoptetUpload() {
   if ((lr.producers_disabled || []).length) {
     const d = el('div', 'muted', '');
     d.dataset.testid = 'shoptet-upload-producers-disabled';
-    d.textContent = 'Vypnuté: ' + lr.producers_disabled.join(', ');
+    // #299 opravné kolo 2 — "zváženie 1": plain "Vypnuté: …" is ambiguous on
+    // THIS card, which can ALSO show the cycle itself switched off (▶ Štart /
+    // ⏸ Stop up top) — "Producenti vypnutí" names what is disabled.
+    d.textContent = 'Producenti vypnutí: ' + lr.producers_disabled.join(', ');
     st.appendChild(d);
   }
 
