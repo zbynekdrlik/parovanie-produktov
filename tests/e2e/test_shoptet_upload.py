@@ -67,6 +67,29 @@ def test_the_card_names_how_many_changes_are_waiting_and_which_are_blocked(
     expect(blocked).to_contain_text("staršie, než je povolený limit")
 
 
+# ── #299 hĺbková recenzia (5) — „N× eshop tento kód..." read wrong the moment ─
+# ── N != 1 (singular demonstrative next to a plural counter), and „N× majú ─── #
+# ── pole..." read wrong the moment N == 1 (plural verb for one field). Both ── #
+# ── reasons now decline through `pluralWord` like `pluralZmeny` above. ──────  #
+def test_pending_blocked_reason_sentence_declines_singular_vs_plural(
+        shoptet_upload_server, page):
+    page.goto(shoptet_upload_server)
+    page.wait_for_selector('[data-testid="version"]')
+
+    out = page.evaluate("""() => [
+      pendingBlockedReasonSentence([{reason: 'not-in-catalog'}]),
+      pendingBlockedReasonSentence([
+        {reason: 'not-in-catalog'}, {reason: 'not-in-catalog'}, {reason: 'not-in-catalog'}]),
+      pendingBlockedReasonSentence([{reason: 'stale-field'}]),
+      pendingBlockedReasonSentence([{reason: 'stale-field'}, {reason: 'stale-field'}]),
+    ]""")
+
+    assert out[0] == "1× eshop tento kód v katalógu nemá, čaká, kým sa objaví"
+    assert out[1] == "3× eshop tieto kódy v katalógu nemá, čakajú, kým sa objavia"
+    assert out[2] == "1× má pole staršie, než je povolený limit"
+    assert out[3] == "2× majú pole staršie, než je povolený limit"
+
+
 def test_the_console_stays_clean(shoptet_upload_server, page):
     msgs = []
     page.on("console", lambda m: msgs.append(m))
