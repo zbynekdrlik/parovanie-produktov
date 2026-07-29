@@ -329,6 +329,39 @@ def test_an_assignment_the_eshop_has_OVERTAKEN_is_removed_from_the_store(iso, mo
     assert result2["remaining"] == 0, result2
 
 
+def test_a_queued_but_not_yet_confirmed_supplier_is_never_treated_as_obsolete(
+        iso, monkeypatch):
+    """#299 záverečná recenzia — Critical C1. Since the #299 migration, credit for
+    this table (uploaded_suppliers.json) lands only AFTER the hourly drain's OWN
+    import confirms the row — never at send time. That opens a real window: a code
+    can be CURRENTLY QUEUED (sent by an earlier run, or by this very one, still
+    waiting for the drain to confirm it) while `uploaded_suppliers.json` genuinely
+    has not caught up yet. Before the fix, `c not in uploaded` reads that exactly
+    like „nobody ever wrote this" — and if the export already shows the eshop's
+    own supplier (the value we are literally in the middle of sending), #215's
+    removal fires and deletes the manager's live assignment, while the row is
+    STILL sitting in the queue and STILL going out to the live eshop every hour
+    with a value he can no longer see anywhere in this app."""
+    webapp._save_supplier_assign({"5/A": "BETALOV"})
+    monkeypatch.setattr(webapp, "CODE2PAIR", {"5/A": "555"})
+    # the export already carries the value we are sending — the exact ambiguous
+    # shape #215's own comment warns about (own_supplier is true for 5/A)
+    monkeypatch.setattr(webapp, "_iter_export_lines", _export_lines(
+        "code;pairCode;supplier\r\n5/A;555;BETALOV\r\n"))
+    # 5/A is CURRENTLY QUEUED for its supplier field — not yet confirmed, so
+    # uploaded_suppliers.json (seeded empty by `iso`) does not know about it yet
+    webapp.queue_shoptet_fields("parovania_eshop_suppliers", "code;pairCode;supplier",
+                                [["5/A", "555", "BETALOV"]])
+
+    result, status = webapp._do_upload_suppliers(dry=False)
+
+    assert status == 200, result
+    assert result["obsolete_removed"] == [], result
+    assert webapp._load_supplier_assign() == {"5/A": "BETALOV"}, (
+        "the manager's assignment must survive while its own write is still "
+        "in flight in the queue")
+
+
 def test_an_assignment_whose_name_the_manager_CHANGED_is_never_removed(iso, monkeypatch):
     """The trap in „the eshop already has its own supplier": after WE wrote a supplier back,
     the export carries it — so a name the manager then EDITS looks exactly like an
