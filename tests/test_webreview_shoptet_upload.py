@@ -254,6 +254,30 @@ def test_a_field_queued_WELL_WITHIN_the_age_limit_is_sent_normally(cycle):
     assert res["confirmed"] == 1
 
 
+# ── #299 opravné kolo 2 review N-I3 (Important) — `stale_blocked()` fires for ─ #
+# ── ANY `blocked` reason it sees 3+ CONSECUTIVE runs for, and since I5 that ── #
+# ── is no longer only "not-in-catalog": a code held back for being ─────────── #
+# ── `stale-field` reaches the SAME alarm. The log/warning used to hard-code ── #
+# ── "eshop ich v katalógu nemá" regardless of the real reason. ─────────────── #
+def test_a_stale_field_blocked_3_runs_names_the_REAL_reason_not_the_catalogue(cycle):
+    webapp.queue_shoptet_fields("restock_skladom", "code;pairCode;availabilityInStock",
+                                [["A", "P", "Skladom"]])
+    pending = webapp._load_pending()
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=webapp.QUEUED_FIELD_MAX_AGE_S + 3600)).isoformat()
+    pending["A"]["fields"]["availabilityInStock"]["queued_at"] = old
+    webapp._save_pending(pending, prev=webapp._load_pending())
+
+    res = None
+    for _ in range(3):
+        res = webapp.run_shoptet_upload()
+
+    assert res["stale_blocked"] == ["A"], res
+    all_warnings = " ".join(res["warnings"])
+    assert "katalógu" not in all_warnings, res["warnings"]
+    assert "limit" in all_warnings, res["warnings"]
+
+
 # ── #299 opravné kolo 1 review C1 (Critical) — replaces the deleted queue-based ─
 # ── streak signal ("3 hourly cycles with 0 fields of its own queued"), which ── #
 # ── fired on EVERY healthy install: these producers run DAILY, this drain runs ─
