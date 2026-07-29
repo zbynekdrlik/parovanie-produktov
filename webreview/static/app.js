@@ -4500,7 +4500,17 @@ function renderShoptetUpload() {
     b.dataset.testid = 'pending-blocked';
     // #299 opravné kolo 3 (1) — text per skutočný `reason`, nie natvrdo „katalóg" pre
     // všetky (viď `pendingBlockedReasonSentence` vyššie).
-    b.textContent = 'Zablokované: ' + P.blocked.length
+    //
+    // #299 hĺbková recenzia (6) — the label says „polí" (FIELDS), never a bare
+    // „Zablokované: N" — `P.blocked` is `/api/pending-shoptet`'s per-FIELD list
+    // (one entry per code+column), while the run's own „N kódov čaká
+    // zablokovaných" warning (app.py, `_stale_blocked_reason_sentence`'s
+    // caller) counts CODES; the two numbers can legitimately differ (one code
+    // can carry more than one blocked field) and sat on this same card with no
+    // unit at all next to one that already said "kódov" — genitive plural
+    // regardless of count, same invariant convention as "riadkov" elsewhere in
+    // this module (`Shoptet nepotvrdil N … riadkov`).
+    b.textContent = 'Zablokovaných polí: ' + P.blocked.length
       + ' — ' + pendingBlockedReasonSentence(P.blocked);
     st.appendChild(b);
   }
