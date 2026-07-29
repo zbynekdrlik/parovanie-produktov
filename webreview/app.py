@@ -9984,14 +9984,24 @@ def api_automations():
 def api_pending_shoptet():
     """What the next hourly `shoptet_upload` will send, and what it cannot send yet
     (#299 Task 7 — the „Sync do Shoptetu" card). Read-only over `pending_shoptet.json`;
-    writes nothing, triggers nothing. Session-gated like every other endpoint."""
+    writes nothing, triggers nothing. Session-gated like every other endpoint.
+
+    #299 hĺbková recenzia (10) — carries BOTH `queued_at` (refreshed on every
+    re-queue of the same value) AND `first_queued_at` (frozen at the first queue
+    of the current value, per `queue_fields`' N-C1 split) on every item. The UI
+    does not render either today, but `queued_at` alone is the OBNOVOVANÝ
+    timestamp — a field re-affirmed daily by its producer could sit genuinely
+    stale for days while `queued_at` reads as fresh as "this morning". Exposing
+    `first_queued_at` alongside it means a future "waiting since" render has the
+    non-misleading one available without a second migration."""
     pending = _load_pending()
     waiting, blocked = [], []
     for code in sorted(pending):
         e = pending[code]
         for field, f in sorted((e.get("fields") or {}).items()):
             item = {"code": code, "field": field, "value": f.get("value", ""),
-                    "source": f.get("source", ""), "queued_at": f.get("queued_at", "")}
+                    "source": f.get("source", ""), "queued_at": f.get("queued_at", ""),
+                    "first_queued_at": f.get("first_queued_at", "")}
             if e.get("blocked"):
                 blocked.append({**item, "reason": e["blocked"].get("reason", "")})
             else:
